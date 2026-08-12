@@ -2,6 +2,8 @@ import json
 import pytest
 from httpx import ASGITransport, AsyncClient
 from cogdoc.api.app import _unhandled_error_response, create_app
+from cogdoc.api.auth_store import AuthStore
+from cogdoc.api.resource_access import ResourceAccessStore
 from cogdoc.api.session_store import SessionStore
 
 
@@ -173,6 +175,133 @@ async def test_optional_ocr_dependency_is_degraded_but_ready(monkeypatch):
     assert resp.json()["components"]["ocr"] == {
         "status": "degraded",
         "required": False,
+    }
+
+
+@pytest.mark.anyio
+async def test_account_mode_requires_healthy_authentication_and_acl_stores(
+    tmp_path, monkeypatch
+):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    auth_store = AuthStore(str(tmp_path / "auth.db"), scrypt_n=1 << 10)
+    access_store = ResourceAccessStore(tmp_path / "access.db")
+    app = create_app(
+        session_store=SessionStore(),
+        auth_store=auth_store,
+        resource_access_store=access_store,
+    )
+
+    try:
+        async with app.router.lifespan_context(app):
+            async with await _client(app) as client:
+                structured = await client.get("/health/ready")
+                legacy = await client.get("/readyz")
+    finally:
+        auth_store.close()
+        access_store.close()
+
+    assert structured.status_code == legacy.status_code == 200
+    components = structured.json()["components"]
+    assert components["authentication"] == {
+        "status": "ready",
+        "required": True,
+    }
+    assert components["resource_access"] == {
+        "status": "ready",
+        "required": True,
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("closed_store", ["authentication", "resource_access"])
+async def test_account_mode_readiness_fails_closed_when_security_store_is_closed(
+    tmp_path, monkeypatch, closed_store
+):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    auth_store = AuthStore(str(tmp_path / "auth.db"), scrypt_n=1 << 10)
+    access_store = ResourceAccessStore(tmp_path / "access.db")
+    app = create_app(
+        session_store=SessionStore(),
+        auth_store=auth_store,
+        resource_access_store=access_store,
+    )
+
+    try:
+        async with app.router.lifespan_context(app):
+            if closed_store == "authentication":
+                auth_store.close()
+            else:
+                access_store.close()
+            async with await _client(app) as client:
+                structured = await client.get("/health/ready")
+                legacy = await client.get("/readyz")
+    finally:
+        auth_store.close()
+        access_store.close()
+
+    assert structured.status_code == legacy.status_code == 503
+    failed = structured.json()["components"][closed_store]
+    assert failed == {"status": "not_ready", "required": True}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("failed_store", "failure_kind"),
+    [
+        ("authentication", "damaged"),
+        ("resource_access", "damaged"),
+        ("authentication", "exception"),
+        ("resource_access", "exception"),
+    ],
+)
+async def test_account_mode_readiness_rejects_damaged_or_exceptional_store(
+    tmp_path, monkeypatch, failed_store, failure_kind
+):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    auth_store = AuthStore(str(tmp_path / "auth.db"), scrypt_n=1 << 10)
+    access_store = ResourceAccessStore(tmp_path / "access.db")
+    app = create_app(
+        session_store=SessionStore(),
+        auth_store=auth_store,
+        resource_access_store=access_store,
+    )
+
+    try:
+        async with app.router.lifespan_context(app):
+            target_store = (
+                auth_store if failed_store == "authentication" else access_store
+            )
+            if failure_kind == "damaged":
+                # Simulate a partially damaged migration while the connection
+                # itself is alive; it must not look like an empty database.
+                table = (
+                    "auth_sessions"
+                    if failed_store == "authentication"
+                    else "resource_access_acl_epochs"
+                )
+                target_store._conn.execute(f"DROP TABLE {table}")
+            else:
+                monkeypatch.setattr(
+                    target_store,
+                    "check",
+                    lambda: (_ for _ in ()).throw(RuntimeError("probe failed")),
+                )
+            async with await _client(app) as client:
+                response = await client.get("/health/ready")
+    finally:
+        auth_store.close()
+        access_store.close()
+
+    assert response.status_code == 503
+    assert response.json()["components"][failed_store] == {
+        "status": "not_ready",
+        "required": True,
     }
 
 

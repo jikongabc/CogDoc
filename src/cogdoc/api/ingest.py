@@ -1,3 +1,4 @@
+import hashlib
 import inspect
 import json
 import logging
@@ -46,9 +47,12 @@ class RegistryCorruptError(Exception):
     pass
 
 
-# 知识库元数据的 JSON 注册表；source/chroma/bm25/manifest 仍按 kb_id 物理隔离。
+# 知识库元数据的 JSON 注册表；逻辑 (tenant_id, kb_id) 映射到稳定的物理 storage_id。
 class KnowledgeBaseRegistry:
-    # 知识库元数据的 JSON 注册表；source/chroma/bm25/manifest 仍按 kb_id 物理隔离。
+    # 非默认租户使用独立命名空间。完整 SHA-256 既不泄漏租户名，也避免危险字符进入路径。
+    _TENANT_STORAGE_PREFIX = "t-"
+
+    # 知识库元数据的 JSON 注册表；source/chroma/bm25/manifest 按 storage_id 物理隔离。
     def __init__(
         self,
         registry_path: str | None = None,
@@ -77,13 +81,71 @@ class KnowledgeBaseRegistry:
         except json.JSONDecodeError:
             self._quarantine_corrupt()
             raise RegistryCorruptError(f"registry 损坏已隔离: {self._path}")
-        if not isinstance(data, dict) or any(
-            not isinstance(k, str) or not isinstance(v, dict) or v.get("kb_id") != k
-            for k, v in data.items()
-        ):
+        if not isinstance(data, dict):
             self._quarantine_corrupt()
             raise RegistryCorruptError(f"registry 顶层非 dict 已隔离: {self._path}")
-        return data
+
+        # 旧版以 kb_id 为 key，且可能没有 tenant/owner/storage 字段。只在内存中补齐，
+        # 不在读取时改盘；下一次真实 mutation 才会自然写出新格式。
+        normalized: dict[str, dict] = {}
+        logical_keys: set[tuple[str, str]] = set()
+        try:
+            for persisted_key, raw_record in data.items():
+                if not isinstance(persisted_key, str) or not isinstance(
+                    raw_record, dict
+                ):
+                    raise ValueError("registry entry must be an object")
+                kb_id = raw_record.get("kb_id")
+                tenant_id = raw_record.get("tenant_id", "default")
+                owner_id = raw_record.get("owner_id", "default")
+                if not isinstance(kb_id, str) or not kb_id:
+                    raise ValueError("registry kb_id is invalid")
+                if not isinstance(tenant_id, str) or not tenant_id:
+                    raise ValueError("registry tenant_id is invalid")
+                if not isinstance(owner_id, str) or not owner_id:
+                    raise ValueError("registry owner_id is invalid")
+                if self._validate_kb_id(kb_id) != kb_id:
+                    raise ValueError("registry kb_id is not canonical")
+                if (
+                    self._normalize_identity_id(tenant_id, field="tenant_id")
+                    != tenant_id
+                ):
+                    raise ValueError("registry tenant_id is not canonical")
+                if self._normalize_identity_id(owner_id, field="owner_id") != owner_id:
+                    raise ValueError("registry owner_id is not canonical")
+
+                stored_storage_id = raw_record.get("storage_id")
+                if stored_storage_id is None:
+                    # No released version wrote a non-default tenant without a
+                    # storage_id, so only the exact legacy default layout is safe.
+                    if tenant_id != "default" or persisted_key != kb_id:
+                        raise ValueError("registry legacy storage identity is invalid")
+                    storage_id = kb_id
+                elif not isinstance(stored_storage_id, str) or not stored_storage_id:
+                    raise ValueError("registry storage_id is invalid")
+                else:
+                    storage_id = stored_storage_id
+
+                expected_storage_id = self._make_storage_id(kb_id, tenant_id)
+                if storage_id != expected_storage_id or persisted_key != storage_id:
+                    raise ValueError("registry storage identity does not match record")
+                logical_key = (tenant_id, kb_id)
+                if logical_key in logical_keys or storage_id in normalized:
+                    raise ValueError(
+                        "registry contains duplicate knowledge base identity"
+                    )
+                logical_keys.add(logical_key)
+                normalized[storage_id] = {
+                    **raw_record,
+                    "kb_id": kb_id,
+                    "tenant_id": tenant_id,
+                    "owner_id": owner_id,
+                    "storage_id": storage_id,
+                }
+        except ValueError:
+            self._quarantine_corrupt()
+            raise RegistryCorruptError(f"registry 记录非法已隔离: {self._path}")
+        return normalized
 
     # 隔离损坏文件。
     def _quarantine_corrupt(self) -> None:
@@ -99,41 +161,162 @@ class KnowledgeBaseRegistry:
 
     # 保存 entries。
     def _save_entries(self, entries: dict) -> None:
-        # 原子写候选表：先写临时文件再 rename，避免中途崩溃留下半截 JSON。
+        # 原子且持久地写候选表：先写临时文件并 fsync，再 rename 并 fsync
+        # 父目录，避免掉电后出现“内存已提交、registry 名字却消失”。
         tmp_path = f"{self._path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(entries, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, self._path)
+        parent = os.path.dirname(self._path) or "."
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(parent, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
-    # 返回目录。
-    def source_dir(self, kb_id: str) -> str:
-        return self._source_dir_for(kb_id)
+    @classmethod
+    def _make_storage_id(cls, kb_id: str, tenant_id: str) -> str:
+        if tenant_id == "default":
+            return kb_id
+        identity = json.dumps(
+            [tenant_id, kb_id], ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        digest = hashlib.sha256(b"cogdoc-kb-storage-v1\0" + identity).hexdigest()
+        return f"{cls._TENANT_STORAGE_PREFIX}{digest}"
+
+    @classmethod
+    def storage_id_for(cls, kb_id: str, tenant_id: str = "default") -> str:
+        """Return the physical identity used for locks, paths, and indexes."""
+
+        kb_id, tenant_id, _ = cls._validated_identity(kb_id, tenant_id)
+        return cls._make_storage_id(kb_id, tenant_id)
+
+    @staticmethod
+    def _validate_kb_id(value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("kb_id must be a string")
+        if (
+            not value
+            or value != value.strip()
+            or len(value) > 56
+            or value in {".", ".."}
+            or "\x00" in value
+            or any(character in "/\\" or character.isspace() for character in value)
+        ):
+            raise ValueError("invalid kb_id")
+        return value
+
+    @staticmethod
+    def _normalize_identity_id(value: str, *, field: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+        normalized = value.strip()
+        if (
+            not normalized
+            or len(normalized) > 160
+            or any(
+                ord(character) < 32 or ord(character) == 127 for character in normalized
+            )
+        ):
+            raise ValueError(f"invalid {field}")
+        return normalized
+
+    @classmethod
+    def _validated_identity(
+        cls, kb_id: str, tenant_id: str, owner_id: str | None = None
+    ) -> tuple[str, str, str | None]:
+        kb_id = cls._validate_kb_id(kb_id)
+        tenant_id = cls._normalize_identity_id(tenant_id, field="tenant_id")
+        if owner_id is not None:
+            owner_id = cls._normalize_identity_id(owner_id, field="owner_id")
+        return kb_id, tenant_id, owner_id
+
+    def _get_unlocked(self, kb_id: str, tenant_id: str) -> dict | None:
+        storage_id = self._make_storage_id(kb_id, tenant_id)
+        record = self._entries.get(storage_id)
+        if record is None:
+            return None
+        if record.get("kb_id") != kb_id or record.get("tenant_id") != tenant_id:
+            # A hash collision or corrupt in-memory state must never resolve to
+            # another tenant's data.
+            return None
+        return record
+
+    # 将租户内逻辑 slug 解析为带稳定物理身份的完整记录。
+    def resolve(self, kb_id: str, tenant_id: str = "default") -> dict | None:
+        kb_id, tenant_id, _ = self._validated_identity(kb_id, tenant_id)
+        with self._lock:
+            record = self._get_unlocked(kb_id, tenant_id)
+            return dict(record) if record is not None else None
+
+    # 按物理身份反查，用于 job/research/trace 等异步资源授权。
+    def get_by_storage_id(self, storage_id: str) -> dict | None:
+        if not isinstance(storage_id, str) or not storage_id:
+            return None
+        with self._lock:
+            record = self._entries.get(storage_id)
+            return dict(record) if record is not None else None
+
+    # 返回目录。既接受逻辑 kb_id（可带 tenant），也接受记录中的 storage_id。
+    def source_dir(self, kb_id: str, tenant_id: str | None = None) -> str:
+        with self._lock:
+            direct = self._entries.get(kb_id) if tenant_id is None else None
+            if direct is not None:
+                storage_id = str(direct["storage_id"])
+            else:
+                resolved_tenant = "default" if tenant_id is None else tenant_id
+                kb_id, resolved_tenant, _ = self._validated_identity(
+                    kb_id, resolved_tenant
+                )
+                record = self._get_unlocked(kb_id, resolved_tenant)
+                storage_id = (
+                    str(record["storage_id"])
+                    if record is not None
+                    else self._make_storage_id(kb_id, resolved_tenant)
+                )
+        return self._source_dir_for(storage_id)
 
     # 创建。
-    def create(self, kb_id: str) -> dict:
+    def create(
+        self,
+        kb_id: str,
+        tenant_id: str = "default",
+        owner_id: str = "default",
+    ) -> dict:
+        kb_id, tenant_id, owner_id = self._validated_identity(
+            kb_id, tenant_id, owner_id
+        )
+        assert owner_id is not None
+        storage_id = self._make_storage_id(kb_id, tenant_id)
         with self._lock:
-            if kb_id in self._entries:
+            if self._get_unlocked(kb_id, tenant_id) is not None:
                 raise KBExistsError(kb_id)
+            if storage_id in self._entries:
+                # Defensive collision guard: never alias two logical identities.
+                raise RegistryCorruptError("storage_id collision")
             # 新 incarnation：epoch 自增，令删库前在飞、捕获旧 epoch 的任务在重建后仍被守卫拦下。
-            shared_epoch_store().bump(kb_id)
-            os.makedirs(self._source_dir_for(kb_id), exist_ok=True)
-            # tenant_id/owner_id 现填默认值，为未来多租户隔离预留。
+            shared_epoch_store().bump(storage_id)
+            os.makedirs(self._source_dir_for(storage_id), exist_ok=True)
             record = {
                 "kb_id": kb_id,
                 "created_at": _now_iso(),
-                "tenant_id": "default",
-                "owner_id": "default",
+                "tenant_id": tenant_id,
+                "owner_id": owner_id,
+                "storage_id": storage_id,
             }
             # registry 持久化是提交点：先写盘成功再更新内存。提交前 lifecycle 仍是旧态（如 deleted→读被拦）， 故"registry 已存在但 lifecycle 未 active"是 fail-closed，不会出现"registry 缺失但可读旧数据"。
-            candidate = {**self._entries, kb_id: record}
+            candidate = {**self._entries, storage_id: record}
             self._save_entries(candidate)
             self._entries = candidate
             # 提交后切 active，清除同名 KB 的 deleted tombstone，恢复读写。
             try:
-                shared_lifecycle_store().set(kb_id, LIFECYCLE_ACTIVE)
+                shared_lifecycle_store().set(storage_id, LIFECYCLE_ACTIVE)
             except Exception:
                 # 先清目录、再撤 registry。目录清理失败时保留 registry 记录，让调用方可显式 DELETE 重试， 不能移除记录后让同名 create 复用半创建目录。
-                kb_dir = os.path.dirname(self._source_dir_for(kb_id))
+                kb_dir = os.path.dirname(self._source_dir_for(storage_id))
                 try:
                     shutil.rmtree(kb_dir)
                 except FileNotFoundError:
@@ -142,35 +325,71 @@ class KnowledgeBaseRegistry:
                     raise KBCleanupError(
                         f"KB 创建 finalize 失败且目录补偿失败: {kb_dir}"
                     ) from cleanup_exc
-                candidate = {k: v for k, v in self._entries.items() if k != kb_id}
+                candidate = {k: v for k, v in self._entries.items() if k != storage_id}
                 self._save_entries(candidate)
                 self._entries = candidate
                 raise
             return dict(record)
 
     # 检查存在性。
-    def exists(self, kb_id: str) -> bool:
+    def exists(self, kb_id: str, tenant_id: str | None = None) -> bool:
+        if tenant_id is None:
+            with self._lock:
+                if kb_id in self._entries:
+                    return True
+        resolved_tenant = "default" if tenant_id is None else tenant_id
+        try:
+            kb_id, resolved_tenant, _ = self._validated_identity(kb_id, resolved_tenant)
+        except ValueError:
+            return False
         with self._lock:
-            return kb_id in self._entries
+            return self._get_unlocked(kb_id, resolved_tenant) is not None
 
     # 返回结果。
-    def get(self, kb_id: str) -> dict | None:
+    def get(self, kb_id: str, tenant_id: str | None = None) -> dict | None:
+        if tenant_id is None:
+            with self._lock:
+                direct = self._entries.get(kb_id)
+                if direct is not None:
+                    return dict(direct)
+        resolved_tenant = "default" if tenant_id is None else tenant_id
+        try:
+            kb_id, resolved_tenant, _ = self._validated_identity(kb_id, resolved_tenant)
+        except ValueError:
+            return None
         with self._lock:
-            record = self._entries.get(kb_id)
+            record = self._get_unlocked(kb_id, resolved_tenant)
             return dict(record) if record else None
 
     # 列出。
-    def list(self) -> list[dict]:
+    def list(self, tenant_id: str | None = None) -> list[dict]:
+        if tenant_id is not None:
+            tenant_id = self._normalize_identity_id(tenant_id, field="tenant_id")
         with self._lock:
-            return [dict(record) for record in self._entries.values()]
+            return [
+                dict(record)
+                for record in self._entries.values()
+                if tenant_id is None or record.get("tenant_id") == tenant_id
+            ]
 
     # 删除。
-    def delete(self, kb_id: str) -> bool:
+    def delete(self, kb_id: str, tenant_id: str | None = None) -> bool:
         # 先删源目录，成功后才从 registry 移除：目录删失败时 registry 仍保留该 KB，DELETE 可重试不返回 404。
         with self._lock:
-            if kb_id not in self._entries:
+            record = self._entries.get(kb_id) if tenant_id is None else None
+            if record is None:
+                resolved_tenant = "default" if tenant_id is None else tenant_id
+                try:
+                    kb_id, resolved_tenant, _ = self._validated_identity(
+                        kb_id, resolved_tenant
+                    )
+                except ValueError:
+                    return False
+                record = self._get_unlocked(kb_id, resolved_tenant)
+            if record is None:
                 return False
-            kb_dir = os.path.dirname(self._source_dir_for(kb_id))
+            storage_id = str(record["storage_id"])
+            kb_dir = os.path.dirname(self._source_dir_for(storage_id))
             try:
                 shutil.rmtree(kb_dir)
             except FileNotFoundError:
@@ -178,7 +397,7 @@ class KnowledgeBaseRegistry:
             except OSError as exc:
                 raise KBCleanupError(f"KB 目录删除失败: {kb_dir}") from exc
             # 目录已清，再原子写出不含该 KB 的候选表并更新内存。
-            candidate = {k: v for k, v in self._entries.items() if k != kb_id}
+            candidate = {k: v for k, v in self._entries.items() if k != storage_id}
             self._save_entries(candidate)
             self._entries = candidate
             return True
@@ -389,6 +608,18 @@ class IndexJobManager:
         if stored is None or stored.get("committed_generation_id") != gen_id:
             raise RuntimeError(f"job {job_id} 的 generation 提交证据未持久化")
 
+    def _prepare_authorized_commit(
+        self,
+        job_id: str,
+        gen_id: str,
+        authorization_guard: Callable[[], None] | None,
+    ) -> None:
+        # Persist crash-recovery evidence first, then make the live authorization
+        # check the final fallible operation immediately before switch_active.
+        self._prepare_commit(job_id, gen_id)
+        if authorization_guard is not None:
+            authorization_guard()
+
     # 拒绝ifunresolved。
     def _reject_if_unresolved(self, job_id: str, kb_id: str) -> bool:
         if not self._journal.has_entries(kb_id):
@@ -457,15 +688,41 @@ class IndexJobManager:
 
     # 提交上传。
     def submit_upload(
-        self, kb_id: str, source_dir: str, filename: str, content: bytes
+        self,
+        kb_id: str,
+        source_dir: str,
+        filename: str,
+        content: bytes,
+        on_finished: Callable[[], None] | None = None,
+        authorization_guard: Callable[[], None] | None = None,
     ) -> dict:
         # 写文件与构建索引作为一个 executor command：保证每个 job 快照与其 mutation 精确对应。
-        return self._enqueue(kb_id, self._run_with_write, source_dir, filename, content)
+        return self._enqueue(
+            kb_id,
+            self._run_with_write,
+            source_dir,
+            filename,
+            content,
+            on_finished,
+            authorization_guard,
+        )
 
     # 提交删除文档。
-    def submit_delete_doc(self, kb_id: str, path: str) -> dict:
+    def submit_delete_doc(
+        self,
+        kb_id: str,
+        path: str,
+        on_succeeded: Callable[[], None] | None = None,
+        authorization_guard: Callable[[], None] | None = None,
+    ) -> dict:
         # 存在性检查在 executor command 内进行，保证与上传队列有序：upload 排在前则文件已落盘。
-        return self._enqueue(kb_id, self._run_with_delete_doc, path)
+        return self._enqueue(
+            kb_id,
+            self._run_with_delete_doc,
+            path,
+            on_succeeded,
+            authorization_guard,
+        )
 
     # 运行blocking。
     def run_blocking(self, kb_id: str, fn: Callable, *args) -> object:
@@ -559,6 +816,32 @@ class IndexJobManager:
         source_dir: str,
         filename: str,
         content: bytes,
+        on_finished: Callable[[], None] | None = None,
+        authorization_guard: Callable[[], None] | None = None,
+    ) -> None:
+        try:
+            self._run_with_write_reserved(
+                job_id,
+                kb_id,
+                base_epoch,
+                source_dir,
+                filename,
+                content,
+                authorization_guard,
+            )
+        finally:
+            if on_finished is not None:
+                on_finished()
+
+    def _run_with_write_reserved(
+        self,
+        job_id: str,
+        kb_id: str,
+        base_epoch: int,
+        source_dir: str,
+        filename: str,
+        content: bytes,
+        authorization_guard: Callable[[], None] | None = None,
     ) -> None:
         if self._store.get(job_id) is None:
             return
@@ -568,6 +851,13 @@ class IndexJobManager:
             )
             return
         if self._reject_if_unresolved(job_id, kb_id):
+            return
+        if authorization_guard is not None and not self._ingest_takes_on_commit:
+            self._fail_job(
+                job_id,
+                kb_id,
+                RuntimeError("索引构建器不支持提交前权限复验"),
+            )
             return
         dest = os.path.join(source_dir, filename)
         backup = f"{dest}.{job_id}{_BAK_SUFFIX}"  # 唯一名，绝不覆盖上次崩溃遗留的备份
@@ -591,7 +881,9 @@ class IndexJobManager:
             job_id,
             kb_id,
             source_dir,
-            on_commit=lambda gid: self._prepare_commit(job_id, gid),
+            on_commit=lambda gid: self._prepare_authorized_commit(
+                job_id, gid, authorization_guard
+            ),
         )
         if ok:
             # 已提交：先打不可逆 committed 标记，再 best-effort 清备份，最后无条件清 journal。 不能因备份清理失败而保留 journal——否则后续切代/删库会让它被误判未提交而回滚已提交源文件。
@@ -613,7 +905,13 @@ class IndexJobManager:
 
     # 运行with删除文档。
     def _run_with_delete_doc(
-        self, job_id: str, kb_id: str, base_epoch: int, path: str
+        self,
+        job_id: str,
+        kb_id: str,
+        base_epoch: int,
+        path: str,
+        on_succeeded: Callable[[], None] | None = None,
+        authorization_guard: Callable[[], None] | None = None,
     ) -> None:
         if self._store.get(job_id) is None:
             return
@@ -623,6 +921,13 @@ class IndexJobManager:
             )
             return
         if self._reject_if_unresolved(job_id, kb_id):
+            return
+        if authorization_guard is not None and not self._ingest_takes_on_commit:
+            self._fail_job(
+                job_id,
+                kb_id,
+                RuntimeError("索引构建器不支持提交前权限复验"),
+            )
             return
         if not os.path.exists(path):
             self._fail_job(
@@ -650,7 +955,10 @@ class IndexJobManager:
             job_id,
             kb_id,
             os.path.dirname(path),
-            on_commit=lambda gid: self._prepare_commit(job_id, gid),
+            on_commit=lambda gid: self._prepare_authorized_commit(
+                job_id, gid, authorization_guard
+            ),
+            on_succeeded=on_succeeded,
         )
         if ok:
             committed_marked = self._journal.mark_committed(job_id)
@@ -669,7 +977,14 @@ class IndexJobManager:
             self._finish_rollback(job_id)
 
     # 运行ingest。
-    def _run_ingest(self, job_id, kb_id, source_dir, on_commit=None) -> bool:
+    def _run_ingest(
+        self,
+        job_id,
+        kb_id,
+        source_dir,
+        on_commit=None,
+        on_succeeded: Callable[[], None] | None = None,
+    ) -> bool:
         try:
             self._store.update(job_id, status="running")
         except Exception:
@@ -679,10 +994,7 @@ class IndexJobManager:
             if self._ingest_takes_on_commit:
                 # 提交点贴死 switch_active：build 在提交前用 gen_id 回调 record_generation。
                 ingest_kwargs["on_commit"] = on_commit
-            if (
-                self._ingest_takes_knowledge_store
-                and self._knowledge_store is not None
-            ):
+            if self._ingest_takes_knowledge_store and self._knowledge_store is not None:
                 ingest_kwargs["knowledge_store"] = self._knowledge_store
             # 不支持新参数的旧/测试 ingest_fn 保持原有两参数调用契约。
             result = self._ingest_fn(kb_id, source_dir, **ingest_kwargs)
@@ -690,6 +1002,17 @@ class IndexJobManager:
             # 构建未提交（active 仍是旧代）：返回 False 触发源文件回滚。
             self._fail_job(job_id, kb_id, exc)
             return False
+        if on_succeeded is not None:
+            try:
+                # ingest_fn 返回代表新索引代已经提交。删除文档的 ACL 清理必须
+                # 位于此提交点之后、job succeeded 终态之前，确保客户端看到成功
+                # 时旧策略与 document grants 已不可见。
+                on_succeeded()
+            except Exception as exc:
+                # 索引提交不可逆，返回 True 让调用方完成 quarantine/journal
+                # 收尾；同时把 job 标失败，避免把未完成的安全清理报告为成功。
+                self._fail_job(job_id, kb_id, exc)
+                return True
         # 索引已提交：终态状态写入做退避重试（缓解 SQLite 瞬时锁），仍失败则记 error，不回滚已生效源文件。
         last_exc = None
         for attempt in range(4):

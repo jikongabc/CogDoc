@@ -39,7 +39,7 @@ A local RAG knowledge-base console for individuals and teams, built on **LangGra
 
 - **Trace observability, review queue, and webhooks** — every request can export a safe JSON trace with config, node timings, rewrites, evidence previews, and errors; the web UI scopes traces to the current conversation, aggregates pending/stale knowledge and feedback into a review queue, and can emit webhook events for new pending knowledge.
 
-- **API access control and rate limiting** — optional API keys protect `/v1` routes, with a token-bucket limiter that avoids throttling high-frequency health/session/trace polling.
+- **Real accounts, team workspaces, and retrieval ACLs** — optional persistent email/password accounts provide revocable sessions, workspace membership, invitations, RBAC, and tenant-isolated state. Knowledge-base/document policies and subject grants are enforced inside vector and BM25 recall before top-k, then checked again before evidence reaches prompts, traces, or background Research.
 
 ## Feature Walkthrough
 
@@ -94,6 +94,8 @@ Dependencies live in [pyproject.toml](pyproject.toml): runtime in `[project.depe
 
 Copy `.env.example` to `.env` and set at least your cloud `LLM_API_KEY` (or run `/local` with Ollama). Put PDFs in the inbox `your_documents/` (or set `COGDOC_DOC_DIR`). `make native` must be re-run after any change under `rust_core/src/` — the `.so` is not auto-rebuilt and not committed.
 
+Persistent accounts default to off for a no-surprise upgrade. For an individual or team deployment, set `COGDOC_ACCOUNT_AUTH_ENABLED=true`, start the API, register the first owner, and use its returned Bearer token. An enterprise can then invite the remaining members and set `COGDOC_SELF_REGISTRATION_ENABLED=false`.
+
 ## How to Use
 
 The CLI and web app share the same KB → ingest → ask flow. Set up once (see [Quick Start](#quick-start)): install deps, build the native extension (`make native && make check`), configure `.env`, and drop PDFs into `your_documents/`.
@@ -124,13 +126,14 @@ make frontend       # terminal 2: Streamlit UI (opens in the browser)
 
 In the browser:
 
-1. **Sidebar → Knowledge base** — create a KB, or select an existing one.
-2. **Sidebar → Documents** — upload a PDF and ingest it; a progress panel polls the background index job until it finishes.
-3. **Conversations** — start a new conversation or reopen a previous one (session and KB persist in the URL, so a refresh resumes the same chat).
-4. **Chat** — pick a mode (`auto` / `qa` / `summary` / `compare`), ask, watch live progress, and read the finalized answer with its citation sources, evidence snippets, and 👍/👎 feedback.
-5. Toggle **Local Ollama mode** in the sidebar to route generation to the local model.
-6. Open **Debug** to inspect traces for the current conversation only, or use **Retrieval debug** to call `/v1/retrieve` directly and inspect chunk hits, rerank scores, and retrieval metadata.
-7. Switch the main view to **Derived Knowledge** to create knowledge, review pending/stale items, inspect feedback analysis, enable/disable retrieval tuning, export the review queue, and scan for stale bindings after document changes.
+1. **Account** — when account auth is enabled, register or sign in, then choose one of your personal/team workspaces.
+2. **Sidebar → Knowledge base** — create a KB, or select an existing one.
+3. **Sidebar → Documents** — upload a PDF and ingest it; a progress panel polls the background index job until it finishes.
+4. **Conversations** — start a new conversation or reopen a previous one (session and KB persist in the URL, so a refresh resumes the same chat).
+5. **Chat** — pick a mode (`auto` / `qa` / `summary` / `compare`), ask, watch live progress, and read the finalized answer with its citation sources, evidence snippets, and 👍/👎 feedback.
+6. Toggle **Local Ollama mode** in the sidebar to route generation to the local model.
+7. Open **Debug** to inspect traces for the current conversation only, or use **Retrieval debug** to call `/v1/retrieve` directly and inspect chunk hits, rerank scores, and retrieval metadata.
+8. Switch the main view to **Derived Knowledge** to create knowledge, review pending/stale items, inspect feedback analysis, enable/disable retrieval tuning, export the review queue, and scan for stale bindings after document changes.
 
 ### Calling the API directly
 
@@ -138,7 +141,18 @@ The Streamlit app is a thin client over the FastAPI service — you can hit it d
 
 | Endpoint | Purpose |
 | --- | --- |
+| `GET /v1/auth/config`, `POST /v1/auth/register`, `POST /v1/auth/login` | Discover account mode, create an account/personal workspace, or issue an opaque Bearer session |
+| `GET /v1/auth/me`, `POST /v1/auth/logout`, `POST /v1/auth/logout-all` | Inspect the current identity or revoke one/all login sessions |
+| `GET /v1/auth/sessions`, `DELETE /v1/auth/sessions/{id}`, `POST /v1/auth/change-password` | Manage devices/sessions and rotate the password |
+| `GET/POST /v1/workspaces`, `POST /v1/workspaces/{id}/switch` | List/create workspaces and switch the current session's active workspace |
+| `GET /v1/workspaces/{id}/members`, `PATCH/DELETE /v1/workspaces/{id}/members/{member_id}` | List members, change roles, or remove a member |
+| `POST/GET /v1/workspaces/{id}/invites`, `DELETE /v1/workspaces/{id}/invites/{invite_id}`, `POST /v1/auth/invitations/accept` | Issue, inspect, revoke, or accept one-time workspace invitations |
+| `GET /v1/tenant` | Inspect the authenticated workspace, subject, role, permissions, and quota usage |
+| `GET /v1/audit-events` | Page through the current workspace's hash-chained audit metadata (owner/admin) |
 | `POST /v1/knowledge-bases`, `GET /v1/knowledge-bases` | Create / list knowledge bases |
+| `GET/PATCH /v1/knowledge-bases/{kb}/access` | Inspect or change a KB's `workspace` / `private` policy |
+| `GET/PATCH /v1/knowledge-bases/{kb}/documents/{document_id}/access` | Inspect or change a document's `inherit` / `workspace` / `private` policy |
+| `GET/POST/DELETE .../access/grants[/subject_id]` | Manage subject grants at either KB or document scope |
 | `POST /v1/knowledge-bases/{kb}/documents` | Upload + ingest a PDF (returns an async `job_id`) |
 | `GET /v1/knowledge-bases/{kb}/sources`, `GET /v1/knowledge-bases/{kb}/sources/{source}/chunks` | Browse indexed sources and chunk previews |
 | `GET /v1/index-jobs/{job_id}` | Poll ingestion progress |
@@ -179,8 +193,21 @@ client receives the finalized answer as one `token` event immediately before the
 normal `final` event, not as token-by-token prose. Other tasks retain live model
 tokens unless the global claim-verification gate requires buffering.
 
-If `COGDOC_API_KEYS` is configured, `/v1` requests are authenticated and rate-limited; with no keys set, `/v1` is open (the server logs a warning at startup).
-Evidence-eval list/review/export and Research review/publication routes remain disabled until the independent `COGDOC_EVAL_REVIEW_API_KEYS` set is configured. Research gap acceptance requires a non-blank rationale. Reviewer/publisher identities are server-derived key fingerprints; raw keys and client-provided actor names are never persisted.
+### Accounts, workspaces, and RAG authorization
+
+`COGDOC_ACCOUNT_AUTH_ENABLED=false` is the backward-compatible default. Set it to `true` for persistent human identities: registration atomically creates a user, an owner membership, a personal workspace, and a login session. Passwords must contain at least 12 characters and are stored as versioned, salted scrypt hashes. Session and invitation values are opaque bearer secrets returned only at issuance; only SHA-256 digests are persisted, and invitations are single-use. Sessions expire, can be listed/revoked individually or globally, and password changes revoke the other active sessions. Repeated bad logins trigger a configurable temporary lock. Send the returned token as `Authorization: Bearer <token>`; it is not a cookie and must never be put in URLs or logs.
+
+Owners can manage the workspace itself; admins combine write, delete, review/publish, and access-management permissions; editors read/query/write; reviewers read/query/review/publish; viewers read/query. Owners/admins manage members and invitations, but a normal role edit cannot manufacture another owner or remove the last owner. Switching workspaces changes the legacy active workspace of that login session. Current clients additionally send the non-secret `X-CogDoc-Workspace` selector on every protected request, so two browser tabs sharing one Bearer can stay pinned to different memberships; the server still validates that membership, and a selector conflicting with a `/v1/workspaces/{id}` path fails closed as an opaque 404. Omitting the header preserves compatibility with clients that rely on the session's active workspace. Knowledge bases with the same public slug are physically isolated by workspace, while account users' conversation sessions and traces are additionally namespaced by user. Cross-workspace list, detail, and mutation requests appear absent rather than revealing another tenant's resource.
+
+New knowledge bases default to `workspace`; uploaded documents default to `inherit`. A `private` KB is visible only to its resource owner, workspace owner/admin, or a same-workspace subject with a KB grant. Documents may inherit the KB, reopen visibility to the workspace, or become private; a document grant can expose only that document. Grant roles and workspace roles are intersected, so an ACL grant cannot elevate a user's workspace permissions. Missing, malformed, or unavailable ACL state denies access in account mode. Only owner/admin identities with `manage_access` can alter policies or grants.
+
+Query authorization is materialized as an explicit `ALL`, non-empty `SUBSET`, or `DENY` scope. For a subset, Chroma vector filtering, BM25 candidate selection, approved-derived-knowledge lookup, Summary, Compare, and QA all apply the source allowlist before top-k/reranking; a second post-fusion guard removes any result returned by a stale or custom backend that ignored the filter. This avoids unauthorized high-scoring chunks crowding authorized evidence out of top-k and prevents forbidden text from entering prompts, traces, or persisted evidence. Background Research freezes its creator and exact source boundary, rechecks current workspace membership and ACLs before/after retrieval, refuses a backend that cannot enforce a subset, and stops if access has been revoked; later grants do not silently broaden an already-running job.
+
+Static service principals remain available for automation and staged upgrades. `COGDOC_API_PRINCIPALS` maps each key to a `tenant_id`, `subject_id`, and role; legacy `COGDOC_API_KEYS` and `COGDOC_EVAL_REVIEW_API_KEYS` remain `default`-workspace admins. When account auth is enabled, configured service keys and human sessions coexist. With account auth disabled, authentication is open only when all three static credential settings are empty. Bearer takes precedence over `X-API-Key` if both are sent. Explicit reviewer/admin/owner principals can use evidence-eval and Research review routes; persisted actors always come from the authenticated identity. Hard quotas cover KB count, committed plus in-flight PDF count, and PDF bytes. `/v1/tenant` reports `limits`, `usage`, and `reserved`; quota failures return HTTP 409 with `TENANT_QUOTA_EXCEEDED`.
+
+`COGDOC_API_KEY` (singular) is an outbound credential consumed by the Streamlit/CLI client, not a server credential allowlist. If it is present in the Streamlit process and the browser has no human session token, the UI deliberately enters service-key mode and skips the account login screen. Leave it empty on every shared or multi-user frontend; configure accepted service identities on the API with `COGDOC_API_KEYS` / `COGDOC_API_PRINCIPALS`, and let human users sign in normally. A singular key is appropriate only for a trusted single-user console or dedicated automation frontend.
+
+The module-level production app durably appends metadata-only events to `COGDOC_DATA_DIR/audit/events.jsonl`: mutations receive an intent record before execution and an HTTP response-commit record before response headers are sent; reads receive the latter. A corrupt or unwritable chain makes protected traffic fail closed with HTTP 503. `GET /v1/audit-events` returns the current workspace newest-first, with an exclusive `before_sequence` cursor. Public probes/docs and unauthenticated 401 attempts are not recorded. The per-workspace SHA-256 chain detects malformed, truncated, rewritten, or broken history during a live process and validates self-consistency after restart, but it is not a signature, WORM store, or external trusted head; back up and externally anchor it when adversarial filesystem tampering is in scope.
 
 ### Layered memory
 
@@ -245,7 +272,7 @@ Only after all three steps succeed should `.env` be changed to `COGDOC_STATE_BAC
 - **Retrieval** — `bge-m3` multilingual vector recall + BM25 keyword recall, fused by the Rust RRF kernel and reranked by `bge-reranker-v2-m3`; PDF vectors and approved derived-knowledge vectors live in [Chroma](https://www.trychroma.com/), PDFs are parsed by PyMuPDF.
 - **Orchestration** — [LangGraph](https://langchain-ai.github.io/langgraph/) wires routing → task subgraphs → physical citation self-heal → optional parent-graph claim audit / bounded repair / refusal into a loopable state graph.
 - **Models** — OpenAI-compatible dual backend, hot-swappable: cloud DeepSeek or local Ollama `qwen2.5:7b`.
-- **Serving and observability** — FastAPI with SSE streaming, optional API-key auth and token-bucket rate limiting; sessions, index jobs, feedback, review queues, and derived knowledge are persisted locally; JSON traces exported for the web Trace panel and standalone Debug console.
+- **Serving and observability** — FastAPI with SSE streaming, optional persistent-account/service-key auth, workspace RBAC/resource ACLs, and token-bucket rate limiting; sessions, index jobs, feedback, review queues, and derived knowledge are persisted locally; JSON traces feed the web Trace panel and standalone Debug console.
 
 ## Architecture
 
@@ -569,7 +596,7 @@ Approved derived knowledge is indexed separately from source PDFs. Review action
 chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{local_chunk_index}
 ```
 
-`chunk_id` is the single stable child identity key across chunker, index, retriever, RRF, citations, and evidence — dedup and fusion never rely on array position. `parent_chunk_id = sha256:{source_sha256}:src:{source_name}:section:{section_index}` groups children for context hydration but never replaces their citation identity. The contract is versioned (`chunk_identity_version = source_sha256_name_page_span_local_v5_parent_child_section_index_cs600_ov60_min30_ctx160`); changing chunk boundaries, structure detection, or indexed text must bump `CHUNK_IDENTITY_BASE_VERSION` so stale indexes rebuild instead of mixing schemes.
+`chunk_id` is the single stable child identity key across chunker, index, retriever, RRF, citations, and evidence — dedup and fusion never rely on array position. `document_id = doc-{sha256(source-name-v1)}` is the stable per-KB ACL identity, while `parent_chunk_id = sha256:{source_sha256}:src:{source_name}:section:{section_index}` groups children for context hydration but never replaces their citation identity. The contract is versioned (`chunk_identity_version = source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index_cs600_ov60_min30_ctx160`); changing document identity, chunk boundaries, structure detection, or indexed text must bump `CHUNK_IDENTITY_BASE_VERSION` so stale indexes rebuild instead of mixing schemes.
 
 ## Query Pipeline
 
@@ -656,12 +683,23 @@ CogDoc/
 | `COGDOC_WEBHOOK_TIMEOUT_SECONDS` | `3` | Timeout for webhook delivery attempts |
 | `COGDOC_FEEDBACK_STORE` | `jsonl` | Feedback storage backend; set `sqlite` to use SQLite with JSONL export |
 | `COGDOC_DERIVED_KNOWLEDGE_INDEX_AUTO_REFRESH` | `false` | Rebuild approved derived-knowledge vectors in the background after review changes |
-| `COGDOC_API_KEYS` | unset | Comma-separated API keys; empty disables API auth |
-| `COGDOC_EVAL_REVIEW_API_KEYS` | unset | Independent admin keys for evidence-eval curation and Research review/publication; empty keeps those routes disabled |
+| `COGDOC_ACCOUNT_AUTH_ENABLED` | `false` | Enable persistent human accounts, login sessions, workspaces, invitations, and resource ACL enforcement; opt-in for compatibility |
+| `COGDOC_SELF_REGISTRATION_ENABLED` | `true` | Permit public account registration while account auth is enabled; disable after enterprise bootstrap to use invitations only |
+| `COGDOC_AUTH_SESSION_TTL_SECONDS` | `2592000` | Login-session lifetime (30 days) |
+| `COGDOC_AUTH_INVITE_TTL_SECONDS` | `604800` | One-time workspace-invitation lifetime (7 days) |
+| `COGDOC_AUTH_MAX_FAILED_LOGINS` | `5` | Consecutive bad password attempts before temporary lockout |
+| `COGDOC_AUTH_LOCKOUT_SECONDS` | `900` | Account lockout duration after the failed-login limit is reached |
+| `COGDOC_API_KEYS` | unset | Comma-separated legacy default/admin API keys; auth is open only when this, principals, and review keys are all empty |
+| `COGDOC_API_PRINCIPALS` | unset | One-line JSON map from API keys to `tenant_id`, `subject_id`, and RBAC `role`; preferred for team workspaces |
+| `COGDOC_EVAL_REVIEW_API_KEYS` | unset | Legacy evidence-eval/Research review keys; each also authenticates ordinary routes as default/admin |
 | `RATE_LIMIT_PER_MINUTE` | `120` | Token-bucket refill rate for protected API routes |
 | `RATE_LIMIT_BURST` | `120` | Token-bucket burst capacity; `<=0` disables rate limiting |
+| `COGDOC_TENANT_MAX_KNOWLEDGE_BASES` | `0` | Hard KB limit per workspace; `0` is unlimited |
+| `COGDOC_TENANT_MAX_DOCUMENTS` | `0` | Hard committed + in-flight PDF limit per workspace; `0` is unlimited |
+| `COGDOC_TENANT_MAX_STORAGE_MB` | `0` | Hard committed + in-flight PDF-byte limit per workspace in MiB; `0` is unlimited |
 | `COGDOC_MAX_UPLOAD_MB` | `50` | Maximum PDF upload size through the API/frontend |
 | `COGDOC_RESEARCH_WORKERS` | `2` | Maximum concurrent background research evidence/report jobs |
+| `COGDOC_CHAT_STREAM_IDLE_TIMEOUT_SECONDS` | `300` | Maximum idle time between SSE worker events; prevents indefinitely open streams |
 | `COGDOC_RESEARCH_RETRIEVAL_TOP_K` | `8` | Candidate depth retrieved and reranked per research section |
 | `COGDOC_RESEARCH_MAX_PENDING` | `32` | Maximum admitted queued/running Research background attempts before API requests fail with `503` |
 | `COGDOC_RESEARCH_PROVIDER_WORKERS` | `4` | Maximum concurrent process-isolated provider calls within background Research attempts |
@@ -750,13 +788,15 @@ Requirements: Python 3.11+ (developed on 3.13; the extension targets 3.8+), a Ru
 | `make eval-suite-update-baseline` | Refresh `eval/eval_suite_baseline.json` after review |
 | `make run` | Start the interactive CLI console |
 | `make serve` | Start the FastAPI service (`uvicorn cogdoc.api.app:app`) |
-| `make frontend` | Start the Streamlit web app |
+| `make frontend` | Load `.env` without overriding exported values, then start the Streamlit web app |
 | `make debug` | Start the standalone Debug console |
 | `uvicorn scripts.cogeval_cogdoc_wrapper:app --port 8003` | Start the optional CogEval-compatible adapter for a running CogDoc API |
 | `cd rust_core && cargo test` | Run Rust unit tests |
 | `cd rust_core && cargo fmt --check` | Check Rust formatting |
 
 Test layering: business logic and the Python↔native API contract are tested in Python (`tests/`); pure-Rust logic uses Rust `#[test]` in `rust_core/src/`. Native-dependent Python tests `importorskip` when `rust_core` is not built, so run `make native` before a full regression.
+
+GitHub CI runs Rust formatting/tests, builds and runtime-checks the native wheel, runs the full Python suite plus API smoke, the production account-auth smoke, and the lightweight eval gate. It then builds and boots the Docker image as a non-root user and repeats the real account flow: readiness, anonymous denial, registration/login, workspace invitation, viewer write denial, and private-KB grant/revocation; after a graceful stop it also exercises the volume-backed default backup, read-only verification, and a root-helper restore drill. Unfiltered `pytest` discovery means the account store/routes, workspace isolation, resource-policy/grant, pre-top-k scope, and Research revalidation tests are included automatically. Third-party Actions are pinned to full commits and jobs use read-only repository permissions. Tags and manual dispatches also build a recursively checksummed bundle containing the Python sdist/wheel, the Linux x86_64 CPython 3.13 native wheel, and root-preserving `scripts/` operations helpers; before uploading it, the workflow checks version/tag agreement, reruns the same full Python/smoke/eval gates, force-installs both wheel and sdist bundles plus their native wheel in separate environments, and repeats that Docker account/backup/restore smoke. This artifact workflow does not publish to PyPI or GitHub Releases, and the two wheels must be installed together.
 
 Offline evaluation uses local JSONL files under `eval/`. `make eval-suite` is the default lightweight gate: it audits retrieval and quality eval coverage, runs quality metrics, prints summaries by case type and layer, and skips model-backed retrieval by default. `make eval-suite-report` writes `eval/eval_suite_report.json`; `make eval-suite-baseline` compares aggregate, case-type, and layer-level quality metrics against `eval/eval_suite_baseline.json`; `make eval-suite-update-baseline` refreshes that baseline after review. Generated reports and baselines are ignored by Git.
 

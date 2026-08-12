@@ -7,7 +7,19 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Mapping, Sequence
-import streamlit as st
+
+try:
+    import streamlit as st
+except ModuleNotFoundError:
+    class _MissingStreamlit:
+        def __getattr__(self, name):
+            raise ModuleNotFoundError(
+                "Streamlit is required to run the CogDoc frontend. "
+                'Install it with `pip install -e ".[frontend]"`.'
+            )
+
+    st = _MissingStreamlit()
+
 from cogdoc.frontend.api_client import (
     CogDocAPIError,
     CogDocClient,
@@ -23,6 +35,9 @@ STREAM_PREVIEW_TAIL_CHARS = 3600
 SIDEBAR_CACHE_TTL_SECONDS = 2.0
 SIDEBAR_STREAM_CACHE_TTL_SECONDS = 30.0
 SIDEBAR_STALE_CACHE_GRACE_SECONDS = 120.0
+# Keep the displayed workspace and role close to the server's live membership
+# state without turning every Streamlit rerun into an authentication round trip.
+AUTH_PROFILE_TTL_SECONDS = 5.0
 RESEARCH_SUMMARY_PAGE_SIZE = 20
 NO_REFERENCE_ANSWER = "在所提供的参考资料中未找到与该问题相关的内容，建议查阅更多资料。"
 TRACE_NODE_LABELS = {
@@ -239,22 +254,84 @@ def _research_summary_response_payload(response, cached_payload: object) -> Mapp
 
 # 创建测试客户端。
 def _client() -> CogDocClient:
-    return CogDocClient(st.session_state.api_url)
+    return CogDocClient(
+        st.session_state.api_url,
+        api_key=_current_api_credential(),
+        workspace_id=_current_workspace_id(),
+    )
+
+
+def _current_api_credential() -> str:
+    """Return the active credential without ever persisting it outside session state."""
+
+    token = str(st.session_state.get("auth_token") or "")
+    return token or os.getenv("COGDOC_API_KEY", "")
+
+
+def _current_workspace_id() -> str | None:
+    if st.session_state.get("auth_mode") != "account":
+        return None
+    workspace = st.session_state.get("auth_workspace", {})
+    if not isinstance(workspace, Mapping):
+        return None
+    workspace_id = str(workspace.get("workspace_id") or "")
+    return workspace_id or None
+
+
+def _active_auth_cache_identity() -> str:
+    credential = _current_api_credential()
+    return (
+        hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        if credential
+        else "anonymous"
+    )
 
 
 # 处理响应错误。
 def _response_error(response, fallback: str = "请求失败") -> str:
+    _observe_authenticated_response(response.status_code)
     return format_api_error(response_payload(response), response.status_code, fallback)
+
+
+def _response_succeeded(response) -> bool:
+    """Treat every HTTP 2xx response as success at the thin-client boundary."""
+
+    return 200 <= int(response.status_code) < 300
+
+
+def _handle_acl_grant_response(
+    response, *, success_message: str, failure_message: str
+) -> None:
+    """Render exactly one terminal outcome for an ACL grant request."""
+
+    if _response_succeeded(response):
+        st.success(success_message)
+        st.rerun()
+    else:
+        st.error(_response_error(response, failure_message))
 
 
 # 提取响应状态与载荷。
 def _response_status_payload(response) -> tuple[int, object]:
+    _observe_authenticated_response(response.status_code)
     return response.status_code, response_payload(response)
 
 
 # 初始化状态。
 def _init_state() -> None:
     st.session_state.setdefault("api_url", DEFAULT_API_URL)
+    # Account tokens live only in Streamlit's server-side browser session.  They
+    # are never copied to query parameters, disk caches, or widget defaults.
+    st.session_state.setdefault("auth_token", "")
+    st.session_state.setdefault("auth_mode", "unknown")
+    st.session_state.setdefault("auth_config_by_url", {})
+    st.session_state.setdefault("auth_user", {})
+    st.session_state.setdefault("auth_workspace", {})
+    st.session_state.setdefault("auth_workspaces", [])
+    st.session_state.setdefault("auth_permissions", [])
+    st.session_state.setdefault("auth_me_loaded_for", "")
+    st.session_state.setdefault("auth_me_loaded_at", 0.0)
+    st.session_state.setdefault("last_invite_token", "")
     # 会话标识持久化进地址栏，刷新后复用同一会话。
     if "session_id" not in st.session_state:
         st.session_state.session_id = st.query_params.get("sid") or uuid.uuid4().hex
@@ -321,8 +398,9 @@ def _sidebar_cache_ttl() -> float:
 # 读取带时效的接口缓存。
 def _cached_api_value(key: tuple, loader):
     cache = st.session_state.api_cache
+    scoped_key = ("auth", _active_auth_cache_identity(), *key)
     now = time.monotonic()
-    entry = cache.get(key)
+    entry = cache.get(scoped_key)
     if entry and now - entry["time"] <= _sidebar_cache_ttl():
         return entry["value"]
     try:
@@ -331,7 +409,7 @@ def _cached_api_value(key: tuple, loader):
         if entry and now - entry["time"] <= SIDEBAR_STALE_CACHE_GRACE_SECONDS:
             return entry["value"]
         raise
-    cache[key] = {"time": now, "value": value}
+    cache[scoped_key] = {"time": now, "value": value}
     return value
 
 
@@ -341,7 +419,10 @@ def _clear_api_cache(prefix: tuple | None = None) -> None:
         st.session_state.api_cache.clear()
         return
     for key in list(st.session_state.api_cache):
-        if key[: len(prefix)] == prefix:
+        # New cache entries are identity scoped.  Accept legacy keys as well so
+        # hot-upgraded Streamlit sessions can be cleared normally.
+        logical_key = key[2:] if key[:1] == ("auth",) else key
+        if logical_key[: len(prefix)] == prefix:
             st.session_state.api_cache.pop(key, None)
 
 
@@ -356,6 +437,361 @@ def _clear_research_summary_cache(client: CogDocClient, kb_id: str) -> None:
     for key in list(cache):
         if isinstance(key, tuple) and key[: len(prefix)] == prefix:
             cache.pop(key, None)
+
+
+def _stop_background_requests() -> None:
+    for pending in st.session_state.get("pending_streams", {}).values():
+        stop_event = pending.get("stop_event") if isinstance(pending, Mapping) else None
+        if stop_event is not None:
+            stop_event.set()
+        response = pending.get("response") if isinstance(pending, Mapping) else None
+        if response is not None:
+            response.close()
+
+
+def _reset_user_context() -> None:
+    """Drop every user/workspace-scoped UI value on identity boundary changes."""
+
+    _stop_background_requests()
+    for name, empty in (
+        ("messages_by_context", {}),
+        ("restored_contexts", set()),
+        ("pending_streams", {}),
+        ("pending_retrieve_debugs", {}),
+        ("api_cache", {}),
+        ("main_views_by_context", {}),
+        ("trace_cache", {}),
+        ("trace_labels", {}),
+        ("trace_options_by_id", {}),
+        ("trace_session_items_by_context", {}),
+        ("trace_session_loaded", set()),
+        ("trace_session_error", {}),
+        ("retrieve_debug_by_context", {}),
+        ("feedback_action_by_message", {}),
+        ("research_summary_cache", {}),
+        ("research_summary_pages", {}),
+        ("research_open_job_by_kb", {}),
+        ("known_sessions", {}),
+    ):
+        st.session_state[name] = empty
+    st.session_state.kb_id = None
+    st.session_state.active_trace_id = ""
+    st.session_state.research_notice = None
+    # An invite is a one-time workspace capability. Never carry it across an
+    # identity/workspace/role boundary where it could be shown under the wrong
+    # tenant and delivered to the wrong recipient.
+    st.session_state.last_invite_token = ""
+    _invalidate_auth_profile()
+    for key in list(st.session_state):
+        if str(key).startswith(("member-role-", "member-save-", "member-remove-")):
+            st.session_state.pop(key, None)
+    st.session_state.pop("active-workspace-picker", None)
+    st.session_state.session_id = uuid.uuid4().hex
+    st.query_params["sid"] = st.session_state.session_id
+    st.query_params.pop("kb", None)
+
+
+def _clear_account_session() -> None:
+    _reset_user_context()
+    st.session_state.auth_token = ""
+    st.session_state.auth_user = {}
+    st.session_state.auth_workspace = {}
+    st.session_state.auth_workspaces = []
+    st.session_state.auth_permissions = []
+    st.session_state.last_invite_token = ""
+
+
+def _invalidate_auth_profile() -> None:
+    st.session_state.auth_me_loaded_for = ""
+    st.session_state.auth_me_loaded_at = 0.0
+
+
+def _observe_authenticated_response(status_code: int) -> None:
+    """Reconcile authentication state after a protected request is rejected."""
+
+    if st.session_state.get("auth_mode") != "account":
+        return
+    if status_code == 401:
+        _clear_account_session()
+    elif status_code == 403:
+        # A 403 can be a legitimate route-level denial, so retain the session;
+        # force /auth/me on the next render to pick up a concurrent role change.
+        _invalidate_auth_profile()
+
+
+def _apply_auth_session(payload: object) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    token = payload.get("access_token")
+    user = payload.get("user")
+    workspace = payload.get("workspace")
+    permissions = payload.get("permissions", [])
+    if (
+        not isinstance(token, str)
+        or not token
+        or not isinstance(user, Mapping)
+        or not isinstance(workspace, Mapping)
+        or not isinstance(permissions, list)
+    ):
+        return False
+    previous_token = str(st.session_state.get("auth_token") or "")
+    previous_workspace = st.session_state.get("auth_workspace", {})
+    previous_workspace_id = (
+        str(previous_workspace.get("workspace_id") or "")
+        if isinstance(previous_workspace, Mapping)
+        else ""
+    )
+    workspace_id = str(workspace.get("workspace_id") or "")
+    if not workspace_id:
+        return False
+    if token != previous_token or workspace_id != previous_workspace_id:
+        _reset_user_context()
+    st.session_state.auth_token = token
+    st.session_state.auth_mode = "account"
+    st.session_state.auth_user = dict(user)
+    st.session_state.auth_workspace = dict(workspace)
+    st.session_state.auth_permissions = [str(value) for value in permissions]
+    _invalidate_auth_profile()
+    return True
+
+
+def _apply_auth_profile(payload: object) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    user = payload.get("user")
+    workspace = payload.get("workspace")
+    workspaces = payload.get("workspaces", [])
+    permissions = payload.get("permissions", [])
+    if (
+        not isinstance(user, Mapping)
+        or not isinstance(workspace, Mapping)
+        or not isinstance(workspaces, list)
+        or not isinstance(permissions, list)
+    ):
+        return False
+    previous_user = st.session_state.get("auth_user", {})
+    previous_workspace = st.session_state.get("auth_workspace", {})
+    previous_permissions = st.session_state.get("auth_permissions", [])
+    previous_user_id = (
+        str(previous_user.get("user_id") or "")
+        if isinstance(previous_user, Mapping)
+        else ""
+    )
+    previous_workspace_id = (
+        str(previous_workspace.get("workspace_id") or "")
+        if isinstance(previous_workspace, Mapping)
+        else ""
+    )
+    previous_role = (
+        str(previous_workspace.get("role") or "")
+        if isinstance(previous_workspace, Mapping)
+        else ""
+    )
+    user_id = str(user.get("user_id") or "")
+    workspace_id = str(workspace.get("workspace_id") or "")
+    role = str(workspace.get("role") or "")
+    if not user_id or not workspace_id or not role:
+        return False
+    identity_changed = bool(previous_user_id and previous_user_id != user_id)
+    workspace_changed = bool(
+        previous_workspace_id and previous_workspace_id != workspace_id
+    )
+    authorization_changed = bool(
+        previous_role
+        and (
+            previous_role != role
+            or {str(value) for value in previous_permissions}
+            != {str(value) for value in permissions}
+        )
+    )
+    if identity_changed or workspace_changed or authorization_changed:
+        # This also stops background requests carrying the former authority and
+        # removes cached KB/document data before applying the server profile.
+        _reset_user_context()
+    st.session_state.auth_user = dict(user)
+    st.session_state.auth_workspace = dict(workspace)
+    st.session_state.auth_workspaces = [
+        dict(value) for value in workspaces if isinstance(value, Mapping)
+    ]
+    st.session_state.auth_permissions = [str(value) for value in permissions]
+    return True
+
+
+def _auth_config() -> Mapping | None:
+    base_url = str(st.session_state.api_url).rstrip("/")
+    cached = st.session_state.auth_config_by_url.get(base_url)
+    if isinstance(cached, Mapping):
+        return cached
+    try:
+        response = CogDocClient(base_url, api_key="").get_auth_config()
+    except Exception as exc:
+        st.error(f"连接身份服务失败: {exc}")
+        return None
+    if response.status_code == 404:
+        # Older/local backends without the capability endpoint remain usable.
+        config = {
+            "account_auth_enabled": False,
+            "self_registration_enabled": False,
+        }
+    elif response.status_code == 200:
+        payload = response_payload(response)
+        if not isinstance(payload, Mapping):
+            st.error("身份服务返回了无效配置。")
+            return None
+        config = dict(payload)
+    else:
+        st.error(_response_error(response, "读取身份配置失败"))
+        return None
+    st.session_state.auth_config_by_url[base_url] = config
+    return config
+
+
+def _refresh_auth_profile(*, force: bool = False) -> bool:
+    token = str(st.session_state.auth_token or "")
+    fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    loaded_at = float(st.session_state.get("auth_me_loaded_at") or 0.0)
+    if (
+        not force
+        and st.session_state.auth_me_loaded_for == fingerprint
+        and 0.0 <= now - loaded_at < AUTH_PROFILE_TTL_SECONDS
+    ):
+        return True
+    try:
+        response = _client().get_me()
+    except Exception as exc:
+        st.error(f"读取账号信息失败: {exc}")
+        return False
+    if response.status_code == 404 and _current_workspace_id() is not None:
+        # The tab-pinned workspace may have been removed concurrently. Retry
+        # exactly once without the selector so AuthStore can fall back to the
+        # user's personal workspace; _apply_auth_profile then clears old-tenant
+        # UI state before applying that authoritative profile.
+        try:
+            response = CogDocClient(
+                st.session_state.api_url,
+                api_key=token,
+                workspace_id=None,
+            ).get_me()
+        except Exception as exc:
+            st.error(f"读取账号信息失败: {exc}")
+            return False
+    if response.status_code in {401, 403}:
+        _clear_account_session()
+        st.warning("登录状态已失效或权限已变更，请重新登录。")
+        return False
+    if response.status_code != 200:
+        st.error(_response_error(response, "读取账号信息失败"))
+        return False
+    if not _apply_auth_profile(response_payload(response)):
+        st.error("身份服务返回了无效账号信息。")
+        return False
+    st.session_state.auth_me_loaded_for = fingerprint
+    st.session_state.auth_me_loaded_at = time.monotonic()
+    return True
+
+
+def _submit_auth_response(response, fallback: str) -> bool:
+    if response.status_code not in (200, 201):
+        st.error(_response_error(response, fallback))
+        return False
+    if not _apply_auth_session(response_payload(response)):
+        st.error("身份服务返回了无效登录结果。")
+        return False
+    st.rerun()
+    return True
+
+
+def _render_auth_screen(config: Mapping) -> None:
+    st.subheader("登录 CogDoc")
+    st.caption("账号会话仅保存在当前浏览器的 Streamlit 会话中。")
+    login_tab, register_tab, invite_tab = st.tabs(["登录", "注册", "接受邀请"])
+    public_client = CogDocClient(st.session_state.api_url, api_key="")
+    with login_tab:
+        with st.form("account-login", clear_on_submit=True):
+            email = st.text_input("邮箱", key="login-email")
+            password = st.text_input("密码", type="password", key="login-password")
+            submitted = st.form_submit_button("登录", use_container_width=True)
+        if submitted:
+            try:
+                response = public_client.login(email.strip(), password)
+                _submit_auth_response(response, "登录失败")
+            except Exception as exc:
+                st.error(f"登录失败: {exc}")
+    with register_tab:
+        if not bool(config.get("self_registration_enabled", False)):
+            st.info("当前部署未开放自主注册，请使用邀请链接加入工作区。")
+        else:
+            with st.form("account-register", clear_on_submit=True):
+                display_name = st.text_input("显示名称", key="register-name")
+                email = st.text_input("邮箱", key="register-email")
+                workspace_name = st.text_input(
+                    "个人工作区名称（可选）", key="register-workspace"
+                )
+                password = st.text_input(
+                    "密码（至少 12 位）", type="password", key="register-password"
+                )
+                submitted = st.form_submit_button(
+                    "创建账号", use_container_width=True
+                )
+            if submitted:
+                try:
+                    response = public_client.register(
+                        email.strip(),
+                        password,
+                        display_name.strip(),
+                        workspace_name.strip() or None,
+                    )
+                    _submit_auth_response(response, "注册失败")
+                except Exception as exc:
+                    st.error(f"注册失败: {exc}")
+    with invite_tab:
+        with st.form("anonymous-invite", clear_on_submit=True):
+            token = st.text_input("邀请令牌", type="password", key="invite-token")
+            email = st.text_input("受邀邮箱", key="invite-email")
+            display_name = st.text_input("显示名称", key="invite-name")
+            password = st.text_input(
+                "密码", type="password", key="invite-password"
+            )
+            submitted = st.form_submit_button("接受邀请", use_container_width=True)
+        if submitted:
+            try:
+                response = public_client.accept_workspace_invite(
+                    token.strip(),
+                    email=email.strip(),
+                    password=password,
+                    display_name=display_name.strip() or None,
+                )
+                _submit_auth_response(response, "接受邀请失败")
+            except Exception as exc:
+                st.error(f"接受邀请失败: {exc}")
+
+
+def _auth_gate() -> bool:
+    with st.sidebar:
+        st.title("CogDoc")
+        previous_url = str(st.session_state.api_url)
+        entered_url = st.text_input("后端地址", previous_url, key="auth-api-url")
+        if entered_url.rstrip("/") != previous_url.rstrip("/"):
+            _clear_account_session()
+            st.session_state.api_url = entered_url.rstrip("/")
+            st.rerun()
+    config = _auth_config()
+    if config is None:
+        return False
+    if not bool(config.get("account_auth_enabled", False)):
+        st.session_state.auth_mode = "legacy"
+        return True
+    if st.session_state.auth_token:
+        st.session_state.auth_mode = "account"
+        return _refresh_auth_profile()
+    if os.getenv("COGDOC_API_KEY", ""):
+        # Static API principals remain a supported automation/local deployment
+        # path even when human account auth is enabled alongside them.
+        st.session_state.auth_mode = "api_key"
+        return True
+    _render_auth_screen(config)
+    return False
 
 
 # 处理上下文键。
@@ -2585,6 +3021,8 @@ def _knowledge_area(kb_id: str | None) -> None:
 def _retrieve_debug_worker(
     *,
     api_url: str,
+    auth_token: str,
+    workspace_id: str | None,
     kb_id: str,
     query: str,
     top_k: int,
@@ -2593,7 +3031,11 @@ def _retrieve_debug_worker(
     outbox: queue.Queue,
 ) -> None:
     try:
-        client = CogDocClient(api_url)
+        client = CogDocClient(
+            api_url,
+            api_key=auth_token,
+            workspace_id=workspace_id,
+        )
         resp = client.retrieve(
             kb_id,
             query,
@@ -2639,6 +3081,8 @@ def _start_retrieve_debug(
         target=_retrieve_debug_worker,
         kwargs={
             "api_url": st.session_state.api_url,
+            "auth_token": _current_api_credential(),
+            "workspace_id": _current_workspace_id(),
             "kb_id": kb_id,
             "query": query,
             "top_k": top_k,
@@ -2761,14 +3205,454 @@ def _debug_area(kb_id: str | None) -> None:
         _render_retrieve_debug(_client(), kb_id)
 
 
+def _render_workspace_members(client: CogDocClient, workspace_id: str) -> None:
+    try:
+        member_status, member_payload = _cached_api_value(
+            ("workspace-members", client.base_url, workspace_id),
+            lambda: _response_status_payload(
+                client.list_workspace_members(workspace_id)
+            ),
+        )
+    except Exception as exc:
+        st.error(f"读取成员失败: {exc}")
+        return
+    if member_status != 200 or not isinstance(member_payload, Mapping):
+        st.error(format_api_error(member_payload, member_status, "读取成员失败"))
+        return
+    members = member_payload.get("members", [])
+    if not isinstance(members, list):
+        st.error("成员列表响应格式不符合预期。")
+        return
+    for member in members:
+        if not isinstance(member, Mapping):
+            continue
+        member_id = str(member.get("member_id") or member.get("user_id") or "")
+        role = str(member.get("role") or "viewer")
+        label = str(member.get("display_name") or member.get("email") or member_id)
+        st.caption(f"{label} · {member.get('email') or '-'} · {role}")
+        if not member_id or role == "owner":
+            continue
+        controls = st.columns([3, 1, 1])
+        roles = ["viewer", "reviewer", "editor", "admin"]
+        selected_role = controls[0].selectbox(
+            "成员角色",
+            roles,
+            index=roles.index(role) if role in roles else 0,
+            key=f"member-role-{workspace_id}-{member_id}",
+            label_visibility="collapsed",
+        )
+        if controls[1].button(
+            "保存", key=f"member-save-{workspace_id}-{member_id}"
+        ):
+            response = client.update_workspace_member(
+                workspace_id, member_id, selected_role
+            )
+            if response.status_code == 200:
+                _invalidate_auth_profile()
+                _clear_api_cache(
+                    ("workspace-members", client.base_url, workspace_id)
+                )
+                st.rerun()
+            else:
+                st.error(_response_error(response, "更新成员失败"))
+        if controls[2].button(
+            "移除", key=f"member-remove-{workspace_id}-{member_id}"
+        ):
+            response = client.remove_workspace_member(workspace_id, member_id)
+            if response.status_code == 204:
+                _invalidate_auth_profile()
+                _clear_api_cache(
+                    ("workspace-members", client.base_url, workspace_id)
+                )
+                st.rerun()
+            else:
+                st.error(_response_error(response, "移除成员失败"))
+
+
+def _render_workspace_invites(client: CogDocClient, workspace_id: str) -> None:
+    with st.form(f"workspace-invite-{workspace_id}", clear_on_submit=True):
+        email = st.text_input("邀请邮箱")
+        role = st.selectbox(
+            "邀请角色", ["viewer", "reviewer", "editor", "admin"]
+        )
+        submitted = st.form_submit_button("创建邀请", use_container_width=True)
+    if submitted:
+        response = client.create_workspace_invite(workspace_id, email.strip(), role)
+        if response.status_code == 201:
+            payload = response_payload(response)
+            invite_token = (
+                str(payload.get("invite_token") or "")
+                if isinstance(payload, Mapping)
+                else ""
+            )
+            st.session_state.last_invite_token = invite_token
+            _clear_api_cache(("workspace-invites", client.base_url, workspace_id))
+            st.success("邀请已创建。请通过可信渠道把一次性令牌交给受邀人。")
+        else:
+            st.error(_response_error(response, "创建邀请失败"))
+    if st.session_state.last_invite_token:
+        st.code(st.session_state.last_invite_token, language=None)
+        if st.button("隐藏邀请令牌", key=f"hide-invite-token-{workspace_id}"):
+            st.session_state.last_invite_token = ""
+            st.rerun()
+    try:
+        invite_status, invite_payload = _cached_api_value(
+            ("workspace-invites", client.base_url, workspace_id),
+            lambda: _response_status_payload(
+                client.list_workspace_invites(workspace_id)
+            ),
+        )
+    except Exception as exc:
+        st.error(f"读取邀请失败: {exc}")
+        return
+    if invite_status != 200 or not isinstance(invite_payload, Mapping):
+        st.error(format_api_error(invite_payload, invite_status, "读取邀请失败"))
+        return
+    invites = invite_payload.get("invites", [])
+    if not isinstance(invites, list):
+        return
+    for invite in invites:
+        if not isinstance(invite, Mapping) or invite.get("status") != "pending":
+            continue
+        invite_id = str(invite.get("invite_id") or "")
+        row = st.columns([5, 1])
+        row[0].caption(
+            f"{invite.get('email') or '-'} · {invite.get('role') or '-'} · 待接受"
+        )
+        if invite_id and row[1].button(
+            "撤销", key=f"invite-revoke-{workspace_id}-{invite_id}"
+        ):
+            response = client.revoke_workspace_invite(workspace_id, invite_id)
+            if response.status_code == 204:
+                _clear_api_cache(
+                    ("workspace-invites", client.base_url, workspace_id)
+                )
+                st.rerun()
+            else:
+                st.error(_response_error(response, "撤销邀请失败"))
+
+
+def _render_account_sidebar(client: CogDocClient) -> None:
+    mode = st.session_state.auth_mode
+    if mode == "api_key":
+        st.caption("🔐 API Key 身份")
+        return
+    if mode != "account":
+        st.caption("本地兼容模式")
+        return
+    user = st.session_state.auth_user
+    workspace = st.session_state.auth_workspace
+    display_name = str(user.get("display_name") or user.get("email") or "账号")
+    st.subheader(display_name)
+    st.caption(str(user.get("email") or ""))
+
+    workspaces = [
+        item
+        for item in st.session_state.auth_workspaces
+        if isinstance(item, Mapping) and item.get("workspace_id")
+    ]
+    current_id = str(workspace.get("workspace_id") or "")
+    if current_id and all(item.get("workspace_id") != current_id for item in workspaces):
+        workspaces.append(workspace)
+    workspace_ids = [str(item["workspace_id"]) for item in workspaces]
+    names = {
+        str(item["workspace_id"]): str(item.get("name") or item["workspace_id"])
+        for item in workspaces
+    }
+    if workspace_ids:
+        selected = st.selectbox(
+            "当前工作区",
+            workspace_ids,
+            index=workspace_ids.index(current_id) if current_id in workspace_ids else 0,
+            format_func=lambda value: names.get(value, value),
+            key="active-workspace-picker",
+        )
+        if selected != current_id:
+            response = client.switch_workspace(selected)
+            if response.status_code == 200:
+                if _apply_auth_session(response_payload(response)):
+                    st.rerun()
+                else:
+                    st.error("身份服务返回了无效工作区会话。")
+            else:
+                st.error(_response_error(response, "切换工作区失败"))
+    st.caption(f"角色：{workspace.get('role') or '-'}")
+
+    with st.expander("新建工作区"):
+        with st.form("create-workspace", clear_on_submit=True):
+            name = st.text_input("工作区名称")
+            submitted = st.form_submit_button("创建", use_container_width=True)
+        if submitted:
+            response = client.create_workspace(name.strip())
+            payload = response_payload(response)
+            created = payload.get("workspace") if isinstance(payload, Mapping) else None
+            created_id = (
+                str(created.get("workspace_id") or "")
+                if isinstance(created, Mapping)
+                else ""
+            )
+            if response.status_code == 201 and created_id:
+                switched = client.switch_workspace(created_id)
+                if switched.status_code == 200 and _apply_auth_session(
+                    response_payload(switched)
+                ):
+                    st.rerun()
+                st.error(_response_error(switched, "切换到新工作区失败"))
+            else:
+                st.error(_response_error(response, "创建工作区失败"))
+
+    role = str(workspace.get("role") or "")
+    if current_id and role in {"owner", "admin"}:
+        with st.expander("成员与邀请"):
+            st.markdown("**成员**")
+            _render_workspace_members(client, current_id)
+            st.markdown("**邀请**")
+            _render_workspace_invites(client, current_id)
+
+    with st.expander("接受工作区邀请"):
+        with st.form("authenticated-invite", clear_on_submit=True):
+            token = st.text_input("邀请令牌", type="password")
+            submitted = st.form_submit_button("接受并切换", use_container_width=True)
+        if submitted:
+            response = client.accept_workspace_invite(token.strip())
+            if response.status_code == 200 and _apply_auth_session(
+                response_payload(response)
+            ):
+                st.rerun()
+            st.error(_response_error(response, "接受邀请失败"))
+
+    if st.button("退出登录", use_container_width=True):
+        try:
+            response = client.logout()
+            if response.status_code not in (204, 401):
+                st.warning(_response_error(response, "服务端退出失败"))
+        except Exception:
+            pass
+        _clear_account_session()
+        st.rerun()
+
+
+def _render_resource_access_controls(
+    client: CogDocClient, kb_id: str, documents: list[Mapping]
+) -> None:
+    """Render owner/admin controls for KB, document, and subject ACLs."""
+
+    if st.session_state.auth_mode != "account" or "manage_access" not in set(
+        st.session_state.auth_permissions
+    ):
+        return
+    with st.expander("访问权限"):
+        try:
+            policy_response = client.get_kb_access_policy(kb_id)
+            policy_payload = response_payload(policy_response)
+        except Exception as exc:
+            st.error(f"读取权限失败: {exc}")
+            return
+        if policy_response.status_code != 200 or not isinstance(
+            policy_payload, Mapping
+        ):
+            st.error(_response_error(policy_response, "读取权限失败"))
+            return
+
+        current_policy = str(policy_payload.get("policy") or "workspace")
+        selected_policy = st.selectbox(
+            "知识库可见性",
+            ["workspace", "private"],
+            index=1 if current_policy == "private" else 0,
+            format_func=lambda value: "仅授权成员" if value == "private" else "工作区成员",
+            key=f"kb-policy-{kb_id}",
+        )
+        if st.button("保存知识库权限", key=f"save-kb-policy-{kb_id}"):
+            response = client.update_kb_access_policy(kb_id, selected_policy)
+            if response.status_code == 200:
+                _clear_api_cache()
+                st.success("知识库权限已更新。")
+                st.rerun()
+            st.error(_response_error(response, "更新知识库权限失败"))
+
+        workspace = st.session_state.auth_workspace
+        workspace_id = str(workspace.get("workspace_id") or "")
+        try:
+            member_response = client.list_workspace_members(workspace_id)
+            member_payload = response_payload(member_response)
+        except Exception as exc:
+            st.error(f"读取可授权成员失败: {exc}")
+            return
+        members = (
+            member_payload.get("members", [])
+            if member_response.status_code == 200
+            and isinstance(member_payload, Mapping)
+            else []
+        )
+        member_rows = [item for item in members if isinstance(item, Mapping)]
+        subject_ids = [str(item.get("user_id") or "") for item in member_rows]
+        subject_ids = [item for item in subject_ids if item]
+        member_labels = {
+            str(item.get("user_id") or ""): str(
+                item.get("display_name") or item.get("email") or item.get("user_id")
+            )
+            for item in member_rows
+        }
+
+        if subject_ids:
+            st.markdown("**知识库单独授权**")
+            grant_columns = st.columns([3, 2, 1])
+            subject_id = grant_columns[0].selectbox(
+                "成员",
+                subject_ids,
+                format_func=lambda value: member_labels.get(value, value),
+                key=f"kb-grant-subject-{kb_id}",
+            )
+            grant_role = grant_columns[1].selectbox(
+                "权限",
+                ["viewer", "reviewer", "editor"],
+                key=f"kb-grant-role-{kb_id}",
+            )
+            if grant_columns[2].button("授权", key=f"kb-grant-save-{kb_id}"):
+                response = client.grant_kb_access(kb_id, subject_id, grant_role)
+                _handle_acl_grant_response(
+                    response,
+                    success_message="知识库授权已更新。",
+                    failure_message="知识库授权失败",
+                )
+        grant_response = client.list_kb_grants(kb_id)
+        grant_payload = response_payload(grant_response)
+        grants = (
+            grant_payload.get("grants", [])
+            if grant_response.status_code == 200
+            and isinstance(grant_payload, Mapping)
+            else []
+        )
+        for grant in grants:
+            if not isinstance(grant, Mapping) or not grant.get("subject_id"):
+                continue
+            granted_subject = str(grant["subject_id"])
+            row = st.columns([5, 1])
+            row[0].caption(
+                f"{member_labels.get(granted_subject, granted_subject)} · {grant.get('role') or '-'}"
+            )
+            if row[1].button(
+                "撤销", key=f"kb-grant-revoke-{kb_id}-{granted_subject}"
+            ):
+                response = client.revoke_kb_access(kb_id, granted_subject)
+                if response.status_code == 204:
+                    st.rerun()
+                st.error(_response_error(response, "撤销知识库授权失败"))
+
+        document_options = {
+            str(item.get("document_id") or ""): str(item.get("name") or "")
+            for item in documents
+            if item.get("document_id") and item.get("name")
+        }
+        if not document_options:
+            return
+        st.markdown("**文档级权限**")
+        document_id = st.selectbox(
+            "文档",
+            list(document_options),
+            format_func=lambda value: document_options.get(value, value),
+            key=f"document-policy-target-{kb_id}",
+        )
+        document_response = client.get_document_access_policy(kb_id, document_id)
+        document_payload = response_payload(document_response)
+        document_configured = document_response.status_code == 200 and isinstance(
+            document_payload, Mapping
+        )
+        if document_response.status_code not in {200, 404}:
+            st.error(_response_error(document_response, "读取文档权限失败"))
+            return
+        if not document_configured:
+            st.caption("该文档尚未建立 ACL，保存后将以稳定 document_id 初始化。")
+            document_payload = {}
+        document_policy = str(document_payload.get("policy") or "inherit")
+        selected_document_policy = st.selectbox(
+            "文档可见性",
+            ["inherit", "workspace", "private"],
+            index=["inherit", "workspace", "private"].index(document_policy),
+            format_func=lambda value: {
+                "inherit": "继承知识库",
+                "workspace": "工作区成员",
+                "private": "仅授权成员",
+            }[value],
+            key=f"document-policy-{kb_id}-{document_id}",
+        )
+        if st.button("保存文档权限", key=f"save-document-policy-{kb_id}"):
+            response = client.update_document_access_policy(
+                kb_id,
+                document_id,
+                selected_document_policy,
+                source=None
+                if document_configured
+                else document_options[document_id],
+            )
+            if response.status_code == 200:
+                _clear_api_cache()
+                st.success("文档权限已更新。")
+                st.rerun()
+            st.error(_response_error(response, "更新文档权限失败"))
+        if subject_ids and document_configured:
+            doc_columns = st.columns([3, 2, 1])
+            doc_subject = doc_columns[0].selectbox(
+                "文档授权成员",
+                subject_ids,
+                format_func=lambda value: member_labels.get(value, value),
+                key=f"document-grant-subject-{kb_id}-{document_id}",
+            )
+            doc_role = doc_columns[1].selectbox(
+                "文档权限",
+                ["viewer", "reviewer", "editor"],
+                key=f"document-grant-role-{kb_id}-{document_id}",
+            )
+            if doc_columns[2].button(
+                "授权", key=f"document-grant-save-{kb_id}-{document_id}"
+            ):
+                response = client.grant_document_access(
+                    kb_id, document_id, doc_subject, doc_role
+                )
+                _handle_acl_grant_response(
+                    response,
+                    success_message="文档授权已更新。",
+                    failure_message="文档授权失败",
+                )
+        if document_configured:
+            document_grant_response = client.list_document_grants(kb_id, document_id)
+            document_grant_payload = response_payload(document_grant_response)
+            document_grants = (
+                document_grant_payload.get("grants", [])
+                if document_grant_response.status_code == 200
+                and isinstance(document_grant_payload, Mapping)
+                else []
+            )
+            for grant in document_grants:
+                if not isinstance(grant, Mapping) or not grant.get("subject_id"):
+                    continue
+                granted_subject = str(grant["subject_id"])
+                row = st.columns([5, 1])
+                row[0].caption(
+                    f"{member_labels.get(granted_subject, granted_subject)} · {grant.get('role') or '-'}"
+                )
+                if row[1].button(
+                    "撤销",
+                    key=(
+                        f"document-grant-revoke-{kb_id}-{document_id}-"
+                        f"{granted_subject}"
+                    ),
+                ):
+                    response = client.revoke_document_access(
+                        kb_id, document_id, granted_subject
+                    )
+                    if response.status_code == 204:
+                        st.rerun()
+                    st.error(_response_error(response, "撤销文档授权失败"))
+
+
 # 完成 侧边栏 处理。
 def _sidebar() -> None:
     # 侧栏：后端地址、模式开关、知识库选择/新建/上传入库/文档列表。
     with st.sidebar:
-        st.title("CogDoc")
-        st.session_state.api_url = st.text_input("后端地址", st.session_state.api_url)
-        st.session_state.is_local = st.toggle("本地 Ollama 模式", value=False)
         client = _client()
+        _render_account_sidebar(client)
+        st.session_state.is_local = st.toggle("本地 Ollama 模式", value=False)
 
         st.divider()
         st.subheader("知识库")
@@ -2777,6 +3661,8 @@ def _sidebar() -> None:
                 ("kbs", client.base_url), client.list_knowledge_bases
             )
         except CogDocAPIError as exc:
+            if exc.status_code is not None:
+                _observe_authenticated_response(exc.status_code)
             st.error(f"读取知识库失败: {exc}")
             return
         except Exception as exc:
@@ -2806,8 +3692,15 @@ def _sidebar() -> None:
 
         with st.form("create_kb", clear_on_submit=True):
             new_kb = st.text_input("新建知识库 ID")
+            new_kb_policy = st.selectbox(
+                "初始权限",
+                ["workspace", "private"],
+                format_func=lambda value: "仅自己/授权成员" if value == "private" else "工作区成员",
+            )
             if st.form_submit_button("创建") and new_kb:
-                resp = client.create_knowledge_base(new_kb)
+                resp = client.create_knowledge_base(
+                    new_kb, access_policy=new_kb_policy
+                )
                 if resp.status_code == 201:
                     _clear_api_cache(("kbs", client.base_url))
                     st.success(f"已创建 {new_kb}")
@@ -2874,6 +3767,14 @@ def _sidebar() -> None:
                     _clear_api_cache(("kbs", client.base_url))
                     st.rerun()
 
+        _render_resource_access_controls(
+            client,
+            kb_id,
+            [item for item in docs if isinstance(item, Mapping)]
+            if isinstance(docs, list)
+            else [],
+        )
+
         _render_source_browser(client, kb_id)
 
         with st.expander("⚠️ 删除知识库"):
@@ -2923,6 +3824,8 @@ def _poll_job(client: CogDocClient, job_id: str) -> None:
 def _stream_chat_worker(
     *,
     api_url: str,
+    auth_token: str,
+    workspace_id: str | None,
     kb_id: str,
     session_id: str,
     prompt: str,
@@ -2933,7 +3836,11 @@ def _stream_chat_worker(
 ) -> None:
     # 后台线程只碰队列和停止事件，不直接写界面状态。
     try:
-        client = CogDocClient(api_url)
+        client = CogDocClient(
+            api_url,
+            api_key=auth_token,
+            workspace_id=workspace_id,
+        )
         for event, data in client.stream_chat(
             kb_id,
             prompt,
@@ -2986,6 +3893,8 @@ def _start_stream(kb_id: str, prompt: str, mode: str) -> None:
         target=_stream_chat_worker,
         kwargs={
             "api_url": st.session_state.api_url,
+            "auth_token": _current_api_credential(),
+            "workspace_id": _current_workspace_id(),
             "kb_id": kb_id,
             "session_id": st.session_state.session_id,
             "prompt": prompt,
@@ -3090,7 +3999,10 @@ def _drain_stream_events() -> None:
             elif event == "error":
                 pending["error"] = data
             elif event == "response":
-                pending["response"] = data.get("response")
+                response = data.get("response")
+                pending["response"] = response
+                if response is not None:
+                    _observe_authenticated_response(response.status_code)
             elif event == "done":
                 pending["cancelled"] = bool(data.get("cancelled"))
                 pending["done"] = True
@@ -3925,6 +4837,8 @@ def main() -> None:
     _init_state()
     _hide_default_chrome()
     _brand_header()
+    if not _auth_gate():
+        return
     _sidebar()
     _chat_area()
 

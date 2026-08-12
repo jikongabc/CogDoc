@@ -106,6 +106,8 @@ class HybridRetriever(BaseRetriever):
         *,
         scope: RetrievalScope | None = None,
     ) -> List[RetrievedDoc]:
+        if scope is not None and scope.denies_all:
+            return []
         # 两路召回后交给 native RRF 做去重融合。
         self._ensure_servable()
         recall_top_k = top_k * 3  # 扩大召回池提高融合质量

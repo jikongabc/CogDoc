@@ -36,6 +36,7 @@ def chunk_preview(
     anchor = str(anchor_text or "").strip()
     return ChunkPreview(
         chunk_id=str(meta.get("chunk_id", "")),
+        document_id=str(meta.get("document_id", "")),
         chunk_index=meta.get("chunk_index"),
         source=str(meta.get("source", "") or ""),
         source_sha256=str(meta.get("source_sha256", "") or ""),

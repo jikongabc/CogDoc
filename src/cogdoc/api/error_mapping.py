@@ -8,6 +8,8 @@ _RATE_LIMIT_TOKENS = ("rate limit", "ratelimit", "429", "too many requests")
 # 每个错误码对应的 HTTP 状态：让客户端据码决定退避重试还是直接放弃。
 _STATUS_BY_CODE = {
     ErrorCode.UNAUTHORIZED: 401,
+    ErrorCode.FORBIDDEN: 403,
+    ErrorCode.TENANT_QUOTA_EXCEEDED: 409,
     ErrorCode.REQUEST_THROTTLED: 429,
     ErrorCode.STREAM_INTERRUPTED: 502,
     ErrorCode.LLM_TIMEOUT: 504,

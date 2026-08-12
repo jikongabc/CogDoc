@@ -1,0 +1,214 @@
+name: Build release artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  packages:
+    name: Verified package bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-12
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt
+
+      - name: Cache Rust build inputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust_core/target/
+          key: release-rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('rust_core/Cargo.lock') }}
+          restore-keys: |
+            release-rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-
+            rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            rust_core/pyproject.toml
+
+      - name: Install build tools
+        run: |
+          python -m pip install "pip==26.0.1"
+          python -m pip install \
+            "build==1.5.0" \
+            "maturin==1.14.1" \
+            "mypy==2.3.0" \
+            "ruff==0.15.18" \
+            "setuptools==81.0.0" \
+            "wheel==0.46.3"
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path rust_core/Cargo.toml --all -- --check
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path rust_core/Cargo.toml --locked
+
+      - name: Verify release version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            python scripts/check_release_version.py --tag "${GITHUB_REF_NAME}"
+          else
+            python scripts/check_release_version.py
+          fi
+
+      - name: Build distributable packages
+        run: |
+          python -m build --sdist --wheel --outdir release
+          mkdir -p release/scripts
+          cp scripts/backup_state.py scripts/restore_state.py scripts/migrate_state.py release/scripts/
+          docker run --rm \
+            --volume "$PWD:/io" \
+            --workdir /io/rust_core \
+            --entrypoint /bin/bash \
+            ghcr.io/pyo3/maturin:v1.14.1@sha256:2665227312dd1eab1c29c70a001dc8aac53155a2d048bede3b2df7f1691c8e38 \
+            -lc 'set -euo pipefail; rustup toolchain install 1.97.1 --profile minimal; rustup default 1.97.1; maturin build --release --locked --interpreter /opt/python/cp313-cp313/bin/python --out /io/release'
+          native_wheels=(release/rust_core-*.whl)
+          [[ ${#native_wheels[@]} -eq 1 ]]
+          [[ "${native_wheels[0]}" == *manylinux_2_17_x86_64.manylinux2014_x86_64.whl ]]
+          (
+            cd release
+            while IFS= read -r -d '' artifact; do
+              sha256sum -- "${artifact}"
+            done < <(find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z) \
+              > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
+
+      - name: Verify source and built artifact bundles
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m pip install release/rust_core-*.whl
+          for script in backup_state.py restore_state.py migrate_state.py; do
+            python "release/scripts/${script}" --help >/dev/null
+          done
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import runpy
+
+          release_root = Path("release").resolve()
+          os.environ.pop("COGDOC_BACKUP_DIR", None)
+          backup = runpy.run_path(str(release_root / "scripts" / "backup_state.py"))
+          restore = runpy.run_path(str(release_root / "scripts" / "restore_state.py"))
+          assert backup["ROOT"] == release_root
+          assert backup["_default_backup_dir"]() == release_root / "backups"
+          assert restore["ROOT"] == release_root
+          PY
+          make lint
+          make typecheck-security
+          python -m pytest -q
+          python scripts/check_native.py
+          python scripts/smoke_api.py
+          python scripts/smoke_account_auth.py
+          python scripts/eval_suite.py
+          python -m pip check
+          python -m venv --system-site-packages /tmp/cogdoc-release-venv
+          /tmp/cogdoc-release-venv/bin/python -m pip install --force-reinstall --no-deps \
+            release/cogdoc-*.whl release/rust_core-*.whl
+          /tmp/cogdoc-release-venv/bin/python -m pip check
+          (cd /tmp && /tmp/cogdoc-release-venv/bin/python -c \
+            'import cogdoc, cogdoc.api.app, rust_core; from cogdoc.tools.rust_core_loader import REQUIRED_NATIVE_SYMBOLS; assert "/tmp/cogdoc-release-venv/" in cogdoc.__file__; assert "/tmp/cogdoc-release-venv/" in cogdoc.api.app.__file__; assert "/tmp/cogdoc-release-venv/" in rust_core.__file__; assert all(hasattr(rust_core, name) for name in REQUIRED_NATIVE_SYMBOLS); print(cogdoc.__version__)')
+          python -m venv --system-site-packages /tmp/cogdoc-sdist-venv
+          /tmp/cogdoc-sdist-venv/bin/python -m pip install \
+            --no-build-isolation \
+            --force-reinstall \
+            --no-deps \
+            release/cogdoc-*.tar.gz release/rust_core-*.whl
+          /tmp/cogdoc-sdist-venv/bin/python -m pip check
+          (cd /tmp && /tmp/cogdoc-sdist-venv/bin/python -c \
+            'import cogdoc, cogdoc.api.app, rust_core; from cogdoc.tools.rust_core_loader import REQUIRED_NATIVE_SYMBOLS; assert "/tmp/cogdoc-sdist-venv/" in cogdoc.__file__; assert "/tmp/cogdoc-sdist-venv/" in cogdoc.api.app.__file__; assert "/tmp/cogdoc-sdist-venv/" in rust_core.__file__; assert all(hasattr(rust_core, name) for name in REQUIRED_NATIVE_SYMBOLS); print(cogdoc.__version__)')
+          (cd release && sha256sum --check --strict SHA256SUMS)
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build release-equivalent image without publishing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: cogdoc:release-check
+          cache-from: type=gha,scope=cogdoc-release
+          cache-to: type=gha,mode=max,scope=cogdoc-release
+
+      - name: Run release image account-auth smoke
+        run: |
+          account_volume="cogdoc-release-account-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker volume create "${account_volume}" >/dev/null
+          docker run --detach --name cogdoc-release-check \
+            --mount "source=${account_volume},target=/app/data" \
+            --env COGDOC_ACCOUNT_AUTH_ENABLED=true \
+            --env COGDOC_SELF_REGISTRATION_ENABLED=true \
+            --env COGDOC_STATE_BACKEND=sqlite \
+            --env COGDOC_TRACE_ENABLED=false \
+            --publish 127.0.0.1:8000:8000 cogdoc:release-check
+          trap 'docker logs cogdoc-release-check || true; docker rm --force cogdoc-release-check >/dev/null 2>&1 || true; docker volume rm "${account_volume}" >/dev/null 2>&1 || true' EXIT
+          python3 scripts/smoke_account_auth.py \
+            --url http://127.0.0.1:8000 \
+            --startup-timeout 90
+          docker stop --timeout 25 cogdoc-release-check >/dev/null
+          backup_json="$(docker run --rm \
+            --mount "source=${account_volume},target=/app/data" \
+            cogdoc:release-check \
+            python scripts/backup_state.py --json)"
+          backup_name="$(python3 -c \
+            'import json, pathlib, sys; print(pathlib.Path(json.load(sys.stdin)["archive"]).name)' \
+            <<<"${backup_json}")"
+          docker run --rm \
+            --mount "source=${account_volume},target=/app/data" \
+            cogdoc:release-check \
+            python scripts/restore_state.py \
+              "/app/data/backups/${backup_name}" --verify-only
+          docker run --rm --user 0 \
+            --env "BACKUP_NAME=${backup_name}" \
+            --mount "source=${account_volume},target=/source,readonly" \
+            --entrypoint /bin/bash cogdoc:release-check \
+            -lc 'set -euo pipefail; python /app/scripts/restore_state.py "/source/backups/${BACKUP_NAME}" --target /tmp/restore-drill; test -f /tmp/restore-drill/data/state.db'
+
+      - name: Recheck release checksums
+        run: (cd release && sha256sum --check --strict SHA256SUMS)
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cogdoc-packages-${{ github.run_id }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 30

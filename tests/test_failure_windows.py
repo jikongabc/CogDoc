@@ -1,3 +1,4 @@
+import os
 from unittest.mock import MagicMock, patch
 import pytest
 from cogdoc.api.ingest import IndexJobManager
@@ -22,8 +23,6 @@ def _boom_ingest(kb_id, source_dir):
 # 验证 upload build failure restore fail keeps journal。
 def test_upload_build_failure_restore_fail_keeps_journal(tmp_path):
     # 覆盖上传构建失败、且恢复旧文件失败：journal 必须保留，供启动恢复重试。
-    import os
-
     source_dir = str(tmp_path / "src")
     os.makedirs(source_dir)
     dest = os.path.join(source_dir, "a.pdf")
@@ -58,8 +57,6 @@ def test_upload_build_failure_restore_fail_keeps_journal(tmp_path):
 # 验证 upload new file build failure remove fail keeps journal。
 def test_upload_new_file_build_failure_remove_fail_keeps_journal(tmp_path):
     # 新增上传构建失败、删除残缺新文件失败：journal 保留。
-    import os
-
     source_dir = str(tmp_path / "src")
     journal = MutationJournal(journal_dir=str(tmp_path / "j"))
     mgr = IndexJobManager(
@@ -79,8 +76,6 @@ def test_upload_new_file_build_failure_remove_fail_keeps_journal(tmp_path):
 # 验证 journal recover remove fail keeps entry。
 def test_journal_recover_remove_fail_keeps_entry(tmp_path):
     # 恢复时删除未提交新文件失败：保留 journal 条目下次重试。
-    import os
-
     src = tmp_path / "src"
     src.mkdir()
     dest = src / "a.pdf"

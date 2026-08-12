@@ -2,10 +2,11 @@ DEFAULT_CHUNK_CHAR_SIZE = 600
 DEFAULT_CHUNK_CHAR_OVERLAP = 60
 MIN_CHUNK_CHARS = 30
 DEFAULT_CHUNK_CONTEXT_CHARS = 160
+DOCUMENT_ID_VERSION = "source-name-v1"
 
-# 切块和检索索引输入变化时必须同步更新版本；章节层级参与切块和索引后升级到第五版。
+# 切块和检索索引输入变化时必须同步更新版本。
 CHUNK_IDENTITY_BASE_VERSION = (
-    "source_sha256_name_page_span_local_v5_parent_child_section_index"
+    "source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index"
 )
 CHUNK_IDENTITY_VERSION = (
     f"{CHUNK_IDENTITY_BASE_VERSION}"
@@ -14,6 +15,19 @@ CHUNK_IDENTITY_VERSION = (
     f"_min{MIN_CHUNK_CHARS}"
     f"_ctx{DEFAULT_CHUNK_CONTEXT_CHARS}"
 )
+
+
+def build_document_id(source_name: str) -> str:
+    """Return the stable document ACL identity within one knowledge base."""
+
+    if not isinstance(source_name, str) or not source_name:
+        raise ValueError("source_name is required to build a stable document_id")
+    import hashlib
+
+    digest = hashlib.sha256(
+        b"cogdoc-document-id-source-name-v1\0" + source_name.encode("utf-8")
+    ).hexdigest()
+    return f"doc-{digest}"
 
 
 # 构建分块id。

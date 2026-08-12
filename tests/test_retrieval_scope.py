@@ -8,7 +8,7 @@ from cogdoc.tools.retriever.derived_knowledge import (
     DerivedKnowledgeRetriever,
 )
 from cogdoc.tools.retriever.hybrid import HybridRetriever
-from cogdoc.tools.retriever.scope import RetrievalScope
+from cogdoc.tools.retriever.scope import RetrievalAccessMode, RetrievalScope
 from cogdoc.tools.retriever.vector_retriever import VectorRetriever
 
 
@@ -60,6 +60,45 @@ def test_scope_preserves_exact_source_identity():
 
     assert scope.allows_source(" a.pdf ") is True
     assert scope.allows_source("a.pdf") is False
+
+
+def test_scope_distinguishes_deny_from_all_and_rejects_ambiguous_subset():
+    unrestricted = RetrievalScope()
+    denied = RetrievalScope.deny()
+
+    assert unrestricted.access_mode is RetrievalAccessMode.ALL
+    assert unrestricted.allows_source("secret.pdf") is True
+    assert denied.access_mode is RetrievalAccessMode.DENY
+    assert denied.allows_source("secret.pdf") is False
+    assert denied.allows_document(_doc("secret", "secret.pdf")) is False
+    with pytest.raises(ValueError, match="at least one source"):
+        RetrievalScope(access_mode=RetrievalAccessMode.SUBSET)
+
+
+def test_scope_intersection_never_promotes_empty_authorization_to_all():
+    task = RetrievalScope(allowed_sources=("a.pdf", "b.pdf"))
+    authorization = RetrievalScope(allowed_sources=("b.pdf", "c.pdf"))
+
+    combined = task.intersect(authorization)
+    assert combined.allowed_sources == ("b.pdf",)
+    assert combined.access_mode is RetrievalAccessMode.SUBSET
+    assert task.intersect(RetrievalScope(allowed_sources=("c.pdf",))).denies_all
+    assert RetrievalScope().intersect(RetrievalScope.deny()).denies_all
+
+
+def test_deny_scope_stops_vector_search_before_embedding_or_backend(monkeypatch):
+    collection = _VectorCollection()
+    retriever = VectorRetriever.__new__(VectorRetriever)
+    retriever.collection = collection
+    embedded = []
+    monkeypatch.setattr(
+        "cogdoc.tools.retriever.vector_retriever.Embedder.embed_query",
+        lambda query: embedded.append(query),
+    )
+
+    assert retriever.search("secret", scope=RetrievalScope.deny()) == []
+    assert embedded == []
+    assert collection.options is None
 
 
 class _VectorCollection:

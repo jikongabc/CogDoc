@@ -13,7 +13,9 @@ from httpx import ASGITransport, AsyncClient
 
 from cogdoc.api.app import create_app
 from cogdoc.api.ingest import KnowledgeBaseRegistry
+from cogdoc.api.resource_access import AccessMode, ResourceAccessStore
 from cogdoc.api.routes import research as research_routes
+from cogdoc.api.tenancy import Principal, Role
 from cogdoc.config.settings import Settings
 from cogdoc.daemon_executor import DaemonExecutorCapacityError
 from cogdoc.research_control import ResearchDeadlineExceeded
@@ -409,21 +411,14 @@ async def test_research_api_queue_full_is_retryable_and_does_not_start_job(
                 )
                 first_id = first.json()["job"]["job_id"]
                 second_id = second.json()["job"]["job_id"]
-                started = await client.post(
-                    f"/v1/research-jobs/{first_id}/start"
-                )
+                started = await client.post(f"/v1/research-jobs/{first_id}/start")
                 assert started.status_code == 202
                 assert entered.wait(2)
 
-                rejected = await client.post(
-                    f"/v1/research-jobs/{second_id}/start"
-                )
+                rejected = await client.post(f"/v1/research-jobs/{second_id}/start")
                 assert rejected.status_code == 503
                 assert rejected.headers["retry-after"] == "1"
-                assert (
-                    rejected.json()["error_code"]
-                    == "RESEARCH_CAPACITY_EXHAUSTED"
-                )
+                assert rejected.json()["error_code"] == "RESEARCH_CAPACITY_EXHAUSTED"
                 current = await client.get(f"/v1/research-jobs/{second_id}")
                 assert current.json()["job"]["status"] == "planned"
                 release.set()
@@ -588,7 +583,9 @@ async def test_research_auto_plan_rejects_stale_revision_before_external_reads(
 
 
 @pytest.mark.anyio
-async def test_research_auto_plan_returns_retryable_capacity_error(tmp_path, monkeypatch):
+async def test_research_auto_plan_returns_retryable_capacity_error(
+    tmp_path, monkeypatch
+):
     app = _make_app(tmp_path, monkeypatch)
     calls = []
     app.state.research_planning_executor.shutdown(
@@ -632,9 +629,9 @@ async def test_research_auto_plan_returns_retryable_capacity_error(tmp_path, mon
 async def test_research_auto_plan_maps_control_deadline_to_503(tmp_path, monkeypatch):
     app = _make_app(tmp_path, monkeypatch)
     app.state.research_source_reader = lambda _kb_id: []
-    app.state.research_plan_generator = lambda *_args, **_kwargs: (
-        _ for _ in ()
-    ).throw(ResearchDeadlineExceeded())
+    app.state.research_plan_generator = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        ResearchDeadlineExceeded()
+    )
     async with app.router.lifespan_context(app):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://testserver"
@@ -726,6 +723,250 @@ async def test_research_auto_plan_rejects_completed_job_before_external_reads(
     assert response.status_code == 409
     assert response.json()["error_code"] == "RESEARCH_JOB_STATE_CONFLICT"
     assert calls == []
+
+
+@pytest.mark.anyio
+async def test_research_auto_plan_rechecks_authorization_before_persisting(
+    tmp_path, monkeypatch
+):
+    app = _make_app(tmp_path, monkeypatch)
+    generated_sections = [
+        {
+            "title": "revoked output",
+            "research_question": "must never be persisted",
+            "evidence_requirements": [],
+            "success_criteria": "must never be persisted",
+        }
+    ]
+    authorized = True
+
+    def generate_then_revoke(*_args, **_kwargs):
+        nonlocal authorized
+        authorized = False
+        return generated_sections
+
+    app.state.research_plan_generator = generate_then_revoke
+    monkeypatch.setattr(
+        research_routes,
+        "_job_is_authorized",
+        lambda _request, _row: authorized,
+    )
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            created = await client.post(
+                "/v1/research-jobs",
+                json={"kb_id": "kb", "objective": "authorization race"},
+            )
+            job = created.json()["job"]
+            before = app.state.research_job_store.get(job["job_id"])
+            response = await client.post(
+                f"/v1/research-jobs/{job['job_id']}/plan/auto",
+                json={"expected_revision": job["revision"]},
+            )
+            after = app.state.research_job_store.get(job["job_id"])
+
+    assert response.status_code == 404
+    assert response.json()["error_code"] == "RESEARCH_JOB_NOT_FOUND"
+    assert after == before
+    assert "revoked output" not in json.dumps(after, ensure_ascii=False)
+
+
+@pytest.mark.anyio
+async def test_research_auto_plan_rechecks_live_session_membership_before_commit(
+    tmp_path, monkeypatch
+):
+    app = _make_app(tmp_path, monkeypatch)
+    principal = Principal.for_user_session(
+        tenant_id="workspace-a",
+        subject_id="user-a",
+        role=Role.EDITOR,
+        session_id="session-a",
+    )
+    membership = {"role": "editor"}
+
+    class MembershipStore:
+        def membership(self, workspace_id, user_id):
+            assert (workspace_id, user_id) == ("workspace-a", "user-a")
+            return membership or None
+
+    app.state.auth_store = MembershipStore()
+    monkeypatch.setattr(
+        research_routes, "request_principal", lambda _request: principal
+    )
+    monkeypatch.setattr(
+        research_routes,
+        "scope_for_storage_id",
+        lambda _request, storage_id: SimpleNamespace(
+            tenant_id="workspace-a", storage_id=storage_id
+        ),
+    )
+    monkeypatch.setattr(
+        research_routes, "resource_access_decision", lambda *_args, **_kwargs: None
+    )
+    app.state.research_source_reader = lambda _kb_id: []
+
+    def generate_then_remove(*_args, **_kwargs):
+        membership.clear()
+        return [
+            {
+                "title": "must stay transient",
+                "research_question": "revoked member",
+                "evidence_requirements": [],
+                "success_criteria": "not persisted",
+            }
+        ]
+
+    app.state.research_plan_generator = generate_then_remove
+    job = app.state.research_job_store.create(
+        kb_id="kb",
+        objective="membership race",
+        authorization={
+            "version": "research-auth-v1",
+            "tenant_id": "workspace-a",
+            "created_by": "user-a",
+            "creator_role": "editor",
+            "auth_kind": "user_session",
+            "mode": "all",
+            "acl_epoch": 1,
+            "allowed_sources": [],
+        },
+    )
+    before = app.state.research_job_store.get(job["job_id"])
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            response = await client.post(
+                f"/v1/research-jobs/{job['job_id']}/plan/auto",
+                json={"expected_revision": job["revision"]},
+            )
+            after = app.state.research_job_store.get(job["job_id"])
+
+    assert response.status_code == 404
+    assert after == before
+
+
+def test_research_authorization_rejects_stale_admin_role_for_private_kb(
+    tmp_path, monkeypatch
+):
+    access_store = ResourceAccessStore(tmp_path / "resource-access.db")
+    access_store.set_kb_policy(
+        "workspace-a", "kb", "resource-owner", "private"
+    )
+    membership = {"role": "admin"}
+    principal = Principal.for_user_session(
+        tenant_id="workspace-a",
+        subject_id="user-a",
+        role=Role.ADMIN,
+        session_id="session-a",
+    )
+
+    class MembershipStore:
+        @staticmethod
+        def membership(workspace_id, user_id):
+            assert (workspace_id, user_id) == ("workspace-a", "user-a")
+            return membership
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                auth_store=MembershipStore(),
+                resource_access_store=access_store,
+            )
+        ),
+        state=SimpleNamespace(principal=principal),
+        method="GET",
+        url=SimpleNamespace(path="/v1/research-jobs/rj-private"),
+    )
+    scope = SimpleNamespace(
+        tenant_id="workspace-a",
+        external_id="private",
+        storage_id="kb",
+        owner_id="resource-owner",
+    )
+    monkeypatch.setattr(
+        research_routes,
+        "scope_for_storage_id",
+        lambda _request, _storage_id: scope,
+    )
+    row = {
+        "job_id": "rj-private",
+        "kb_id": "kb",
+        "authorization": {
+            "version": "research-auth-v1",
+            "tenant_id": "workspace-a",
+            "created_by": "user-a",
+            "creator_role": "admin",
+            "auth_kind": "user_session",
+            "mode": "all",
+            "acl_epoch": 1,
+            "allowed_sources": [],
+        },
+    }
+    try:
+        # The request-start admin snapshot can bypass this private ACL, while a
+        # freshly authenticated editor cannot. The live-role guard must stop the
+        # stale admin snapshot from reaching that bypass after a demotion.
+        assert access_store.allowed_sources(principal, "kb").mode is AccessMode.ALL
+        fresh_editor = Principal.for_user_session(
+            tenant_id="workspace-a",
+            subject_id="user-a",
+            role=Role.EDITOR,
+            session_id="session-a",
+        )
+        assert (
+            access_store.allowed_sources(fresh_editor, "kb").mode
+            is AccessMode.DENY
+        )
+        assert research_routes._job_is_authorized(request, row)
+
+        membership["role"] = "editor"
+
+        assert not research_routes._job_is_authorized(request, row)
+    finally:
+        access_store.close()
+
+
+def test_research_legacy_job_rejects_stale_session_role_after_demotion(
+    monkeypatch,
+):
+    membership = {"role": "admin"}
+    principal = Principal.for_user_session(
+        tenant_id="workspace-a",
+        subject_id="user-a",
+        role=Role.ADMIN,
+        session_id="session-a",
+    )
+
+    class MembershipStore:
+        @staticmethod
+        def membership(_workspace_id, _user_id):
+            return membership
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                auth_store=MembershipStore(), resource_access_store=None
+            )
+        ),
+        state=SimpleNamespace(principal=principal),
+        method="GET",
+        url=SimpleNamespace(path="/v1/research-jobs/rj-legacy"),
+    )
+    monkeypatch.setattr(
+        research_routes,
+        "scope_for_storage_id",
+        lambda _request, storage_id: SimpleNamespace(storage_id=storage_id),
+    )
+    legacy_row = {"job_id": "rj-legacy", "kb_id": "kb"}
+    assert research_routes._job_is_authorized(request, legacy_row)
+
+    membership["role"] = "editor"
+
+    assert not research_routes._job_is_authorized(request, legacy_row)
 
 
 @pytest.mark.anyio
@@ -977,14 +1218,13 @@ async def test_research_api_generates_and_downloads_markdown_report(
     assert downloaded.headers["x-cogdoc-integrity"] == "verified"
     assert published.status_code == 200
     assert published.json()["job"]["review_status"] == "published"
-    expected_reviewer = "eval-review:" + hashlib.sha256(
-        b"test-review-key"
-    ).hexdigest()[:16]
+    expected_reviewer = (
+        "eval-review:" + hashlib.sha256(b"test-review-key").hexdigest()[:16]
+    )
     assert reviewed_job["review_history"][-1]["reviewer"] == expected_reviewer
     assert published.json()["job"]["published_by"] == expected_reviewer
     assert (
-        published.json()["job"]["published_report"]["published_by"]
-        == expected_reviewer
+        published.json()["job"]["published_report"]["published_by"] == expected_reviewer
     )
     assert published.json()["job"]["publication_sha256"]
     assert (
@@ -1024,9 +1264,10 @@ async def test_research_api_generates_and_downloads_markdown_report(
         assert manifest["artifact_schema_version"] == "research-artifact-v2"
         assert manifest["artifact_sha256"]
         assert manifest["published_by"] == expected_reviewer
-        assert manifest["publication_sha256"] == published.json()["job"][
-            "publication_sha256"
-        ]
+        assert (
+            manifest["publication_sha256"]
+            == published.json()["job"]["publication_sha256"]
+        )
         for name, expected_sha256 in manifest["files"].items():
             assert hashlib.sha256(archive.read(name)).hexdigest() == expected_sha256
 
@@ -1361,7 +1602,9 @@ async def test_research_api_hides_verified_artifact_after_current_projection_dri
     assert bundle.status_code == 409
 
 
-@pytest.mark.parametrize("publication_drift", ["review_trace", "publisher", "timestamp"])
+@pytest.mark.parametrize(
+    "publication_drift", ["review_trace", "publisher", "timestamp"]
+)
 @pytest.mark.anyio
 async def test_research_api_rejects_published_projection_with_drifted_review_trace(
     tmp_path, monkeypatch, publication_drift
@@ -1447,19 +1690,13 @@ async def test_research_api_rejects_published_projection_with_drifted_review_tra
 
             tampered = app.state.research_job_store.get(job_id)
             if publication_drift == "review_trace":
-                tampered["sections"][0]["reviewed_at"] = (
-                    "2099-01-01T00:00:00Z"
-                )
+                tampered["sections"][0]["reviewed_at"] = "2099-01-01T00:00:00Z"
             elif publication_drift == "publisher":
                 tampered["published_by"] = "eval-review:tampered"
-                tampered["published_report"]["published_by"] = (
-                    "eval-review:tampered"
-                )
+                tampered["published_report"]["published_by"] = "eval-review:tampered"
             else:
                 tampered["published_at"] = "2099-01-01T00:00:00Z"
-                tampered["published_report"]["published_at"] = (
-                    "2099-01-01T00:00:00Z"
-                )
+                tampered["published_report"]["published_at"] = "2099-01-01T00:00:00Z"
             app.state.research_job_store.import_records([tampered])
 
             fetched = await client.get(f"/v1/research-jobs/{job_id}")

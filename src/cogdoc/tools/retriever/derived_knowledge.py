@@ -279,7 +279,9 @@ class DerivedKnowledgeIndex:
         *,
         scope: RetrievalScope | None = None,
     ) -> list[RetrievedDoc]:
-        if scope is not None and not scope.include_derived_knowledge:
+        if scope is not None and (
+            scope.denies_all or not scope.include_derived_knowledge
+        ):
             return []
         collection = self._collection(kb_id)
         if collection.count() <= 0:
@@ -406,7 +408,9 @@ class DerivedKnowledgeRetriever:
         *,
         scope: RetrievalScope | None = None,
     ) -> list[RetrievedDoc]:
-        if scope is not None and not scope.include_derived_knowledge:
+        if scope is not None and (
+            scope.denies_all or not scope.include_derived_knowledge
+        ):
             return []
         index = self._index_or_none()
         if index is not None:

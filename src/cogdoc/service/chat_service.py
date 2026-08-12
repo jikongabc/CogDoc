@@ -332,6 +332,7 @@ def run_chat(
     session_id: str | None = None,
     *,
     state_runtime=None,
+    retrieval_scope=None,
 ) -> Iterator[ChatEvent]:
     global app
     if app is None:
@@ -367,6 +368,7 @@ def run_chat(
         "request_id": trace_id,
         "trace_id": trace_id,
         "session_id": session_id,
+        "retrieval_scope": retrieval_scope,
     }
 
     configurable = {
@@ -377,6 +379,7 @@ def run_chat(
         "trace_id": trace_id,
         "session_id": session_id,
         "state_runtime": state_runtime,
+        "retrieval_scope": retrieval_scope,
     }
     if forced_task in FORCED_TASK_TYPES:
         configurable["forced_task"] = forced_task

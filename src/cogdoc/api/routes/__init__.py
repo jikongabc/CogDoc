@@ -1,4 +1,6 @@
 from cogdoc.api.routes.agent import router as agent_router
+from cogdoc.api.routes.access import router as access_router
+from cogdoc.api.routes.auth import router as auth_router
 from cogdoc.api.routes.chat import router as chat_router
 from cogdoc.api.routes.documents import router as documents_router
 from cogdoc.api.routes.feedback import router as feedback_router
@@ -12,6 +14,8 @@ from cogdoc.api.routes.traces import router as traces_router
 
 __all__ = [
     "agent_router",
+    "access_router",
+    "auth_router",
     "chat_router",
     "documents_router",
     "feedback_router",

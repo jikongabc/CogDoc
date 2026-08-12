@@ -11,6 +11,13 @@ from cogdoc.api.retrieval_eval_draft_store import (
     RetrievalEvalDraftStore,
 )
 from cogdoc.api.schemas import RetrievalEvalDraftReviewRequest
+from cogdoc.api.tenant_scope import (
+    externalize_kb_fields,
+    request_principal,
+    resolve_kb_scope,
+    row_is_authorized,
+    scope_for_storage_id,
+)
 from cogdoc.service.index_provenance import current_index_provenance
 from cogdoc.tools.eval.retrieval_eval_drafts import (
     DraftStatus,
@@ -32,6 +39,51 @@ def _store(request: Request) -> RetrievalEvalDraftStore:
     if store is None:
         raise HTTPException(status_code=503, detail="证据评测草稿存储不可用")
     return store
+
+
+def _kb_storage_id(request: Request, kb_id: str) -> str:
+    scope = resolve_kb_scope(request, kb_id, allow_legacy_default=True)
+    if scope is None:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    return scope.storage_id
+
+
+def _owns_storage_id(request: Request, storage_id: object) -> bool:
+    value = str(storage_id or "")
+    if not value:
+        return False
+    if scope_for_storage_id(request, value) is not None:
+        return True
+    principal = request_principal(request)
+    if principal.tenant_id != "default":
+        return False
+    if value.startswith("t-"):
+        return False
+    registry = request.app.state.kb_registry
+    getter = getattr(registry, "get_by_storage_id", None)
+    # Unregistered rows are historical single-tenant data. A physical ID that
+    # is registered to another tenant must never enter this compatibility path.
+    return not callable(getter) or getter(value) is None
+
+
+def _require_owned_draft(request: Request, draft_id: str) -> dict[str, Any]:
+    row = _store(request).get(draft_id)
+    if row is None or not _row_allowed(request, row):
+        raise HTTPException(status_code=404, detail="证据评测草稿不存在")
+    return row
+
+
+def _row_allowed(request: Request, row: Mapping[str, Any]) -> bool:
+    storage_id = str(row.get("kb_id") or "")
+    scope = scope_for_storage_id(request, storage_id) if storage_id else None
+    if scope is not None:
+        return row_is_authorized(request, scope, row)
+    return _owns_storage_id(request, storage_id)
+
+
+def _review_actor(request: Request, legacy_actor: str) -> str:
+    principal = request_principal(request)
+    return legacy_actor if principal.tenant_id == "default" else principal.subject_id
 
 
 def _snapshot(kb_id: str) -> dict[str, Any]:
@@ -57,10 +109,14 @@ def _stale_reasons(
 
 def _public_row(
     row: Mapping[str, Any],
+    request: Request,
     snapshots: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     reasons = _stale_reasons(row, snapshots)
-    return {**row, "is_stale": bool(reasons), "stale_reasons": reasons}
+    return externalize_kb_fields(
+        {**row, "is_stale": bool(reasons), "stale_reasons": reasons},
+        request,
+    )
 
 
 def _task_kinds(row: Mapping[str, Any]) -> set[str]:
@@ -90,6 +146,7 @@ async def export_retrieval_eval_drafts(
         dataset_partition=dataset_partition,
         limit=_MAX_EXPORT_ROWS,
     )
+    rows = [row for row in rows if _row_allowed(request, row)]
     rows.sort(key=lambda row: str(row.get("draft_id") or ""))
     items: list[dict[str, Any]] = []
     stale: list[dict[str, Any]] = []
@@ -105,11 +162,12 @@ async def export_retrieval_eval_drafts(
         }:
             incompatible.append(str(row["draft_id"]))
             continue
-        items.append(
+        item = (
             dict(row)
             if export_format == "generic_v1"
             else export_retrieval_eval_case(row)
         )
+        items.append(externalize_kb_fields(item, request))
     return {
         "schema_version": "v1",
         "format": export_format,
@@ -135,20 +193,23 @@ async def list_retrieval_eval_drafts(
     limit: int = Query(default=100, ge=1, le=500),
     _reviewer: str = Depends(require_eval_reviewer),
 ):
+    storage_id = _kb_storage_id(request, kb_id) if kb_id is not None else None
     rows = _store(request).list(
-        kb_id=kb_id,
+        kb_id=storage_id,
         status=status,
         dataset_partition=dataset_partition,
         limit=_MAX_EXPORT_ROWS
-        if task_kind is not None or is_stale is not None
+        if kb_id is None or task_kind is not None or is_stale is not None
         else limit,
     )
     decorated = []
     snapshots: dict[str, dict[str, Any]] = {}
     for row in rows:
+        if not _row_allowed(request, row):
+            continue
         if task_kind is not None and task_kind not in _task_kinds(row):
             continue
-        public = _public_row(row, snapshots)
+        public = _public_row(row, request, snapshots)
         if is_stale is not None and public["is_stale"] is not is_stale:
             continue
         decorated.append(public)
@@ -163,10 +224,8 @@ async def get_retrieval_eval_draft(
     request: Request,
     _reviewer: str = Depends(require_eval_reviewer),
 ):
-    row = _store(request).get(draft_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="证据评测草稿不存在")
-    return {"schema_version": "v1", "draft": _public_row(row)}
+    row = _require_owned_draft(request, draft_id)
+    return {"schema_version": "v1", "draft": _public_row(row, request)}
 
 
 @router.post("/{draft_id}/review")
@@ -177,9 +236,7 @@ async def review_retrieval_eval_draft(
     reviewer: str = Depends(require_eval_reviewer),
 ):
     store = _store(request)
-    current = store.get(draft_id)
-    if current is None:
-        raise HTTPException(status_code=404, detail="证据评测草稿不存在")
+    current = _require_owned_draft(request, draft_id)
     if body.decision == DraftStatus.APPROVED.value:
         try:
             preview: Mapping[str, Any] = current
@@ -202,7 +259,7 @@ async def review_retrieval_eval_draft(
         updated = store.review(
             draft_id,
             decision=body.decision,
-            reviewer=reviewer,
+            reviewer=_review_actor(request, reviewer),
             annotations=body.annotations,
             reason=body.reason,
             expected_revision=body.expected_revision,
@@ -213,4 +270,4 @@ async def review_retrieval_eval_draft(
         raise HTTPException(status_code=404, detail="证据评测草稿不存在") from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"schema_version": "v1", "draft": _public_row(updated)}
+    return {"schema_version": "v1", "draft": _public_row(updated, request)}

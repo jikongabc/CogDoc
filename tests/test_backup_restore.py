@@ -1,6 +1,10 @@
 import copy
 import io
 import json
+import os
+import runpy
+import shutil
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -9,7 +13,14 @@ import pytest
 
 from cogdoc.config.settings import get_settings
 from scripts import backup_state
-from scripts.backup_state import MANIFEST_NAME, ROOT, _arcname, create_backup
+from scripts.backup_state import (
+    DEFAULT_BACKUP_DIR,
+    MANIFEST_NAME,
+    ROOT,
+    _arcname,
+    _default_backup_dir,
+    create_backup,
+)
 from scripts.restore_state import RestoreError, restore_archive
 
 
@@ -96,6 +107,91 @@ def test_backup_cli_defaults_to_text_and_json_is_opt_in(
 
 def test_root_arcname_remains_dot() -> None:
     assert _arcname(ROOT) == "."
+
+
+def test_backup_default_dir_can_be_overridden_for_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("COGDOC_BACKUP_DIR", raising=False)
+    assert _default_backup_dir() == DEFAULT_BACKUP_DIR
+
+    configured = tmp_path / "persistent-backups"
+    monkeypatch.setenv("COGDOC_BACKUP_DIR", str(configured))
+    assert _default_backup_dir() == configured
+
+
+def test_backup_output_nested_in_data_is_not_recursively_archived(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "state.db").write_bytes(b"state")
+    output_dir = data / "backups"
+    monkeypatch.setenv("COGDOC_DATA_DIR", str(data))
+    monkeypatch.setenv("COGDOC_TRACE_DIR", str(data / "logs" / "traces"))
+    get_settings.cache_clear()
+    try:
+        first = create_backup(
+            output_dir,
+            name="first.tar.gz",
+            include_traces=True,
+            include_env=False,
+            extra_paths=[],
+        )
+        second = create_backup(
+            output_dir,
+            name="second.tar.gz",
+            include_traces=True,
+            include_env=False,
+            extra_paths=[],
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert first.is_file()
+    with tarfile.open(second, "r:gz") as bundle:
+        names = bundle.getnames()
+    assert any(name.endswith("data/state.db") for name in names)
+    assert not any("/backups/" in f"/{name}/" for name in names)
+
+
+def test_release_bundle_ops_scripts_keep_root_contract_and_support_help(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle_root = tmp_path / "release"
+    bundle_scripts = bundle_root / "scripts"
+    bundle_scripts.mkdir(parents=True)
+    script_names = ("backup_state.py", "restore_state.py", "migrate_state.py")
+    for name in script_names:
+        shutil.copy2(ROOT / "scripts" / name, bundle_scripts / name)
+
+    environment = os.environ.copy()
+    source_path = str(ROOT / "src")
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = (
+        f"{source_path}{os.pathsep}{existing_pythonpath}"
+        if existing_pythonpath
+        else source_path
+    )
+    for name in script_names:
+        completed = subprocess.run(
+            [sys.executable, str(bundle_scripts / name), "--help"],
+            cwd=bundle_root,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "usage:" in completed.stdout
+
+    monkeypatch.delenv("COGDOC_BACKUP_DIR", raising=False)
+    backup_module = runpy.run_path(str(bundle_scripts / "backup_state.py"))
+    restore_module = runpy.run_path(str(bundle_scripts / "restore_state.py"))
+    assert backup_module["ROOT"] == bundle_root
+    assert backup_module["_default_backup_dir"]() == bundle_root / "backups"
+    assert restore_module["ROOT"] == bundle_root
 
 
 def test_v1_archive_restores_with_degraded_verification(tmp_path: Path) -> None:

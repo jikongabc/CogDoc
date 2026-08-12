@@ -2,7 +2,16 @@
 
 PYTHON  ?= python
 MATURIN ?= maturin
+RUFF    ?= ruff
+MYPY    ?= mypy
 SHELL   := /bin/bash
+SECURITY_TYPECHECK_MODULES := \
+	src/cogdoc/api/auth_store.py \
+	src/cogdoc/api/audit.py \
+	src/cogdoc/api/resource_access.py \
+	src/cogdoc/api/tenancy.py \
+	src/cogdoc/api/tenant_scope.py \
+	src/cogdoc/api/research_access.py
 EVAL_SUITE_RELEASE_ARGS := --run-retrieval --retrieval-coverage-profile baseline --rerank --retrieval-gate eval/retrieval_gate.json
 RELIABILITY_DIR ?= artifacts/reliability
 RELIABILITY_GRACE ?= 10
@@ -24,14 +33,17 @@ UVICORN_GRACEFUL_SHUTDOWN_SECONDS ?= 15
 # src-layout：包源码在 src/，入口经 PYTHONPATH 注入，无需先安装即可 run/serve/test。
 export PYTHONPATH := src
 
-.PHONY: help install native check test smoke-api reliability-gate run debug backup eval eval-coverage eval-retrieval-report eval-retrieval-baseline eval-retrieval-gate eval-quality eval-quality-coverage eval-suite eval-suite-run-retrieval eval-suite-report eval-suite-baseline eval-suite-update-baseline serve frontend
+.PHONY: help install native check lint typecheck-security test smoke-api smoke-account-auth reliability-gate run debug backup eval eval-coverage eval-retrieval-report eval-retrieval-baseline eval-retrieval-gate eval-quality eval-quality-coverage eval-suite eval-suite-run-retrieval eval-suite-report eval-suite-baseline eval-suite-update-baseline serve frontend
 
 help:
 	@echo "make install - 可编辑安装含开发依赖 (pip install -e '.[dev]')"
 	@echo "make native  - 构建 rust_core 原生扩展 (cd rust_core && maturin develop --release)"
 	@echo "make check   - 校验原生扩展是否就绪 (scripts/check_native.py)"
+	@echo "make lint    - 对仓库 Python 代码运行 Ruff（仅豁免旧脚本的路径引导 E402）"
+	@echo "make typecheck-security - 对认证、审计、ACL 与租户边界运行定向 mypy"
 	@echo "make test    - 运行 pytest 全量测试"
 	@echo "make smoke-api - 运行不依赖真实模型/索引的 API E2E smoke"
+	@echo "make smoke-account-auth - 启动隔离生产 app，验证账号登录与 Bearer 工作区访问"
 	@echo "make reliability-gate - 运行有界 native/smoke/test/eval 与真实 API soak 门禁"
 	@echo "make backup  - 备份 data/ 与 logs/traces/ 到 backups/"
 	@echo "make eval    - 离线检索评测 recall@k/MRR (scripts/eval_retrieval.py)"
@@ -49,7 +61,7 @@ help:
 	@echo "make run     - 启动多库多对话控制台 (python -m cogdoc.cli)"
 	@echo "make debug   - 启动独立 Debug 控制台 (python -m cogdoc.debug)"
 	@echo "make serve   - 启动 FastAPI 服务 (uvicorn cogdoc.api.app:app)"
-	@echo "make frontend - 启动 Streamlit 前端 (src/cogdoc/frontend/app.py)"
+	@echo "make frontend - 加载 .env 后启动 Streamlit 前端 (src/cogdoc/frontend/app.py)"
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]"
@@ -61,21 +73,36 @@ native:
 check:
 	$(PYTHON) scripts/check_native.py
 
+lint:
+	$(RUFF) check . \
+		--extend-per-file-ignores "scripts/backup_state.py:E402" \
+		--extend-per-file-ignores "scripts/check_native.py:E402" \
+		--extend-per-file-ignores "scripts/eval_agent.py:E402" \
+		--extend-per-file-ignores "scripts/eval_quality.py:E402" \
+		--extend-per-file-ignores "scripts/eval_suite.py:E402"
+
+typecheck-security:
+	$(MYPY) $(SECURITY_TYPECHECK_MODULES)
+
 test:
 	$(PYTHON) -m pytest
 
 smoke-api:
 	$(PYTHON) scripts/smoke_api.py
 
+smoke-account-auth:
+	$(PYTHON) scripts/smoke_account_auth.py
+
 RELIABILITY_EVAL_DATA_DIR ?= $(abspath $(RELIABILITY_DIR)/eval-data)
 RELIABILITY_EVAL_KB_ID ?= arch_blueprint_2026
 RELIABILITY_EVAL_SOURCE_DIR ?= $(abspath your_documents)
 
 # 发布可靠性门禁。普通开发目标保持原行为，只有该目标施加 hard timeout。
-reliability-gate:
-	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_NATIVE_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/native-timeout.json --cwd rust_core -- $(MATURIN) develop --release
+reliability-gate: lint typecheck-security
+	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_NATIVE_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/native-timeout.json --cwd rust_core -- $(MATURIN) develop --release --locked
 	$(PYTHON) scripts/run_guarded.py --timeout 60 --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/check-timeout.json -- $(PYTHON) scripts/check_native.py
 	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_SMOKE_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/smoke-timeout.json -- $(PYTHON) scripts/smoke_api.py
+	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_SMOKE_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/account-smoke-timeout.json -- $(PYTHON) scripts/smoke_account_auth.py
 	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_TEST_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/test-timeout.json -- $(PYTHON) -m pytest
 	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_EVAL_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/eval-index-timeout.json -- env COGDOC_DATA_DIR=$(RELIABILITY_EVAL_DATA_DIR) $(PYTHON) scripts/prepare_eval_index.py --kb-id $(RELIABILITY_EVAL_KB_ID) --source-dir $(RELIABILITY_EVAL_SOURCE_DIR) --eval-set eval/retrieval_eval.jsonl --json $(RELIABILITY_DIR)/eval-index.json
 	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_EVAL_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/eval-timeout.json -- env COGDOC_DATA_DIR=$(RELIABILITY_EVAL_DATA_DIR) $(PYTHON) scripts/eval_suite.py $(EVAL_SUITE_RELEASE_ARGS) --json $(RELIABILITY_DIR)/eval-suite.json
@@ -130,4 +157,9 @@ serve:
 	$(PYTHON) -m uvicorn cogdoc.api.app:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown $(UVICORN_GRACEFUL_SHUTDOWN_SECONDS)
 
 frontend:
-	$(PYTHON) -m streamlit run src/cogdoc/frontend/app.py
+	@if [[ -f .env ]]; then \
+		$(PYTHON) -m dotenv run --no-override -- \
+			$(PYTHON) -m streamlit run src/cogdoc/frontend/app.py; \
+	else \
+		$(PYTHON) -m streamlit run src/cogdoc/frontend/app.py; \
+	fi

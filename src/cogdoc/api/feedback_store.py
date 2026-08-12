@@ -129,11 +129,13 @@ class FeedbackStore:
         trace_id = str(payload.get("trace_id") or "")
         if not trace_id:
             return None
+        kb_id = str(payload.get("kb_id") or "")
         with self._lock:
             rows = self._read_all()
         for row in rows:
             if (
                 str(row.get("trace_id") or "") == trace_id
+                and str(row.get("kb_id") or "") == kb_id
                 and row.get("feedback") in _QUICK_FEEDBACK_TYPES
             ):
                 return row
@@ -324,12 +326,14 @@ class SqliteFeedbackStore(FeedbackStore):
         trace_id = str(payload.get("trace_id") or "")
         if not trace_id:
             return None
+        kb_id = str(payload.get("kb_id") or "")
         with self._lock:
             row = self._conn.execute(
                 "SELECT feedback_id, is_bad_case FROM feedback_entries "
-                "WHERE trace_id=? AND feedback IN ('thumbs_up', 'thumbs_down') "
+                "WHERE trace_id=? AND kb_id=? "
+                "AND feedback IN ('thumbs_up', 'thumbs_down') "
                 "ORDER BY created_at ASC LIMIT 1",
-                (trace_id,),
+                (trace_id, kb_id),
             ).fetchone()
         if row is None:
             return None

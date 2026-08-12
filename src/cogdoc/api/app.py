@@ -1,14 +1,17 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
-from typing import Callable
-from fastapi import FastAPI, Request
+from typing import Callable, Mapping
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
+from cogdoc import __version__
 from cogdoc.api.access_control import (
     AccessControlMiddleware,
     TokenBucketRateLimiter,
     build_rate_limiter,
 )
+from cogdoc.api.audit import AuditStore
+from cogdoc.api.auth_store import AuthStore
 from cogdoc.api.derived_knowledge_store import DerivedKnowledgeStore
 from cogdoc.api.feedback_analysis_store import FeedbackAnalysisStore
 from cogdoc.api.feedback_store import FeedbackStore
@@ -18,8 +21,11 @@ from cogdoc.api.persistence import SqliteJobStore, SqliteSessionStore
 from cogdoc.api.retrieval_feedback_store import RetrievalFeedbackStore
 from cogdoc.api.retrieval_eval_draft_store import RetrievalEvalDraftStore
 from cogdoc.api.research_job_store import ResearchJobStore
+from cogdoc.api.resource_access import ResourceAccessStore
 from cogdoc.api.routes import (
     agent_router,
+    access_router,
+    auth_router,
     chat_router,
     documents_router,
     feedback_router,
@@ -31,6 +37,8 @@ from cogdoc.api.routes import (
 )
 from cogdoc.api.schemas import ErrorCode, build_error_response
 from cogdoc.api.session_store import SessionStore
+from cogdoc.api.tenant_quota import TenantQuotaManager, TenantQuotaPolicy
+from cogdoc.api.tenancy import Permission, Principal, Role
 from cogdoc.api.webhooks import WebhookDispatcher
 from cogdoc.agents.research_planner import propose_research_plan
 import logging
@@ -97,6 +105,63 @@ def _default_retrieval_eval_draft_store():
     return StateRuntime.default_retrieval_eval_draft_store()
 
 
+def _research_acl_checker(auth_store, access_store, job: Mapping) -> bool:
+    """Re-evaluate a durable research snapshot before each background phase."""
+
+    authorization = job.get("authorization")
+    if not isinstance(authorization, Mapping):
+        return True
+    try:
+        tenant_id = str(authorization["tenant_id"])
+        subject_id = str(authorization["created_by"])
+        storage_id = str(job["kb_id"])
+        role_value = str(authorization.get("creator_role") or "viewer")
+        membership_id = None
+        if authorization.get("auth_kind") == "user_session":
+            if auth_store is None:
+                return False
+            membership = auth_store.membership(tenant_id, subject_id)
+            if not isinstance(membership, Mapping):
+                return False
+            role_value = str(membership.get("role") or "")
+            membership_id = str(
+                membership.get("member_id") or membership.get("membership_id") or ""
+            )
+            if not membership_id:
+                return False
+        principal = Principal(
+            tenant_id=tenant_id,
+            subject_id=subject_id,
+            role=Role(role_value),
+            key_fingerprint=(
+                "session:background-research"
+                if authorization.get("auth_kind") == "user_session"
+                else "background:research"
+            ),
+            membership_id=membership_id,
+        )
+        current = access_store.allowed_sources(
+            principal,
+            storage_id,
+            tenant_id=tenant_id,
+            permission=Permission.QUERY,
+        )
+        if not current.is_allowed:
+            return False
+        current_mode = str(current.mode.value)
+        frozen_mode = str(authorization.get("mode") or "")
+        if current_mode == "all":
+            return frozen_mode in {"all", "subset"}
+        if current_mode != "subset" or frozen_mode != "subset":
+            return False
+        frozen_sources = {
+            str(item) for item in authorization.get("allowed_sources") or ()
+        }
+        return bool(frozen_sources and frozen_sources <= set(current.allowed_sources))
+    except Exception:
+        return False
+
+
 # 构建未捕获异常响应。
 def _unhandled_error_response(exc: Exception) -> JSONResponse:
     # 线程池关闭竞争窗口的调度异常归为暂时不可用，其余未预期异常归为内部错误；都不漏栈。
@@ -132,10 +197,20 @@ def create_app(
     derived_knowledge_index_statuser: Callable | None = None,
     close_state_runtime_on_shutdown: bool | None = None,
     api_keys: set[str] | None = None,
+    api_principals: Mapping[str, Principal | Mapping[str, str]] | None = None,
     eval_review_api_keys: set[str] | None = None,
     rate_limiter: TokenBucketRateLimiter | None = None,
+    audit_store: AuditStore | None = None,
+    auth_store: AuthStore | None = None,
+    resource_access_store: ResourceAccessStore | None = None,
+    self_registration_enabled: bool | None = None,
     offload_workers: int | None = None,
 ) -> FastAPI:
+    if auth_store is not None and resource_access_store is None:
+        raise ValueError(
+            "account authentication requires a fail-closed resource_access_store"
+        )
+
     # 管理结果。
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -179,7 +254,8 @@ def create_app(
             # 后台清扫僵尸索引代、空闲执行器和锁表。
             sweeper = BackgroundSweeper(
                 kb_ids_provider=lambda: [
-                    r["kb_id"] for r in app.state.kb_registry.list()
+                    str(r.get("storage_id") or r["kb_id"])
+                    for r in app.state.kb_registry.list()
                 ],
                 index_jobs=app.state.index_jobs,
             )
@@ -280,11 +356,7 @@ def create_app(
             drained = False
             try:
                 # 所有定时器生产者都停止后再统一取消和等待。
-                drained = (
-                    cancel_all_timers()
-                    and research_drained
-                    and planning_drained
-                )
+                drained = cancel_all_timers() and research_drained and planning_drained
             except Exception as exc:
                 log_event(
                     "shutdown",
@@ -316,6 +388,24 @@ def create_app(
                     level=logging.ERROR,
                     error_class=type(exc).__name__,
                 )
+            for store_name, ownership_name in (
+                ("auth_store", "close_auth_store_on_shutdown"),
+                ("resource_access_store", "close_resource_access_store_on_shutdown"),
+            ):
+                try:
+                    active_store = getattr(app.state, store_name, None)
+                    if active_store is not None and getattr(
+                        app.state, ownership_name, False
+                    ):
+                        active_store.close()
+                except Exception as exc:
+                    log_event(
+                        "shutdown",
+                        f"{store_name}_close_failed",
+                        {},
+                        level=logging.ERROR,
+                        error_class=type(exc).__name__,
+                    )
             # 仅在后台线程确已排空时才显式释放进程锁，否则留给进程退出自动释放。
             if drained:
                 _release_retained_single_instance_lock(lock_fh)
@@ -331,10 +421,24 @@ def create_app(
 
     app = FastAPI(
         title="CogDoc API",
-        version="0.2.0",
+        version=__version__,
         lifespan=lifespan,
     )
     app.state.lifecycle_status = "created"
+    app.state.auth_store = auth_store
+    app.state.resource_access_store = resource_access_store
+    # Keep account authentication distinct from optional static API-key auth.
+    # Readiness requires both durable security stores only in account mode.
+    app.state.account_auth_enabled = auth_store is not None
+    app.state.self_registration_enabled = (
+        get_settings().cogdoc_self_registration_enabled
+        if self_registration_enabled is None
+        else bool(self_registration_enabled)
+    )
+    # Injected stores are caller-owned. The module-level production stores are
+    # closed explicitly by their process and can be shared by app factories.
+    app.state.close_auth_store_on_shutdown = False
+    app.state.close_resource_access_store_on_shutdown = False
     # Create operational telemetry before background managers so both HTTP and
     # post-202 research work share one app-local Prometheus registry.
     app.state.metrics = Metrics()
@@ -415,6 +519,15 @@ def create_app(
             kb_exists=app.state.kb_registry.exists,
             max_workers=get_settings().cogdoc_research_workers,
             top_k=get_settings().cogdoc_research_retrieval_top_k,
+            authorization_checker=(
+                partial(
+                    _research_acl_checker,
+                    app.state.auth_store,
+                    app.state.resource_access_store,
+                )
+                if app.state.resource_access_store is not None
+                else None
+            ),
         )
         if runtime.research_job_store is not None
         else None
@@ -422,6 +535,23 @@ def create_app(
     bind_observer = getattr(app.state.research_execution_manager, "bind_observer", None)
     if callable(bind_observer):
         bind_observer(app.state.research_observer)
+    bind_authorization = getattr(
+        app.state.research_execution_manager,
+        "bind_authorization_checker",
+        None,
+    )
+    if app.state.resource_access_store is not None:
+        if not callable(bind_authorization):
+            raise ValueError(
+                "resource_access_store requires an authorization-aware research manager"
+            )
+        bind_authorization(
+            partial(
+                _research_acl_checker,
+                app.state.auth_store,
+                app.state.resource_access_store,
+            )
+        )
     app.state.research_plan_generator = research_plan_generator or partial(
         propose_research_plan,
         observer=app.state.research_observer,
@@ -456,17 +586,119 @@ def create_app(
         runtime.record_derived_knowledge_index_error
     )
     resolved_keys = set(settings.api_key_set if api_keys is None else api_keys)
+    raw_principals = (
+        settings.api_principal_map if api_principals is None else api_principals
+    )
+    resolved_principals: dict[str, Principal] = {}
+    for raw_key, raw_principal in raw_principals.items():
+        if isinstance(raw_principal, Principal):
+            principal = raw_principal
+        elif isinstance(raw_principal, Mapping):
+            principal = Principal.for_api_key(
+                raw_key,
+                tenant_id=str(raw_principal.get("tenant_id") or ""),
+                subject_id=str(raw_principal.get("subject_id") or ""),
+                role=str(raw_principal.get("role") or ""),
+            )
+        else:
+            raise TypeError("api_principals values must be Principal or mapping")
+        resolved_principals[raw_key] = principal
+    app.state.explicit_principal_fingerprints = {
+        principal.key_fingerprint for principal in resolved_principals.values()
+    }
     # Review keys are administrator credentials and therefore also authenticate
     # ordinary endpoints; keeping one union avoids middleware rejecting them first.
     resolved_keys.update(resolved_review_keys)
     resolved_limiter = rate_limiter or build_rate_limiter(
         settings.rate_limit_per_minute, settings.rate_limit_burst
     )
-    app.state.auth_enabled = bool(resolved_keys)
+    app.state.auth_enabled = bool(
+        resolved_keys or resolved_principals or app.state.auth_store is not None
+    )
+    app.state.tenant_quota = TenantQuotaManager(
+        app.state.kb_registry,
+        TenantQuotaPolicy(
+            max_knowledge_bases=settings.cogdoc_tenant_max_knowledge_bases,
+            max_documents=settings.cogdoc_tenant_max_documents,
+            max_storage_bytes=settings.cogdoc_tenant_max_storage_mb * 1024 * 1024,
+        ),
+    )
+    # ``create_app`` is also the test/application-factory seam.  Audit is
+    # opt-in there so independent in-process apps never append into one shared
+    # production file; the module-level production app injects the durable
+    # store explicitly below.
+    app.state.audit_store = audit_store
+
+    @app.get("/v1/tenant", tags=["tenant"])
+    async def current_tenant(request: Request):
+        from cogdoc.api.offload import run_sync
+        from cogdoc.api.tenant_scope import request_principal
+
+        principal = request_principal(request)
+        quota = await run_sync(
+            request.app.state.offload_executor,
+            request.app.state.tenant_quota.snapshot,
+            principal.tenant_id,
+        )
+        return {
+            "schema_version": "v1",
+            "tenant_id": principal.tenant_id,
+            "subject_id": principal.subject_id,
+            "role": principal.role.value,
+            "permissions": sorted(
+                permission.value for permission in principal.permissions
+            ),
+            "quota": quota,
+        }
+
+    @app.get("/v1/auth/config", tags=["auth"])
+    async def auth_config():
+        return {
+            "schema_version": "v1",
+            "account_auth_enabled": app.state.account_auth_enabled,
+            "self_registration_enabled": app.state.self_registration_enabled,
+        }
+
+    @app.get("/v1/audit-events", tags=["tenant"])
+    async def list_audit_events(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=1000),
+        before_sequence: int | None = Query(default=None, ge=1),
+    ):
+        from cogdoc.api.tenant_scope import request_principal
+
+        principal = request_principal(request)
+        active_audit_store = request.app.state.audit_store
+        if active_audit_store is None:
+            return JSONResponse(
+                status_code=503,
+                content=build_error_response(
+                    ErrorCode.INTERNAL_ERROR, "审计存储不可用"
+                ).model_dump(),
+            )
+        from cogdoc.api.offload import run_sync
+
+        events = await run_sync(
+            request.app.state.offload_executor,
+            active_audit_store.list,
+            principal.tenant_id,
+            limit=limit,
+            before_sequence=before_sequence,
+        )
+        next_cursor = events[-1]["sequence"] if len(events) == limit else None
+        return {
+            "schema_version": "v1",
+            "tenant_id": principal.tenant_id,
+            "events": events,
+            "next_before_sequence": next_cursor,
+        }
+
     app.add_middleware(
         AccessControlMiddleware,
         api_keys=resolved_keys,
+        principals=resolved_principals,
         rate_limiter=resolved_limiter,
+        auth_store=app.state.auth_store,
     )
     # 指标中间件在访问控制外层（后加=最外层），故 401/429 也被计入请求统计。
     app.add_middleware(MetricsMiddleware, metrics=app.state.metrics)
@@ -477,6 +709,8 @@ def create_app(
         return _unhandled_error_response(exc)
 
     app.include_router(chat_router)
+    app.include_router(auth_router)
+    app.include_router(access_router)
     app.include_router(agent_router)
     app.include_router(health_router)
     app.include_router(documents_router)
@@ -493,6 +727,22 @@ _settings = get_settings()
 _db_path = _settings.state_db_path
 _kb_registry = KnowledgeBaseRegistry()
 _state_runtime = StateRuntime.from_settings(_settings)
+_auth_store = (
+    AuthStore(
+        _db_path,
+        session_ttl_seconds=_settings.cogdoc_auth_session_ttl_seconds,
+        invite_ttl_seconds=_settings.cogdoc_auth_invite_ttl_seconds,
+        max_failed_logins=_settings.cogdoc_auth_max_failed_logins,
+        lockout_seconds=_settings.cogdoc_auth_lockout_seconds,
+    )
+    if _settings.cogdoc_account_auth_enabled
+    else None
+)
+_resource_access_store = (
+    ResourceAccessStore(_db_path, legacy_workspace_default=False)
+    if _auth_store is not None
+    else None
+)
 app = create_app(
     state_runtime=_state_runtime,
     close_state_runtime_on_shutdown=True,
@@ -503,4 +753,10 @@ app = create_app(
         kb_exists=_kb_registry.exists,
         knowledge_store=_state_runtime.knowledge_store,
     ),
+    audit_store=AuditStore(_settings.audit_log_path),
+    auth_store=_auth_store,
+    resource_access_store=_resource_access_store,
+    self_registration_enabled=_settings.cogdoc_self_registration_enabled,
 )
+app.state.close_auth_store_on_shutdown = _auth_store is not None
+app.state.close_resource_access_store_on_shutdown = _resource_access_store is not None

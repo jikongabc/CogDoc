@@ -28,6 +28,21 @@ def _ocr_readiness_component() -> dict[str, Any]:
     )
 
 
+def _security_store_component(store: Any, *, required: bool) -> dict[str, Any]:
+    """Probe one security store without ever treating uncertainty as healthy."""
+
+    check = getattr(store, "check", None) if store is not None else None
+    healthy = False
+    if callable(check):
+        try:
+            healthy = check() is True
+        except Exception:
+            healthy = False
+    if healthy:
+        return _component("ready", required=required)
+    return _component("not_ready" if required else "degraded", required=required)
+
+
 def _readiness_snapshot(request: Request) -> tuple[bool, dict[str, Any]]:
     app_state = request.app.state
     components: dict[str, dict[str, Any]] = {}
@@ -70,9 +85,32 @@ def _readiness_snapshot(request: Request) -> tuple[bool, dict[str, Any]]:
     components["rust_core"] = _component("ready" if native_ready else "not_ready")
 
     auth_enabled = bool(getattr(app_state, "auth_enabled", False))
-    components["authentication"] = _component(
-        "ready" if auth_enabled else "degraded", required=False
+    account_auth_enabled = bool(
+        getattr(
+            app_state,
+            "account_auth_enabled",
+            getattr(app_state, "auth_store", None) is not None,
+        )
     )
+    if account_auth_enabled:
+        components["authentication"] = _security_store_component(
+            getattr(app_state, "auth_store", None), required=True
+        )
+        components["resource_access"] = _security_store_component(
+            getattr(app_state, "resource_access_store", None), required=True
+        )
+    else:
+        # Preserve the legacy/static-key contract: authentication is advisory,
+        # and an optional ACL store cannot make an auth-off deployment unready.
+        components["authentication"] = _component(
+            "ready" if auth_enabled else "degraded", required=False
+        )
+        resource_store = getattr(app_state, "resource_access_store", None)
+        components["resource_access"] = (
+            _security_store_component(resource_store, required=False)
+            if resource_store is not None
+            else _component("degraded", required=False)
+        )
     components["ocr"] = _ocr_readiness_component()
 
     ready = all(

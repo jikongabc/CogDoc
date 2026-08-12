@@ -130,9 +130,19 @@ class SessionStore:
     def clear_kb(self, doc_id: str) -> None:
         # 删库时连带清掉该 KB 下所有会话，避免同名新库复用 doc_id 后捡到旧历史。
         with self._lock:
-            for key in [k for k in self._entries if k[0] == doc_id]:
+            user_prefix = f"{doc_id}~u-"
+            for key in [
+                k
+                for k in self._entries
+                if k[0] == doc_id or k[0].startswith(user_prefix)
+            ]:
                 self._entries.pop(key, None)
-            self._long_memory.pop(doc_id, None)
+            for memory_doc_id in [
+                key
+                for key in self._long_memory
+                if key == doc_id or key.startswith(user_prefix)
+            ]:
+                self._long_memory.pop(memory_doc_id, None)
 
     # 清除知识库长期记忆。
     def clear_long_term(self, doc_id: str) -> None:

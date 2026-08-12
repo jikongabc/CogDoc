@@ -40,6 +40,9 @@ def document_loader_node(state: GraphState) -> dict:
     with kb_read_lease(doc_id):
         engine = RetrieverFactory.get_engine(doc_id)
         sources = engine.list_sources()
+    retrieval_scope = state.get("retrieval_scope")
+    if retrieval_scope is not None:
+        sources = [source for source in sources if retrieval_scope.allows_source(source)]
     selected_sources = select_sources_for_compare(query, sources)
 
     resolution_trace = []
@@ -120,6 +123,8 @@ def document_loader_node(state: GraphState) -> dict:
         engine = RetrieverFactory.get_engine(doc_id)
         for source in selected_sources:
             docs = engine.load_source_chunks(source)
+            if retrieval_scope is not None:
+                docs = [doc for doc in docs if retrieval_scope.allows_document(doc)]
             if docs:
                 docs_by_source[source] = docs
 
@@ -223,6 +228,7 @@ def cell_evidence_node(
     )
     configurable = (config or {}).get("configurable", {})
     runtime = configurable.get("state_runtime")
+    authorization_scope = configurable.get("retrieval_scope")
     if runtime is None:
         from cogdoc.state_runtime import default_state_runtime
 
@@ -250,6 +256,7 @@ def cell_evidence_node(
                 settings.evidence_unit_verify_max_units_per_batch
             ),
             structured_client=configurable.get("evidence_unit_structured_client"),
+            authorization_scope=authorization_scope,
         )
 
     metrics = batch.metrics

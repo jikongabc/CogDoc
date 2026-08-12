@@ -24,6 +24,18 @@ MANIFEST_NAME = "backup_manifest.json"
 MANIFEST_VERSION = "v2"
 
 
+def _default_backup_dir() -> Path:
+    """Return the CLI default without changing the source-tree default.
+
+    Container images set ``COGDOC_BACKUP_DIR`` to a directory on the persisted
+    data volume.  Source checkouts that do not export it keep writing to the
+    historical ``<repo>/backups`` directory.
+    """
+
+    configured = os.environ.get("COGDOC_BACKUP_DIR", "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_BACKUP_DIR
+
+
 def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
@@ -79,15 +91,25 @@ def collect_paths(
 
 
 def _payload_entries(
-    paths: list[Path], *, include_env: bool
+    paths: list[Path],
+    *,
+    include_env: bool,
+    excluded_paths: Iterable[Path] = (),
 ) -> tuple[dict[str, Path], set[str]]:
     files: dict[str, Path] = {}
     directories: set[str] = set()
     env_path = (ROOT / ".env").resolve()
+    exclusions = tuple(path.absolute() for path in excluded_paths)
     for root in paths:
         root_name = _arcname(root)
         candidates = [root] if root.is_file() else [root, *sorted(root.rglob("*"))]
         for source in candidates:
+            absolute_source = source.absolute()
+            if any(
+                absolute_source == excluded or excluded in absolute_source.parents
+                for excluded in exclusions
+            ):
+                continue
             if source.is_symlink():
                 raise ValueError(f"备份不允许符号链接: {source}")
             if source.resolve() == env_path and not include_env:
@@ -187,6 +209,7 @@ def create_backup(
     include_env: bool,
     extra_paths: list[Path],
 ) -> Path:
+    output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_name = name or f"cogdoc-backup-{_timestamp()}.tar.gz"
     if not archive_name.endswith(".tar.gz"):
@@ -202,7 +225,18 @@ def create_backup(
     )
     if not paths:
         raise FileNotFoundError("没有找到可备份的路径")
-    source_files, directories = _payload_entries(paths, include_env=include_env)
+    if any(path.is_dir() and path.resolve() == output_dir for path in paths):
+        raise ValueError("备份输出目录不能与状态根目录相同")
+    nested_output = [
+        output_dir
+        for path in paths
+        if path.is_dir() and output_dir.is_relative_to(path.resolve())
+    ]
+    source_files, directories = _payload_entries(
+        paths,
+        include_env=include_env,
+        excluded_paths=nested_output,
+    )
     created_at = _created_at()
     mtime = int(datetime.now(timezone.utc).timestamp())
 
@@ -276,7 +310,7 @@ def print_summary(archive_path: Path, *, json_output: bool = False) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="备份 CogDoc 本地运行状态")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_BACKUP_DIR)
+    parser.add_argument("--output-dir", type=Path, default=_default_backup_dir())
     parser.add_argument("--name", default=None)
     parser.add_argument("--include-traces", action="store_true", default=True)
     parser.add_argument("--no-traces", action="store_false", dest="include_traces")

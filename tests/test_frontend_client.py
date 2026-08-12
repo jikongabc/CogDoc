@@ -375,6 +375,209 @@ def test_source_chunks_client_sends_anchor_text(monkeypatch):
     }
 
 
+def test_account_client_methods_keep_bearer_on_authenticated_calls(monkeypatch):
+    calls = []
+
+    def response(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.get",
+        lambda url, **kwargs: response("GET", url, **kwargs),
+    )
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.post",
+        lambda url, **kwargs: response("POST", url, **kwargs),
+    )
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.patch",
+        lambda url, **kwargs: response("PATCH", url, **kwargs),
+    )
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.delete",
+        lambda url, **kwargs: response("DELETE", url, **kwargs),
+    )
+    client = CogDocClient("http://api/", api_key="session-secret")
+
+    client.get_auth_config()
+    client.register("new@example.com", "password-long", "New User", "Personal")
+    client.login("new@example.com", "password-long", "ws-1")
+    client.get_me()
+    client.list_workspaces()
+    client.create_workspace("Team")
+    client.switch_workspace("ws-2")
+    client.list_workspace_members("ws-2")
+    client.update_workspace_member("ws-2", "user-2", "editor")
+    client.remove_workspace_member("ws-2", "user-2")
+    client.create_workspace_invite("ws-2", "invitee@example.com", "viewer")
+    client.list_workspace_invites("ws-2")
+    client.revoke_workspace_invite("ws-2", "invite-1")
+    client.accept_workspace_invite("opaque-invite-token")
+    client.logout()
+
+    assert calls[0][0:2] == ("GET", "http://api/v1/auth/config")
+    assert calls[1][1] == "http://api/v1/auth/register"
+    assert calls[1][2]["json"] == {
+        "email": "new@example.com",
+        "password": "password-long",
+        "display_name": "New User",
+        "workspace_name": "Personal",
+    }
+    assert calls[2][2]["json"]["workspace_id"] == "ws-1"
+    assert calls[6][1] == "http://api/v1/workspaces/ws-2/switch"
+    assert calls[8][2]["json"] == {"role": "editor"}
+    assert calls[13][1] == "http://api/v1/auth/invitations/accept"
+    assert calls[13][2]["json"] == {"token": "opaque-invite-token"}
+    assert all(
+        call[2]["headers"]["Authorization"] == "Bearer session-secret"
+        for call in calls
+    )
+    assert all(
+        calls[index][2]["headers"]["X-CogDoc-Workspace"] == "ws-2"
+        for index in range(6, 13)
+    )
+    assert all(
+        "X-CogDoc-Workspace" not in calls[index][2]["headers"]
+        for index in (0, 1, 2, 3, 4, 5, 13, 14)
+    )
+
+
+def test_resource_access_client_methods_use_stable_acl_endpoints(monkeypatch):
+    calls = []
+
+    def response(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.get",
+        lambda url, **kwargs: response("GET", url, **kwargs),
+    )
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.post",
+        lambda url, **kwargs: response("POST", url, **kwargs),
+    )
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.patch",
+        lambda url, **kwargs: response("PATCH", url, **kwargs),
+    )
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.delete",
+        lambda url, **kwargs: response("DELETE", url, **kwargs),
+    )
+    client = CogDocClient("http://api", api_key="secret")
+
+    client.get_kb_access_policy("kb")
+    client.update_kb_access_policy("kb", "private")
+    client.get_document_access_policy("kb", "doc-1")
+    client.update_document_access_policy(
+        "kb", "doc-1", "private", source="policy.pdf"
+    )
+    client.list_kb_grants("kb")
+    client.grant_kb_access("kb", "user-2", "viewer")
+    client.revoke_kb_access("kb", "user-2")
+    client.list_document_grants("kb", "doc-1")
+    client.grant_document_access("kb", "doc-1", "user-2", "editor")
+    client.revoke_document_access("kb", "doc-1", "user-2")
+
+    assert calls[0][1] == "http://api/v1/knowledge-bases/kb/access"
+    assert calls[1][0] == "PATCH"
+    assert calls[1][2]["json"] == {
+        "schema_version": "v1",
+        "policy": "private",
+    }
+    assert calls[3][2]["json"] == {
+        "schema_version": "v1",
+        "policy": "private",
+        "source": "policy.pdf",
+    }
+    assert calls[5][2]["json"]["subject_id"] == "user-2"
+    assert calls[-1][1].endswith("/documents/doc-1/access/grants/user-2")
+
+
+def test_client_pins_workspace_header_and_updates_it_from_session_response(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(("GET", url, kwargs))
+        return httpx.Response(200, json=[])
+
+    def fake_post(url, **kwargs):
+        calls.append(("POST", url, kwargs))
+        return httpx.Response(
+            200,
+            json={
+                "workspace": {
+                    "workspace_id": "workspace-b",
+                    "name": "B",
+                    "role": "owner",
+                }
+            },
+        )
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", fake_get)
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.post", fake_post)
+    client = CogDocClient(
+        "http://api",
+        api_key="same-session",
+        workspace_id="workspace-a",
+    )
+
+    client.list_knowledge_bases()
+    client.switch_workspace("workspace-b")
+    client.list_knowledge_bases()
+
+    assert calls[0][2]["headers"] == {
+        "Authorization": "Bearer same-session",
+        "X-CogDoc-Workspace": "workspace-a",
+    }
+    assert calls[1][2]["headers"] == {
+        "Authorization": "Bearer same-session",
+        "X-CogDoc-Workspace": "workspace-b",
+    }
+    assert calls[2][2]["headers"] == {
+        "Authorization": "Bearer same-session",
+        "X-CogDoc-Workspace": "workspace-b",
+    }
+
+
+@pytest.mark.parametrize(
+    "workspace_id",
+    ["", " workspace", "workspace ", "work\nspace", "x" * 161],
+)
+def test_client_rejects_noncanonical_workspace_header(workspace_id):
+    with pytest.raises(ValueError, match="workspace_id"):
+        CogDocClient("http://api", api_key="session", workspace_id=workspace_id)
+
+
+def test_create_knowledge_base_sends_initial_access_policy(monkeypatch):
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return httpx.Response(201, json={"kb_id": "private-kb"})
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.post", fake_post)
+    response = CogDocClient("http://api", api_key="session").create_knowledge_base(
+        "private-kb", access_policy="private"
+    )
+
+    assert response.status_code == 201
+    assert calls == [
+        (
+            "http://api/v1/knowledge-bases",
+            {
+                "json": {"kb_id": "private-kb", "access_policy": "private"},
+                "timeout": 180.0,
+                "headers": {"Authorization": "Bearer session"},
+            },
+        )
+    ]
+
+
 # 验证派生知识客户端方法调用稳定端点场景。
 def test_knowledge_client_methods_call_expected_endpoints(monkeypatch):
     calls = []

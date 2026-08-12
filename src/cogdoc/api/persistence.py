@@ -245,11 +245,19 @@ class SqliteSessionStore:
     # 删库时连带清掉该 KB 下所有会话，避免同名新库复用 doc_id 后捡到旧历史。
     def clear_kb(self, doc_id: str) -> None:
         with self._lock:
+            escaped_doc_id = (
+                doc_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            user_pattern = f"{escaped_doc_id}~u-%"
             # 执行内部回调。
             def _do():
-                self._conn.execute("DELETE FROM sessions WHERE doc_id=?", (doc_id,))
                 self._conn.execute(
-                    "DELETE FROM long_memories WHERE doc_id=?", (doc_id,)
+                    "DELETE FROM sessions WHERE doc_id=? OR doc_id LIKE ? ESCAPE '\\'",
+                    (doc_id, user_pattern),
+                )
+                self._conn.execute(
+                    "DELETE FROM long_memories WHERE doc_id=? OR doc_id LIKE ? ESCAPE '\\'",
+                    (doc_id, user_pattern),
                 )
                 self._conn.commit()
 

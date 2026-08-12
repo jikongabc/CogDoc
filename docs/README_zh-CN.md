@@ -39,7 +39,7 @@
 
 - **Trace 可观测、审核队列与 webhook** — 每次请求可导出安全 JSON trace，包含请求配置、节点耗时、改写、证据预览与错误摘要；网页端只展示当前对话的 trace，并把待审核/过期知识、反馈分析、检索调权聚合成审核队列，也可在新待审核知识产生时投递 webhook。
 
-- **API 鉴权与限流** — 可选 API key 保护 `/v1` 路由，并使用令牌桶限流；健康检查、会话列表和 trace 轮询等高频只读接口不会误伤正常使用。
+- **真实账号、团队工作区与检索 ACL** — 可选的持久邮箱/密码账号提供可撤销登录会话、成员关系、邀请、RBAC 与租户状态隔离。知识库/文档策略和主体 grant 会在向量与 BM25 的 top-k 之前生效，并在证据进入 Prompt、Trace 或后台 Research 前再次复验。
 
 ## 功能演示
 
@@ -94,6 +94,8 @@ make run        # 构建/复用索引、预热模型、启动控制台
 
 把 `.env.example` 复制为 `.env`，至少设置云端 `LLM_API_KEY`（或用 `/local` 走 Ollama）。把 PDF 放进收件箱 `your_documents/`（或设置 `COGDOC_DOC_DIR`）。每次修改 `rust_core/src/` 下的代码后都必须重跑 `make native`——`.so` 不会自动重建，也不纳入版本控制。
 
+持久账号默认关闭，保证旧部署升级后行为不突变。个人或团队部署应设置 `COGDOC_ACCOUNT_AUTH_ENABLED=true`，启动 API 后注册首位 owner，并使用返回的 Bearer token。企业可随后邀请其他成员，再设置 `COGDOC_SELF_REGISTRATION_ENABLED=false` 关闭公开注册。
+
 ## 使用流程
 
 CLI 和网页端共用同一条 建库 → 入库 → 提问 流程。先按[快速开始](#快速开始)装一次环境：安装依赖、构建原生扩展（`make native && make check`）、配置 `.env`、把 PDF 放进 `your_documents/`。
@@ -124,13 +126,14 @@ make frontend       # 终端 2：Streamlit 网页端（自动在浏览器打开�
 
 在浏览器里：
 
-1. **侧栏 → 知识库** — 新建一个库，或选择已有的库。
-2. **侧栏 → 文档** — 上传 PDF 并入库；进度面板会轮询后台入库任务直到完成。
-3. **对话** — 新建对话或重开历史对话（会话和知识库持久化进 URL，刷新后续上同一对话）。
-4. **聊天** — 选模式（`auto` / `qa` / `summary` / `compare`），提问，查看实时进度，再读取已完成终态处理的答案及其引用来源、证据片段和 👍/👎 反馈。
-5. 在侧栏打开 **本地 Ollama 模式** 即可把生成切到本地模型。
-6. 打开 **调试**，只查看当前对话的请求 trace；也可以用 **检索调试** 直接调用 `/v1/retrieve`，检查命中 chunk、重排分数和 retrieval 元数据。
-7. 切到主视图里的 **派生知识**，可以新增知识、审核待处理/过期项、查看反馈分析、启用/禁用检索调权、导出审核队列，并在文档变化后扫描过期绑定。
+1. **账号** — 开启账号鉴权后先注册或登录，再选择个人/团队工作区。
+2. **侧栏 → 知识库** — 新建一个库，或选择已有的库。
+3. **侧栏 → 文档** — 上传 PDF 并入库；进度面板会轮询后台入库任务直到完成。
+4. **对话** — 新建对话或重开历史对话（会话和知识库持久化进 URL，刷新后续上同一对话）。
+5. **聊天** — 选模式（`auto` / `qa` / `summary` / `compare`），提问，查看实时进度，再读取已完成终态处理的答案及其引用来源、证据片段和 👍/👎 反馈。
+6. 在侧栏打开 **本地 Ollama 模式** 即可把生成切到本地模型。
+7. 打开 **调试**，只查看当前对话的请求 trace；也可以用 **检索调试** 直接调用 `/v1/retrieve`，检查命中 chunk、重排分数和 retrieval 元数据。
+8. 切到主视图里的 **派生知识**，可以新增知识、审核待处理/过期项、查看反馈分析、启用/禁用检索调权、导出审核队列，并在文档变化后扫描过期绑定。
 
 ### 直接调用 API
 
@@ -138,7 +141,18 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 
 | 端点 | 用途 |
 | --- | --- |
+| `GET /v1/auth/config`、`POST /v1/auth/register`、`POST /v1/auth/login` | 查询账号模式、创建账号/个人工作区，或签发不透明 Bearer 会话 |
+| `GET /v1/auth/me`、`POST /v1/auth/logout`、`POST /v1/auth/logout-all` | 查看当前身份，或撤销单个/全部登录会话 |
+| `GET /v1/auth/sessions`、`DELETE /v1/auth/sessions/{id}`、`POST /v1/auth/change-password` | 管理设备会话与修改密码 |
+| `GET/POST /v1/workspaces`、`POST /v1/workspaces/{id}/switch` | 列出/创建工作区，并切换当前登录会话的活动工作区 |
+| `GET /v1/workspaces/{id}/members`、`PATCH/DELETE /v1/workspaces/{id}/members/{member_id}` | 列出成员、调整角色或移除成员 |
+| `POST/GET /v1/workspaces/{id}/invites`、`DELETE .../invites/{invite_id}`、`POST /v1/auth/invitations/accept` | 签发、查看、撤销或接受一次性工作区邀请 |
+| `GET /v1/tenant` | 查看当前工作区、主体、角色、权限与配额使用量 |
+| `GET /v1/audit-events` | 分页读取当前工作区的哈希链审计元数据（owner/admin） |
 | `POST /v1/knowledge-bases`、`GET /v1/knowledge-bases` | 创建 / 列出知识库 |
+| `GET/PATCH /v1/knowledge-bases/{kb}/access` | 查看或切换知识库的 `workspace` / `private` 策略 |
+| `GET/PATCH /v1/knowledge-bases/{kb}/documents/{document_id}/access` | 查看或切换文档的 `inherit` / `workspace` / `private` 策略 |
+| `GET/POST/DELETE .../access/grants[/subject_id]` | 在知识库或文档级管理主体 grant |
 | `POST /v1/knowledge-bases/{kb}/documents` | 上传 + 入库 PDF（返回异步 `job_id`） |
 | `GET /v1/knowledge-bases/{kb}/sources`、`GET /v1/knowledge-bases/{kb}/sources/{source}/chunks` | 浏览已索引来源文件与 chunk 预览 |
 | `GET /v1/index-jobs/{job_id}` | 轮询入库进度 |
@@ -177,8 +191,21 @@ Compare 的中间模型文本可能包含内部 Evidence ID，且尚未通过终
 因此会被有意缓冲；客户端不会收到逐 token 正文，而是在常规 `final` 事件前，
 通过单个 `token` 事件收到最终答案。其他任务保留实时模型 token，除非全局声明校验门禁要求缓冲。
 
-若配置了 `COGDOC_API_KEYS`，`/v1` 请求会被鉴权并限流；不配 key 时 `/v1` 对外开放（服务启动时会打告警日志）。
-证据评测的列表/审核/导出以及 Research 报告的审阅/发布接口，必须另外配置独立的 `COGDOC_EVAL_REVIEW_API_KEYS` 才会启用；接受证据缺口时必须填写非空理由。审核者和发布者身份由服务端对 key 取指纹得到，不落盘原始 key，也不接受客户端自报 actor。
+### 账号、工作区与 RAG 权限
+
+`COGDOC_ACCOUNT_AUTH_ENABLED=false` 是向后兼容默认值。设为 `true` 后启用持久真人身份：注册会在一个事务内创建用户、owner 成员关系、个人工作区及登录会话。密码最少 12 个字符，以带版本和随机盐的 scrypt 哈希保存。登录会话与邀请值都是只在签发时返回的不透明 bearer 秘密，数据库仅保存其 SHA-256 摘要，邀请只能使用一次。会话会过期，可单独或全量撤销；修改密码会撤销其他活动会话；连续登录失败会触发可配置的临时锁定。客户端用 `Authorization: Bearer <token>` 发送会话，不应把 token 放入 URL 或日志。
+
+owner 可管理工作区本身；admin 同时拥有写入、删除、审核/发布和权限管理；editor 可读、查询和写入；reviewer 可读、查询、审核和发布；viewer 可读和查询。owner/admin 管理成员与邀请，但普通角色修改不能凭空产生另一个 owner，也不能移除最后一位 owner。切换工作区会改变该登录会话的兼容活动工作区；新版客户端还会在每个受保护请求中发送非敏感的 `X-CogDoc-Workspace` 选择器，因此两个共用同一 Bearer 的浏览器标签页也能各自固定到不同成员关系。服务端仍会验证该成员关系；选择器与 `/v1/workspaces/{id}` 路径冲突时以不透明 404 fail-closed。不带该 header 的旧客户端继续使用 session 活动工作区。同一公开 slug 的知识库按工作区使用不同物理身份；真人账号的对话会话与 Trace 还会按用户分隔。跨工作区请求统一表现为资源不存在，不泄露另一租户的资源。
+
+新知识库默认采用 `workspace`，新上传文档默认采用 `inherit`。`private` 知识库只对资源 owner、工作区 owner/admin，或得到知识库 grant 的同工作区主体可见。文档可继承知识库、单独开放给工作区，或设为 private；文档 grant 只开放对应文档。grant 角色权限与工作区角色权限取交集，因此不能借 ACL 提权。账号模式下 ACL 缺失、损坏或不可用都会拒绝访问。只有具备 `manage_access` 的 owner/admin 能修改策略与 grant。
+
+查询权限会固化成明确的 `ALL`、非空 `SUBSET` 或 `DENY`。当结果为子集时，Chroma 向量过滤、BM25 候选选择、已审核派生知识、Summary、Compare 与 QA 都会在 top-k/重排之前使用来源 allowlist；融合后还有第二道过滤，防止过期或自定义后端忽略过滤后把越权结果带入 Prompt、Trace 或持久证据。这也避免高分越权 chunk 在 top-k 中挤掉可见证据。后台 Research 会冻结创建者及精确来源边界，在召回前后重新检查当前成员关系和 ACL；无法执行子集过滤的后端会被拒绝，权限撤销会中止任务，后续新增授权也不会静默扩大已经运行的任务范围。
+
+静态服务主体仍可用于自动化和分阶段升级。`COGDOC_API_PRINCIPALS` 把每个 key 映射到 `tenant_id`、`subject_id` 与角色；旧 `COGDOC_API_KEYS` 和 `COGDOC_EVAL_REVIEW_API_KEYS` 仍作为 `default` 工作区 admin。开启账号鉴权后，显式服务 key 与真人会话可以并存；关闭账号鉴权时，只有三类静态凭据全部为空才进入开放本地 owner 模式。同时发送 Bearer 与 `X-API-Key` 时 Bearer 优先。显式 reviewer/admin/owner 可使用证据评测和 Research 审核接口，落盘操作人始终来自认证身份。硬配额覆盖知识库数、已提交加在途 PDF 数及 PDF 字节；`/v1/tenant` 返回 `limits`、`usage`、`reserved`，超限返回 HTTP 409 与 `TENANT_QUOTA_EXCEEDED`。
+
+`COGDOC_API_KEY`（单数）是 Streamlit/CLI 客户端向外发请求时使用的凭据，不是服务端的 key 白名单。如果 Streamlit 进程设置了它，而当前浏览器没有真人会话 token，界面会按设计直接进入服务 key 模式并跳过账号登录页。共享或多用户前端必须留空该变量；API 端用 `COGDOC_API_KEYS` / `COGDOC_API_PRINCIPALS` 配置可接受的服务身份，真人用户应正常登录。单数 key 只适合受信的单用户控制台或专用自动化前端。
+
+模块级生产应用把纯元数据事件持久追加到 `COGDOC_DATA_DIR/audit/events.jsonl`：修改操作执行前写 intent，发送响应头前写 HTTP response-commit；读取操作只写后者。链损坏或不可写时，受保护流量以 HTTP 503 fail-closed。`GET /v1/audit-events` 按当前工作区 sequence 倒序分页，`before_sequence` 是排他游标。公开探针/文档及未认证的 401 尝试不入审计。每工作区 SHA-256 链可在进程存活期间识别 malformed、截断、改写和断链，并在重启后验证自身一致性，但它不是签名、WORM 或外部可信 head；若威胁模型包含恶意文件系统写入，必须备份并在外部锚定。
 
 ### 分层记忆
 
@@ -198,7 +225,7 @@ Compare 的中间模型文本可能包含内部 Evidence ID，且尚未通过终
 - **检索** — `bge-m3` 多语言向量召回 + BM25 关键词召回，Rust RRF 融合后再用 `bge-reranker-v2-m3` 精排；PDF 向量和已通过派生知识向量都落 [Chroma](https://www.trychroma.com/)，PDF 解析走 PyMuPDF。
 - **编排** — [LangGraph](https://langchain-ai.github.io/langgraph/) 把路由 → 任务子图 → 物理引用自愈 → 可选父图声明审计 / 有限修复 / 拒答串成可循环状态图。
 - **模型** — OpenAI 兼容双后端、一键热切：云端 DeepSeek，本地 Ollama `qwen2.5:7b`。
-- **服务与可观测** — FastAPI 提供 SSE 流式接口、可选 API key 鉴权和令牌桶限流；会话、入库任务、反馈、审核队列和派生知识都本地持久化；JSON trace 同时服务于网页 Trace 面板和独立 Debug 控制台。
+- **服务与可观测** — FastAPI 提供 SSE 流式接口、可选持久账号/服务 key 鉴权、工作区 RBAC/资源 ACL 与令牌桶限流；会话、入库任务、反馈、审核队列和派生知识都本地持久化；JSON trace 同时服务于网页 Trace 面板和独立 Debug 控制台。
 
 ## 架构
 
@@ -522,7 +549,7 @@ Python 层负责图编排、Prompt、模型客户端、索引、CLI 控制台、
 chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{local_chunk_index}
 ```
 
-`chunk_id` 是贯穿 chunker、index、retriever、RRF、引用和 evidence 的唯一稳定 child 身份键——去重和融合从不依赖数组下标。`parent_chunk_id = sha256:{source_sha256}:src:{source_name}:section:{section_index}` 只负责把 child 组织成可补充的上下文组，绝不替代 child 的引用身份。契约带版本（`chunk_identity_version = source_sha256_name_page_span_local_v5_parent_child_section_index_cs600_ov60_min30_ctx160`）；改动切块边界、结构识别或索引文本必须 bump `CHUNK_IDENTITY_BASE_VERSION`，让旧索引重建而非混用两套方案。
+`chunk_id` 是贯穿 chunker、index、retriever、RRF、引用和 evidence 的唯一稳定 child 身份键——去重和融合从不依赖数组下标。`document_id = doc-{sha256(source-name-v1)}` 是知识库内稳定的文档 ACL 身份；`parent_chunk_id = sha256:{source_sha256}:src:{source_name}:section:{section_index}` 只负责把 child 组织成可补充的上下文组，绝不替代 child 的引用身份。契约带版本（`chunk_identity_version = source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index_cs600_ov60_min30_ctx160`）；改动文档身份、切块边界、结构识别或索引文本必须 bump `CHUNK_IDENTITY_BASE_VERSION`，让旧索引重建而非混用两套方案。
 
 ## 查询链路
 
@@ -654,12 +681,23 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `COGDOC_WEBHOOK_TIMEOUT_SECONDS` | `3` | 回调投递请求超时时间 |
 | `COGDOC_FEEDBACK_STORE` | `jsonl` | 反馈存储后端；设为 `sqlite` 时使用数据库并导出逐行对象副本 |
 | `COGDOC_DERIVED_KNOWLEDGE_INDEX_AUTO_REFRESH` | `false` | 知识审核变更后在后台重建派生知识向量索引 |
-| `COGDOC_API_KEYS` | 未设置 | 逗号分隔的 API key；为空则关闭 API 鉴权 |
-| `COGDOC_EVAL_REVIEW_API_KEYS` | 未设置 | 证据评测管理及 Research 审阅/发布的独立管理 key；为空时这些接口保持关闭 |
+| `COGDOC_ACCOUNT_AUTH_ENABLED` | `false` | 启用持久真人账号、登录会话、工作区、邀请及资源 ACL；默认关闭以兼容旧部署 |
+| `COGDOC_SELF_REGISTRATION_ENABLED` | `true` | 账号模式下允许公开注册；企业完成首位 owner 初始化后可关闭，仅使用邀请 |
+| `COGDOC_AUTH_SESSION_TTL_SECONDS` | `2592000` | 登录会话有效期（30 天） |
+| `COGDOC_AUTH_INVITE_TTL_SECONDS` | `604800` | 一次性工作区邀请有效期（7 天） |
+| `COGDOC_AUTH_MAX_FAILED_LOGINS` | `5` | 触发临时锁定前允许的连续密码失败次数 |
+| `COGDOC_AUTH_LOCKOUT_SECONDS` | `900` | 达到失败上限后的账号锁定时长 |
+| `COGDOC_API_KEYS` | 未设置 | 逗号分隔的旧版 default/admin key；仅当它、principals、审核 key 都为空时开放鉴权 |
+| `COGDOC_API_PRINCIPALS` | 未设置 | API key 到 `tenant_id`、`subject_id`、RBAC `role` 的单行 JSON 映射；团队工作区首选 |
+| `COGDOC_EVAL_REVIEW_API_KEYS` | 未设置 | 旧版证据评测/Research 审核 key；同时可按 default/admin 访问普通路由 |
 | `RATE_LIMIT_PER_MINUTE` | `120` | 受保护 API 路由的令牌桶补充速率 |
 | `RATE_LIMIT_BURST` | `120` | 令牌桶突发容量；`<=0` 表示关闭限流 |
+| `COGDOC_TENANT_MAX_KNOWLEDGE_BASES` | `0` | 每工作区知识库硬上限；`0` 表示不限 |
+| `COGDOC_TENANT_MAX_DOCUMENTS` | `0` | 每工作区已提交加在途 PDF 硬上限；`0` 表示不限 |
+| `COGDOC_TENANT_MAX_STORAGE_MB` | `0` | 每工作区已提交加在途 PDF MiB 硬上限；`0` 表示不限 |
 | `COGDOC_MAX_UPLOAD_MB` | `50` | 网页/API 上传 PDF 的单文件大小上限 |
 | `COGDOC_RESEARCH_WORKERS` | `2` | 后台 Research 证据与报告任务最大并发数 |
+| `COGDOC_CHAT_STREAM_IDLE_TIMEOUT_SECONDS` | `300` | SSE worker 事件间最大空闲秒数，避免流式请求永久挂起 |
 | `COGDOC_RESEARCH_RETRIEVAL_TOP_K` | `8` | 每个研究章节的候选召回与重排深度 |
 | `COGDOC_RESEARCH_MAX_PENDING` | `32` | Research 后台 attempt 的已准入排队/运行总上限；超限 API 返回 `503` |
 | `COGDOC_RESEARCH_PROVIDER_WORKERS` | `4` | 后台 Research attempt 内可并发运行的进程隔离 provider 调用上限 |
@@ -748,13 +786,15 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `make eval-suite-update-baseline` | 复核后刷新 `eval/eval_suite_baseline.json` |
 | `make run` | 启动交互式 CLI 控制台 |
 | `make serve` | 启动 FastAPI 服务（`uvicorn cogdoc.api.app:app`） |
-| `make frontend` | 启动 Streamlit 网页端 |
+| `make frontend` | 加载 `.env`（不覆盖已导出变量）并启动 Streamlit 网页端 |
 | `make debug` | 启动独立 Debug 控制台 |
 | `uvicorn scripts.cogeval_cogdoc_wrapper:app --port 8003` | 为已运行的 CogDoc API 启动可选的 CogEval 兼容适配服务 |
 | `cd rust_core && cargo test` | 运行 Rust 单元测试 |
 | `cd rust_core && cargo fmt --check` | 检查 Rust 代码格式 |
 
 测试分层：业务逻辑与 Python↔native API 契约用 Python 覆盖（`tests/`）；纯 Rust 逻辑用 `rust_core/src/` 里的 Rust `#[test]`。依赖 native 的 Python 测试在未构建时会 `importorskip` 跳过，完整回归前请先 `make native`。
+
+GitHub CI 会执行 Rust 格式/单测、构建并运行时校验 native wheel、运行全量 Python 测试、API smoke、生产账号鉴权 smoke 和轻量评测门禁。随后以非 root 用户构建并启动 Docker 镜像，再次完整执行真实账号流程：就绪、匿名拒绝、注册/登录、工作区邀请、viewer 写入拒绝，以及私有知识库授权/撤销；优雅停服后还会实测数据卷默认备份、只读校验和 root helper 恢复演练。`pytest` 不加筛选地发现全部测试，因此账号存储/路由、工作区隔离、资源策略/grant、top-k 前权限 scope 与 Research 复验测试都会自动进入门禁。第三方 Action 固定到完整 commit，job 仅有仓库只读权限。tag 与手动触发还会生成递归校验和包，包含 Python sdist/wheel、Linux x86_64 CPython 3.13 native wheel，以及保持根目录语义的 `scripts/` 运维工具；上传前会检查版本/tag 一致性，重跑同一套全量 Python/smoke/eval 门禁，在两个独立环境分别强制安装 wheel 或 sdist 及其 native wheel，并重复 Docker 账号/备份/恢复 smoke。该流程不会发布到 PyPI 或 GitHub Releases，两个 wheel 必须一起安装。
 
 离线评测使用 `eval/` 下的本地 JSONL。`make eval-suite` 是默认轻量门禁：它会审计检索和质量评测集覆盖，运行质量指标，按用例类型和层级输出摘要，默认跳过依赖模型的真实检索。`make eval-suite-report` 写入 `eval/eval_suite_report.json`；`make eval-suite-baseline` 对比 `eval/eval_suite_baseline.json` 的聚合指标、类型指标和分层质量指标；`make eval-suite-update-baseline` 在复核后刷新这份基线。生成的报告和基线文件都被 Git 忽略。
 

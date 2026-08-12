@@ -342,7 +342,10 @@ class Console:
     # 完成 cmd知识库 处理。
     def cmd_kb(self, sub: str, name: str) -> None:
         if sub in ("", "list"):
-            records = self.registry.list()
+            # The local console is the backward-compatible default workspace;
+            # tenant-scoped API workspaces must never appear as ambiguous
+            # duplicate slugs in its selector.
+            records = self.registry.list(tenant_id="default")
             if not records:
                 print("（暂无知识库。用 /kb new <名称> 创建一个。）")
                 return
@@ -1693,7 +1696,10 @@ class Console:
             if len(tokens) == 1:
                 return KB_SUBCOMMANDS
             if len(tokens) == 2 and tokens[1].lower() in ("use", "rm"):
-                return [r["kb_id"] for r in self.registry.list()]
+                return [
+                    r["kb_id"]
+                    for r in self.registry.list(tenant_id="default")
+                ]
             return []
         if cmd in ("/dk", "/knowledge"):
             if len(tokens) == 1:
@@ -1940,7 +1946,7 @@ def main():
     print("=" * 60)
     print("🚀 CogDoc 控制台 | 多知识库 + 多对话 | 输入 /help 查看命令")
     print(f"📥 收件箱目录: {console.inbox_dir}（把 PDF 放进来，再 /add 入库）")
-    records = console.registry.list()
+    records = console.registry.list(tenant_id="default")
     if not records:
         print("ℹ️ 当前还没有知识库。用 /kb new <名称> 创建你的第一个知识库。")
     elif len(records) == 1:

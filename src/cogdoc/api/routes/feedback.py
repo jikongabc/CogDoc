@@ -4,7 +4,7 @@ import math
 import re
 from collections.abc import Mapping
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from cogdoc.agents.feedback_understanding import (
     FeedbackAnalysis,
@@ -17,6 +17,13 @@ from cogdoc.api.schemas import (
     FeedbackRequest,
     FeedbackResponse,
     FeedbackType,
+)
+from cogdoc.api.tenant_scope import (
+    externalize_kb_fields,
+    request_principal,
+    resolve_kb_scope,
+    row_is_authorized,
+    scope_for_storage_id,
 )
 from cogdoc.api.webhooks import notify_pending_created
 from cogdoc.observability.logger import log_event
@@ -35,6 +42,79 @@ _CLIENT_ATTRIBUTION_FIELDS = (
     "related_chunk_text_hash",
     "related_anchor_text",
 )
+
+
+def _kb_storage_id(request: Request, kb_id: str) -> str:
+    scope = resolve_kb_scope(request, kb_id, allow_legacy_default=True)
+    if scope is None:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    return scope.storage_id
+
+
+def _owns_storage_id(request: Request, storage_id: object) -> bool:
+    value = str(storage_id or "")
+    if not value:
+        return False
+    if scope_for_storage_id(request, value) is not None:
+        return True
+    principal = request_principal(request)
+    if principal.tenant_id != "default":
+        return False
+    if value.startswith("t-"):
+        return False
+    registry = request.app.state.kb_registry
+    getter = getattr(registry, "get_by_storage_id", None)
+    # Records predating the tenant registry belong to the historical default
+    # workspace. A registered foreign record must never take this fallback.
+    return not callable(getter) or getter(value) is None
+
+
+def _feedback_record(request: Request, feedback_id: str) -> Mapping | None:
+    rows = request.app.state.feedback_store.export_records()
+    return next(
+        (
+            row
+            for row in rows
+            if str(row.get("feedback_id") or "") == feedback_id
+        ),
+        None,
+    )
+
+
+def _row_allowed(request: Request, row: Mapping | None) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    storage_id = str(row.get("kb_id") or "")
+    scope = scope_for_storage_id(request, storage_id) if storage_id else None
+    if scope is not None:
+        return row_is_authorized(request, scope, row)
+    return _owns_storage_id(request, storage_id)
+
+
+def _retrieval_feedback_record(request: Request, feedback_id: str) -> Mapping | None:
+    rows = request.app.state.retrieval_feedback_store.export_records()
+    return next(
+        (
+            row
+            for row in rows
+            if str(row.get("retrieval_feedback_id") or "") == feedback_id
+        ),
+        None,
+    )
+
+
+def _require_owned_retrieval_feedback(
+    request: Request, feedback_id: str
+) -> Mapping:
+    row = _retrieval_feedback_record(request, feedback_id)
+    source_row = (
+        _feedback_record(request, str(row.get("feedback_id") or ""))
+        if isinstance(row, Mapping)
+        else None
+    )
+    if row is None or not _row_allowed(request, source_row or row):
+        raise HTTPException(status_code=404, detail="检索反馈不存在")
+    return row
 
 
 def _trusted_trace(payload: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -339,6 +419,17 @@ def _create_knowledge_quiet(
 @router.post("/feedback", status_code=201)
 async def submit_feedback(body: FeedbackRequest, request: Request):
     # 控制层只落盘，不做评判；坏样本归集逻辑在存储层里。
+    principal = request_principal(request)
+    if body.kb_id:
+        storage_id = _kb_storage_id(request, body.kb_id)
+    elif principal.tenant_id == "default":
+        storage_id = None
+    else:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    created_by = principal.subject_id
+    body = body.model_copy(
+        update={"kb_id": storage_id, "created_by": created_by}
+    )
     payload = body.model_dump(exclude_none=True)
     if body.feedback_text and not payload.get("comment"):
         payload["comment"] = body.feedback_text
@@ -346,7 +437,18 @@ async def submit_feedback(body: FeedbackRequest, request: Request):
         payload["correction"] = body.correction_text
     trace = _trusted_trace(payload)
     trusted_trace = _hydrate_feedback_from_trace(payload, trace)
+    if storage_id is not None:
+        scope = scope_for_storage_id(request, storage_id)
+        access_store = getattr(request.app.state, "resource_access_store", None)
+        if access_store is not None and (
+            scope is None or not row_is_authorized(request, scope, payload)
+        ):
+            raise HTTPException(status_code=404, detail="文档不存在")
     result = request.app.state.feedback_store.record(payload)
+    if result.get("deduplicated"):
+        existing = _feedback_record(request, str(result["feedback_id"]))
+        if existing is None or not _row_allowed(request, existing):
+            raise HTTPException(status_code=404, detail="反馈不存在")
     retrieval_eval_draft_id = None
     retrieval_eval_draft_status = None
     feedback_value = getattr(body.feedback, "value", body.feedback)
@@ -429,8 +531,9 @@ async def list_feedback(
     is_bad_case: bool | None = None,
     limit: int = Query(default=100, ge=1, le=500),
 ):
+    storage_id = _kb_storage_id(request, kb_id)
     rows = request.app.state.feedback_store.list(
-        kb_id=kb_id,
+        kb_id=storage_id,
         trace_id=trace_id,
         session_id=session_id,
         feedback=feedback.value if feedback is not None else None,
@@ -438,7 +541,10 @@ async def list_feedback(
         is_bad_case=is_bad_case,
         limit=limit,
     )
-    return FeedbackListResponse(feedback=rows)
+    rows = [row for row in rows if _row_allowed(request, row)]
+    return FeedbackListResponse(
+        feedback=externalize_kb_fields(rows, request)
+    )
 
 
 # 查询反馈理解结果。
@@ -453,8 +559,17 @@ async def list_feedback_analysis(
     min_confidence: float | None = Query(default=None, ge=0, le=1),
     limit: int = Query(default=100, ge=1, le=500),
 ):
+    storage_id = _kb_storage_id(request, kb_id)
+    if feedback_id is not None:
+        feedback_row = _feedback_record(request, feedback_id)
+        if (
+            feedback_row is None
+            or feedback_row.get("kb_id") != storage_id
+            or not _row_allowed(request, feedback_row)
+        ):
+            raise HTTPException(status_code=404, detail="反馈不存在")
     rows = request.app.state.feedback_analysis_store.list(
-        kb_id=kb_id,
+        kb_id=storage_id,
         feedback_id=feedback_id,
         trace_id=trace_id,
         recommended_action=recommended_action,
@@ -462,7 +577,17 @@ async def list_feedback_analysis(
         min_confidence=min_confidence,
         limit=limit,
     )
-    return {"feedback_analysis": rows}
+    rows = [
+        row
+        for row in rows
+        if _row_allowed(
+            request,
+            _feedback_record(request, str(row.get("feedback_id") or "")) or row,
+        )
+    ]
+    return {
+        "feedback_analysis": externalize_kb_fields(rows, request)
+    }
 
 
 # 查询检索反馈。
@@ -473,19 +598,33 @@ async def list_retrieval_feedback(
     enabled: bool | None = None,
     limit: int = Query(default=100, ge=1, le=500),
 ):
+    storage_id = _kb_storage_id(request, kb_id)
     rows = request.app.state.retrieval_feedback_store.list(
-        kb_id=kb_id, enabled=enabled, limit=limit
+        kb_id=storage_id, enabled=enabled, limit=limit
     )
-    return {"retrieval_feedback": rows}
+    rows = [
+        row
+        for row in rows
+        if _row_allowed(
+            request,
+            _feedback_record(request, str(row.get("feedback_id") or "")) or row,
+        )
+    ]
+    return {
+        "retrieval_feedback": externalize_kb_fields(rows, request)
+    }
 
 
 # 禁用检索反馈。
 @router.post("/retrieval-feedback/{feedback_id}/disable")
 async def disable_retrieval_feedback(feedback_id: str, body: dict, request: Request):
+    _require_owned_retrieval_feedback(request, feedback_id)
+    principal = request_principal(request)
+    actor = principal.subject_id
     row = request.app.state.retrieval_feedback_store.set_enabled(
         feedback_id,
         False,
-        actor=body.get("actor"),
+        actor=actor,
         reason=body.get("reason"),
     )
     if row is None:
@@ -496,6 +635,7 @@ async def disable_retrieval_feedback(feedback_id: str, body: dict, request: Requ
 # 启用检索反馈。
 @router.post("/retrieval-feedback/{feedback_id}/enable")
 async def enable_retrieval_feedback(feedback_id: str, request: Request):
+    _require_owned_retrieval_feedback(request, feedback_id)
     row = request.app.state.retrieval_feedback_store.set_enabled(feedback_id, True)
     if row is None:
         return JSONResponse(status_code=404, content={"message": "检索反馈不存在"})

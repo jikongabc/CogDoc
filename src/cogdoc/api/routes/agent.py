@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from functools import partial
+import inspect
 from typing import Any
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
@@ -16,6 +17,12 @@ from cogdoc.api.schemas import (
     TaskRequest,
     build_error_response,
     chat_result_to_response,
+)
+from cogdoc.api.tenant_scope import (
+    internal_session_id,
+    resolve_kb_scope,
+    retrieval_scope_for_request,
+    session_store_doc_id,
 )
 from cogdoc.config.settings import get_settings
 from cogdoc.service.chat_service import ChatResult, ChatServiceError, run_chat_sync
@@ -57,8 +64,8 @@ def _error(
 
 # 校验知识库存在。
 def _ensure_kb_exists(request: Request, kb_id: str) -> JSONResponse | None:
-    if not request.app.state.kb_registry.exists(kb_id):
-        return _error(ErrorCode.KB_NOT_FOUND, f"知识库不存在: {kb_id}", 404)
+    if resolve_kb_scope(request, kb_id) is None:
+        return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
     return None
 
 
@@ -92,13 +99,18 @@ async def _task_endpoint(
     response: Response,
     forced_task: str,
 ) -> ChatResponse | JSONResponse:
-    kb_error = _ensure_kb_exists(request, body.doc_id)
-    if kb_error is not None:
-        return kb_error
+    scope = resolve_kb_scope(request, body.doc_id)
+    if scope is None:
+        return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
+    external_doc_id = body.doc_id
+    retrieval_scope = retrieval_scope_for_request(request, scope)
+    body = body.model_copy(update={"doc_id": scope.storage_id})
 
     runner = getattr(request.app.state, "chat_runner", run_chat_sync)
     session_store = request.app.state.session_store
-    chat_history = session_store.get_history(body.doc_id, body.session_id, body.query)
+    chat_history = session_store.get_history(
+        session_store_doc_id(request, body.doc_id), body.session_id, body.query
+    )
     try:
         result = await run_sync(
             request.app.state.offload_executor,
@@ -109,7 +121,8 @@ async def _task_endpoint(
             body.is_local,
             chat_history,
             forced_task,
-            body.session_id,
+            internal_session_id(request, body.session_id),
+            retrieval_scope,
         )
     except ChatServiceError as exc:
         code = classify_error_code(exc.stage, exc.error_class, exc.message)
@@ -122,7 +135,10 @@ async def _task_endpoint(
             details={"error_class": exc.error_class, "stage": exc.stage},
         )
 
-    _record_task_session(request, body, result)
+    session_body = body.model_copy(
+        update={"doc_id": session_store_doc_id(request, body.doc_id)}
+    )
+    _record_task_session(request, session_body, result)
     request.app.state.metrics.chat_results.labels(
         result.task_type, str(result.is_valid).lower()
     ).inc()
@@ -132,14 +148,16 @@ async def _task_endpoint(
     )
     request.app.state.metrics.observe_retrieval(result.task_type, result.raw_output)
     task_response = chat_result_to_response(
-        result, doc_id=body.doc_id, session_id=body.session_id
+        result, doc_id=external_doc_id, session_id=body.session_id
     )
     response.headers["X-Trace-Id"] = task_response.trace_id
     return task_response
 
 
 # 运行检索。
-def _run_retrieve(body: RetrieveRequest, *, state_runtime=None) -> list:
+def _run_retrieve(
+    body: RetrieveRequest, *, state_runtime=None, retrieval_scope=None
+) -> list:
     from cogdoc.service.retriever_factory import RetrieverFactory
     from cogdoc.service.kb_readers import kb_read_lease
     from cogdoc.service.retrieval_pipeline import (
@@ -163,6 +181,7 @@ def _run_retrieve(body: RetrieveRequest, *, state_runtime=None) -> list:
             queries=build_retrieval_queries(body.query, max_queries=1),
             top_k=body.top_k,
             rrf_k=float(settings.hybrid_rrf_k),
+            scope=retrieval_scope,
         )
         docs = retrieval_result.docs
         if not body.rerank or not docs:
@@ -172,6 +191,29 @@ def _run_retrieve(body: RetrieveRequest, *, state_runtime=None) -> list:
         if target_device == "cpu" and not settings.qa_rerank_on_cpu:
             return skipped_cpu_rerank_docs(docs, top_n)
         return BGEReranker.rerank(body.query, docs, top_n=top_n, device=target_device)
+
+
+def _call_retrieve_runner(runner, body: RetrieveRequest, retrieval_scope):
+    """Call legacy test/custom runners while enforcing the final route guard."""
+
+    try:
+        parameters = inspect.signature(runner).parameters
+        accepts_scope = "retrieval_scope" in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    except (TypeError, ValueError):
+        accepts_scope = False
+    docs = (
+        runner(body, retrieval_scope=retrieval_scope)
+        if accepts_scope
+        else runner(body)
+    )
+    return [
+        doc
+        for doc in docs
+        if isinstance(doc, Mapping) and retrieval_scope.allows_document(doc)
+    ]
 
 
 # 截断文本预览。
@@ -239,17 +281,22 @@ async def compare(body: TaskRequest, request: Request, response: Response):
 # 结构化检索接口。
 @router.post("/retrieve", response_model=RetrieveResponse, responses=_ERROR_RESPONSES)
 async def retrieve(body: RetrieveRequest, request: Request):
-    kb_error = _ensure_kb_exists(request, body.doc_id)
-    if kb_error is not None:
-        return kb_error
+    scope = resolve_kb_scope(request, body.doc_id)
+    if scope is None:
+        return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
+    external_doc_id = body.doc_id
+    retrieval_scope = retrieval_scope_for_request(request, scope)
+    body = body.model_copy(update={"doc_id": scope.storage_id})
     retrieve_runner = getattr(request.app.state, "retrieve_runner", None) or partial(
         _run_retrieve,
         state_runtime=request.app.state.state_runtime,
     )
     docs = await run_sync(
         request.app.state.offload_executor,
+        _call_retrieve_runner,
         retrieve_runner,
         body,
+        retrieval_scope,
     )
     hits = [
         _retrieve_hit(rank, doc)
@@ -257,7 +304,7 @@ async def retrieve(body: RetrieveRequest, request: Request):
         if isinstance(doc, Mapping)
     ]
     return RetrieveResponse(
-        doc_id=body.doc_id,
+        doc_id=external_doc_id,
         query=body.query,
         top_k=body.top_k,
         rerank=body.rerank,

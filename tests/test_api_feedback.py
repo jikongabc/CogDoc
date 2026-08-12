@@ -739,6 +739,8 @@ async def test_correction_can_create_pending_knowledge(
     assert knowledge["related_page_end"] == 2
     assert knowledge["related_chunk_text_hash"] == "hash-c1"
     assert knowledge["related_anchor_text"] == "差旅报销"
+    assert feedback["created_by"] == "local"
+    assert knowledge["created_by"] == "local"
     # 普通纠错只供审核和派生知识，不代表检索证据有错。
     assert _read_jsonl(root / "retrieval_feedback.jsonl") == []
     assert [event for event, _ in webhook_dispatcher.events] == [
@@ -979,6 +981,7 @@ async def test_retrieval_feedback_can_disable_and_enable(tmp_path, monkeypatch):
     assert enabled.json()["status"] == "enabled"
     rows = _read_jsonl(root / "retrieval_feedback.jsonl")
     assert rows[-2]["enabled"] is False and rows[-2]["disable_reason"] == "误点"
+    assert rows[-2]["disabled_by"] == "local"
     assert rows[-1]["enabled"] is True and rows[-1]["disabled_at"] is None
 
 

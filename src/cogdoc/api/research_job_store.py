@@ -1765,6 +1765,7 @@ class ResearchJobStore:
         title: str = "",
         section_titles: Sequence[str] | None = None,
         is_local: bool = False,
+        authorization: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         timestamp = now_iso()
         clean_objective = " ".join(objective.split())
@@ -1774,6 +1775,11 @@ class ResearchJobStore:
             "title": " ".join(title.split()) or clean_objective[:80],
             "objective": clean_objective,
             "is_local": bool(is_local),
+            **(
+                {"authorization": _clone(dict(authorization))}
+                if authorization is not None
+                else {}
+            ),
             "artifact_schema_floor": RESEARCH_ARTIFACT_VERSION,
             "status": "planned",
             "revision": 1,
@@ -2419,6 +2425,7 @@ class SqliteResearchJobStore(ResearchJobStore):
         title: str = "",
         section_titles: Sequence[str] | None = None,
         is_local: bool = False,
+        authorization: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         timestamp = now_iso()
         clean_objective = " ".join(objective.split())
@@ -2428,6 +2435,11 @@ class SqliteResearchJobStore(ResearchJobStore):
             "title": " ".join(title.split()) or clean_objective[:80],
             "objective": clean_objective,
             "is_local": bool(is_local),
+            **(
+                {"authorization": _clone(dict(authorization))}
+                if authorization is not None
+                else {}
+            ),
             "artifact_schema_floor": RESEARCH_ARTIFACT_VERSION,
             "status": "planned",
             "revision": 1,

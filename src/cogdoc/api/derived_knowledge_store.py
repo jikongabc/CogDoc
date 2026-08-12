@@ -99,7 +99,7 @@ class DerivedKnowledgeStore:
                 conflict_group_id = self._ensure_conflict_group(similar)
             now = now_iso()
             entry = {
-                "knowledge_id": f"K{uuid4().hex[:12]}",
+                "knowledge_id": f"K{uuid4().hex}",
                 "kb_id": kb_id,
                 "text": text,
                 "normalized_text": normalized_text,
@@ -155,7 +155,7 @@ class DerivedKnowledgeStore:
                 )
             now = now_iso()
             entry = {
-                "knowledge_id": f"K{uuid4().hex[:12]}",
+                "knowledge_id": f"K{uuid4().hex}",
                 "kb_id": current["kb_id"],
                 "text": text,
                 "normalized_text": normalized_text,
@@ -651,7 +651,7 @@ class DerivedKnowledgeStore:
             "",
         )
         if not group_id:
-            group_id = f"C{uuid4().hex[:12]}"
+            group_id = f"C{uuid4().hex}"
         now = now_iso()
         for row in rows:
             if row.get("conflict_group_id") == group_id:

@@ -4,44 +4,194 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  test:
+  native:
+    name: Rust and native extension
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-12
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt
+
+      - name: Cache Rust build inputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust_core/target/
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('rust_core/Cargo.lock') }}
+          restore-keys: |
+            rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path rust_core/Cargo.toml --all -- --check
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path rust_core/Cargo.toml --locked
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Build native wheel
+        run: |
+          mkdir -p dist/native
+          docker run --rm \
+            --volume "$PWD:/io" \
+            --workdir /io/rust_core \
+            --entrypoint /bin/bash \
+            ghcr.io/pyo3/maturin:v1.14.1@sha256:2665227312dd1eab1c29c70a001dc8aac53155a2d048bede3b2df7f1691c8e38 \
+            -lc 'set -euo pipefail; rustup toolchain install 1.97.1 --profile minimal; rustup default 1.97.1; maturin build --release --locked --interpreter /opt/python/cp313-cp313/bin/python --out /io/dist/native'
+          native_wheels=(dist/native/rust_core-*.whl)
+          [[ ${#native_wheels[@]} -eq 1 ]]
+          [[ "${native_wheels[0]}" == *manylinux_2_17_x86_64.manylinux2014_x86_64.whl ]]
+
+      - name: Verify native runtime symbols
+        run: |
+          python -m pip install dist/native/*.whl
+          python scripts/check_native.py
+
+      - name: Upload native wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-wheel-${{ github.sha }}
+          path: dist/native/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  python:
+    name: Python tests, smoke, and eval
+    needs: native
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
           cache: pip
+          cache-dependency-path: pyproject.toml
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      # 复用 HuggingFace 缓存，避免每次重新下载 BGE 嵌入/精排模型。
-      - uses: actions/cache@v4
+      - name: Download native wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: ~/.cache/huggingface
-          key: hf-${{ runner.os }}
+          name: native-wheel-${{ github.sha }}
+          path: dist/native
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          # 不固定到 PyTorch CPU 专用源：download-r2.pytorch.org 在 GitHub runner 上偶发 TLS 握手失败。
-          # 直接走 PyPI 解析 pyproject 依赖，避免 CI 被外部镜像单点阻断。
-          pip install -e ".[dev]"
+          python -m pip install "pip==26.0.1"
+          python -m pip install -e ".[dev]"
+          python -m pip install dist/native/*.whl
 
-      - name: Build and install rust_core
+      - name: Verify release version sources
+        run: python scripts/check_release_version.py
+
+      - name: Run Python static checks
         run: |
-          # CI 无激活 venv，maturin develop 会报错；改为 build wheel 再装。
-          cd rust_core && maturin build --release --out dist
-          pip install dist/*.whl
+          make lint
+          make typecheck-security
 
-      - name: Run tests
-        run: pytest -q
+      - name: Run Python tests
+        run: python -m pytest -q
 
       - name: Run API smoke
         run: make smoke-api
 
+      - name: Run production account-auth smoke
+        run: make smoke-account-auth
+
       - name: Run eval coverage gate
         run: make eval-suite
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build image without publishing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: cogdoc:ci
+          cache-from: type=gha,scope=cogdoc-ci
+          cache-to: type=gha,mode=max,scope=cogdoc-ci
+
+      - name: Run container account-auth smoke
+        run: |
+          account_volume="cogdoc-ci-account-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker volume create "${account_volume}" >/dev/null
+          docker run --detach --name cogdoc-ci \
+            --mount "source=${account_volume},target=/app/data" \
+            --env COGDOC_ACCOUNT_AUTH_ENABLED=true \
+            --env COGDOC_SELF_REGISTRATION_ENABLED=true \
+            --env COGDOC_STATE_BACKEND=sqlite \
+            --env COGDOC_TRACE_ENABLED=false \
+            --publish 127.0.0.1:8000:8000 cogdoc:ci
+          trap 'docker logs cogdoc-ci || true; docker rm --force cogdoc-ci >/dev/null 2>&1 || true; docker volume rm "${account_volume}" >/dev/null 2>&1 || true' EXIT
+          python3 scripts/smoke_account_auth.py \
+            --url http://127.0.0.1:8000 \
+            --startup-timeout 90
+          docker stop --timeout 25 cogdoc-ci >/dev/null
+          backup_json="$(docker run --rm \
+            --mount "source=${account_volume},target=/app/data" \
+            cogdoc:ci \
+            python scripts/backup_state.py --json)"
+          backup_name="$(python3 -c \
+            'import json, pathlib, sys; print(pathlib.Path(json.load(sys.stdin)["archive"]).name)' \
+            <<<"${backup_json}")"
+          docker run --rm \
+            --mount "source=${account_volume},target=/app/data" \
+            cogdoc:ci \
+            python scripts/restore_state.py \
+              "/app/data/backups/${backup_name}" --verify-only
+          docker run --rm --user 0 \
+            --env "BACKUP_NAME=${backup_name}" \
+            --mount "source=${account_volume},target=/source,readonly" \
+            --entrypoint /bin/bash cogdoc:ci \
+            -lc 'set -euo pipefail; python /app/scripts/restore_state.py "/source/backups/${BACKUP_NAME}" --target /tmp/restore-drill; test -f /tmp/restore-drill/data/state.db'

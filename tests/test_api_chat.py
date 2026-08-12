@@ -1,5 +1,8 @@
-import pytest
+import asyncio
 import threading
+from types import SimpleNamespace
+
+import pytest
 from httpx import ASGITransport, AsyncClient
 from cogdoc.api.app import create_app
 from cogdoc.api.persistence import SqliteSessionStore
@@ -364,6 +367,83 @@ async def test_chat_stream_emits_sse_frames_and_writes_session(monkeypatch):
     display = store.get_display("kb", "s1")
     assert display[1]["trace_id"] == "trace-sse"
     assert display[1]["query"] == "问题"
+
+
+@pytest.mark.anyio
+async def test_chat_stream_watchdog_recovers_lost_threadsafe_wakeup(monkeypatch):
+    """A completed producer must not depend on one selector wakeup succeeding."""
+
+    import cogdoc.api.app as app_module
+    import cogdoc.api.routes.chat as chat_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    result = _result("最终答案", "trace-watchdog")
+
+    def fake_stream(doc_id, query, is_local, chat_history, forced_task):
+        yield ChatEvent("final", {"result": result, "output": result.raw_output})
+
+    app = create_app(chat_stream_runner=fake_stream, session_store=SessionStore())
+    loop = asyncio.get_running_loop()
+    # Append callbacks to the ready queue without writing the selector self-pipe.
+    # The route's short timer must wake the loop and drain those callbacks.
+    monkeypatch.setattr(loop, "call_soon_threadsafe", loop.call_soon)
+    monkeypatch.setattr(chat_module, "_STREAM_QUEUE_WATCHDOG_SECONDS", 0.01)
+
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            response = await asyncio.wait_for(
+                client.post(
+                    "/v1/chat/stream",
+                    json={"query": "问题", "doc_id": "kb", "session_id": "s1"},
+                ),
+                timeout=2.0,
+            )
+
+    assert response.status_code == 200
+    assert "event: final" in response.text
+    assert "trace-watchdog" in response.text
+
+
+@pytest.mark.anyio
+async def test_chat_stream_idle_timeout_emits_error_and_ends(monkeypatch):
+    import cogdoc.api.app as app_module
+    import cogdoc.api.routes.chat as chat_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(
+        chat_module,
+        "get_settings",
+        lambda: SimpleNamespace(cogdoc_chat_stream_idle_timeout_seconds=0.05),
+    )
+    result = _result("过晚答案", "trace-too-late")
+
+    def slow_stream(doc_id, query, is_local, chat_history, forced_task):
+        yield ChatEvent("request_started", {"trace_id": "slow", "doc_id": doc_id})
+        threading.Event().wait(0.2)
+        yield ChatEvent("final", {"result": result, "output": result.raw_output})
+
+    app = create_app(chat_stream_runner=slow_stream, session_store=SessionStore())
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            response = await asyncio.wait_for(
+                client.post(
+                    "/v1/chat/stream",
+                    json={"query": "问题", "doc_id": "kb", "session_id": "s1"},
+                ),
+                timeout=2.0,
+            )
+
+    assert response.status_code == 200
+    assert "event: start" in response.text
+    assert "event: error" in response.text
+    assert "STREAM_INTERRUPTED" in response.text
+    assert "event: final" not in response.text
 
 
 # 验证注入流式 runner 的畸形 audit 不会在 final 帧前被指标/摘要转换打断。

@@ -271,7 +271,7 @@ def _scope_key(unit: EvidenceUnit) -> tuple[tuple[str, ...], bool]:
 def _retriever_scope(scope: RetrievalScope) -> RetrievalScope | None:
     """Keep the legacy unscoped call shape when the scope is a true no-op."""
 
-    if not scope.allowed_sources and scope.include_derived_knowledge:
+    if scope.allows_all_sources and scope.include_derived_knowledge:
         return None
     return scope
 
@@ -703,6 +703,7 @@ def retrieve_evidence_units(
     fallback_docs_by_source: Mapping[str, Sequence[RetrievedDoc]] | None = None,
     query_phase: Literal["primary", "recovery"] = "primary",
     retrieval_round: int = 0,
+    authorization_scope: RetrievalScope | None = None,
 ) -> EvidenceUnitBatchResult:
     """Execute one source-safe retrieval/pack plan for any agent's units.
 
@@ -750,6 +751,8 @@ def retrieve_evidence_units(
 
     for group_units in grouped.values():
         scope = _runtime_scope(group_units[0])
+        if authorization_scope is not None:
+            scope = scope.intersect(authorization_scope)
         retriever_scope = _retriever_scope(scope)
         queries = [
             RetrievalQuery(
@@ -803,6 +806,8 @@ def retrieve_evidence_units(
     source_cache: dict[str, list[RetrievedDoc]] = {}
     for unit in normalized_units:
         scope = _runtime_scope(unit)
+        if authorization_scope is not None:
+            scope = scope.intersect(authorization_scope)
         candidates = candidates_by_unit.get(unit.unit_id, [])
         unit_retrieval_round = retrieval_round
         ranking_query = (

@@ -9,6 +9,7 @@ from cogdoc.tools.chunk_identity import (
     DEFAULT_CHUNK_CHAR_SIZE,
     MIN_CHUNK_CHARS,
     build_chunk_id,
+    build_document_id,
     build_parent_chunk_id,
 )
 from cogdoc.tools.section_structure import SectionSpan, detect_section_spans
@@ -208,6 +209,7 @@ def chunk_paper(
         return []
 
     source_name = parsed_pages[0]["source"]
+    document_id = build_document_id(source_name)
     if not source_sha256:
         raise ValueError("source_sha256 is required for stable chunk identity")
 
@@ -304,6 +306,7 @@ def chunk_paper(
 
             meta = {
                 "chunk_id": chunk_id,
+                "document_id": document_id,
                 "source_sha256": source_sha256,
                 "local_chunk_index": local_chunk_index,
                 "chunk_index": local_chunk_index,

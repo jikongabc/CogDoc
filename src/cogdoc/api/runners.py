@@ -24,8 +24,24 @@ def run_with_optional_session(
     chat_history: list,
     forced_task: str | None,
     session_id: str | None,
+    retrieval_scope: object | None = None,
 ) -> Any:
     args = (doc_id, query, is_local, chat_history, forced_task)
-    if runner_accepts_session_id(runner):
-        return runner(*args, session_id=session_id)
+    try:
+        signature = inspect.signature(runner)
+        parameters = signature.parameters
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in parameters.values()
+        )
+    except (TypeError, ValueError):
+        parameters = {}
+        accepts_kwargs = False
+    kwargs: dict[str, Any] = {}
+    if "session_id" in parameters or accepts_kwargs:
+        kwargs["session_id"] = session_id
+    if "retrieval_scope" in parameters or accepts_kwargs:
+        kwargs["retrieval_scope"] = retrieval_scope
+    if kwargs:
+        return runner(*args, **kwargs)
     return runner(*args)

@@ -603,6 +603,7 @@ def retrieve_node(
     )
     configurable = (config or {}).get("configurable", {})
     runtime = configurable.get("state_runtime")
+    retrieval_scope = configurable.get("retrieval_scope")
     if runtime is None:
         from cogdoc.state_runtime import default_state_runtime
 
@@ -619,6 +620,7 @@ def retrieve_node(
             retrieval_feedback_store=runtime.retrieval_feedback_store,
             rrf_k=float(settings.hybrid_rrf_k),
             retrieval_round=retry_count,
+            scope=retrieval_scope,
         )
     retrieved_docs, carryover_count = _carry_verified_docs(state, retrieval_result.docs)
     raw_requirements = [

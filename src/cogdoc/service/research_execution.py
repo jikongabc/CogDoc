@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import hashlib
+import inspect
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import CancelledError, Future
@@ -15,6 +16,10 @@ from cogdoc.api.research_job_store import (
     ResearchJobStateConflictError,
     ResearchJobStore,
     research_run_control,
+)
+from cogdoc.api.research_access import (
+    research_authorization,
+    research_retrieval_scope,
 )
 from cogdoc.config.settings import get_settings
 from cogdoc.daemon_executor import (
@@ -87,6 +92,7 @@ def retrieve_research_evidence(
     *,
     state_runtime,
     top_k: int = 8,
+    retrieval_scope=None,
 ) -> list[Mapping[str, Any]]:
     """Reuse the production hybrid retrieval path for one research section."""
 
@@ -102,6 +108,7 @@ def retrieve_research_evidence(
             queries=build_retrieval_queries(query, max_queries=1),
             top_k=top_k,
             rrf_k=float(settings.hybrid_rrf_k),
+            scope=retrieval_scope,
         )
         docs = list(result.docs)
         if not docs:
@@ -243,6 +250,7 @@ class ResearchExecutionManager:
         provider_max_pending: int | None = None,
         retrieval_doc_reservation: int | None = None,
         observer: ResearchObserver | None = None,
+        authorization_checker: Callable[[Mapping[str, Any]], bool] | None = None,
     ):
         self._store = store
         self._retrieve = retrieve
@@ -304,6 +312,7 @@ class ResearchExecutionManager:
         )
         self._closed = False
         self._observer = observer
+        self._authorization_checker = authorization_checker
 
     @classmethod
     def from_runtime(
@@ -316,6 +325,7 @@ class ResearchExecutionManager:
         top_k: int = 8,
         max_pending: int | None = None,
         observer: ResearchObserver | None = None,
+        authorization_checker: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> "ResearchExecutionManager":
         # Local import avoids coupling the evidence executor to report-generation
         # dependencies during module import.
@@ -341,10 +351,60 @@ class ResearchExecutionManager:
             max_pending=max_pending,
             retrieval_doc_reservation=top_k,
             observer=observer,
+            authorization_checker=authorization_checker,
         )
 
     def bind_observer(self, observer: ResearchObserver | None) -> None:
         self._observer = observer
+
+    def bind_authorization_checker(
+        self, checker: Callable[[Mapping[str, Any]], bool] | None
+    ) -> None:
+        self._authorization_checker = checker
+
+    def _assert_authorized(self, job: Mapping[str, Any]) -> None:
+        authorization = research_authorization(job)
+        if authorization is None:
+            return
+        checker = self._authorization_checker
+        if checker is None or not checker(job):
+            raise ResearchJobStateConflictError(
+                "research authorization is stale or unavailable"
+            )
+        scope = research_retrieval_scope(job)
+        if scope is None or scope.denies_all:
+            raise ResearchJobStateConflictError("research authorization denies access")
+
+    def _retrieve_for_job(
+        self,
+        job: Mapping[str, Any],
+        kb_id: str,
+        query: str,
+    ) -> list[Mapping[str, Any]]:
+        self._assert_authorized(job)
+        scope = research_retrieval_scope(job)
+        if scope is None:
+            return list(self._retrieve(kb_id, query))
+        try:
+            parameters = inspect.signature(self._retrieve).parameters.values()
+            accepts_scope = any(
+                parameter.name == "retrieval_scope"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_scope = False
+        if accepts_scope:
+            docs = self._retrieve(kb_id, query, retrieval_scope=scope)
+        elif scope.allows_all_sources:
+            docs = self._retrieve(kb_id, query)
+        else:
+            raise ResearchJobStateConflictError(
+                "research retriever cannot enforce the authorization subset"
+            )
+        # Final guard protects persisted evidence from a backend that accepted
+        # but ignored the pre-top-k scope.
+        return [doc for doc in docs if scope.allows_document(doc)]
 
     def _observe(self, method: str, **fields: Any) -> None:
         observer = self._observer
@@ -651,6 +711,7 @@ class ResearchExecutionManager:
         transition_started = False
         try:
             kb_id = str(current.get("kb_id") or "")
+            self._assert_authorized(current)
             with kb_read_lease(kb_id):
                 snapshot = self._read_provenance(kb_id)
                 if (
@@ -714,9 +775,11 @@ class ResearchExecutionManager:
             # Provenance is relevant only after we know there is a paused
             # execution to resume.
             if current.get("status") != "paused":
+                self._assert_authorized(current)
                 row = self._store.resume(job_id)
                 self._release_submission()
                 return row
+            self._assert_authorized(current)
             with kb_read_lease(str(current.get("kb_id") or "")):
                 self.assert_current(current)
                 transition_started = True
@@ -739,6 +802,7 @@ class ResearchExecutionManager:
             current = self._store.get(job_id)
             if current is None:
                 raise KeyError(job_id)
+            self._assert_authorized(current)
             with kb_read_lease(str(current.get("kb_id") or "")):
                 self.assert_current(current)
                 transition_started = True
@@ -775,6 +839,7 @@ class ResearchExecutionManager:
         transition_started = False
         try:
             kb_id = str(current.get("kb_id") or "")
+            self._assert_authorized(current)
             with kb_read_lease(kb_id):
                 snapshot = self._read_provenance(kb_id)
                 if not is_trackable_research_provenance(snapshot):
@@ -817,6 +882,7 @@ class ResearchExecutionManager:
         current = self._store.get(job_id)
         if current is None:
             raise KeyError(job_id)
+        self._assert_authorized(current)
         with kb_read_lease(str(current.get("kb_id") or "")):
             self.assert_current(current)
             return self._store.review_report(
@@ -838,6 +904,7 @@ class ResearchExecutionManager:
         current = self._store.get(job_id)
         if current is None:
             raise KeyError(job_id)
+        self._assert_authorized(current)
         with kb_read_lease(str(current.get("kb_id") or "")):
             self.assert_current(current)
             return self._store.publish_report(
@@ -1350,6 +1417,7 @@ class ResearchExecutionManager:
                 job = self._store.get(job_id)
                 if job is None:
                     return
+                self._assert_authorized(job)
                 requested_section_ids = {
                     str(section_id)
                     for section_id in job.get("regeneration_section_ids") or []
@@ -1383,6 +1451,10 @@ class ResearchExecutionManager:
                     # this final check and the durable artifact commit.
                     self.assert_current(job_id)
                     control.checkpoint()
+                    # Keep authorization as the final fallible external check:
+                    # report generation and provenance/control checks may span a
+                    # revocation, whose output must never cross the store boundary.
+                    self._assert_authorized(job)
                     committed = self._store.complete_report(
                         job_id,
                         report_execution_id=report_execution_id,
@@ -1474,8 +1546,9 @@ class ResearchExecutionManager:
                                 retrieval_queries=1,
                                 candidate_docs=self._retrieval_doc_reservation,
                             )
-                            retrieved = list(self._retrieve(kb_id, query))
+                            retrieved = self._retrieve_for_job(row, kb_id, query)
                             checkpoint_for_draining_section()
+                            self._assert_authorized(row)
                             self.assert_current(row)
                             query_results.append(
                                 {
@@ -1500,21 +1573,26 @@ class ResearchExecutionManager:
                         evidence = public_research_evidence(docs)
                         self.assert_current(row)
                         checkpoint_for_draining_section()
+                        execution_metrics = {
+                            "candidate_count": len(docs),
+                            "evidence_count": len(evidence),
+                            "query_count": len(query_results),
+                            "requirements": query_results,
+                            "duration_ms": round(
+                                (time.monotonic() - started) * 1000, 3
+                            ),
+                        }
+                        # Evidence shaping and provenance/control checks happen
+                        # after retrieval. Revalidate the live ACL only once all
+                        # commit inputs are ready, then cross the durable boundary.
+                        self._assert_authorized(row)
                         committed = self._store.complete_section(
                             job_id,
                             section_id,
                             execution_id=execution_id,
                             evidence_status="partial" if evidence else "missing",
                             evidence=evidence,
-                            execution_metrics={
-                                "candidate_count": len(docs),
-                                "evidence_count": len(evidence),
-                                "query_count": len(query_results),
-                                "requirements": query_results,
-                                "duration_ms": round(
-                                    (time.monotonic() - started) * 1000, 3
-                                ),
-                            },
+                            execution_metrics=execution_metrics,
                             lease_id=lease_id,
                         )
                         committed_control = research_run_control(

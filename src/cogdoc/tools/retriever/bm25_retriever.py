@@ -5,6 +5,7 @@ from threading import RLock
 from typing import Any, List, cast
 from cogdoc.config.settings import get_settings
 from cogdoc.graph.state import DocMeta, RetrievedDoc
+from cogdoc.tools.chunk_identity import build_document_id
 from cogdoc.tools.document_loader import list_sources, load_source_chunks
 from cogdoc.tools.tokenizer import tokenize_mixed_text, tokenize_corpus
 from cogdoc.tools.rust_core_loader import ensure_rust_core
@@ -99,12 +100,16 @@ class BM25Retriever(BaseRetriever):
     def _clean_doc(c: RetrievedDoc) -> RetrievedDoc:
         # 只留 chunk 身份元数据，去掉检索期临时字段。
         meta = c["meta"]
+        source = str(meta["source"])
         cleaned_meta: dict[str, Any] = {
             "chunk_id": str(meta["chunk_id"]),
+            "document_id": str(
+                meta.get("document_id") or build_document_id(source)
+            ),
             "source_sha256": str(meta["source_sha256"]),
             "local_chunk_index": int(meta["local_chunk_index"]),
             "chunk_index": int(meta["chunk_index"]),
-            "source": str(meta["source"]),
+            "source": source,
             "page": int(meta["page"]),
             "page_start": int(meta["page_start"]),
             "page_end": int(meta["page_end"]),
@@ -205,6 +210,8 @@ class BM25Retriever(BaseRetriever):
         *,
         scope: RetrievalScope | None = None,
     ) -> List[RetrievedDoc]:
+        if scope is not None and scope.denies_all:
+            return []
         # 一致快照：bm25 与 registry 必须取自同一次原子替换，否则下标会错配到新 registry。
         with self._lock:
             bm25 = self.bm25
@@ -257,16 +264,20 @@ class BM25Retriever(BaseRetriever):
                     "BM25 index is missing stable chunk_id metadata; rebuild the index."
                 )
             source_sha256 = str(meta_data.get("source_sha256", ""))
+            source = str(meta_data["source"])
             page_start = int(meta_data["page_start"])
             page_end = int(meta_data["page_end"])
             local_chunk_index = int(meta_data["local_chunk_index"])
 
             meta: dict[str, Any] = {
                 "chunk_id": str(chunk_id),
+                "document_id": str(
+                    meta_data.get("document_id") or build_document_id(source)
+                ),
                 "source_sha256": source_sha256,
                 "local_chunk_index": local_chunk_index,
                 "chunk_index": int(meta_data["chunk_index"]),
-                "source": str(meta_data["source"]),
+                "source": source,
                 "page": int(meta_data["page"]),
                 "page_start": page_start,
                 "page_end": page_end,

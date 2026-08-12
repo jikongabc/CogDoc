@@ -17,6 +17,7 @@ def merge_lists(old_list: Optional[Any], new_list: Optional[Any]) -> List[Any]:
 # chunk_id 是检索链路里的稳定身份键。
 class DocMeta(TypedDict):
     chunk_id: str
+    document_id: str
     source_sha256: str
     local_chunk_index: int
     chunk_index: int
@@ -237,6 +238,7 @@ class GraphState(TypedDict):
     task_type: NotRequired[str]
     router_reason: NotRequired[str]
     top_k: NotRequired[int]
+    retrieval_scope: NotRequired[Any]
 
     rewritten_queries: NotRequired[List[str]]
     evidence_requirements: NotRequired[List[EvidenceRequirementPlan]]

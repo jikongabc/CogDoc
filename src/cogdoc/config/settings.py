@@ -1,5 +1,7 @@
 from functools import lru_cache
+import json
 from pathlib import Path
+from typing import Any
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -50,19 +52,84 @@ class Settings(BaseSettings):
         default="logs/traces", validation_alias="COGDOC_TRACE_DIR"
     )
 
-    # 访问控制：密钥逗号分隔，留空则关闭鉴权。
+    # 访问控制：旧密钥逗号分隔；只有全部三类凭据均为空才关闭鉴权。
     cogdoc_api_keys: str = Field(default="", validation_alias="COGDOC_API_KEYS")
+    # 团队工作区身份映射。JSON 对象的 key 是 API key，value 包含
+    # tenant_id / subject_id / role。与旧 COGDOC_API_KEYS 可并存；旧 key
+    # 为了无损升级仍映射到 default 租户的 admin。
+    cogdoc_api_principals: str = Field(
+        default="", validation_alias="COGDOC_API_PRINCIPALS"
+    )
     # 评测与 Research 发布审核是高权限操作；未配置时相关接口保持关闭。
     cogdoc_eval_review_api_keys: str = Field(
         default="", validation_alias="COGDOC_EVAL_REVIEW_API_KEYS"
+    )
+    # Persistent human accounts are opt-in for compatibility with existing
+    # local/API-key deployments. Once enabled, protected endpoints require a
+    # real session (or an explicitly configured service API key).
+    cogdoc_account_auth_enabled: bool = Field(
+        default=False, validation_alias="COGDOC_ACCOUNT_AUTH_ENABLED"
+    )
+    cogdoc_self_registration_enabled: bool = Field(
+        default=True, validation_alias="COGDOC_SELF_REGISTRATION_ENABLED"
+    )
+    cogdoc_auth_session_ttl_seconds: float = Field(
+        default=30 * 24 * 60 * 60,
+        ge=300,
+        le=10 * 365 * 24 * 60 * 60,
+        validation_alias="COGDOC_AUTH_SESSION_TTL_SECONDS",
+    )
+    cogdoc_auth_invite_ttl_seconds: float = Field(
+        default=7 * 24 * 60 * 60,
+        ge=300,
+        le=365 * 24 * 60 * 60,
+        validation_alias="COGDOC_AUTH_INVITE_TTL_SECONDS",
+    )
+    cogdoc_auth_max_failed_logins: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        validation_alias="COGDOC_AUTH_MAX_FAILED_LOGINS",
+    )
+    cogdoc_auth_lockout_seconds: float = Field(
+        default=15 * 60,
+        ge=1,
+        le=24 * 60 * 60,
+        validation_alias="COGDOC_AUTH_LOCKOUT_SECONDS",
     )
     # 限流令牌桶：每分钟补充速率 + 突发容量；容量<=0 关闭限流。
     rate_limit_per_minute: int = Field(
         default=120, validation_alias="RATE_LIMIT_PER_MINUTE"
     )
     rate_limit_burst: int = Field(default=120, validation_alias="RATE_LIMIT_BURST")
+    # 0 表示不设限。配额只以服务端解析出的 tenant_id 为信任边界。
+    cogdoc_tenant_max_knowledge_bases: int = Field(
+        default=0,
+        ge=0,
+        validation_alias="COGDOC_TENANT_MAX_KNOWLEDGE_BASES",
+    )
+    cogdoc_tenant_max_documents: int = Field(
+        default=0,
+        ge=0,
+        validation_alias="COGDOC_TENANT_MAX_DOCUMENTS",
+    )
+    cogdoc_tenant_max_storage_mb: int = Field(
+        default=0,
+        ge=0,
+        validation_alias="COGDOC_TENANT_MAX_STORAGE_MB",
+    )
     cogdoc_offload_workers: int = Field(
         default=2, validation_alias="COGDOC_OFFLOAD_WORKERS"
+    )
+    # SSE worker events cross a thread/event-loop boundary.  Bound the time
+    # without any event so a wedged provider cannot leave an HTTP request open
+    # forever; the queue bridge itself polls more frequently as a lost-wakeup
+    # watchdog.
+    cogdoc_chat_stream_idle_timeout_seconds: float = Field(
+        default=300.0,
+        ge=1.0,
+        le=3600.0,
+        validation_alias="COGDOC_CHAT_STREAM_IDLE_TIMEOUT_SECONDS",
     )
     cogdoc_research_workers: int = Field(
         default=2,
@@ -723,6 +790,55 @@ class Settings(BaseSettings):
         return {k.strip() for k in self.cogdoc_api_keys.split(",") if k.strip()}
 
     @property
+    def api_principal_map(self) -> dict[str, dict[str, Any]]:
+        """Parse the optional API-key-to-principal map fail closed.
+
+        Parsing is deliberately deferred until application construction so a
+        malformed production credential map cannot silently degrade to the
+        legacy shared-default identity.
+        """
+
+        raw = self.cogdoc_api_principals.strip()
+        if not raw:
+            return {}
+
+        def reject_duplicate_keys(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError(
+                        f"COGDOC_API_PRINCIPALS contains duplicate key: {key!r}"
+                    )
+                value[key] = item
+            return value
+
+        try:
+            payload = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError("COGDOC_API_PRINCIPALS must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("COGDOC_API_PRINCIPALS must be a JSON object")
+        result: dict[str, dict[str, Any]] = {}
+        for raw_key, raw_principal in payload.items():
+            key = str(raw_key).strip()
+            if not key or not isinstance(raw_principal, dict):
+                raise ValueError(
+                    "COGDOC_API_PRINCIPALS entries require a non-blank key "
+                    "and object value"
+                )
+            if key in result:
+                raise ValueError(
+                    "COGDOC_API_PRINCIPALS contains keys that collide after trimming"
+                )
+            if set(raw_principal) != {"tenant_id", "subject_id", "role"}:
+                raise ValueError(
+                    "COGDOC_API_PRINCIPALS principal fields must be exactly "
+                    "tenant_id, subject_id, and role"
+                )
+            result[key] = dict(raw_principal)
+        return result
+
+    @property
     def eval_review_api_key_set(self) -> set[str]:
         return {
             key.strip()
@@ -735,6 +851,10 @@ class Settings(BaseSettings):
     def state_db_path(self) -> str:
         # 会话与入库任务落盘，进程重启不丢状态。
         return str(self.data_dir / "state.db")
+
+    @property
+    def audit_log_path(self) -> str:
+        return str(self.data_dir / "audit" / "events.jsonl")
 
     # 处理反馈数据库路径。
     @property

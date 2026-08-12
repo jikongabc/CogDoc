@@ -96,6 +96,8 @@ async def test_manual_knowledge_lifecycle(tmp_path, monkeypatch):
         assert row["related_page_end"] == 3
         assert row["related_chunk_text_hash"] == "hash-old"
         assert row["related_anchor_text"] == "审批规则"
+        # 客户端自报 created_by 不可信；本地无鉴权模式固定归属 local。
+        assert row["created_by"] == "local"
         knowledge_id = row["knowledge_id"]
 
         pending = await client.get(
@@ -112,7 +114,7 @@ async def test_manual_knowledge_lifecycle(tmp_path, monkeypatch):
         )
         assert approved.status_code == 200
         assert approved.json()["status"] == "approved"
-        assert approved.json()["reviewed_by"] == "admin"
+        assert approved.json()["reviewed_by"] == "local"
 
         archived = await client.post(
             f"/v1/knowledge/{knowledge_id}/archive", json={"actor": "admin"}
@@ -373,7 +375,7 @@ async def test_stale_knowledge_approve_refreshes_binding(tmp_path, monkeypatch):
     assert row["related_page_end"] == 5
     assert row["related_chunk_text_hash"] == "hash-new"
     assert row["related_anchor_text"] == "新版锚点"
-    assert row["reviewed_by"] == "admin"
+    assert row["reviewed_by"] == "local"
     assert row["review_note"] == "新版文档确认仍有效"
 
 

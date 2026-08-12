@@ -51,6 +51,14 @@ class ErrorCode(str, Enum):
     UNKNOWN_INTENT = "UNKNOWN_INTENT"
     BAD_REQUEST = "BAD_REQUEST"
     UNAUTHORIZED = "UNAUTHORIZED"
+    FORBIDDEN = "FORBIDDEN"
+    AUTH_CONFLICT = "AUTH_CONFLICT"
+    SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
+    WORKSPACE_NOT_FOUND = "WORKSPACE_NOT_FOUND"
+    MEMBER_NOT_FOUND = "MEMBER_NOT_FOUND"
+    INVITE_INVALID = "INVITE_INVALID"
+    INVITE_NOT_FOUND = "INVITE_NOT_FOUND"
+    TENANT_QUOTA_EXCEEDED = "TENANT_QUOTA_EXCEEDED"
     REQUEST_THROTTLED = "REQUEST_THROTTLED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     KB_NOT_FOUND = "KB_NOT_FOUND"
@@ -272,6 +280,7 @@ class JobStatus(str, Enum):
 # 建知识库请求体，限制长度避免集合名截断后碰撞。
 class KnowledgeBaseCreate(ApiModel):
     kb_id: str = Field(min_length=1, max_length=56)
+    access_policy: Literal["workspace", "private"] = "workspace"
 
     # 校验结果。
     @field_validator("kb_id")
@@ -919,6 +928,7 @@ class ResearchProvenanceResponse(ApiModel):
 class Document(ApiModel):
     name: str
     sha256: str = ""
+    document_id: str = ""
 
 
 # 知识库来源文件列表响应。
@@ -931,6 +941,7 @@ class SourceListResponse(ApiModel):
 # 文档分块预览，不返回完整正文。
 class ChunkPreview(ApiModel):
     chunk_id: str = ""
+    document_id: str = ""
     chunk_index: int | None = None
     source: str = ""
     source_sha256: str = ""
@@ -1364,6 +1375,269 @@ class TraceListItem(ApiModel):
 class TraceListResponse(ApiModel):
     schema_version: Literal["v1"] = API_SCHEMA_VERSION
     traces: list[TraceListItem] = Field(default_factory=list)
+
+
+# Authentication and workspace contracts deliberately use strict strings.  In
+# particular, credentials and identifiers must never be produced by coercing a
+# JSON number or boolean into text.
+WorkspaceRole = Literal["owner", "admin", "editor", "reviewer", "viewer"]
+AssignableWorkspaceRole = Literal["admin", "editor", "reviewer", "viewer"]
+
+
+def _normalized_auth_text(value: str, *, field: str, maximum: int) -> str:
+    normalized = unicodedata.normalize("NFKC", " ".join(value.split()))
+    if not normalized:
+        raise ValueError(f"{field} must not be blank")
+    if len(normalized) > maximum:
+        raise ValueError(f"{field} is too long")
+    if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+        raise ValueError(f"{field} contains control characters")
+    return normalized
+
+
+def _normalized_email(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
+    if (
+        len(normalized) > 320
+        or normalized.count("@") != 1
+        or any(character.isspace() for character in normalized)
+    ):
+        raise ValueError("invalid email address")
+    local, domain = normalized.split("@", 1)
+    if not local or not domain or domain.startswith(".") or domain.endswith("."):
+        raise ValueError("invalid email address")
+    return normalized
+
+
+class AuthRegisterRequest(ApiModel):
+    email: str = Field(strict=True, min_length=3, max_length=320)
+    password: str = Field(strict=True, min_length=12, max_length=256)
+    display_name: str = Field(strict=True, min_length=1, max_length=120)
+    workspace_name: str | None = Field(
+        default=None, strict=True, min_length=1, max_length=120
+    )
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, value: str) -> str:
+        return _normalized_email(value)
+
+    @field_validator("display_name")
+    @classmethod
+    def _display_name(cls, value: str) -> str:
+        return _normalized_auth_text(value, field="display_name", maximum=120)
+
+    @field_validator("workspace_name")
+    @classmethod
+    def _workspace_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalized_auth_text(value, field="workspace_name", maximum=120)
+
+
+class AuthLoginRequest(ApiModel):
+    email: str = Field(strict=True, min_length=3, max_length=320)
+    password: str = Field(strict=True, min_length=1, max_length=256)
+    workspace_id: str | None = Field(
+        default=None, strict=True, min_length=1, max_length=160
+    )
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, value: str) -> str:
+        return _normalized_email(value)
+
+    @field_validator("workspace_id")
+    @classmethod
+    def _workspace_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalized_auth_text(value, field="workspace_id", maximum=160)
+
+
+class AuthChangePasswordRequest(ApiModel):
+    current_password: str = Field(strict=True, min_length=1, max_length=256)
+    new_password: str = Field(strict=True, min_length=12, max_length=256)
+
+    @model_validator(mode="after")
+    def _password_must_change(self):
+        if self.current_password == self.new_password:
+            raise ValueError("new_password must differ from current_password")
+        return self
+
+
+class WorkspaceCreateRequest(ApiModel):
+    name: str = Field(strict=True, min_length=1, max_length=120)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        return _normalized_auth_text(value, field="name", maximum=120)
+
+
+class WorkspaceUpdateRequest(WorkspaceCreateRequest):
+    expected_revision: int | None = Field(default=None, strict=True, ge=0)
+
+
+class WorkspaceMemberUpdateRequest(ApiModel):
+    # Ownership transfer is intentionally not smuggled through a role edit.  A
+    # dedicated transfer operation can later preserve the single-owner invariant.
+    role: AssignableWorkspaceRole
+    expected_revision: int | None = Field(default=None, strict=True, ge=0)
+
+
+class WorkspaceInviteCreateRequest(ApiModel):
+    email: str = Field(strict=True, min_length=3, max_length=320)
+    role: AssignableWorkspaceRole
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, value: str) -> str:
+        return _normalized_email(value)
+
+
+class WorkspaceInviteAcceptRequest(ApiModel):
+    token: str = Field(strict=True, min_length=16, max_length=512)
+    email: str | None = Field(default=None, strict=True, min_length=3, max_length=320)
+    password: str | None = Field(
+        default=None, strict=True, min_length=1, max_length=256
+    )
+    display_name: str | None = Field(
+        default=None, strict=True, min_length=1, max_length=120
+    )
+
+    @field_validator("token")
+    @classmethod
+    def _token(cls, value: str) -> str:
+        # Tokens are opaque and case-sensitive; only surrounding whitespace is
+        # rejected rather than normalized.
+        if value != value.strip() or any(ord(character) < 33 for character in value):
+            raise ValueError("invalid invite token")
+        return value
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, value: str | None) -> str | None:
+        return None if value is None else _normalized_email(value)
+
+    @field_validator("display_name")
+    @classmethod
+    def _display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalized_auth_text(value, field="display_name", maximum=120)
+
+    @model_validator(mode="after")
+    def _anonymous_credentials_are_complete(self):
+        if (self.email is None) != (self.password is None):
+            raise ValueError("email and password must be supplied together")
+        if self.display_name is not None and self.email is None:
+            raise ValueError("display_name requires email and password")
+        return self
+
+
+class AuthUser(ApiModel):
+    user_id: str
+    email: str
+    display_name: str
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class AuthWorkspace(ApiModel):
+    workspace_id: str
+    name: str
+    role: WorkspaceRole
+    created_at: str = ""
+    updated_at: str = ""
+    revision: int = Field(default=0, ge=0)
+
+
+class AuthSessionInfo(ApiModel):
+    session_id: str
+    created_at: str = ""
+    last_seen_at: str = ""
+    expires_at: str = ""
+    current: bool = False
+
+
+class AuthSessionResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_at: str = ""
+    user: AuthUser
+    workspace: AuthWorkspace
+    permissions: list[str] = Field(default_factory=list)
+
+
+class AuthMeResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    user: AuthUser
+    workspace: AuthWorkspace
+    permissions: list[str] = Field(default_factory=list)
+    workspaces: list[AuthWorkspace] = Field(default_factory=list)
+
+
+class AuthSessionListResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    sessions: list[AuthSessionInfo] = Field(default_factory=list)
+
+
+class WorkspaceResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    workspace: AuthWorkspace
+
+
+class WorkspaceListResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    workspaces: list[AuthWorkspace] = Field(default_factory=list)
+
+
+class WorkspaceMember(ApiModel):
+    member_id: str
+    user_id: str
+    email: str
+    display_name: str
+    role: WorkspaceRole
+    joined_at: str = ""
+    updated_at: str = ""
+
+
+class WorkspaceMemberResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    member: WorkspaceMember
+
+
+class WorkspaceMemberListResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    workspace_id: str
+    members: list[WorkspaceMember] = Field(default_factory=list)
+
+
+class WorkspaceInvite(ApiModel):
+    invite_id: str
+    workspace_id: str
+    email: str
+    role: AssignableWorkspaceRole
+    status: Literal["pending", "accepted", "revoked", "expired"] = "pending"
+    created_by: str = ""
+    created_at: str = ""
+    expires_at: str = ""
+
+
+class WorkspaceInviteCreateResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    invite: WorkspaceInvite
+    # Returned exactly once so a self-hosted deployment without a mailer can
+    # deliver the invitation out of band.  List responses never contain it.
+    invite_token: str
+
+
+class WorkspaceInviteListResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    workspace_id: str
+    invites: list[WorkspaceInvite] = Field(default_factory=list)
 
 
 # 转换为映射。

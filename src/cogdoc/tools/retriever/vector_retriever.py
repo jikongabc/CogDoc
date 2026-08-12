@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Any, List, cast
 from cogdoc.config.settings import get_settings
 from cogdoc.graph.state import DocMeta, RetrievedDoc
+from cogdoc.tools.chunk_identity import build_document_id
 from cogdoc.tools.embedder import Embedder
 from cogdoc.tools.retriever.base_retriever import BaseRetriever
 from cogdoc.tools.retriever.metadata import copy_optional_structure_metadata
@@ -106,14 +107,18 @@ class VectorRetriever(BaseRetriever):
         for c in chunks:
             meta = c["meta"]
             chunk_id = str(meta["chunk_id"])
+            source = str(meta["source"])
             ids.append(chunk_id)
             texts.append(c["text"])
             stored_meta: dict[str, Any] = {
                 "chunk_id": chunk_id,
+                "document_id": str(
+                    meta.get("document_id") or build_document_id(source)
+                ),
                 "source_sha256": meta["source_sha256"],
                 "local_chunk_index": meta["local_chunk_index"],
                 "chunk_index": meta["chunk_index"],
-                "source": meta["source"],
+                "source": source,
                 "page": meta["page"],
                 "page_start": meta["page_start"],
                 "page_end": meta["page_end"],
@@ -173,6 +178,8 @@ class VectorRetriever(BaseRetriever):
         *,
         scope: RetrievalScope | None = None,
     ) -> List[RetrievedDoc]:
+        if scope is not None and scope.denies_all:
+            return []
         # source allowlist 下推到 Chroma query，确保目标 source 在本通道
         # top-k 之前参与竞争，不能先取全库 top-k 再过滤。
         query_options: dict[str, Any] = {
@@ -224,12 +231,16 @@ def _meta_from_stored(meta_data: Mapping[str, Any]) -> DocMeta:
         raise RuntimeError(
             "Vector index is missing stable chunk_id metadata; rebuild the index."
         )
+    source = str(meta_data["source"])
     restored: dict[str, Any] = {
         "chunk_id": str(chunk_id),
+        "document_id": str(
+            meta_data.get("document_id") or build_document_id(source)
+        ),
         "source_sha256": str(meta_data.get("source_sha256", "")),
         "local_chunk_index": int(meta_data["local_chunk_index"]),
         "chunk_index": int(meta_data["chunk_index"]),
-        "source": str(meta_data["source"]),
+        "source": source,
         "page": int(meta_data["page"]),
         "page_start": int(meta_data["page_start"]),
         "page_end": int(meta_data["page_end"]),

@@ -476,6 +476,114 @@ def test_submit_delete_doc_removes_file_before_ingest(tmp_path):
     assert not os.path.exists(path)
 
 
+def test_upload_revocation_during_build_denies_commit_and_restores_source(tmp_path):
+    import os
+
+    from cogdoc.api.persistence import InMemoryJobStore
+
+    source_dir = str(tmp_path / "sources")
+    os.makedirs(source_dir)
+    destination = os.path.join(source_dir, "a.pdf")
+    with open(destination, "wb") as stream:
+        stream.write(b"OLD")
+    build_started = threading.Event()
+    allow_commit = threading.Event()
+    authorized = [True]
+    switched_generations = []
+
+    def delayed_ingest(kb_id, source_dir, *, on_commit=None):
+        assert open(destination, "rb").read() == b"NEW"
+        build_started.set()
+        assert allow_commit.wait(timeout=5)
+        assert on_commit is not None
+        on_commit("generation-new")
+        # Models KBState.switch_active: it must be unreachable after revocation.
+        switched_generations.append("generation-new")
+        return MagicMock(document_count=1, chunk_count=1)
+
+    def authorization_guard() -> None:
+        if not authorized[0]:
+            raise PermissionError("membership was revoked")
+
+    store = InMemoryJobStore()
+    mgr = IndexJobManager(
+        ingest_fn=delayed_ingest,
+        source_dir_for=lambda kb: source_dir,
+        job_store=store,
+    )
+    job = mgr.submit_upload(
+        "guard-upload-kb",
+        source_dir,
+        "a.pdf",
+        b"NEW",
+        authorization_guard=authorization_guard,
+    )
+    assert build_started.wait(timeout=5)
+    authorized[0] = False
+    allow_commit.set()
+    mgr.run_blocking("guard-upload-kb", lambda: None)
+    mgr.shutdown()
+
+    assert switched_generations == []
+    assert open(destination, "rb").read() == b"OLD"
+    assert store.get(job["job_id"])["status"] == "failed"
+
+
+def test_document_delete_revocation_during_build_denies_commit_and_restores_source(
+    tmp_path,
+):
+    import os
+
+    from cogdoc.api.persistence import InMemoryJobStore
+
+    source_dir = str(tmp_path / "sources")
+    os.makedirs(source_dir)
+    path = os.path.join(source_dir, "a.pdf")
+    with open(path, "wb") as stream:
+        stream.write(b"DOC")
+    build_started = threading.Event()
+    allow_commit = threading.Event()
+    authorized = [True]
+    switched_generations = []
+    acl_cleared = []
+
+    def delayed_ingest(kb_id, source_dir, *, on_commit=None):
+        assert not os.path.exists(path)
+        build_started.set()
+        assert allow_commit.wait(timeout=5)
+        assert on_commit is not None
+        on_commit("generation-without-doc")
+        switched_generations.append("generation-without-doc")
+        return MagicMock(document_count=0, chunk_count=0)
+
+    def authorization_guard() -> None:
+        if not authorized[0]:
+            raise PermissionError("membership was revoked")
+
+    store = InMemoryJobStore()
+    mgr = IndexJobManager(
+        ingest_fn=delayed_ingest,
+        source_dir_for=lambda kb: source_dir,
+        job_store=store,
+    )
+    job = mgr.submit_delete_doc(
+        "guard-delete-kb",
+        path,
+        on_succeeded=lambda: acl_cleared.append(True),
+        authorization_guard=authorization_guard,
+    )
+    assert build_started.wait(timeout=5)
+    authorized[0] = False
+    allow_commit.set()
+    mgr.run_blocking("guard-delete-kb", lambda: None)
+    mgr.shutdown()
+
+    assert switched_generations == []
+    assert acl_cleared == []
+    assert open(path, "rb").read() == b"DOC"
+    assert store.get(job["job_id"])["status"] == "failed"
+
+
 # 构建失败回滚源文件。
 
 
@@ -681,9 +789,7 @@ def test_release_executor_defers_until_queued_delete_and_create_finish():
         return future
 
     mgr._submit_tracked = tracked_submit
-    first_thread = threading.Thread(
-        target=lambda: mgr.run_blocking("kb", first_delete)
-    )
+    first_thread = threading.Thread(target=lambda: mgr.run_blocking("kb", first_delete))
     second_thread = threading.Thread(
         target=lambda: mgr.run_blocking("kb", second_delete)
     )

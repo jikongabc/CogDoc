@@ -12,6 +12,8 @@ from cogdoc.api.ingest import IndexJobManager, KnowledgeBaseRegistry
 from cogdoc.api.retrieval_feedback_store import RetrievalFeedbackStore
 from cogdoc.api.retrieval_eval_draft_store import RetrievalEvalDraftStore
 from cogdoc.api.research_job_store import ResearchJobStore
+from cogdoc.api.resource_access import ResourceAccessStore
+from cogdoc.tools.chunk_identity import build_document_id
 from cogdoc.tools.eval.retrieval_eval_drafts import create_pending_draft
 
 
@@ -38,7 +40,12 @@ def _ok_ingest(kb_id, source_dir):
 
 
 # 构造应用。
-def _make_app(tmp_path, ingest_fn=_ok_ingest, monkeypatch=None):
+def _make_app(
+    tmp_path,
+    ingest_fn=_ok_ingest,
+    monkeypatch=None,
+    resource_access_store=None,
+):
     if monkeypatch is not None:
         import cogdoc.api.app as app_module
 
@@ -73,9 +80,8 @@ def _make_app(tmp_path, ingest_fn=_ok_ingest, monkeypatch=None):
         retrieval_eval_draft_store=RetrievalEvalDraftStore(
             path=str(tmp_path / "retrieval_eval_drafts.jsonl")
         ),
-        research_job_store=ResearchJobStore(
-            path=str(tmp_path / "research_jobs.json")
-        ),
+        research_job_store=ResearchJobStore(path=str(tmp_path / "research_jobs.json")),
+        resource_access_store=resource_access_store,
     )
     return app, source_dir_for
 
@@ -338,6 +344,48 @@ def test_delete_kb_session_cleanup_failure_keeps_registry(monkeypatch):
     assert released == ["kb"]
 
 
+def test_queued_kb_delete_revalidates_before_any_destructive_cleanup(monkeypatch):
+    import cogdoc.api.routes.documents as docs_module
+
+    deleted = []
+    released = []
+    destructive_calls = []
+    registry = SimpleNamespace(delete=lambda kb_id: deleted.append(kb_id))
+    jobs = SimpleNamespace(release_executor=lambda kb_id: released.append(kb_id))
+
+    def authorization_guard() -> None:
+        raise PermissionError("membership was removed while delete was queued")
+
+    monkeypatch.setattr(docs_module, "kb_write_lock", lambda kb_id: nullcontext())
+    monkeypatch.setattr(
+        docs_module,
+        "delete_kb_index_transactional",
+        lambda kb_id: destructive_calls.append(("index", kb_id)),
+    )
+    monkeypatch.setattr(
+        docs_module,
+        "mark_kb_deleted",
+        lambda kb_id: destructive_calls.append(("tombstone", kb_id)),
+    )
+    monkeypatch.setattr(
+        docs_module,
+        "delete_trace_files",
+        lambda **kwargs: destructive_calls.append(("traces", kwargs["doc_id"])),
+    )
+
+    with pytest.raises(PermissionError, match="membership was removed"):
+        docs_module._delete_kb(
+            "kb",
+            registry,
+            jobs,
+            authorization_guard=authorization_guard,
+        )
+
+    assert destructive_calls == []
+    assert deleted == []
+    assert released == ["kb"]
+
+
 # 验证 create kb rejects overlong id。
 @pytest.mark.anyio
 async def test_create_kb_rejects_overlong_id(tmp_path, monkeypatch):
@@ -477,12 +525,113 @@ async def test_delete_missing_document_job_fails_with_not_found(tmp_path, monkey
     assert done.json()["error_code"] == "DOCUMENT_NOT_FOUND"
 
 
+@pytest.mark.anyio
+async def test_successful_document_delete_clears_acl_before_job_succeeds_and_reupload(
+    tmp_path, monkeypatch
+):
+    access_store = ResourceAccessStore(tmp_path / "resource-access.db")
+    app, _ = _make_app(
+        tmp_path,
+        monkeypatch=monkeypatch,
+        resource_access_store=access_store,
+    )
+    document_id = build_document_id("a.pdf")
+
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            created = await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
+            assert created.status_code == 201
+            storage_id = app.state.kb_registry.resolve("kb", "default")["storage_id"]
+
+            uploaded = await client.post(
+                "/v1/knowledge-bases/kb/documents",
+                files={"file": ("a.pdf", b"%PDF-1.4 data", "application/pdf")},
+            )
+            uploaded_done = await _wait_job(client, uploaded.json()["job_id"])
+            assert uploaded_done.json()["status"] == "succeeded"
+
+            access_store.set_document_policy(
+                "default", storage_id, document_id, "a.pdf", policy="private"
+            )
+            access_store.grant_subject(
+                "default", storage_id, "alice", "viewer", document_id=document_id
+            )
+
+            deleted = await client.delete("/v1/knowledge-bases/kb/documents/a.pdf")
+            deleted_done = await _wait_job(client, deleted.json()["job_id"])
+            assert deleted_done.json()["status"] == "succeeded"
+            # The terminal success is published only after both policy and
+            # document-scoped grants have been removed.
+            assert (
+                access_store.get_document_policy("default", storage_id, document_id)
+                is None
+            )
+            assert (
+                access_store.list_grants("default", storage_id, document_id=document_id)
+                == []
+            )
+
+            reuploaded = await client.post(
+                "/v1/knowledge-bases/kb/documents",
+                files={"file": ("a.pdf", b"%PDF-1.4 new", "application/pdf")},
+            )
+            reuploaded_done = await _wait_job(client, reuploaded.json()["job_id"])
+            assert reuploaded_done.json()["status"] == "succeeded"
+
+    new_policy = access_store.get_document_policy("default", storage_id, document_id)
+    assert new_policy is not None
+    assert new_policy["policy"] == "inherit"
+    assert (
+        access_store.list_grants("default", storage_id, document_id=document_id) == []
+    )
+
+
+@pytest.mark.anyio
+async def test_failed_document_delete_preserves_policy_and_document_grants(
+    tmp_path, monkeypatch
+):
+    access_store = ResourceAccessStore(tmp_path / "resource-access.db")
+    app, _ = _make_app(
+        tmp_path,
+        monkeypatch=monkeypatch,
+        resource_access_store=access_store,
+    )
+    document_id = build_document_id("ghost.pdf")
+
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            created = await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
+            assert created.status_code == 201
+            storage_id = app.state.kb_registry.resolve("kb", "default")["storage_id"]
+            access_store.set_document_policy(
+                "default", storage_id, document_id, "ghost.pdf", policy="private"
+            )
+            access_store.grant_subject(
+                "default", storage_id, "alice", "viewer", document_id=document_id
+            )
+
+            deleted = await client.delete("/v1/knowledge-bases/kb/documents/ghost.pdf")
+            deleted_done = await _wait_job(client, deleted.json()["job_id"])
+
+    assert deleted_done.json()["status"] == "failed"
+    assert deleted_done.json()["error_code"] == "DOCUMENT_NOT_FOUND"
+    preserved = access_store.get_document_policy("default", storage_id, document_id)
+    assert preserved is not None
+    assert preserved["policy"] == "private"
+    assert [
+        grant["subject_id"]
+        for grant in access_store.list_grants(
+            "default", storage_id, document_id=document_id
+        )
+    ] == ["alice"]
+
+
 # 验证 ingest failure marks job failed。
 @pytest.mark.anyio
 async def test_ingest_failure_marks_job_failed(tmp_path, monkeypatch):
     # 模拟失败路径。
     def boom(kb_id, source_dir):
-        raise ValueError("解析崩了")
+        raise ValueError(f"解析崩了: {kb_id} {source_dir}/private.pdf")
 
     app, _ = _make_app(tmp_path, ingest_fn=boom, monkeypatch=monkeypatch)
     async with app.router.lifespan_context(app):
@@ -496,3 +645,6 @@ async def test_ingest_failure_marks_job_failed(tmp_path, monkeypatch):
 
     assert done.json()["status"] == "failed"
     assert done.json()["error_code"] == "INGEST_FAILED"
+    assert done.json()["message"] == "索引任务执行失败"
+    assert "private.pdf" not in done.text
+    assert str(tmp_path) not in done.text

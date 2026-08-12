@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from cogdoc.api.feedback_store import SqliteFeedbackStore
+from cogdoc.api.feedback_store import FeedbackStore, SqliteFeedbackStore
 
 
 # 读取逐行对象文件。
@@ -132,8 +132,8 @@ def test_sqlite_feedback_store_deduplicates_quick_trace_feedback(tmp_path):
     assert len(_read_jsonl(tmp_path / "feedback.jsonl")) == 1
 
 
-# 验证赞踩去重只看同一回答 trace。
-def test_sqlite_feedback_store_deduplicates_quick_feedback_across_kb(tmp_path):
+# 验证赞踩去重同时包含知识库作用域。
+def test_sqlite_feedback_store_keeps_quick_feedback_isolated_by_kb(tmp_path):
     store = SqliteFeedbackStore(
         db_path=str(tmp_path / "feedback.db"),
         feedback_path=str(tmp_path / "feedback.jsonl"),
@@ -144,9 +144,36 @@ def test_sqlite_feedback_store_deduplicates_quick_feedback_across_kb(tmp_path):
     second = store.record({"kb_id": "kb", "trace_id": "t1", "feedback": "thumbs_down"})
 
     assert first["deduplicated"] is False
-    assert second["deduplicated"] is True
-    assert store.counts(kb_id="kb")["total"] == 0
-    assert len(_read_jsonl(tmp_path / "feedback.jsonl")) == 1
+    assert second["deduplicated"] is False
+    assert store.counts(kb_id="kb")["total"] == 1
+    assert len(_read_jsonl(tmp_path / "feedback.jsonl")) == 2
+
+
+def test_jsonl_feedback_store_keeps_quick_feedback_isolated_by_kb(tmp_path):
+    store = FeedbackStore(
+        feedback_path=str(tmp_path / "feedback.jsonl"),
+        bad_cases_path=str(tmp_path / "bad_cases.jsonl"),
+    )
+
+    first = store.record(
+        {
+            "kb_id": "tenant-a-storage",
+            "trace_id": "same",
+            "feedback": "thumbs_up",
+        }
+    )
+    second = store.record(
+        {
+            "kb_id": "tenant-b-storage",
+            "trace_id": "same",
+            "feedback": "thumbs_down",
+        }
+    )
+
+    assert first["deduplicated"] is False
+    assert second["deduplicated"] is False
+    assert store.counts(kb_id="tenant-a-storage")["total"] == 1
+    assert store.counts(kb_id="tenant-b-storage")["total"] == 1
 
 
 # 验证数据库反馈存储允许同一回答后续纠错。

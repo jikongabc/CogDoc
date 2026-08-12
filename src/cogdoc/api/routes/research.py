@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from threading import Event
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from cogdoc.api.offload import run_sync, run_sync_until
@@ -24,6 +24,11 @@ from cogdoc.api.research_job_store import (
     ResearchJobStore,
     research_current_review_invariant,
     research_run_control,
+)
+from cogdoc.api.research_access import (
+    build_research_authorization,
+    research_authorization,
+    research_retrieval_scope,
 )
 from cogdoc.api.schemas import (
     ErrorCode,
@@ -39,6 +44,16 @@ from cogdoc.api.schemas import (
     ResearchReportReviewUpdate,
     build_error_response,
 )
+from cogdoc.api.tenant_scope import (
+    externalize_kb_fields,
+    is_user_session_principal,
+    request_principal,
+    resource_access_decision,
+    resolve_kb_scope,
+    scope_for_storage_id,
+    tenant_storage_ids,
+)
+from cogdoc.api.tenancy import Permission, ROLE_PERMISSIONS, Role, required_permission
 from cogdoc.daemon_executor import DaemonExecutorCapacityError
 from cogdoc.config.settings import get_settings
 from cogdoc.research_control import (
@@ -51,6 +66,7 @@ from cogdoc.service.research_execution import (
 )
 from cogdoc.service.research_provenance import (
     RESEARCH_ARTIFACT_VERSION,
+    research_artifact_sha256,
     research_artifact_integrity_status,
     research_artifact_matches_job_projection,
     research_publication_sha256,
@@ -84,16 +100,88 @@ def _manager(request: Request):
     return getattr(request.app.state, "research_execution_manager", None)
 
 
+def _job_is_authorized(request: Request, row) -> bool:
+    """Authorize both the KB and the exact evidence boundary frozen by a job."""
+
+    if not isinstance(row, dict):
+        return False
+    storage_id = str(row.get("kb_id") or "")
+    scope = scope_for_storage_id(request, storage_id) if storage_id else None
+    if scope is None:
+        return False
+    principal = request_principal(request)
+    if is_user_session_principal(principal):
+        auth_store = getattr(request.app.state, "auth_store", None)
+        membership_reader = getattr(auth_store, "membership", None)
+        if not callable(membership_reader):
+            return False
+        try:
+            membership = membership_reader(principal.tenant_id, principal.subject_id)
+            live_role = Role(str(membership.get("role") or ""))
+        except Exception:
+            return False
+        # The middleware principal is a request-start snapshot. If membership
+        # changed while a long-running research operation was in flight, do not
+        # reuse its stale role for the KB/resource ACL checks below. A retry will
+        # authenticate a fresh principal with the live role.
+        if live_role != principal.role:
+            return False
+        if (
+            required_permission(request.method, request.url.path)
+            not in ROLE_PERMISSIONS[live_role]
+        ):
+            return False
+    authorization = research_authorization(row)
+    if authorization is None:
+        # Old artifacts predate creator/source binding. Keep API-key/local mode
+        # compatible, but expose them to real users only to tenant governance.
+        return not is_user_session_principal(principal) or principal.role in {
+            Role.OWNER,
+            Role.ADMIN,
+        }
+    if str(authorization.get("tenant_id") or "") != principal.tenant_id:
+        return False
+    decision = resource_access_decision(request, scope)
+    if decision is None:
+        return True
+    if decision is False or not getattr(decision, "is_allowed", False):
+        return False
+    current_mode = str(getattr(getattr(decision, "mode", None), "value", ""))
+    if current_mode == "all":
+        return True
+    if current_mode != "subset":
+        return False
+    if str(authorization.get("mode") or "") != "subset":
+        return False
+    current_sources = {str(item) for item in decision.allowed_sources}
+    frozen_sources = {str(item) for item in authorization.get("allowed_sources") or ()}
+    return bool(frozen_sources and frozen_sources <= current_sources)
+
+
 def _accepts_keyword(operation, name: str) -> bool:
     try:
         parameters = inspect.signature(operation).parameters.values()
     except (TypeError, ValueError):
         return False
     return any(
-        parameter.name == name
-        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )
+
+
+def _provenance_matches_job_scope(status, row) -> bool:
+    """Reject a manager result that attempts to project another KB's state."""
+
+    expected_kb_id = str(row.get("kb_id") or "") if isinstance(row, dict) else ""
+    if not expected_kb_id or not isinstance(status, dict):
+        return False
+    for field in ("captured", "current"):
+        snapshot = status.get(field)
+        if snapshot in (None, {}):
+            continue
+        if not isinstance(snapshot, dict) or snapshot.get("kb_id") != expected_kb_id:
+            return False
+    return True
 
 
 def _run_auto_plan(
@@ -105,20 +193,47 @@ def _run_auto_plan(
     is_local: bool,
     deadline_at: str,
     stop_event: Event,
+    retrieval_scope=None,
 ):
     try:
         sources = source_reader(kb_id)
     except Exception:
         # An empty or legacy index can still receive a fact-free editable plan.
         sources = []
+    if retrieval_scope is not None:
+        sources = [
+            source for source in sources if retrieval_scope.allows_source(source)
+        ]
     if stop_event.is_set():
         raise ResearchCancelled("research planning request stopped")
-    kwargs = {"is_local": is_local}
+    kwargs: dict[str, bool | str | Event] = {"is_local": is_local}
     if _accepts_keyword(generator, "deadline_at"):
         kwargs["deadline_at"] = deadline_at
     if _accepts_keyword(generator, "stop_event"):
         kwargs["stop_event"] = stop_event
     return generator(objective, sources, **kwargs)
+
+
+def _commit_auto_plan_if_authorized(
+    request: Request,
+    store: ResearchJobStore,
+    current: dict,
+    job_id: str,
+    *,
+    sections,
+    expected_revision: int,
+    is_local: bool,
+):
+    """Revalidate the live ACL in the same worker call as the plan commit."""
+
+    if not _job_is_authorized(request, current):
+        return None
+    return store.update_plan(
+        job_id,
+        sections=sections,
+        expected_revision=expected_revision,
+        is_local=is_local,
+    )
 
 
 def _observe_lifecycle(
@@ -175,13 +290,10 @@ def _published_state_matches(row, report) -> bool:
     row_published_at = row.get("published_at")
     report_published_at = report.get("published_at")
     row_published_by = row.get("published_by")
-    actor_matches = (
-        row.get("artifact_schema_floor") != RESEARCH_ARTIFACT_VERSION
-        or (
-            type(row_published_by) is str
-            and bool(row_published_by)
-            and report.get("published_by") == row_published_by
-        )
+    actor_matches = row.get("artifact_schema_floor") != RESEARCH_ARTIFACT_VERSION or (
+        type(row_published_by) is str
+        and bool(row_published_by)
+        and report.get("published_by") == row_published_by
     )
     publication_matches = True
     if row.get("artifact_schema_floor") == RESEARCH_ARTIFACT_VERSION:
@@ -199,8 +311,7 @@ def _published_state_matches(row, report) -> bool:
         else:
             publication_matches = (
                 row.get("publication_sha256") == expected_publication_sha256
-                and report.get("publication_sha256")
-                == expected_publication_sha256
+                and report.get("publication_sha256") == expected_publication_sha256
             )
     return (
         row.get("status") == "completed"
@@ -442,6 +553,9 @@ def _safe_public_job_payload(row) -> dict:
     """Never expose report bodies that did not pass the v2 artifact gate."""
 
     payload = copy.deepcopy(dict(row))
+    # Authorization snapshots contain physical resource boundaries and are an
+    # internal execution capability, never an API response field.
+    payload.pop("authorization", None)
     payload["execution_control"] = _public_execution_control(row)
     has_verified_current_projection = False
     had_current_artifact = any(
@@ -478,6 +592,56 @@ def _safe_public_job_payload(row) -> dict:
     return payload
 
 
+def _rehash_externalized_artifact(report: dict) -> None:
+    """Keep a v2 artifact self-verifying after physical KB IDs are projected."""
+
+    if report.get("artifact_schema_version") != RESEARCH_ARTIFACT_VERSION:
+        return
+    report["sha256"] = research_artifact_sha256(
+        content=report["content"],
+        citation_ledger=report["citation_ledger"],
+        provenance=report["provenance"],
+        verification=report["verification"],
+        metadata={
+            "version": report["version"],
+            "generated_at": report["generated_at"],
+        },
+    )
+
+
+def _externalize_integrity_bound_job(payload: dict, request: Request) -> dict:
+    """Project physical KB IDs and rebuild response-local integrity bindings."""
+
+    public = externalize_kb_fields(copy.deepcopy(payload), request)
+    for field in ("report", "published_report"):
+        artifact = public.get(field)
+        if isinstance(artifact, dict):
+            _rehash_externalized_artifact(artifact)
+    history = public.get("report_history")
+    if isinstance(history, list):
+        for version in history:
+            artifact = version.get("report") if isinstance(version, dict) else None
+            if isinstance(artifact, dict):
+                _rehash_externalized_artifact(artifact)
+
+    published = public.get("published_report")
+    if (
+        isinstance(published, dict)
+        and published.get("artifact_schema_version") == RESEARCH_ARTIFACT_VERSION
+    ):
+        publication_sha256 = research_publication_sha256(
+            artifact_sha256=published["sha256"],
+            report_version=public["report_version"],
+            published_at=public["published_at"],
+            published_by=public["published_by"],
+            review_history=public["review_history"],
+            sections=public["sections"],
+        )
+        public["publication_sha256"] = publication_sha256
+        published["publication_sha256"] = publication_sha256
+    return public
+
+
 def _job_with_provenance(row, provenance) -> ResearchJob:
     payload = _safe_public_job_payload(row)
     if provenance is not None:
@@ -495,20 +659,30 @@ async def _public_job(row, request: Request) -> ResearchJob:
             manager.provenance,
             row,
         )
-    return _job_with_provenance(row, provenance)
+    return ResearchJob.model_validate(
+        _externalize_integrity_bound_job(
+            _job_with_provenance(row, provenance).model_dump(mode="json"), request
+        )
+    )
 
 
 async def _public_jobs(rows, request: Request) -> list[ResearchJob]:
     manager = _manager(request)
     if manager is None:
-        return [_job_with_provenance(row, None) for row in rows]
+        return [await _public_job(row, request) for row in rows]
     statuses = await run_sync(
         request.app.state.offload_executor,
         manager.provenance_many,
         rows,
     )
     return [
-        _job_with_provenance(row, provenance) for row, provenance in zip(rows, statuses)
+        ResearchJob.model_validate(
+            _externalize_integrity_bound_job(
+                _job_with_provenance(row, provenance).model_dump(mode="json"),
+                request,
+            )
+        )
+        for row, provenance in zip(rows, statuses)
     ]
 
 
@@ -579,7 +753,8 @@ def _published_bundle(job_id: str, row: dict, report: dict) -> bytes:
 
 @router.post("", status_code=201, response_model=ResearchJobResponse)
 async def create_research_job(body: ResearchJobCreate, request: Request):
-    if not request.app.state.kb_registry.exists(body.kb_id):
+    scope = resolve_kb_scope(request, body.kb_id)
+    if scope is None:
         _observe_lifecycle(
             request,
             action="create",
@@ -588,7 +763,7 @@ async def create_research_job(body: ResearchJobCreate, request: Request):
         )
         return _error(
             ErrorCode.KB_NOT_FOUND,
-            f"知识库不存在: {body.kb_id}",
+            "知识库不存在",
             404,
         )
     store = _store(request)
@@ -600,14 +775,43 @@ async def create_research_job(body: ResearchJobCreate, request: Request):
             error_class="ResearchStoreUnavailable",
         )
         return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
+    principal = request_principal(request)
+    resource_store = getattr(request.app.state, "resource_access_store", None)
+    authorization = None
+    if resource_store is not None:
+        decision = resource_access_decision(request, scope, permission=Permission.QUERY)
+        authorization = build_research_authorization(principal, decision)
+        if authorization["mode"] == "deny":
+            return _error(
+                ErrorCode.KB_NOT_FOUND,
+                "知识库不存在",
+                404,
+            )
+    elif is_user_session_principal(principal):
+        return _error(
+            ErrorCode.INTERNAL_ERROR,
+            "研究权限服务不可用",
+            503,
+        )
+    create_kwargs = {
+        "kb_id": scope.storage_id,
+        "objective": body.objective,
+        "title": body.title,
+        "section_titles": body.section_titles,
+        "is_local": body.is_local,
+    }
+    if authorization is not None and _accepts_keyword(store.create, "authorization"):
+        create_kwargs["authorization"] = authorization
+    elif authorization is not None:
+        return _error(
+            ErrorCode.INTERNAL_ERROR,
+            "研究任务存储不支持权限快照",
+            503,
+        )
     row = await run_sync(
         request.app.state.offload_executor,
         store.create,
-        kb_id=body.kb_id,
-        objective=body.objective,
-        title=body.title,
-        section_titles=body.section_titles,
-        is_local=body.is_local,
+        **create_kwargs,
     )
     _observe_lifecycle(request, action="create", outcome="succeeded", row=row)
     return ResearchJobResponse(job=await _public_job(row, request))
@@ -633,13 +837,39 @@ async def list_research_jobs(
     store = _store(request)
     if store is None:
         return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
-    rows = await run_sync(
-        request.app.state.offload_executor,
-        store.list,
-        kb_id=kb_id,
-        status=status,
-        limit=limit,
-    )
+    allowed_ids = tenant_storage_ids(request)
+    if kb_id is not None:
+        scope = resolve_kb_scope(request, kb_id)
+        if scope is None:
+            return ResearchJobListResponse()
+        rows = await run_sync(
+            request.app.state.offload_executor,
+            store.list,
+            kb_id=scope.storage_id,
+            status=status,
+            limit=limit,
+        )
+    else:
+        rows = []
+        for storage_id in allowed_ids:
+            rows.extend(
+                await run_sync(
+                    request.app.state.offload_executor,
+                    store.list,
+                    kb_id=storage_id,
+                    status=status,
+                    limit=limit,
+                )
+            )
+        rows.sort(
+            key=lambda row: (
+                str(row.get("updated_at") or ""),
+                str(row.get("job_id") or ""),
+            ),
+            reverse=True,
+        )
+        rows = rows[:limit]
+    rows = [row for row in rows if _job_is_authorized(request, row)]
     return ResearchJobListResponse(jobs=await _public_jobs(rows, request))
 
 
@@ -670,15 +900,48 @@ async def list_research_job_summaries(
         decoded = decode_research_summary_cursor(cursor) if cursor else None
     except ResearchSummaryCursorError as exc:
         return _error(ErrorCode.BAD_REQUEST, str(exc), 400)
-    rows = await run_sync(
-        request.app.state.offload_executor,
-        store.list_summary_rows,
-        kb_id=kb_id,
-        status=status,
-        limit=limit + 1,
-        before_updated_at=(decoded.updated_at if decoded else None),
-        before_job_id=(decoded.job_id if decoded else None),
+    allowed_ids = tenant_storage_ids(request)
+    storage_kb_id = None
+    if kb_id is not None:
+        scope = resolve_kb_scope(request, kb_id)
+        if scope is None:
+            return ResearchJobSummaryPage()
+        storage_kb_id = scope.storage_id
+    if storage_kb_id is not None:
+        query_storage_ids = [storage_kb_id]
+    else:
+        query_storage_ids = sorted(allowed_ids)
+    rows = []
+    for query_storage_id in query_storage_ids:
+        rows.extend(
+            await run_sync(
+                request.app.state.offload_executor,
+                store.list_summary_rows,
+                kb_id=query_storage_id,
+                status=status,
+                limit=limit + 1,
+                before_updated_at=(decoded.updated_at if decoded else None),
+                before_job_id=(decoded.job_id if decoded else None),
+            )
+        )
+    rows.sort(
+        key=lambda row: (
+            str(row.get("updated_at") or ""),
+            str(row.get("job_id") or ""),
+        ),
+        reverse=True,
     )
+    rows = rows[: limit + 1]
+    authorized_rows = []
+    for summary_row in rows:
+        full_row = await run_sync(
+            request.app.state.offload_executor,
+            store.get,
+            str(summary_row.get("job_id") or ""),
+        )
+        if full_row is not None and _job_is_authorized(request, full_row):
+            authorized_rows.append(summary_row)
+    rows = authorized_rows
     manager = _manager(request)
     provenances = None
     if manager is not None:
@@ -701,7 +964,7 @@ async def list_research_job_summaries(
             "研究任务摘要投影失败",
             500,
         )
-    payload = page.model_dump(mode="json")
+    payload = externalize_kb_fields(page.model_dump(mode="json"), request)
     etag = research_summary_page_etag(payload)
     headers = {
         "ETag": etag,
@@ -719,7 +982,7 @@ async def get_research_job(job_id: str, request: Request):
     if store is None:
         return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
     row = await run_sync(request.app.state.offload_executor, store.get, job_id)
-    if row is None:
+    if row is None or not _job_is_authorized(request, row):
         return _error(
             ErrorCode.RESEARCH_JOB_NOT_FOUND,
             f"研究任务不存在: {job_id}",
@@ -730,6 +993,16 @@ async def get_research_job(job_id: str, request: Request):
 
 @router.get("/{job_id}/provenance", response_model=ResearchProvenanceResponse)
 async def get_research_provenance(job_id: str, request: Request):
+    store = _store(request)
+    if store is None:
+        return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
+    current = await run_sync(request.app.state.offload_executor, store.get, job_id)
+    if current is None or not _job_is_authorized(request, current):
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
     manager = _manager(request)
     if manager is None:
         return _error(ErrorCode.INTERNAL_ERROR, "研究执行器不可用", 503)
@@ -745,12 +1018,23 @@ async def get_research_provenance(job_id: str, request: Request):
             f"研究任务不存在: {job_id}",
             404,
         )
-    return ResearchProvenanceResponse(
-        job_id=job_id,
-        status=status["status"],
-        stale_reasons=status["stale_reasons"],
-        captured=status["captured"] or None,
-        current=status["current"] or None,
+    if not _provenance_matches_job_scope(status, current):
+        return _error(
+            ErrorCode.INTERNAL_ERROR,
+            "研究来源快照作用域校验失败",
+            500,
+        )
+    return ResearchProvenanceResponse.model_validate(
+        externalize_kb_fields(
+            ResearchProvenanceResponse(
+                job_id=job_id,
+                status=status["status"],
+                stale_reasons=status["stale_reasons"],
+                captured=status["captured"] or None,
+                current=status["current"] or None,
+            ).model_dump(mode="json"),
+            request,
+        )
     )
 
 
@@ -762,6 +1046,16 @@ async def _execution_action(
     lifecycle_action: str | None = None,
 ):
     observed_action = lifecycle_action or action
+    store = _store(request)
+    if store is None:
+        return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
+    current = await run_sync(request.app.state.offload_executor, store.get, job_id)
+    if current is None or not _job_is_authorized(request, current):
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
     manager = _manager(request)
     if manager is None:
         _observe_lifecycle(
@@ -821,6 +1115,12 @@ async def _execution_action(
             error_class=type(exc).__name__,
         )
         return _error(ErrorCode.RESEARCH_JOB_STATE_CONFLICT, str(exc), 409)
+    if not _job_is_authorized(request, row):
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
     _observe_lifecycle(
         request,
         action=observed_action,
@@ -879,7 +1179,7 @@ async def download_research_report(job_id: str, request: Request):
     if store is None:
         return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
     row = await run_sync(request.app.state.offload_executor, store.get, job_id)
-    if row is None:
+    if row is None or not _job_is_authorized(request, row):
         return _error(
             ErrorCode.RESEARCH_JOB_NOT_FOUND,
             f"研究任务不存在: {job_id}",
@@ -917,11 +1217,21 @@ async def review_research_report(
     job_id: str,
     body: ResearchReportReviewUpdate,
     request: Request,
-    _reviewer: str = Depends(require_eval_reviewer),
 ):
     store = _store(request)
     if store is None:
         return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
+    current = await run_sync(request.app.state.offload_executor, store.get, job_id)
+    if current is None or not _job_is_authorized(request, current):
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
+    # Resource existence/ownership is intentionally resolved before the
+    # independent reviewer credential so opaque cross-tenant IDs always look
+    # absent rather than becoming an authorization oracle.
+    _reviewer = await require_eval_reviewer(request)
     manager = _manager(request)
     try:
         if manager is not None:
@@ -956,6 +1266,12 @@ async def review_research_report(
         return _error(ErrorCode.RESEARCH_JOB_STATE_CONFLICT, str(exc), 409)
     except ValueError as exc:
         return _error(ErrorCode.BAD_REQUEST, str(exc), 422)
+    if not _job_is_authorized(request, row):
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
     return ResearchJobResponse(job=await _public_job(row, request))
 
 
@@ -964,11 +1280,18 @@ async def publish_research_report(
     job_id: str,
     body: ResearchReportPublishRequest,
     request: Request,
-    _reviewer: str = Depends(require_eval_reviewer),
 ):
     store = _store(request)
     if store is None:
         return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
+    current = await run_sync(request.app.state.offload_executor, store.get, job_id)
+    if current is None or not _job_is_authorized(request, current):
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
+    _reviewer = await require_eval_reviewer(request)
     manager = _manager(request)
     try:
         if manager is not None:
@@ -999,6 +1322,12 @@ async def publish_research_report(
         return _error(ErrorCode.RESEARCH_EVIDENCE_STALE, str(exc), 409)
     except ResearchJobStateConflictError as exc:
         return _error(ErrorCode.RESEARCH_JOB_STATE_CONFLICT, str(exc), 409)
+    if not _job_is_authorized(request, row):
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
     return ResearchJobResponse(job=await _public_job(row, request))
 
 
@@ -1008,7 +1337,7 @@ async def download_published_research_report(job_id: str, request: Request):
     if store is None:
         return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
     row = await run_sync(request.app.state.offload_executor, store.get, job_id)
-    if row is None:
+    if row is None or not _job_is_authorized(request, row):
         return _error(
             ErrorCode.RESEARCH_JOB_NOT_FOUND,
             f"研究任务不存在: {job_id}",
@@ -1063,7 +1392,7 @@ async def download_published_research_bundle(job_id: str, request: Request):
     if store is None:
         return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
     row = await run_sync(request.app.state.offload_executor, store.get, job_id)
-    if row is None:
+    if row is None or not _job_is_authorized(request, row):
         return _error(
             ErrorCode.RESEARCH_JOB_NOT_FOUND,
             f"研究任务不存在: {job_id}",
@@ -1102,12 +1431,20 @@ async def download_published_research_bundle(job_id: str, request: Request):
             message,
             409,
         )
+    public_row = _externalize_integrity_bound_job(row, request)
+    public_report = public_row.get("published_report")
+    if not isinstance(public_report, dict):
+        return _error(
+            ErrorCode.RESEARCH_JOB_STATE_CONFLICT,
+            "已发布研究报告公开投影失败",
+            409,
+        )
     bundle = await run_sync(
         request.app.state.offload_executor,
         _published_bundle,
         job_id,
-        row,
-        report,
+        public_row,
+        public_report,
     )
     return Response(
         content=bundle,
@@ -1130,6 +1467,13 @@ async def update_research_plan(
     store = _store(request)
     if store is None:
         return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
+    current = await run_sync(request.app.state.offload_executor, store.get, job_id)
+    if current is None or not _job_is_authorized(request, current):
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
     try:
         row = await run_sync(
             request.app.state.offload_executor,
@@ -1150,6 +1494,12 @@ async def update_research_plan(
         return _error(ErrorCode.RESEARCH_JOB_STATE_CONFLICT, str(exc), 409)
     except ValueError as exc:
         return _error(ErrorCode.BAD_REQUEST, str(exc), 422)
+    if not _job_is_authorized(request, row):
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
     return ResearchJobResponse(job=await _public_job(row, request))
 
 
@@ -1163,7 +1513,7 @@ async def generate_research_plan(
     if store is None:
         return _error(ErrorCode.INTERNAL_ERROR, "研究任务存储不可用", 503)
     current = await run_sync(request.app.state.offload_executor, store.get, job_id)
-    if current is None:
+    if current is None or not _job_is_authorized(request, current):
         return _error(
             ErrorCode.RESEARCH_JOB_NOT_FOUND,
             f"研究任务不存在: {job_id}",
@@ -1221,6 +1571,7 @@ async def generate_research_plan(
                 is_local=execution_is_local,
                 deadline_at=planning_deadline_at,
                 stop_event=planning_stop,
+                retrieval_scope=research_retrieval_scope(current),
                 deadline_monotonic=planning_deadline_monotonic,
                 on_cancel=planning_stop.set,
                 on_timeout=planning_stop.set,
@@ -1250,7 +1601,10 @@ async def generate_research_plan(
     try:
         row = await run_sync(
             request.app.state.offload_executor,
-            store.update_plan,
+            _commit_auto_plan_if_authorized,
+            request,
+            store,
+            current,
             job_id,
             sections=sections,
             expected_revision=body.expected_revision,
@@ -1262,4 +1616,16 @@ async def generate_research_plan(
         return _error(ErrorCode.RESEARCH_JOB_STATE_CONFLICT, str(exc), 409)
     except ValueError as exc:
         return _error(ErrorCode.BAD_REQUEST, str(exc), 422)
+    if row is None:
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
+    if not _job_is_authorized(request, row):
+        return _error(
+            ErrorCode.RESEARCH_JOB_NOT_FOUND,
+            f"研究任务不存在: {job_id}",
+            404,
+        )
     return ResearchJobResponse(job=await _public_job(row, request))

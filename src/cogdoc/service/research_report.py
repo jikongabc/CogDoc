@@ -17,6 +17,7 @@ from cogdoc.agents.research_coverage_auditor import (
 )
 from cogdoc.agents.qa_generator import Generator
 from cogdoc.agents.summary_generator import attach_section_citations
+from cogdoc.api.research_access import research_retrieval_scope
 from cogdoc.config.settings import get_settings
 from cogdoc.graph.state import RetrievedDoc
 from cogdoc.research_control import research_checkpoint
@@ -1207,6 +1208,7 @@ def resolve_research_evidence(
                 settings.evidence_unit_verify_max_units_per_batch
             ),
             structured_client=structured_client,
+            authorization_scope=research_retrieval_scope(job),
         )
 
     execution_by_id = {

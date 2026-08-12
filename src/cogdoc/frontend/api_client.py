@@ -6,6 +6,21 @@ from typing import Any, Callable, Iterable, Iterator
 import httpx
 
 DEFAULT_TIMEOUT = 180.0
+WORKSPACE_HEADER = "X-CogDoc-Workspace"
+
+
+def _canonical_workspace_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 160
+        or any(ord(character) < 33 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError("workspace_id must be an exact canonical identifier")
+    return value
 
 
 # 定义接口错误。
@@ -102,12 +117,15 @@ class CogDocClient:
         base_url: str,
         timeout: float = DEFAULT_TIMEOUT,
         api_key: str | None = None,
+        workspace_id: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         # 后端开启鉴权时带上密钥；缺省读环境变量，未配置则不带头。
         key = api_key if api_key is not None else os.getenv("COGDOC_API_KEY", "")
         self._headers = {"Authorization": f"Bearer {key}"} if key else {}
+        self.workspace_id: str | None = None
+        self.set_workspace(workspace_id)
         # Session caches must not cross authentication identities, while the
         # credential itself must never become part of a Streamlit cache key.
         self.auth_cache_identity = (
@@ -117,6 +135,409 @@ class CogDocClient:
     # 拼接结果。
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
+
+    def set_workspace(self, workspace_id: str | None) -> None:
+        """Pin subsequent protected requests to one explicit workspace."""
+
+        self.workspace_id = _canonical_workspace_id(workspace_id)
+        # Replace rather than mutate the mapping: an in-flight httpx call or
+        # observer must keep the exact tab selector it started with.
+        headers = {
+            key: value
+            for key, value in self._headers.items()
+            if key != WORKSPACE_HEADER
+        }
+        if self.workspace_id is not None:
+            headers[WORKSPACE_HEADER] = self.workspace_id
+        self._headers = headers
+
+    def _headers_for_workspace(self, workspace_id: str) -> dict[str, str]:
+        headers = dict(self._headers)
+        headers[WORKSPACE_HEADER] = _canonical_workspace_id(workspace_id) or ""
+        return headers
+
+    def _remember_response_workspace(self, response: httpx.Response) -> httpx.Response:
+        if not 200 <= response.status_code < 300:
+            return response
+        payload = response_payload(response)
+        if not isinstance(payload, Mapping):
+            return response
+        workspace = payload.get("workspace")
+        if not isinstance(workspace, Mapping):
+            return response
+        workspace_id = workspace.get("workspace_id")
+        if isinstance(workspace_id, str):
+            self.set_workspace(workspace_id)
+        return response
+
+    # 读取部署的账号认证能力；该端点始终公开且不会携带凭据也能调用。
+    def get_auth_config(self) -> httpx.Response:
+        return httpx.get(
+            self._url("/v1/auth/config"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def auth_config(self) -> httpx.Response:
+        return self.get_auth_config()
+
+    # 注册账号并创建个人工作区。
+    def register(
+        self,
+        email: str,
+        password: str,
+        display_name: str,
+        workspace_name: str | None = None,
+    ) -> httpx.Response:
+        payload = {
+            "email": email,
+            "password": password,
+            "display_name": display_name,
+            "workspace_name": workspace_name,
+        }
+        response = httpx.post(
+            self._url("/v1/auth/register"),
+            json={key: value for key, value in payload.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+        return self._remember_response_workspace(response)
+
+    # 使用邮箱密码创建不落盘的 Bearer 会话。
+    def login(
+        self,
+        email: str,
+        password: str,
+        workspace_id: str | None = None,
+    ) -> httpx.Response:
+        payload = {
+            "email": email,
+            "password": password,
+            "workspace_id": workspace_id,
+        }
+        response = httpx.post(
+            self._url("/v1/auth/login"),
+            json={key: value for key, value in payload.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+        return self._remember_response_workspace(response)
+
+    def logout(self) -> httpx.Response:
+        return httpx.post(
+            self._url("/v1/auth/logout"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def logout_all(self) -> httpx.Response:
+        return httpx.post(
+            self._url("/v1/auth/logout-all"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def change_password(
+        self, current_password: str, new_password: str
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url("/v1/auth/change-password"),
+            json={
+                "current_password": current_password,
+                "new_password": new_password,
+            },
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_me(self) -> httpx.Response:
+        response = httpx.get(
+            self._url("/v1/auth/me"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+        return self._remember_response_workspace(response)
+
+    def me(self) -> httpx.Response:
+        return self.get_me()
+
+    def list_auth_sessions(self) -> httpx.Response:
+        return httpx.get(
+            self._url("/v1/auth/sessions"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def delete_auth_session(self, session_id: str) -> httpx.Response:
+        return httpx.delete(
+            self._url(f"/v1/auth/sessions/{session_id}"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    # 工作区和成员管理。
+    def list_workspaces(self) -> httpx.Response:
+        return httpx.get(
+            self._url("/v1/workspaces"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_workspace(self, workspace_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/workspaces/{workspace_id}"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def create_workspace(self, name: str) -> httpx.Response:
+        return httpx.post(
+            self._url("/v1/workspaces"),
+            json={"name": name},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def update_workspace(
+        self,
+        workspace_id: str,
+        name: str,
+        expected_revision: int | None = None,
+    ) -> httpx.Response:
+        payload = {"name": name, "expected_revision": expected_revision}
+        return httpx.patch(
+            self._url(f"/v1/workspaces/{workspace_id}"),
+            json={key: value for key, value in payload.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def delete_workspace(self, workspace_id: str) -> httpx.Response:
+        return httpx.delete(
+            self._url(f"/v1/workspaces/{workspace_id}"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def switch_workspace(self, workspace_id: str) -> httpx.Response:
+        response = httpx.post(
+            self._url(f"/v1/workspaces/{workspace_id}/switch"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+        return self._remember_response_workspace(response)
+
+    def list_workspace_members(self, workspace_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/workspaces/{workspace_id}/members"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def update_workspace_member(
+        self,
+        workspace_id: str,
+        member_id: str,
+        role: str,
+        expected_revision: int | None = None,
+    ) -> httpx.Response:
+        payload = {"role": role, "expected_revision": expected_revision}
+        return httpx.patch(
+            self._url(f"/v1/workspaces/{workspace_id}/members/{member_id}"),
+            json={key: value for key, value in payload.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def remove_workspace_member(
+        self, workspace_id: str, member_id: str
+    ) -> httpx.Response:
+        return httpx.delete(
+            self._url(f"/v1/workspaces/{workspace_id}/members/{member_id}"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def create_workspace_invite(
+        self, workspace_id: str, email: str, role: str
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url(f"/v1/workspaces/{workspace_id}/invites"),
+            json={"email": email, "role": role},
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def list_workspace_invites(self, workspace_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/workspaces/{workspace_id}/invites"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def revoke_workspace_invite(
+        self, workspace_id: str, invite_id: str
+    ) -> httpx.Response:
+        return httpx.delete(
+            self._url(f"/v1/workspaces/{workspace_id}/invites/{invite_id}"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def accept_workspace_invite(
+        self,
+        token: str,
+        *,
+        email: str | None = None,
+        password: str | None = None,
+        display_name: str | None = None,
+    ) -> httpx.Response:
+        payload = {
+            "token": token,
+            "email": email,
+            "password": password,
+            "display_name": display_name,
+        }
+        response = httpx.post(
+            self._url("/v1/auth/invitations/accept"),
+            json={key: value for key, value in payload.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+        return self._remember_response_workspace(response)
+
+    def accept_invite(
+        self,
+        token: str,
+        *,
+        email: str | None = None,
+        password: str | None = None,
+        display_name: str | None = None,
+    ) -> httpx.Response:
+        return self.accept_workspace_invite(
+            token,
+            email=email,
+            password=password,
+            display_name=display_name,
+        )
+
+    # 知识库和文档的可见性策略与按主体授权。
+    def get_kb_access_policy(self, kb_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/knowledge-bases/{kb_id}/access"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def update_kb_access_policy(self, kb_id: str, policy: str) -> httpx.Response:
+        return httpx.patch(
+            self._url(f"/v1/knowledge-bases/{kb_id}/access"),
+            json={"schema_version": "v1", "policy": policy},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_document_access_policy(
+        self, kb_id: str, document_id: str
+    ) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def update_document_access_policy(
+        self,
+        kb_id: str,
+        document_id: str,
+        policy: str,
+        *,
+        source: str | None = None,
+    ) -> httpx.Response:
+        payload = {"schema_version": "v1", "policy": policy, "source": source}
+        return httpx.patch(
+            self._url(
+                f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access"
+            ),
+            json={key: value for key, value in payload.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_kb_grants(self, kb_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/knowledge-bases/{kb_id}/access/grants"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def grant_kb_access(
+        self, kb_id: str, subject_id: str, role: str
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url(f"/v1/knowledge-bases/{kb_id}/access/grants"),
+            json={
+                "schema_version": "v1",
+                "subject_id": subject_id,
+                "role": role,
+            },
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def revoke_kb_access(self, kb_id: str, subject_id: str) -> httpx.Response:
+        return httpx.delete(
+            self._url(
+                f"/v1/knowledge-bases/{kb_id}/access/grants/{subject_id}"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_document_grants(
+        self, kb_id: str, document_id: str
+    ) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access/grants"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def grant_document_access(
+        self,
+        kb_id: str,
+        document_id: str,
+        subject_id: str,
+        role: str,
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url(
+                f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access/grants"
+            ),
+            json={
+                "schema_version": "v1",
+                "subject_id": subject_id,
+                "role": role,
+            },
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def revoke_document_access(
+        self, kb_id: str, document_id: str, subject_id: str
+    ) -> httpx.Response:
+        return httpx.delete(
+            self._url(
+                f"/v1/knowledge-bases/{kb_id}/documents/{document_id}"
+                f"/access/grants/{subject_id}"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
 
     # 列出知识库。
     def list_knowledge_bases(self) -> list[dict]:
@@ -128,10 +549,12 @@ class CogDocClient:
         return _expect_list(_checked_json(response), "知识库列表")
 
     # 创建知识库。
-    def create_knowledge_base(self, kb_id: str) -> httpx.Response:
+    def create_knowledge_base(
+        self, kb_id: str, *, access_policy: str = "workspace"
+    ) -> httpx.Response:
         return httpx.post(
             self._url("/v1/knowledge-bases"),
-            json={"kb_id": kb_id},
+            json={"kb_id": kb_id, "access_policy": access_policy},
             timeout=self.timeout,
             headers=self._headers,
         )

@@ -68,6 +68,7 @@ def test_settings_defaults_match_current_runtime_contract():
     assert settings.cogdoc_log_to_console is False
     assert settings.cogdoc_trace_enabled is True
     assert settings.cogdoc_trace_dir == "logs/traces"
+    assert settings.cogdoc_chat_stream_idle_timeout_seconds == 300.0
     assert settings.eval_review_api_key_set == set()
     assert settings.cogdoc_ocr_enabled is False
     assert settings.cogdoc_ocr_provider == "tesseract"
@@ -109,6 +110,7 @@ def test_settings_reads_environment_overrides(monkeypatch):
     monkeypatch.setenv("QA_ADAPTIVE_RETRIEVAL_MAX_RETRIES", "2")
     monkeypatch.setenv("QA_ADAPTIVE_RETRIEVAL_MAX_TOP_K", "24")
     monkeypatch.setenv("COGDOC_EVAL_REVIEW_API_KEYS", "review-a, review-b")
+    monkeypatch.setenv("COGDOC_CHAT_STREAM_IDLE_TIMEOUT_SECONDS", "45")
 
     settings = get_settings()
 
@@ -139,6 +141,73 @@ def test_settings_reads_environment_overrides(monkeypatch):
     assert settings.qa_adaptive_retrieval_max_retries == 2
     assert settings.qa_adaptive_retrieval_max_top_k == 24
     assert settings.eval_review_api_key_set == {"review-a", "review-b"}
+    assert settings.cogdoc_chat_stream_idle_timeout_seconds == 45.0
+
+
+def test_chat_stream_idle_timeout_is_bounded():
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, cogdoc_chat_stream_idle_timeout_seconds=0.5)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, cogdoc_chat_stream_idle_timeout_seconds=3601)
+
+
+def test_api_principal_map_parses_json_without_exposing_legacy_keys(monkeypatch):
+    monkeypatch.setenv(
+        "COGDOC_API_PRINCIPALS",
+        '{"team-key":{"tenant_id":"team-a","subject_id":"alice","role":"editor"}}',
+    )
+    settings = Settings(_env_file=None)
+
+    assert settings.api_principal_map == {
+        "team-key": {
+            "tenant_id": "team-a",
+            "subject_id": "alice",
+            "role": "editor",
+        }
+    }
+    assert settings.api_key_set == set()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "[]",
+        '"not-an-object"',
+        '{"key":"not-an-object"}',
+        (
+            '{"key":{"tenant_id":"t","subject_id":"s",'
+            '"role":"viewer","rol":"owner"}}'
+        ),
+        (
+            '{"key":{"tenant_id":"t","subject_id":"s",'
+            '"role":"viewer","role":"owner"}}'
+        ),
+        (
+            '{" key ":{"tenant_id":"t","subject_id":"s","role":"viewer"},'
+            '"key":{"tenant_id":"t","subject_id":"s","role":"owner"}}'
+        ),
+        "{broken",
+    ],
+)
+def test_api_principal_map_rejects_malformed_configuration(monkeypatch, raw):
+    monkeypatch.setenv("COGDOC_API_PRINCIPALS", raw)
+    settings = Settings(_env_file=None)
+
+    with pytest.raises(ValueError, match="COGDOC_API_PRINCIPALS"):
+        _ = settings.api_principal_map
+
+
+def test_tenant_quota_settings_and_audit_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("COGDOC_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("COGDOC_TENANT_MAX_KNOWLEDGE_BASES", "4")
+    monkeypatch.setenv("COGDOC_TENANT_MAX_DOCUMENTS", "20")
+    monkeypatch.setenv("COGDOC_TENANT_MAX_STORAGE_MB", "512")
+    settings = Settings(_env_file=None)
+
+    assert settings.cogdoc_tenant_max_knowledge_bases == 4
+    assert settings.cogdoc_tenant_max_documents == 20
+    assert settings.cogdoc_tenant_max_storage_mb == 512
+    assert settings.audit_log_path == str(tmp_path / "audit" / "events.jsonl")
 
 
 @pytest.mark.parametrize(

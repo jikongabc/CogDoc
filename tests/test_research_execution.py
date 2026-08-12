@@ -429,6 +429,141 @@ def test_research_execution_manager_builds_and_persists_report(tmp_path):
     assert 'cogdoc_research_coverage_audits_total{status="passed"} 1.0' in scraped
 
 
+def test_research_evidence_revocation_before_commit_does_not_persist_output(
+    tmp_path, monkeypatch
+):
+    from cogdoc.service import research_execution
+
+    store = ResearchJobStore(str(tmp_path / "research.json"))
+    authorization = {
+        "version": "research-auth-v1",
+        "tenant_id": "tenant-a",
+        "created_by": "user-a",
+        "creator_role": "editor",
+        "auth_kind": "user_session",
+        "mode": "all",
+        "acl_epoch": 1,
+        "allowed_sources": [],
+    }
+    job = store.create(
+        kb_id="kb",
+        objective="revoked evidence",
+        section_titles=["section"],
+        authorization=authorization,
+    )
+    authorized = True
+    shape_evidence = research_execution.public_research_evidence
+
+    def shape_then_revoke(docs, *args, **kwargs):
+        nonlocal authorized
+        evidence = shape_evidence(docs, *args, **kwargs)
+        authorized = False
+        return evidence
+
+    monkeypatch.setattr(
+        research_execution,
+        "public_research_evidence",
+        shape_then_revoke,
+    )
+
+    manager = ResearchExecutionManager(
+        store,
+        retrieve=lambda _kb_id, _query: [_doc("revoked-evidence")],
+        kb_exists=lambda _kb_id: True,
+        authorization_checker=lambda _job: authorized,
+    )
+    try:
+        manager.start(job["job_id"])
+        failed = _wait_for(store, job["job_id"], "failed")
+    finally:
+        manager.shutdown()
+
+    section = failed["sections"][0]
+    assert section["status"] == "failed"
+    assert section["evidence"] == []
+    assert section["evidence_status"] == "unsearched"
+    assert set(section["execution_metrics"]) == {"_research_control"}
+    assert not {
+        "candidate_count",
+        "evidence_count",
+        "query_count",
+        "requirements",
+    } & set(section["execution_metrics"])
+    assert "revoked-evidence" not in str(failed)
+
+
+def test_research_report_revocation_before_commit_does_not_persist_output(tmp_path):
+    store = ResearchJobStore(str(tmp_path / "research.json"))
+    authorization = {
+        "version": "research-auth-v1",
+        "tenant_id": "tenant-a",
+        "created_by": "user-a",
+        "creator_role": "editor",
+        "auth_kind": "user_session",
+        "mode": "all",
+        "acl_epoch": 1,
+        "allowed_sources": [],
+    }
+    job = store.create(
+        kb_id="kb",
+        objective="revoked report",
+        section_titles=["section"],
+        authorization=authorization,
+    )
+    authorized = True
+    report_built = False
+
+    def provenance_after_possible_revocation(_kb_id):
+        nonlocal authorized
+        if report_built:
+            authorized = False
+        return _provenance()
+
+    def build_then_mark(current):
+        nonlocal report_built
+        result = _report_result(
+            current,
+            [
+                {
+                    "section_id": "s1",
+                    "status": "no_evidence",
+                    "verification_status": "no_evidence",
+                    "verification_reason_code": "no_direct_support",
+                    "content": "revoked report body",
+                    "claim_audit": {},
+                    "coverage_audit": {},
+                    "evidence": [],
+                    "error": "",
+                }
+            ],
+            status="ready_with_gaps",
+            verification_metrics={"verification_error_count": 1},
+        )
+        report_built = True
+        return result
+
+    manager = ResearchExecutionManager(
+        store,
+        retrieve=lambda _kb_id, _query: [],
+        kb_exists=lambda _kb_id: True,
+        report_builder=build_then_mark,
+        provenance_reader=provenance_after_possible_revocation,
+        authorization_checker=lambda _job: authorized,
+    )
+    try:
+        manager.start(job["job_id"])
+        _wait_for(store, job["job_id"], "evidence_ready")
+        manager.compile(job["job_id"])
+        failed = _wait_for(store, job["job_id"], "failed")
+    finally:
+        manager.shutdown()
+
+    assert failed["report_status"] == "failed"
+    assert failed["report"] is None
+    assert failed["sections"][0]["citation_ledger"] == []
+    assert "revoked report body" not in str(failed)
+
+
 def test_research_execution_manager_fails_report_closed_and_allows_retry(tmp_path):
     store = ResearchJobStore(str(tmp_path / "research.json"))
     job = store.create(kb_id="kb", objective="研究", section_titles=["章节"])

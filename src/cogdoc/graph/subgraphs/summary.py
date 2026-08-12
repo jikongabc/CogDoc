@@ -37,6 +37,9 @@ def document_loader_node(state: GraphState) -> dict:
     with kb_read_lease(doc_id):
         engine = RetrieverFactory.get_engine(doc_id)
         sources = engine.list_sources()
+    retrieval_scope = state.get("retrieval_scope")
+    if retrieval_scope is not None:
+        sources = [source for source in sources if retrieval_scope.allows_source(source)]
     selected_source = select_source_for_summary(query, sources)
 
     resolution_trace = []
@@ -84,6 +87,8 @@ def document_loader_node(state: GraphState) -> dict:
 
     with kb_read_lease(doc_id):
         docs = RetrieverFactory.get_engine(doc_id).load_source_chunks(selected_source)
+    if retrieval_scope is not None:
+        docs = [doc for doc in docs if retrieval_scope.allows_document(doc)]
     if not docs:
         message = f"未能从当前索引加载文档：{selected_source}。请重建索引后再试。"
         result = {
@@ -181,6 +186,7 @@ def section_evidence_node(
     )
     configurable = (config or {}).get("configurable", {})
     runtime = configurable.get("state_runtime")
+    authorization_scope = configurable.get("retrieval_scope")
     if runtime is None:
         from cogdoc.state_runtime import default_state_runtime
 
@@ -208,6 +214,7 @@ def section_evidence_node(
                 settings.evidence_unit_verify_max_units_per_batch
             ),
             structured_client=configurable.get("evidence_unit_structured_client"),
+            authorization_scope=authorization_scope,
         )
 
     metrics = batch.metrics

@@ -5,6 +5,8 @@ import hmac
 
 from fastapi import HTTPException, Request
 
+from cogdoc.api.tenancy import Permission, Principal
+
 
 def _request_api_key(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
@@ -22,6 +24,26 @@ async def require_eval_reviewer(request: Request) -> str:
     completion notification is missed.
     """
 
+    # Explicit tenant principals are the new collaboration authority.  The
+    # middleware has already resolved the endpoint-specific REVIEW/PUBLISH
+    # permission, and the fingerprint set proves this is not the permissive
+    # local principal or a legacy shared admin key.
+    principal = getattr(request.state, "principal", None)
+    explicit_fingerprints = set(
+        getattr(request.app.state, "explicit_principal_fingerprints", set())
+    )
+    if (
+        isinstance(principal, Principal)
+        and principal.key_fingerprint in explicit_fingerprints
+        and (
+            principal.allows(Permission.REVIEW)
+            or principal.allows(Permission.PUBLISH)
+        )
+    ):
+        return principal.subject_id
+
+    # Legacy deployments retain their independent reviewer-key gate exactly as
+    # before.  Merely being a shared default/admin API key is not sufficient.
     configured = set(getattr(request.app.state, "eval_review_api_keys", set()))
     if not configured:
         raise HTTPException(status_code=403, detail="独立审核接口未启用")

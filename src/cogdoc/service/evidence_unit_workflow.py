@@ -545,6 +545,7 @@ def retrieve_verified_evidence_units(
     max_units_per_verification_batch: int = 8,
     structured_client: EvidenceUnitStructuredClient | None = None,
     gate_policy: EvidenceUnitGatePolicy | None = None,
+    authorization_scope=None,
 ) -> VerifiedEvidenceUnitBatchResult:
     """Run the shared retrieval, closed-set verification, and retry workflow."""
 
@@ -559,6 +560,7 @@ def retrieve_verified_evidence_units(
         policy=policy,
         rrf_k=rrf_k,
         fallback_docs_by_source=fallback_docs_by_source,
+        authorization_scope=authorization_scope,
     )
 
     batch_verifier: EvidenceUnitBatchVerifier | None = None
@@ -591,6 +593,7 @@ def retrieve_verified_evidence_units(
             fallback_docs_by_source=fallback_docs_by_source,
             query_phase="recovery",
             retrieval_round=1,
+            authorization_scope=authorization_scope,
         )
 
     return verify_and_retry_evidence_units(

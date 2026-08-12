@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools==81.0.0", "wheel==0.46.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "面向论文的本地 RAG 知识库 — LangGraph 多 Agent问答、结构化摘要、多论文对比，带可验证引用和 Rust 原生混合检索引擎"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 
 # 运行时依赖（原 requirements.txt）。rust_core 原生扩展单独经 maturin 构建安装，不在本 wheel 内。
 dependencies = [
@@ -40,9 +41,11 @@ cogdoc-debug = "cogdoc.debug:main"
 [project.optional-dependencies]
 # 开发：原生扩展构建 + 测试 + BM25/分词对齐参照（原 requirements-dev.txt）。
 dev = [
-    "maturin==1.14.0",
+    "maturin==1.14.1",
+    "mypy==2.3.0",
     "pytest==9.1.0",
     "rank-bm25==0.2.2",
+    "ruff==0.15.18",
     "snowballstemmer==2.2.0",
 ]
 # 前端瘦客户端（原 requirements-frontend.txt），与后端解耦，可单独安装。

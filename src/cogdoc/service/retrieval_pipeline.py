@@ -311,6 +311,12 @@ def retrieve_candidate_pool(
         rrf_k=rrf_k,
         top_n=fusion_top_n,
     )
+    # A retriever implementation is not an authorization authority.  Apply a
+    # second guard after channel fusion so a stale/custom backend cannot smuggle
+    # an out-of-scope source into prompts, traces, or persisted evidence even if
+    # it ignored the pre-top-k scope contract.
+    if scope is not None:
+        fused = [doc for doc in fused if scope.allows_document(doc)]
     adjusted, feedback_error = _apply_feedback_boosts(
         fused,
         kb_id=kb_id,

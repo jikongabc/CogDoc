@@ -1,18 +1,45 @@
-.git
-.venv
-venv
-env
-ENV
-__pycache__
-*.py[cod]
-*.so
-data
-logs
-测试论文
-frontend
-tests
-eval/*.jsonl
-.env
-.env.*
-rust_core/target
-*.md
+# Keep the Docker build context intentionally allow-listed. The runtime image
+# only installs the Python package and the native Rust wheel; local credentials,
+# model caches, test data, editor state, and generated artifacts must never be
+# sent to the daemon or captured by a broad COPY.
+**
+!Dockerfile
+!.dockerignore
+!LICENSE
+!README.md
+!pyproject.toml
+!src/
+!src/**
+!rust_core/
+!rust_core/Cargo.toml
+!rust_core/Cargo.lock
+!rust_core/pyproject.toml
+!rust_core/src/
+!rust_core/src/**
+!scripts/
+!scripts/backup_state.py
+!scripts/restore_state.py
+!scripts/migrate_state.py
+
+# Generated files can exist below an allow-listed source tree.
+src/**/__pycache__/
+src/**/*.py[cod]
+src/**/*.so
+src/*.egg-info/
+src/cogdoc/logs/
+rust_core/target/
+
+# Defense in depth for clients whose negation semantics re-include children of
+# an allow-listed directory.
+.git/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+artifacts/
+build/
+data/
+docs/
+logs/
+node_modules/
+tests/
