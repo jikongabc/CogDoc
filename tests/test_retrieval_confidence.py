@@ -49,19 +49,24 @@ def test_support_rejects_empty_and_low_confidence_candidates():
 def test_support_accepts_semantic_or_lexical_signal():
     settings = _settings()
 
-    semantic = assess_retrieval_support([_doc(distance=0.8, bm25_score=1.0)], settings)
-    lexical = assess_retrieval_support([_doc(distance=1.1, bm25_score=12.0)], settings)
+    semantic = assess_retrieval_support([_doc(distance=0.7, bm25_score=1.0)], settings)
+    lexical = assess_retrieval_support([_doc(distance=1.1, bm25_score=13.0)], settings)
 
     assert semantic.supported is True
     assert lexical.supported is True
 
 
-# 验证缺少旧索引评分元数据时兼容放行。
-def test_support_fails_open_when_confidence_signals_are_unavailable():
+# 缺失所有评分信号时默认拒绝，显式兼容开关可恢复旧行为。
+def test_support_fails_closed_when_confidence_signals_are_unavailable():
     result = assess_retrieval_support([_doc()], _settings())
 
-    assert result.supported is True
+    assert result.supported is False
     assert result.reason == "signals_unavailable"
+
+    compatible = assess_retrieval_support(
+        [_doc()], _settings(qa_abstain_allow_missing_signals=True)
+    )
+    assert compatible.supported is True
 
 
 # 验证派生知识使用独立支持度阈值。
@@ -72,7 +77,28 @@ def test_support_uses_derived_knowledge_score():
     result = assess_retrieval_support([doc], _settings())
 
     assert result.supported is False
-    assert result.signals == {"knowledge_score": 0.4}
+    assert result.signals == {"knowledge_lexical_score": 0.4}
+
+
+def test_support_aggregates_candidates_and_requires_atomic_coverage():
+    first = _doc(distance=0.95, bm25_score=1.0)
+    first["retrieval"]["matched_requirement_ids"] = ["r1"]
+    second = _doc(distance=0.7, bm25_score=1.0)
+    second["meta"]["chunk_id"] = "chunk:test:1"
+    second["retrieval"]["matched_requirement_ids"] = ["r2"]
+
+    supported = assess_retrieval_support(
+        [first, second], _settings(), requirement_ids=["r1", "r2"]
+    )
+    incomplete = assess_retrieval_support(
+        [first], _settings(), requirement_ids=["r1", "r2"]
+    )
+
+    assert supported.supported is True
+    assert supported.signals["distance"] == 0.7
+    assert supported.signals["requirement_coverage"] == 1.0
+    assert incomplete.supported is False
+    assert incomplete.reason == "requirement_coverage_incomplete"
 
 
 # 验证重排节点把低置信度判断写回图状态，供条件边直接拒答。
@@ -103,7 +129,7 @@ def test_rerank_node_marks_low_confidence_retrieval_for_abstention(monkeypatch):
         {
             "query": "比赛时长是多少",
             "doc_id": "kb",
-            "retrieved_docs": [_doc(distance=0.95, bm25_score=5.0)],
+            "retrieved_docs": [_doc(distance=0.94, bm25_score=5.0)],
         }
     )
     assert borderline["retrieval_abstained"] is True

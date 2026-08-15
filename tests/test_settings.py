@@ -20,6 +20,8 @@ def test_settings_defaults_match_current_runtime_contract():
     assert settings.ollama_model_name == "qwen2.5:7b"
     assert settings.qa_retrieval_top_k == 9
     assert settings.qa_rerank_top_n == 3
+    assert settings.qa_rerank_docs_per_requirement == 2
+    assert settings.qa_query_rewrite_fast_path_enabled is True
     assert settings.qa_parent_context_enabled is True
     assert settings.qa_parent_context_max_chunks == 5
     assert settings.qa_parent_context_max_chars == 3600
@@ -29,9 +31,11 @@ def test_settings_defaults_match_current_runtime_contract():
     assert settings.qa_evidence_pack_max_docs == 8
     assert settings.qa_evidence_pack_max_chars == 7200
     assert settings.qa_abstain_enabled is True
-    assert settings.qa_abstain_max_vector_distance == 0.86
-    assert settings.qa_abstain_min_bm25_score == 10.0
-    assert settings.qa_abstain_min_knowledge_score == 0.5
+    assert settings.qa_abstain_max_vector_distance == 0.7117711305618286
+    assert settings.qa_abstain_min_bm25_score == 12.328925491936891
+    assert settings.qa_abstain_min_knowledge_vector_score == 0.5
+    assert settings.qa_abstain_min_knowledge_lexical_score == 0.5
+    assert settings.qa_abstain_allow_missing_signals is False
     assert settings.qa_evidence_verify_enabled is True
     assert settings.qa_evidence_verify_max_docs == 3
     assert settings.qa_evidence_verify_max_chars_per_doc == 1600
@@ -142,6 +146,26 @@ def test_settings_reads_environment_overrides(monkeypatch):
     assert settings.qa_adaptive_retrieval_max_top_k == 24
     assert settings.eval_review_api_key_set == {"review-a", "review-b"}
     assert settings.cogdoc_chat_stream_idle_timeout_seconds == 45.0
+
+
+def test_legacy_knowledge_threshold_falls_back_to_both_split_channels(monkeypatch):
+    monkeypatch.setenv("QA_ABSTAIN_MIN_KNOWLEDGE_SCORE", "0.37")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.qa_abstain_min_knowledge_vector_score == 0.37
+    assert settings.qa_abstain_min_knowledge_lexical_score == 0.37
+
+
+def test_split_knowledge_thresholds_override_legacy_fallback(monkeypatch):
+    monkeypatch.setenv("QA_ABSTAIN_MIN_KNOWLEDGE_SCORE", "0.37")
+    monkeypatch.setenv("QA_ABSTAIN_MIN_KNOWLEDGE_VECTOR_SCORE", "0.61")
+    monkeypatch.setenv("QA_ABSTAIN_MIN_KNOWLEDGE_LEXICAL_SCORE", "4.2")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.qa_abstain_min_knowledge_vector_score == 0.61
+    assert settings.qa_abstain_min_knowledge_lexical_score == 4.2
 
 
 def test_chat_stream_idle_timeout_is_bounded():

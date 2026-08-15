@@ -1,10 +1,10 @@
 {
   "kb_id": "arch_blueprint_2026",
-  "active_generation": "g1d6b677a7006",
+  "active_generation": "gf7970a665f97",
   "generations": {
     "g1d6b677a7006": {
       "id": "g1d6b677a7006",
-      "status": "ready",
+      "status": "superseded",
       "embedding_model": "BAAI/bge-m3",
       "index_build_version": "source_sha256_name_page_span_local_v4_semantic_context_index_cs600_ov60_min30_ctx160|parser=pymupdf_smart_parse_v1|tokenizer=jieba_mixed_native_v2|embedder=BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181|dim=1024|norm=True",
       "base_epoch": 1,
@@ -32,6 +32,38 @@
         }
       ],
       "created_at": 1785830593.444314
+    },
+    "gf7970a665f97": {
+      "id": "gf7970a665f97",
+      "status": "ready",
+      "embedding_model": "BAAI/bge-m3",
+      "index_build_version": "source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index_cs600_ov60_min30_ctx160|parser=pymupdf_smart_parse_v3_ocr_acd63c06b135|tokenizer=jieba_mixed_native_v2|embedder=BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181|dim=1024|norm=True",
+      "base_epoch": 1,
+      "expected_count": 236,
+      "documents": [
+        {
+          "name": "ACM竞赛简介.pdf",
+          "size": 278480,
+          "sha256": "1db31f18622337094cf4f5130cf067a621ccc4dea023a0f5a2830a8f7efdcbd3"
+        },
+        {
+          "name": "AI智能体开发应用赛赛事规程260428.pdf",
+          "size": 293286,
+          "sha256": "8f54f8e25033c6112326679124f8aaadd311a1297ab88cc4dfd5577ef2b13335"
+        },
+        {
+          "name": "大模型开发应用赛.pdf",
+          "size": 447781,
+          "sha256": "1abc1d261330c870598ff9cfdeece7da90ae14f25eddaea8cf40e4223a6fe75c"
+        },
+        {
+          "name": "蓝桥杯.pdf",
+          "size": 554515,
+          "sha256": "f3ad0468e4da1566e41396ddbc50304d000c0e94bfe49f87f85d065887c35c5e"
+        }
+      ],
+      "created_at": 1786732611.196963,
+      "chunk_identity_version": "source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index_cs600_ov60_min30_ctx160"
     }
   }
 }

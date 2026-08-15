@@ -32,7 +32,12 @@ from cogdoc.tools.retriever.evidence_pack import (
 from cogdoc.tools.retriever.evidence_spans import EvidenceSpanSelector
 from cogdoc.tools.retriever.confidence import assess_retrieval_support
 from cogdoc.tools.retriever.fusion import select_rerank_candidates
-from cogdoc.tools.reranker import BGEReranker, skipped_cpu_rerank_docs
+from cogdoc.tools.reranker import (
+    BGEReranker,  # noqa: F401 - compatibility hook for tests/extensions
+    dynamic_rerank_top_n,
+    requirement_query_map,
+    rerank_with_requirement_policy,
+)
 from cogdoc.service.retrieval_pipeline import (
     apply_retrieval_feedback,
     build_retrieval_queries,
@@ -695,11 +700,22 @@ def rerank_node(state: GraphState) -> dict:
     docs = state.get("retrieved_docs", [])
     doc_id = state.get("doc_id", "default")
     settings = get_settings()
-
-    target_device = BGEReranker.default_device()
+    raw_requirements = state.get("evidence_requirements", [])
+    evidence_requirements = [
+        requirement
+        for requirement in raw_requirements
+        if isinstance(requirement, Mapping)
+    ]
+    requirement_queries = requirement_query_map(evidence_requirements)
 
     max_candidates = max(settings.qa_rerank_max_candidates, settings.qa_rerank_top_n)
     requirement_ids = _evidence_requirement_ids(state)
+    anchor_top_n = dynamic_rerank_top_n(
+        base_top_n=settings.qa_rerank_top_n,
+        max_docs=settings.qa_evidence_pack_max_docs,
+        requirement_count=len(requirement_ids),
+        docs_per_requirement=settings.qa_rerank_docs_per_requirement,
+    )
     candidate_docs = (
         select_rerank_candidates(
             docs,
@@ -709,20 +725,18 @@ def rerank_node(state: GraphState) -> dict:
         if max_candidates > 0
         else docs
     )
-    rerank_skipped_reason = ""
-    if target_device == "cpu" and not settings.qa_rerank_on_cpu:
-        rerank_skipped_reason = "cpu_disabled"
-        ranked_candidates = skipped_cpu_rerank_docs(
-            candidate_docs, len(candidate_docs), rerank_skipped_reason
-        )
-    else:
-        ranked_candidates = BGEReranker.rerank(
-            query=query,
-            docs=candidate_docs,
-            top_n=len(candidate_docs),
-            device=target_device,
-        )
-    reranked_docs = ranked_candidates[: settings.qa_rerank_top_n]
+    rerank_execution = rerank_with_requirement_policy(
+        query=query,
+        docs=candidate_docs,
+        requirement_queries=requirement_queries,
+        top_n=len(candidate_docs),
+        allow_cpu=settings.qa_rerank_on_cpu,
+        per_requirement=settings.qa_rerank_docs_per_requirement,
+    )
+    ranked_candidates = rerank_execution.docs
+    target_device = rerank_execution.device
+    rerank_skipped_reason = rerank_execution.skipped_reason
+    reranked_docs = ranked_candidates[:anchor_top_n]
     # 上下文扩展不改变一阶段支持度判断；它只补齐 verifier 与生成所见闭集。
     expanded_docs = _expand_with_neighbor_chunks(doc_id, reranked_docs, state)
     parent_context_expanded_count = sum(
@@ -734,12 +748,6 @@ def rerank_node(state: GraphState) -> dict:
         for doc in expanded_docs
     )
     pinned_ids = set(state.get("evidence_verified_chunk_ids", []))
-    raw_requirements = state.get("evidence_requirements", [])
-    evidence_requirements = [
-        requirement
-        for requirement in raw_requirements
-        if isinstance(requirement, Mapping)
-    ]
     evidence_pack, span_metrics = _build_qa_evidence_pack(
         query=query,
         evidence_requirements=evidence_requirements,
@@ -772,7 +780,9 @@ def rerank_node(state: GraphState) -> dict:
         packed_by_chunk_id.get(str(doc.get("meta", {}).get("chunk_id") or ""), doc)
         for doc in raw_verification_docs
     ]
-    support = assess_retrieval_support(reranked_docs, settings)
+    support = assess_retrieval_support(
+        reranked_docs, settings, requirement_ids=requirement_ids
+    )
     retrieval_abstained = (
         not support.supported or evidence_pack.over_budget_hard_constraints
     )
@@ -820,6 +830,7 @@ def rerank_node(state: GraphState) -> dict:
         adaptive_retrieval_retry_pending=retry_pending,
         retrieval_round=state.get("retrieval_round", 0),
         requirement_count=len(requirement_ids),
+        rerank_anchor_limit=anchor_top_n,
         **span_metrics,
         **pack_metrics,
     )
@@ -1033,9 +1044,7 @@ def _qa_generated_obligation_ids(state: Mapping[str, Any]) -> tuple[str, ...]:
         assessments, (str, bytes, bytearray)
     ):
         return ()
-    if not isinstance(plans, Sequence) or isinstance(
-        plans, (str, bytes, bytearray)
-    ):
+    if not isinstance(plans, Sequence) or isinstance(plans, (str, bytes, bytearray)):
         return ()
     supported_ids = {
         str(item.get("unit_id") or "").strip()

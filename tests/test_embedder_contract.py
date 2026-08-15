@@ -65,6 +65,17 @@ def test_embed_query_uses_normalize_flag(monkeypatch):
     assert fake.last_kwargs.get("normalize_embeddings") == Embedder.NORMALIZE
 
 
+def test_embed_queries_batches_query_contract(monkeypatch):
+    fake = _FakeModel(Embedder.EMBEDDING_DIM)
+    monkeypatch.setattr(Embedder, "get_model", classmethod(lambda cls: fake))
+
+    vectors = Embedder.embed_queries(["x", "y"])
+
+    assert len(vectors) == 2
+    assert fake.last_kwargs.get("normalize_embeddings") == Embedder.NORMALIZE
+    assert fake.last_kwargs.get("batch_size") == 64
+
+
 # 验证 embed documents rejects wrong dim。
 def test_embed_documents_rejects_wrong_dim(monkeypatch):
     fake = _FakeModel(Embedder.EMBEDDING_DIM + 1)  # 维度与契约不符
@@ -79,6 +90,13 @@ def test_embed_query_rejects_wrong_dim(monkeypatch):
     monkeypatch.setattr(Embedder, "get_model", classmethod(lambda cls: fake))
     with pytest.raises(ValueError, match="contract"):
         Embedder.embed_query("x")
+
+
+def test_embed_queries_rejects_wrong_dim(monkeypatch):
+    fake = _FakeModel(Embedder.EMBEDDING_DIM + 1)
+    monkeypatch.setattr(Embedder, "get_model", classmethod(lambda cls: fake))
+    with pytest.raises(ValueError, match="contract"):
+        Embedder.embed_queries(["x", "y"])
 
 
 # 整批校验嵌入向量。

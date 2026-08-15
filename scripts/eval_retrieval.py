@@ -50,6 +50,7 @@ DIAGNOSTIC_METRICS = {
     "parent_context_trigger_rate",
     "parent_context_expanded_count",
     "neighbor_context_expanded_count",
+    "requirement_coverage_abstention_rate",
 }
 DIAGNOSTIC_METRIC_PREFIXES = (
     "evidence_pack_",
@@ -292,6 +293,8 @@ def retrieve_result(
     verification_docs: List[RetrievedDoc] = []
     pre_pack_docs: List[RetrievedDoc] = []
     packed_docs: List[RetrievedDoc] = []
+    rerank_devices: set[str] = set()
+    rerank_skip_reasons: set[str] = set()
     span_metrics: dict[str, Any] = {
         "evidence_span_input_count": 0,
         "evidence_span_output_count": 0,
@@ -365,8 +368,13 @@ def retrieve_result(
             },
             current_docs,
         )
+        from cogdoc.tools.reranker import (
+            dynamic_rerank_top_n,
+            requirement_query_map,
+            rerank_with_requirement_policy,
+        )
+
         if rerank and ranked_docs:
-            from cogdoc.tools.reranker import BGEReranker
 
             max_candidates = max(
                 settings.qa_rerank_max_candidates,
@@ -381,14 +389,33 @@ def retrieve_result(
                 if max_candidates > 0
                 else ranked_docs
             )
-            ranked_docs = BGEReranker.rerank(
+            rerank_execution = rerank_with_requirement_policy(
                 query=query,
                 docs=candidates,
+                requirement_queries=requirement_query_map(evidence_requirements),
                 top_n=len(candidates),
+                allow_cpu=bool(getattr(settings, "qa_rerank_on_cpu", False)),
+                per_requirement=int(
+                    getattr(settings, "qa_rerank_docs_per_requirement", 2)
+                ),
             )
+            ranked_docs = rerank_execution.docs
+            rerank_devices.add(rerank_execution.device)
+            if rerank_execution.skipped_reason:
+                rerank_skip_reasons.add(rerank_execution.skipped_reason)
         # 完整排名用于 recall@n；放行判断严格复用线上 generation top-n 预算。
-        decision_docs = ranked_docs[: max(0, int(settings.qa_rerank_top_n))]
-        support = assess_retrieval_support(decision_docs, settings)
+        anchor_top_n = dynamic_rerank_top_n(
+            base_top_n=max(0, int(settings.qa_rerank_top_n)),
+            max_docs=settings.qa_evidence_pack_max_docs,
+            requirement_count=len(requirement_ids),
+            docs_per_requirement=int(
+                getattr(settings, "qa_rerank_docs_per_requirement", 2)
+            ),
+        )
+        decision_docs = ranked_docs[:anchor_top_n]
+        support = assess_retrieval_support(
+            decision_docs, settings, requirement_ids=requirement_ids
+        )
         generation_docs = decision_docs
         if decision_docs and hasattr(engine, "load_source_chunks"):
             # Hydrate before verifier exactly as the online QA graph does.  Rank
@@ -603,6 +630,8 @@ def retrieve_result(
         "parent_context_expanded_count": parent_context_expanded_count,
         "neighbor_context_expanded_count": neighbor_context_expanded_count,
         "retrieval_feedback_error": retrieval_feedback_error,
+        "rerank_devices": sorted(rerank_devices),
+        "rerank_skip_reasons": sorted(rerank_skip_reasons),
         **span_metrics,
         **pack_metrics,
     }
@@ -684,6 +713,10 @@ def run_eval(
         )
         retry_count = int(retrieval_result.get("retrieval_retry_count", 0) or 0)
         metrics["adaptive_retry_trigger_rate"] = float(retry_count > 0)
+        if item.get("evidence_requirements"):
+            metrics["requirement_coverage_abstention_rate"] = float(
+                retrieval_result.get("reason") == "requirement_coverage_incomplete"
+            )
         if retry_count > 0:
             metrics["adaptive_rescue_rate"] = float(
                 retrieval_result.get("adaptive_retrieval_rescued", False)
@@ -914,6 +947,10 @@ def run_eval(
                 "retrieval_feedback_error": retrieval_result.get(
                     "retrieval_feedback_error", ""
                 ),
+                "rerank_devices": list(retrieval_result.get("rerank_devices", [])),
+                "rerank_skip_reasons": list(
+                    retrieval_result.get("rerank_skip_reasons", [])
+                ),
                 "latency_ms": latency_ms,
                 "metrics": metrics,
             }
@@ -998,6 +1035,25 @@ def run_eval(
             ),
             "qa_evidence_pack_max_docs": settings.qa_evidence_pack_max_docs,
             "qa_evidence_pack_max_chars": settings.qa_evidence_pack_max_chars,
+            "rerank_devices": sorted(
+                {
+                    str(device)
+                    for row in rows
+                    for device in row.get("rerank_devices", [])
+                    if str(device)
+                }
+            ),
+            "rerank_skip_reasons": sorted(
+                {
+                    str(reason)
+                    for row in rows
+                    for reason in row.get("rerank_skip_reasons", [])
+                    if str(reason)
+                }
+            ),
+            "rerank_skipped_query_count": sum(
+                bool(row.get("rerank_skip_reasons")) for row in rows
+            ),
             "warmup_latency_ms": warmup_latency_ms,
         },
         "aggregate": aggregate_metrics,

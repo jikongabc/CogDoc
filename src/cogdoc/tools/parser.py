@@ -18,7 +18,7 @@ from cogdoc.tools.ocr import (
 
 # 解析逻辑变化时 bump：进入增量复用门控，避免未变文档复用旧解析结果。
 PARSER_VERSION = (
-    "pymupdf_smart_parse_v2_ocr_" + ocr_config_signature(get_settings())
+    "pymupdf_smart_parse_v3_ocr_" + ocr_config_signature(get_settings())
 )
 
 
@@ -100,7 +100,12 @@ def smart_parse(
                     _ocr_failure_page(
                         page_num=page_num,
                         source_name=source_name,
-                        native_text="",
+                        # OCR being disabled must not discard text that PyMuPDF
+                        # already extracted.  Short pages often contain exactly
+                        # the dates, identifiers, or contact details a RAG query
+                        # needs, even though they also satisfy the OCR-candidate
+                        # heuristic.
+                        native_text=native_text,
                         config=config,
                         status="disabled",
                     )

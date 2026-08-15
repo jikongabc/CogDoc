@@ -277,7 +277,12 @@ def _trace_config(
         "qa_abstain_enabled": settings.qa_abstain_enabled,
         "qa_abstain_max_vector_distance": (settings.qa_abstain_max_vector_distance),
         "qa_abstain_min_bm25_score": settings.qa_abstain_min_bm25_score,
-        "qa_abstain_min_knowledge_score": settings.qa_abstain_min_knowledge_score,
+        "qa_abstain_min_knowledge_vector_score": (
+            settings.qa_abstain_min_knowledge_vector_score
+        ),
+        "qa_abstain_min_knowledge_lexical_score": (
+            settings.qa_abstain_min_knowledge_lexical_score
+        ),
         "qa_evidence_verify_enabled": settings.qa_evidence_verify_enabled,
         "qa_evidence_verify_max_docs": settings.qa_evidence_verify_max_docs,
         "qa_evidence_verify_max_chars_per_doc": (

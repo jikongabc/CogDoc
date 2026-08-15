@@ -441,9 +441,7 @@ class CogDocClient:
         self, kb_id: str, document_id: str
     ) -> httpx.Response:
         return httpx.get(
-            self._url(
-                f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access"
-            ),
+            self._url(f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -458,9 +456,7 @@ class CogDocClient:
     ) -> httpx.Response:
         payload = {"schema_version": "v1", "policy": policy, "source": source}
         return httpx.patch(
-            self._url(
-                f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access"
-            ),
+            self._url(f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access"),
             json={key: value for key, value in payload.items() if value is not None},
             timeout=self.timeout,
             headers=self._headers,
@@ -473,9 +469,7 @@ class CogDocClient:
             headers=self._headers,
         )
 
-    def grant_kb_access(
-        self, kb_id: str, subject_id: str, role: str
-    ) -> httpx.Response:
+    def grant_kb_access(self, kb_id: str, subject_id: str, role: str) -> httpx.Response:
         return httpx.post(
             self._url(f"/v1/knowledge-bases/{kb_id}/access/grants"),
             json={
@@ -489,16 +483,12 @@ class CogDocClient:
 
     def revoke_kb_access(self, kb_id: str, subject_id: str) -> httpx.Response:
         return httpx.delete(
-            self._url(
-                f"/v1/knowledge-bases/{kb_id}/access/grants/{subject_id}"
-            ),
+            self._url(f"/v1/knowledge-bases/{kb_id}/access/grants/{subject_id}"),
             timeout=self.timeout,
             headers=self._headers,
         )
 
-    def list_document_grants(
-        self, kb_id: str, document_id: str
-    ) -> httpx.Response:
+    def list_document_grants(self, kb_id: str, document_id: str) -> httpx.Response:
         return httpx.get(
             self._url(
                 f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access/grants"
@@ -1082,6 +1072,87 @@ class CogDocClient:
         return httpx.post(
             self._url(f"/v1/retrieval-feedback/{feedback_id}/{action}"),
             **kwargs,
+        )
+
+    def list_retrieval_eval_drafts(
+        self,
+        *,
+        kb_id: str | None = None,
+        status: str | None = None,
+        dataset_partition: str | None = None,
+        task_kind: str | None = None,
+        is_stale: bool | None = None,
+        limit: int = 100,
+    ) -> httpx.Response:
+        params = {
+            "kb_id": kb_id,
+            "status": status,
+            "dataset_partition": dataset_partition,
+            "task_kind": task_kind,
+            "is_stale": is_stale,
+            "limit": limit,
+        }
+        return httpx.get(
+            self._url("/v1/retrieval-eval-drafts"),
+            params={key: value for key, value in params.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_retrieval_eval_draft(self, draft_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/retrieval-eval-drafts/{draft_id}"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_retrieval_eval_candidates(
+        self, draft_id: str, *, top_k: int = 12
+    ) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/retrieval-eval-drafts/{draft_id}/candidates"),
+            params={"top_k": top_k},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def review_retrieval_eval_draft(
+        self,
+        draft_id: str,
+        *,
+        decision: str,
+        expected_revision: int,
+        annotations: Mapping[str, Any] | None = None,
+        reason: str = "",
+    ) -> httpx.Response:
+        payload: dict[str, Any] = {
+            "decision": decision,
+            "expected_revision": expected_revision,
+            "reason": reason,
+        }
+        if annotations is not None:
+            payload["annotations"] = dict(annotations)
+        return httpx.post(
+            self._url(f"/v1/retrieval-eval-drafts/{draft_id}/review"),
+            json=payload,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def export_retrieval_eval_drafts(
+        self,
+        *,
+        dataset_partition: str = "release_gate",
+        export_format: str = "retrieval_eval_v1",
+    ) -> httpx.Response:
+        return httpx.get(
+            self._url("/v1/retrieval-eval-drafts/export"),
+            params={
+                "dataset_partition": dataset_partition,
+                "format": export_format,
+            },
+            timeout=self.timeout,
+            headers=self._headers,
         )
 
     def create_research_job(

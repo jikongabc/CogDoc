@@ -44,5 +44,15 @@ eval/retrieval_eval_report.json
 eval/retrieval_eval_baseline.json
 eval/retrieval_gate.json
 
+# Local retrieval-evaluation workbench data. Final calibrated reports may be
+# committed deliberately; reviewer drafts, private corpus copies, and pending
+# plans are reproducible working files and can contain source text.
+artifacts/reliability/eval-data/kb/*/generations/
+artifacts/reliability/eval-data/knowledge/
+artifacts/reliability/retrieval_eval_drafts.jsonl
+artifacts/reliability/retrieval_eval_pending_plans.jsonl
+artifacts/reliability/retrieval_eval_review_checklist.json
+artifacts/reliability/*-pending-plans.json
+
 # Node / mermaid-cli 本地渲染依赖。
 node_modules/

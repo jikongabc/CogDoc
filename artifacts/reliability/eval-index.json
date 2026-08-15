@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "status": "ready",
-  "created_at": "2026-08-04T08:03:45.537601+00:00",
+  "created_at": "2026-08-14T18:41:03.371149+00:00",
   "kb_id": "arch_blueprint_2026",
-  "data_dir": "/home/xiaohan/CogDoc/artifacts/reliability/eval-data",
+  "data_dir": "artifacts/reliability/eval-data",
   "document_count": 4,
-  "chunk_count": 74,
+  "chunk_count": 236,
   "sources": {
     "ACM竞赛简介.pdf": "1db31f18622337094cf4f5130cf067a621ccc4dea023a0f5a2830a8f7efdcbd3",
     "AI智能体开发应用赛赛事规程260428.pdf": "8f54f8e25033c6112326679124f8aaadd311a1297ab88cc4dfd5577ef2b13335",

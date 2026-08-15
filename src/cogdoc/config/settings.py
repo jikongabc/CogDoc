@@ -2,7 +2,7 @@ from functools import lru_cache
 import json
 from pathlib import Path
 from typing import Any
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -458,6 +458,18 @@ class Settings(BaseSettings):
         default=12, validation_alias="QA_RERANK_MAX_CANDIDATES"
     )
     qa_rerank_on_cpu: bool = Field(default=False, validation_alias="QA_RERANK_ON_CPU")
+    # 多需求问题为每个原子需求保留独立精排锚点；单需求仍沿用固定 top-n。
+    qa_rerank_docs_per_requirement: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        validation_alias="QA_RERANK_DOCS_PER_REQUIREMENT",
+    )
+    # 简短、无指代、无并列需求的问题直接使用原问题检索，省去一次 LLM 改写。
+    qa_query_rewrite_fast_path_enabled: bool = Field(
+        default=True,
+        validation_alias="QA_QUERY_REWRITE_FAST_PATH_ENABLED",
+    )
     # 重排命中保持 child citation identity，同时从同一结构父块补充有界上下文。
     qa_parent_context_enabled: bool = Field(
         default=True, validation_alias="QA_PARENT_CONTEXT_ENABLED"
@@ -507,19 +519,36 @@ class Settings(BaseSettings):
         default=True, validation_alias="QA_ABSTAIN_ENABLED"
     )
     qa_abstain_max_vector_distance: float = Field(
-        default=0.86,
+        default=0.7117711305618286,
         ge=0.0,
         validation_alias="QA_ABSTAIN_MAX_VECTOR_DISTANCE",
     )
     qa_abstain_min_bm25_score: float = Field(
-        default=10.0,
+        default=12.328925491936891,
         ge=0.0,
         validation_alias="QA_ABSTAIN_MIN_BM25_SCORE",
     )
-    qa_abstain_min_knowledge_score: float = Field(
+    # 向量派生知识与词法回退的分数尺度不同，分别校准。旧变量仅作为
+    # 两个新阈值的兼容回退；任一新变量显式存在时始终优先。
+    qa_abstain_min_knowledge_vector_score: float = Field(
         default=0.5,
         ge=0.0,
-        validation_alias="QA_ABSTAIN_MIN_KNOWLEDGE_SCORE",
+        validation_alias=AliasChoices(
+            "QA_ABSTAIN_MIN_KNOWLEDGE_VECTOR_SCORE",
+            "QA_ABSTAIN_MIN_KNOWLEDGE_SCORE",
+        ),
+    )
+    qa_abstain_min_knowledge_lexical_score: float = Field(
+        default=0.5,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "QA_ABSTAIN_MIN_KNOWLEDGE_LEXICAL_SCORE",
+            "QA_ABSTAIN_MIN_KNOWLEDGE_SCORE",
+        ),
+    )
+    qa_abstain_allow_missing_signals: bool = Field(
+        default=False,
+        validation_alias="QA_ABSTAIN_ALLOW_MISSING_SIGNALS",
     )
     qa_evidence_verify_enabled: bool = Field(
         default=True, validation_alias="QA_EVIDENCE_VERIFY_ENABLED"

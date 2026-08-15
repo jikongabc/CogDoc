@@ -241,6 +241,7 @@ class GraphState(TypedDict):
     retrieval_scope: NotRequired[Any]
 
     rewritten_queries: NotRequired[List[str]]
+    query_rewrite_fast_path: NotRequired[bool]
     evidence_requirements: NotRequired[List[EvidenceRequirementPlan]]
     rewrite_similarity_threshold: NotRequired[float]
     retrieved_docs: NotRequired[List[RetrievedDoc]]

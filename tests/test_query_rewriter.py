@@ -1,3 +1,4 @@
+from cogdoc.agents import query_rewriter
 from cogdoc.agents.query_rewriter import (
     EvidenceRequirementDraft,
     QueryRewriteAgent,
@@ -73,6 +74,11 @@ def test_missing_query_key_returns_empty_list():
 
 # 验证 llm failure falls back to original query 场景。
 def test_llm_failure_falls_back_to_original_query(monkeypatch):
+    monkeypatch.setattr(
+        query_rewriter,
+        "should_use_query_rewrite_fast_path",
+        lambda *args, **kwargs: False,
+    )
     monkeypatch.setattr(Generator, "_get_client", lambda **kwargs: _RaisingLLM())
     query = "大模型如何做检索增强"
     result = QueryRewriteAgent.rewrite_query({"query": query})
@@ -91,6 +97,11 @@ def test_llm_failure_falls_back_to_original_query(monkeypatch):
 
 # 验证 successful rewrite passes through 场景。
 def test_successful_rewrite_passes_through(monkeypatch):
+    monkeypatch.setattr(
+        query_rewriter,
+        "should_use_query_rewrite_fast_path",
+        lambda *args, **kwargs: False,
+    )
     monkeypatch.setattr(Generator, "_get_client", lambda **kwargs: _OkLLM(["q1", "q2"]))
     result = QueryRewriteAgent.rewrite_query({"query": "原始问题"})
     assert result == {
@@ -158,6 +169,11 @@ def test_requirement_planner_deduplicates_normalized_questions(monkeypatch):
         "_get_client",
         lambda **kwargs: _OkLLM(["policy"], requirements),
     )
+    monkeypatch.setattr(
+        query_rewriter,
+        "should_use_query_rewrite_fast_path",
+        lambda *args, **kwargs: False,
+    )
 
     result = QueryRewriteAgent.rewrite_query({"query": "Policy A"})
 
@@ -169,6 +185,36 @@ def test_requirement_planner_deduplicates_normalized_questions(monkeypatch):
             "recovery_query": "policy recovery",
         }
     ]
+
+
+def test_simple_self_contained_query_uses_fast_path(monkeypatch):
+    monkeypatch.setattr(
+        Generator,
+        "_get_client_for_node",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("fast path must not call the rewrite model")
+        ),
+    )
+
+    result = QueryRewriteAgent.rewrite_query({"query": "报名截止日期是什么？"})
+
+    assert result["rewritten_queries"] == ["报名截止日期是什么？"]
+    assert result["evidence_requirements"][0]["requirement_id"] == "r1"
+    assert result["query_rewrite_fast_path"] is True
+
+
+def test_single_intent_conjunction_can_still_use_fast_path():
+    assert query_rewriter.should_use_query_rewrite_fast_path("如何安装和启动服务？")
+
+
+def test_explicit_parallel_or_multi_question_query_requires_planning():
+    assert not query_rewriter.should_use_query_rewrite_fast_path(
+        "A 与 B 分别有哪些条件？"
+    )
+    assert not query_rewriter.should_use_query_rewrite_fast_path(
+        "A 是什么，以及 B 如何配置？"
+    )
+    assert not query_rewriter.should_use_query_rewrite_fast_path("A 是什么？B 是什么？")
 
 
 # 验证 rewrite prompt includes recent chat history 场景。

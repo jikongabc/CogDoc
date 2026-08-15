@@ -6,6 +6,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from cogdoc.api.eval_review_auth import require_eval_reviewer
+from cogdoc.api.offload import run_sync
 from cogdoc.api.retrieval_eval_draft_store import (
     DraftRevisionConflictError,
     RetrievalEvalDraftStore,
@@ -14,11 +15,19 @@ from cogdoc.api.schemas import RetrievalEvalDraftReviewRequest
 from cogdoc.api.tenant_scope import (
     externalize_kb_fields,
     request_principal,
+    retrieval_scope_for_request,
     resolve_kb_scope,
     row_is_authorized,
     scope_for_storage_id,
 )
+from cogdoc.config.settings import get_settings
+from cogdoc.service.kb_readers import kb_read_lease
 from cogdoc.service.index_provenance import current_index_provenance
+from cogdoc.service.retrieval_pipeline import (
+    build_retrieval_queries,
+    retrieve_candidate_pool,
+)
+from cogdoc.service.retriever_factory import RetrieverFactory
 from cogdoc.tools.eval.retrieval_eval_drafts import (
     DraftStatus,
     EvidenceUnitTask,
@@ -26,10 +35,119 @@ from cogdoc.tools.eval.retrieval_eval_drafts import (
     detect_stale_reasons,
     export_retrieval_eval_case,
 )
+from cogdoc.tools.retriever.metadata import safe_retrieval_metadata
+from cogdoc.tools.retriever.scope import RetrievalScope
 
 
 router = APIRouter(prefix="/v1/retrieval-eval-drafts", tags=["retrieval-eval"])
 _MAX_EXPORT_ROWS = 2**31 - 1
+
+
+def _candidate_retrieval_scope(request: Request, kb_id: str) -> RetrievalScope:
+    scope = scope_for_storage_id(request, kb_id)
+    if scope is None:
+        return RetrievalScope(include_derived_knowledge=False)
+    allowed = retrieval_scope_for_request(request, scope)
+    return RetrievalScope(
+        allowed_sources=allowed.allowed_sources,
+        include_derived_knowledge=False,
+        access_mode=allowed.access_mode,
+    )
+
+
+def _retrieve_draft_candidates(
+    row: Mapping[str, Any],
+    *,
+    runtime: Any,
+    retrieval_scope: RetrievalScope,
+    top_k: int,
+) -> dict[str, Any]:
+    """Retrieve reviewer-visible source chunks without promoting them to gold."""
+
+    kb_id = str(row.get("kb_id") or "")
+    original_query = str(row.get("query") or "")
+    units = row.get("units")
+    requirements: list[dict[str, str]] = []
+    if isinstance(units, list):
+        for unit in units:
+            if not isinstance(unit, Mapping):
+                continue
+            requirements.append(
+                {
+                    "requirement_id": str(unit.get("unit_id") or ""),
+                    "retrieval_query": str(unit.get("retrieval_query") or ""),
+                    "recovery_query": str(unit.get("recovery_query") or ""),
+                }
+            )
+    queries = build_retrieval_queries(
+        original_query,
+        rewritten_queries=[
+            requirement["recovery_query"]
+            for requirement in requirements
+            if requirement["recovery_query"]
+        ],
+        evidence_requirements=requirements,
+        max_queries=max(1, min(25, len(requirements) * 2 + 1)),
+    )
+    with kb_read_lease(kb_id):
+        result = retrieve_candidate_pool(
+            RetrieverFactory.get_engine(kb_id),
+            runtime.derived_knowledge_retriever,
+            runtime.retrieval_feedback_store,
+            kb_id=kb_id,
+            original_query=original_query,
+            queries=queries,
+            top_k=top_k,
+            rrf_k=float(get_settings().hybrid_rrf_k),
+            fusion_top_n=top_k,
+            scope=retrieval_scope,
+        )
+
+    source_versions = {
+        str(item.get("source") or ""): str(item.get("sha256") or "")
+        for item in row.get("source_versions") or []
+        if isinstance(item, Mapping)
+    }
+    candidates: list[dict[str, Any]] = []
+    for rank, doc in enumerate(result.docs, start=1):
+        if not isinstance(doc, Mapping):
+            continue
+        raw_meta = doc.get("meta")
+        meta = raw_meta if isinstance(raw_meta, Mapping) else {}
+        source = str(meta.get("source") or "")
+        retrieval = safe_retrieval_metadata(doc.get("retrieval"))
+        text = str(doc.get("text") or "")
+        page = meta.get("page")
+        candidates.append(
+            {
+                "rank": rank,
+                "text": text,
+                "text_length": len(text),
+                "chunk_id": str(meta.get("chunk_id") or ""),
+                "parent_chunk_id": str(meta.get("parent_chunk_id") or ""),
+                "source": source,
+                "source_sha256": str(
+                    meta.get("source_sha256") or source_versions.get(source) or ""
+                ),
+                "page": page,
+                "page_start": meta.get("page_start", page),
+                "page_end": meta.get("page_end", page),
+                "section_title": str(meta.get("section_title") or ""),
+                "matched_requirement_ids": list(
+                    retrieval.get("matched_requirement_ids")
+                    or retrieval.get("matched_unit_ids")
+                    or []
+                ),
+                "retrieval": retrieval,
+            }
+        )
+    return {
+        "queries": [query.text for query in result.queries],
+        "ranking_count": result.ranking_count,
+        "channel_counts": result.channel_counts,
+        "feedback_error": result.feedback_error,
+        "candidates": candidates,
+    }
 
 
 def _store(request: Request) -> RetrievalEvalDraftStore:
@@ -226,6 +344,41 @@ async def get_retrieval_eval_draft(
 ):
     row = _require_owned_draft(request, draft_id)
     return {"schema_version": "v1", "draft": _public_row(row, request)}
+
+
+@router.get("/{draft_id}/candidates")
+async def list_retrieval_eval_draft_candidates(
+    draft_id: str,
+    request: Request,
+    top_k: int = Query(default=12, ge=1, le=30),
+    _reviewer: str = Depends(require_eval_reviewer),
+):
+    row = _require_owned_draft(request, draft_id)
+    reasons = _stale_reasons(row)
+    if reasons:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "索引版本已变化，不能继续标注这个草稿",
+                "reasons": reasons,
+            },
+        )
+    result = await run_sync(
+        request.app.state.offload_executor,
+        _retrieve_draft_candidates,
+        row,
+        runtime=request.app.state.state_runtime,
+        retrieval_scope=_candidate_retrieval_scope(
+            request, str(row.get("kb_id") or "")
+        ),
+        top_k=top_k,
+    )
+    return {
+        "schema_version": "v1",
+        "draft_id": draft_id,
+        "is_stale": False,
+        **result,
+    }
 
 
 @router.post("/{draft_id}/review")

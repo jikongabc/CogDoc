@@ -171,9 +171,7 @@ def test_research_client_methods_call_expected_endpoints(monkeypatch):
         expected_revision=2,
         sections=[{"title": "证据", "research_question": "有哪些证据？"}],
     )
-    client.generate_research_plan(
-        "rj_1", expected_revision=3, is_local=True
-    )
+    client.generate_research_plan("rj_1", expected_revision=3, is_local=True)
     client.research_action("rj_1", "pause")
     client.research_action("rj_1", "generate")
     client.research_action("rj_1", "refresh")
@@ -182,9 +180,7 @@ def test_research_client_methods_call_expected_endpoints(monkeypatch):
     client.review_research_report(
         "rj_1",
         expected_revision=7,
-        decisions=[
-            {"section_id": "s1", "decision": "approved", "note": "已核对"}
-        ],
+        decisions=[{"section_id": "s1", "decision": "approved", "note": "已核对"}],
     )
     client.publish_research_report("rj_1", expected_revision=8)
     client.get_published_research_report("rj_1")
@@ -430,8 +426,7 @@ def test_account_client_methods_keep_bearer_on_authenticated_calls(monkeypatch):
     assert calls[13][1] == "http://api/v1/auth/invitations/accept"
     assert calls[13][2]["json"] == {"token": "opaque-invite-token"}
     assert all(
-        call[2]["headers"]["Authorization"] == "Bearer session-secret"
-        for call in calls
+        call[2]["headers"]["Authorization"] == "Bearer session-secret" for call in calls
     )
     assert all(
         calls[index][2]["headers"]["X-CogDoc-Workspace"] == "ws-2"
@@ -471,9 +466,7 @@ def test_resource_access_client_methods_use_stable_acl_endpoints(monkeypatch):
     client.get_kb_access_policy("kb")
     client.update_kb_access_policy("kb", "private")
     client.get_document_access_policy("kb", "doc-1")
-    client.update_document_access_policy(
-        "kb", "doc-1", "private", source="policy.pdf"
-    )
+    client.update_document_access_policy("kb", "doc-1", "private", source="policy.pdf")
     client.list_kb_grants("kb")
     client.grant_kb_access("kb", "user-2", "viewer")
     client.revoke_kb_access("kb", "user-2")
@@ -743,6 +736,73 @@ def test_retrieval_feedback_client_methods_call_expected_endpoints(monkeypatch):
         "http://api/v1/retrieval-feedback/rf1/enable",
     )
     assert "json" not in calls[2][2]
+
+
+def test_retrieval_eval_review_client_methods_call_expected_endpoints(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(("GET", url, kwargs))
+        return httpx.Response(200, json={"ok": True})
+
+    def fake_post(url, **kwargs):
+        calls.append(("POST", url, kwargs))
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", fake_get)
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.post", fake_post)
+
+    client = CogDocClient("http://api", api_key="review-key")
+    client.list_retrieval_eval_drafts(
+        kb_id="kb", status="pending", is_stale=False, limit=50
+    )
+    client.get_retrieval_eval_candidates("d1", top_k=9)
+    client.review_retrieval_eval_draft(
+        "d1",
+        decision="approved",
+        expected_revision=3,
+        annotations={"units": [{"unit_id": "r1"}]},
+    )
+    client.export_retrieval_eval_drafts()
+
+    headers = {"Authorization": "Bearer review-key"}
+    assert calls[0] == (
+        "GET",
+        "http://api/v1/retrieval-eval-drafts",
+        {
+            "params": {
+                "kb_id": "kb",
+                "status": "pending",
+                "is_stale": False,
+                "limit": 50,
+            },
+            "timeout": client.timeout,
+            "headers": headers,
+        },
+    )
+    assert calls[1][0:2] == (
+        "GET",
+        "http://api/v1/retrieval-eval-drafts/d1/candidates",
+    )
+    assert calls[1][2]["params"] == {"top_k": 9}
+    assert calls[2][0:2] == (
+        "POST",
+        "http://api/v1/retrieval-eval-drafts/d1/review",
+    )
+    assert calls[2][2]["json"] == {
+        "decision": "approved",
+        "expected_revision": 3,
+        "reason": "",
+        "annotations": {"units": [{"unit_id": "r1"}]},
+    }
+    assert calls[3][0:2] == (
+        "GET",
+        "http://api/v1/retrieval-eval-drafts/export",
+    )
+    assert calls[3][2]["params"] == {
+        "dataset_partition": "release_gate",
+        "format": "retrieval_eval_v1",
+    }
 
 
 # 验证反馈分析客户端方法调用稳定端点场景。

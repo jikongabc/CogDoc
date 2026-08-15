@@ -303,7 +303,8 @@ def should_verify_evidence(
     if first_stage_supported:
         return True
     return (
-        state.get("retrieval_abstain_reason") == "below_threshold"
+        state.get("retrieval_abstain_reason")
+        in {"below_threshold", "requirement_coverage_incomplete"}
         and float(state.get("retrieval_confidence") or 0.0)
         >= settings.qa_evidence_verify_borderline_min_score
     )

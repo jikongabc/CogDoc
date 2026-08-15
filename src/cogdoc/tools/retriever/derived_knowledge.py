@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Sequence
 from typing import Any, Callable
 
 from cogdoc.api.derived_knowledge_store import DerivedKnowledgeStore
@@ -283,11 +284,34 @@ class DerivedKnowledgeIndex:
             scope.denies_all or not scope.include_derived_knowledge
         ):
             return []
-        collection = self._collection(kb_id)
-        if collection.count() <= 0:
+        rows = self.search_many(kb_id, [query], top_k, scope=scope)
+        return rows[0] if rows else []
+
+    def search_many(
+        self,
+        kb_id: str,
+        queries: Sequence[str],
+        top_k: int,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> list[list[RetrievedDoc]]:
+        if not queries:
             return []
+        if scope is not None and (
+            scope.denies_all or not scope.include_derived_knowledge
+        ):
+            return [[] for _ in queries]
+        collection = self._collection(kb_id)
+        if collection.count() <= 0 or top_k <= 0:
+            return [[] for _ in queries]
+        embed_many = getattr(self.embedder, "embed_queries", None)
+        embeddings = (
+            embed_many(list(queries))
+            if callable(embed_many)
+            else [self.embedder.embed_query(query) for query in queries]
+        )
         query_options: dict[str, Any] = {
-            "query_embeddings": [self.embedder.embed_query(query)],
+            "query_embeddings": embeddings,
             "n_results": top_k,
         }
         if scope is not None and scope.is_source_restricted:
@@ -298,11 +322,33 @@ class DerivedKnowledgeIndex:
                 else {"related_source": {"$in": sources}}
             )
         results = collection.query(**query_options)
-        if not results or not results.get("documents") or not results["documents"][0]:
-            return []
-        docs = results["documents"][0]
-        metas = results["metadatas"][0]
-        distances = (results.get("distances") or [[0.0] * len(docs)])[0]
+        document_rows = results.get("documents") if results else None
+        metadata_rows = results.get("metadatas") if results else None
+        distance_rows = results.get("distances") if results else None
+        output: list[list[RetrievedDoc]] = []
+        for index in range(len(queries)):
+            docs = (
+                document_rows[index]
+                if document_rows and index < len(document_rows)
+                else []
+            )
+            metas = (
+                metadata_rows[index]
+                if metadata_rows and index < len(metadata_rows)
+                else []
+            )
+            distances = (
+                distance_rows[index]
+                if distance_rows and index < len(distance_rows)
+                else [0.0] * len(docs)
+            )
+            output.append(self._materialize_search_row(docs, metas, distances))
+        return output
+
+    @staticmethod
+    def _materialize_search_row(
+        docs: Sequence[Any], metas: Sequence[dict[str, Any]], distances: Sequence[Any]
+    ) -> list[RetrievedDoc]:
         retrieved: list[RetrievedDoc] = []
         for rank, text in enumerate(docs):
             distance = float(distances[rank])
@@ -434,6 +480,61 @@ class DerivedKnowledgeRetriever:
                 if docs:
                     return docs
         return self._lexical_search(kb_id, query, top_k, scope=scope)
+
+    def search_many(
+        self,
+        kb_id: str,
+        queries: Sequence[str],
+        top_k: int = 3,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> list[list[RetrievedDoc]]:
+        if not queries:
+            return []
+        if scope is not None and (
+            scope.denies_all or not scope.include_derived_knowledge
+        ):
+            return [[] for _ in queries]
+        indexed_rows: list[list[RetrievedDoc]] | None = None
+        index = self._index_or_none()
+        if index is not None:
+            try:
+                index.ensure_fresh(kb_id)
+                search_many = getattr(index, "search_many", None)
+                if callable(search_many):
+                    indexed_rows = (
+                        search_many(kb_id, queries, top_k)
+                        if scope is None
+                        else search_many(kb_id, queries, top_k, scope=scope)
+                    )
+                else:
+                    indexed_rows = [
+                        (
+                            index.search(kb_id, query, top_k)
+                            if scope is None
+                            else index.search(kb_id, query, top_k, scope=scope)
+                        )
+                        for query in queries
+                    ]
+                if len(indexed_rows) != len(queries):
+                    raise RuntimeError("derived index returned an invalid row count")
+            except Exception as exc:
+                log_event(
+                    "retrieval",
+                    "derived_knowledge_index_failed",
+                    {},
+                    level=logging.WARNING,
+                    kb_id=kb_id,
+                    error_class=type(exc).__name__,
+                )
+                indexed_rows = None
+        return [
+            row if row else self._lexical_search(kb_id, query, top_k, scope=scope)
+            for query, row in zip(
+                queries,
+                indexed_rows if indexed_rows is not None else [[] for _ in queries],
+            )
+        ]
 
     def _index_or_none(self) -> DerivedKnowledgeIndex | None:
         if not self._index_enabled:

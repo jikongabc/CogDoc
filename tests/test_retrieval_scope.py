@@ -147,6 +147,53 @@ def test_vector_unscoped_search_keeps_the_legacy_query_shape(monkeypatch):
     assert set(collection.options) == {"query_embeddings", "n_results"}
 
 
+class _BatchVectorCollection:
+    def __init__(self):
+        self.options = None
+
+    def query(self, **options):
+        self.options = options
+        return {
+            "documents": [["first"], ["second"]],
+            "ids": [["first"], ["second"]],
+            "metadatas": [
+                [_doc("first", "a.pdf")["meta"]],
+                [_doc("second", "a.pdf")["meta"]],
+            ],
+            "distances": [[0.1], [0.2]],
+        }
+
+
+def test_vector_search_many_batches_embeddings_and_chroma_query(monkeypatch):
+    collection = _BatchVectorCollection()
+    retriever = VectorRetriever.__new__(VectorRetriever)
+    retriever.collection = collection
+    embedded = []
+
+    def embed_queries(queries):
+        embedded.append(list(queries))
+        return [[0.1, 0.2], [0.3, 0.4]]
+
+    monkeypatch.setattr(
+        "cogdoc.tools.retriever.vector_retriever.Embedder.embed_queries",
+        embed_queries,
+    )
+
+    rows = retriever.search_many(
+        ["first query", "second query"],
+        top_k=1,
+        scope=RetrievalScope(allowed_sources=("a.pdf",)),
+    )
+
+    assert embedded == [["first query", "second query"]]
+    assert [[doc["meta"]["chunk_id"] for doc in row] for row in rows] == [
+        ["first"],
+        ["second"],
+    ]
+    assert collection.options["where"] == {"source": "a.pdf"}
+    assert len(collection.options["query_embeddings"]) == 2
+
+
 class _LegacyNativeBm25:
     """Models a loaded extension from before score_topk_filtered existed."""
 
@@ -206,6 +253,38 @@ def test_hybrid_forwards_scope_to_both_channels_before_fusion():
     assert vector.calls == [("query", 3, scope)]
     assert bm25.calls == [("query", 3, scope)]
     assert {doc["meta"]["source"] for doc in docs} == {"target.pdf"}
+
+
+class _BatchVectorChannel(_ScopedChannel):
+    def search_many(self, queries, top_k):
+        self.calls.append((tuple(queries), top_k))
+        rows = []
+        for query in queries:
+            doc = _doc(f"vector-{query}", "target.pdf")
+            doc["retrieval"] = {"search_channel": "vector"}
+            rows.append([doc])
+        return rows
+
+
+class _ScalarChannel(_ScopedChannel):
+    def search(self, query, top_k):
+        self.calls.append((query, top_k))
+        doc = _doc(f"bm25-{query}", "target.pdf")
+        doc["retrieval"] = {"search_channel": "bm25"}
+        return [doc]
+
+
+def test_hybrid_search_many_batches_vector_and_preserves_per_query_bm25():
+    vector = _BatchVectorChannel("vector")
+    bm25 = _ScalarChannel("bm25")
+    retriever = HybridRetriever(vector, bm25)
+
+    rows = retriever.search_many(["q1", "q2"], top_k=1)
+
+    assert vector.calls == [(('q1', 'q2'), 3)]
+    assert bm25.calls == [("q1", 3), ("q2", 3)]
+    assert len(rows) == 2
+    assert all(len(row) == 1 for row in rows)
 
 
 class _KnowledgeStore:

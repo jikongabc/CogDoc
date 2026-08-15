@@ -1,0 +1,61 @@
+{
+  "method": "deterministic_5_fold_worst_case_balanced_accuracy",
+  "constraints": {
+    "minimum_answerable_acceptance_rate": 0.95
+  },
+  "recommended": {
+    "QA_ABSTAIN_MAX_VECTOR_DISTANCE": 0.7117711305618286,
+    "QA_ABSTAIN_MIN_BM25_SCORE": 12.328925491936891
+  },
+  "overall": {
+    "sample_count": 100,
+    "answerable_acceptance_rate": 0.95,
+    "no_answer_abstention_rate": 0.9,
+    "balanced_accuracy": 0.925,
+    "false_accept_rate": 0.1,
+    "false_reject_rate": 0.05
+  },
+  "folds": [
+    {
+      "sample_count": 23,
+      "answerable_acceptance_rate": 0.9523809523809523,
+      "no_answer_abstention_rate": 1.0,
+      "balanced_accuracy": 0.9761904761904762,
+      "false_accept_rate": 0.0,
+      "false_reject_rate": 0.047619047619047616
+    },
+    {
+      "sample_count": 19,
+      "answerable_acceptance_rate": 1.0,
+      "no_answer_abstention_rate": 1.0,
+      "balanced_accuracy": 1.0,
+      "false_accept_rate": 0.0,
+      "false_reject_rate": 0.0
+    },
+    {
+      "sample_count": 25,
+      "answerable_acceptance_rate": 1.0,
+      "no_answer_abstention_rate": 0.7142857142857143,
+      "balanced_accuracy": 0.8571428571428572,
+      "false_accept_rate": 0.2857142857142857,
+      "false_reject_rate": 0.0
+    },
+    {
+      "sample_count": 17,
+      "answerable_acceptance_rate": 0.9333333333333333,
+      "no_answer_abstention_rate": 1.0,
+      "balanced_accuracy": 0.9666666666666667,
+      "false_accept_rate": 0.0,
+      "false_reject_rate": 0.06666666666666667
+    },
+    {
+      "sample_count": 16,
+      "answerable_acceptance_rate": 0.8,
+      "no_answer_abstention_rate": 1.0,
+      "balanced_accuracy": 0.9,
+      "false_accept_rate": 0.0,
+      "false_reject_rate": 0.2
+    }
+  ],
+  "warning": "Apply only after checking annotation coverage and validation sample size; this script never edits runtime configuration."
+}

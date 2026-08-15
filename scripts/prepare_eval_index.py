@@ -29,6 +29,7 @@ from cogdoc.service.process_lock import (
 SCHEMA_VERSION = 1
 MARKER_NAME = ".cogdoc-reliability-corpus.json"
 KB_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,55}$")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _sha256(path: Path) -> str:
@@ -127,6 +128,17 @@ def _write_json(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+def portable_project_path(value: str | Path) -> str:
+    """Keep repository-local metadata portable while preserving external paths."""
+
+    path = Path(value).expanduser()
+    resolved = path.resolve() if path.is_absolute() else (ROOT / path).resolve()
+    try:
+        return resolved.relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kb-id", default="arch_blueprint_2026")
@@ -177,7 +189,7 @@ def main() -> int:
             "status": "ready",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "kb_id": args.kb_id,
-            "data_dir": str(get_settings().cogdoc_data_dir),
+            "data_dir": portable_project_path(get_settings().cogdoc_data_dir),
             "document_count": result.document_count,
             "chunk_count": result.chunk_count,
             "sources": fingerprints,

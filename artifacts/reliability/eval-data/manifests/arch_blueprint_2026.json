@@ -23,6 +23,6 @@
       "sha256": "f3ad0468e4da1566e41396ddbc50304d000c0e94bfe49f87f85d065887c35c5e"
     }
   ],
-  "chunk_identity_version": "source_sha256_name_page_span_local_v4_semantic_context_index_cs600_ov60_min30_ctx160",
-  "index_build_version": "source_sha256_name_page_span_local_v4_semantic_context_index_cs600_ov60_min30_ctx160|parser=pymupdf_smart_parse_v1|tokenizer=jieba_mixed_native_v2|embedder=BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181|dim=1024|norm=True"
+  "chunk_identity_version": "source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index_cs600_ov60_min30_ctx160",
+  "index_build_version": "source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index_cs600_ov60_min30_ctx160|parser=pymupdf_smart_parse_v3_ocr_acd63c06b135|tokenizer=jieba_mixed_native_v2|embedder=BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181|dim=1024|norm=True"
 }

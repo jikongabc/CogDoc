@@ -1,3 +1,4 @@
+import re
 import unicodedata
 from collections.abc import Mapping
 from typing import Any, List
@@ -10,6 +11,7 @@ from cogdoc.agents.conversation_memory import (
 )
 from cogdoc.agents.qa_generator import Generator
 from cogdoc.agents.structured_output import invoke_structured
+from cogdoc.config.settings import Settings, get_settings
 
 
 QUERY_REWRITER_SYSTEM_PROMPT = (
@@ -66,6 +68,55 @@ def _fallback_requirement(query: str) -> dict[str, str]:
     }
 
 
+_CONTEXT_REFERENCE_PATTERN = re.compile(
+    r"(?:这个|那个|上述|上面|前面|其中|它(?:的)?|其(?:中|的)?|前者|后者|"
+    r"\b(?:it|its|this|that|these|those|former|latter)\b)",
+    re.IGNORECASE,
+)
+_COMPLEX_QUERY_PATTERN = re.compile(
+    r"(?:比较|对比|区别|异同|分别|各自|逐一|优缺点|利弊|哪个更|孰优孰劣)"
+)
+_QUERY_TERM_PATTERN = re.compile(
+    r"(?:什么|多少|如何|为什么|是否|能否|何时|什么时候|哪里|哪种|哪个|谁)"
+)
+_CONJUNCTION_PATTERN = re.compile(r"(?:和|与|以及|并且|同时)")
+_PARALLEL_POSSESSIVE_PATTERN = re.compile(
+    r"(?:的[^，。；!?！？]{0,24}(?:和|与|以及)[^，。；!?！？]{0,24}的)"
+)
+
+
+def should_use_query_rewrite_fast_path(
+    query: str,
+    *,
+    history_text: str = "",
+    settings: Settings | None = None,
+) -> bool:
+    """Conservatively identify self-contained single-intent retrieval queries."""
+
+    settings = settings or get_settings()
+    normalized = " ".join(str(query or "").split())
+    if not settings.qa_query_rewrite_fast_path_enabled or not normalized:
+        return False
+    if len(normalized) > 80 or len(re.findall(r"[?？]", normalized)) > 1:
+        return False
+    if _COMPLEX_QUERY_PATTERN.search(normalized):
+        return False
+    # A conjunction alone does not prove multiple intents (for example,
+    # “如何安装和启动服务” is one operation). Two independent question terms
+    # around a conjunction are a stronger signal that atomic planning is needed.
+    if _CONJUNCTION_PATTERN.search(normalized) and len(
+        _QUERY_TERM_PATTERN.findall(normalized)
+    ) > 1:
+        return False
+    # “A 的日期和 B 的费用” has only one surface question phrase but names two
+    # independently verifiable possessive facts.
+    if _PARALLEL_POSSESSIVE_PATTERN.search(normalized):
+        return False
+    if history_text and _CONTEXT_REFERENCE_PATTERN.search(normalized):
+        return False
+    return True
+
+
 def _normalize_requirements(
     drafts: list[EvidenceRequirementDraft], query: str
 ) -> list[dict[str, str]]:
@@ -106,6 +157,12 @@ class QueryRewriteAgent:
 
         if not query:
             return {"rewritten_queries": [], "evidence_requirements": []}
+        if should_use_query_rewrite_fast_path(query, history_text=history_text):
+            return {
+                "rewritten_queries": [query],
+                "evidence_requirements": [_fallback_requirement(query)],
+                "query_rewrite_fast_path": True,
+            }
 
         try:
             llm = Generator._get_client_for_node("query_rewriter", is_local=is_local)

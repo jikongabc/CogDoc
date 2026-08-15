@@ -5,9 +5,17 @@ import pytest
 from scripts.prepare_eval_index import (
     MARKER_NAME,
     load_expected_sources,
+    portable_project_path,
     resolve_corpus,
     sync_managed_corpus,
 )
+
+
+def test_portable_project_path_relativizes_only_repository_paths(tmp_path):
+    assert portable_project_path("artifacts/reliability/eval-data") == (
+        "artifacts/reliability/eval-data"
+    )
+    assert portable_project_path(tmp_path) == str(tmp_path.resolve())
 
 
 def test_load_expected_sources_and_resolve_corpus(tmp_path):

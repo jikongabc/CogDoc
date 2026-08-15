@@ -66,6 +66,17 @@ class FakeIndex:
         return self.docs[:top_k]
 
 
+class BatchIndex(FakeIndex):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+        self.batch_calls = []
+
+    def search_many(self, kb_id, queries, top_k):
+        self.batch_calls.append((kb_id, tuple(queries), top_k))
+        return [self.rows.get(query, [])[:top_k] for query in queries]
+
+
 def test_derived_knowledge_retriever_prefers_index(tmp_path):
     store = DerivedKnowledgeStore(path=str(tmp_path / "knowledge.jsonl"))
     indexed_doc = {
@@ -104,3 +115,31 @@ def test_derived_knowledge_retriever_falls_back_when_index_fails(tmp_path):
     assert len(docs) == 1
     assert docs[0]["meta"]["knowledge_id"] == approved["knowledge_id"]
     assert docs[0]["retrieval"]["search_channel"] == "derived_knowledge"
+
+
+def test_derived_knowledge_retriever_batches_index_and_falls_back_per_empty_row(
+    tmp_path,
+):
+    store = DerivedKnowledgeStore(path=str(tmp_path / "knowledge.jsonl"))
+    store.create(
+        {
+            "kb_id": "kb",
+            "text": "合同审批必须完成法务复核。",
+            "status": "approved",
+        }
+    )
+    indexed = {
+        "text": "indexed",
+        "meta": {"chunk_id": "knowledge:k1", "source_type": "derived_knowledge"},
+        "retrieval": {"search_channel": "derived_knowledge_embedding"},
+    }
+    index = BatchIndex({"indexed query": [indexed]})
+
+    rows = DerivedKnowledgeRetriever(store, index=index).search_many(
+        "kb", ["indexed query", "合同审批法务"], top_k=3
+    )
+
+    assert rows[0] == [indexed]
+    assert rows[1][0]["retrieval"]["search_channel"] == "derived_knowledge"
+    assert index.ensured == ["kb"]
+    assert index.batch_calls == [("kb", ("indexed query", "合同审批法务"), 3)]

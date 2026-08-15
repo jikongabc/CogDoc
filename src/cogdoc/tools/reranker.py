@@ -1,7 +1,9 @@
 import torch
 import copy
 import threading
-from typing import List
+from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from typing import Any, List
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from cogdoc.graph.state import RetrievedDoc
 from cogdoc.tools.device import (
@@ -19,6 +21,15 @@ def skipped_cpu_rerank_docs(
     for doc in selected:
         doc.setdefault("retrieval", {})["rerank_skipped_reason"] = reason
     return selected
+
+
+@dataclass(frozen=True)
+class RerankExecution:
+    """The ranked documents and the runtime policy decision that produced them."""
+
+    docs: List[RetrievedDoc]
+    device: str
+    skipped_reason: str = ""
 
 
 # 定义 BGEReranker 数据结构。
@@ -108,22 +119,8 @@ class BGEReranker:
         if len(docs) <= 1:
             return copy.deepcopy(docs)[:top_n]  # 单文档无需精排
 
-        with model_inference_semaphore("reranker"):
-            tokenizer, model, target_device = cls._get_resources(device)  # 获取单例资源
-
-            pairs = [[query, doc["text"]] for doc in docs]  # 构造[Query, Chunk]配对
-
-            with torch.no_grad():  # 关闭梯度计算
-                inputs = tokenizer(
-                    pairs,
-                    padding=True,  # 自动补齐长度
-                    truncation=True,  # 超长自动截断
-                    max_length=cls.MAX_LENGTH,  # 最大长度限制
-                    return_tensors="pt",  # 返回PyTorch张量
-                ).to(target_device)  # 输入迁移到目标设备
-
-                outputs = model(**inputs, return_dict=True)  # 执行前向推理
-                scores = outputs.logits.view(-1).float().cpu().numpy()  # 提取相关性得分
+        pairs = [(query, str(doc.get("text") or "")) for doc in docs]
+        scores = cls.score_pairs(pairs, device=device)
 
         ranked_docs: List[RetrievedDoc] = []
         for idx, score in enumerate(scores):
@@ -141,3 +138,198 @@ class BGEReranker:
         )  # 按精排得分降序排序
 
         return ranked_docs[:top_n]  # 返回TopN结果
+
+    @classmethod
+    def score_pairs(
+        cls,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        device: str | None = None,
+    ) -> list[float]:
+        """Score arbitrary query/chunk pairs in one cross-encoder forward pass."""
+
+        if not pairs:
+            return []
+        with model_inference_semaphore("reranker"):
+            tokenizer, model, target_device = cls._get_resources(device)
+            with torch.no_grad():
+                inputs = tokenizer(
+                    [[query, text] for query, text in pairs],
+                    padding=True,
+                    truncation=True,
+                    max_length=cls.MAX_LENGTH,
+                    return_tensors="pt",
+                ).to(target_device)
+                outputs = model(**inputs, return_dict=True)
+                return [
+                    float(score)
+                    for score in outputs.logits.view(-1).float().cpu().tolist()
+                ]
+
+
+def dynamic_rerank_top_n(
+    *,
+    base_top_n: int,
+    max_docs: int,
+    requirement_count: int,
+    docs_per_requirement: int,
+) -> int:
+    """Expand anchor capacity only when atomic evidence requirements need it."""
+
+    if min(base_top_n, max_docs, requirement_count, docs_per_requirement) < 0:
+        raise ValueError("rerank limits must be non-negative")
+    required = min(max_docs, requirement_count * docs_per_requirement)
+    # Never silently shrink the explicitly configured base anchor count.  If it
+    # exceeds the evidence-pack budget, the existing hard-budget gate must fail
+    # closed instead of hiding a configuration error.
+    return max(base_top_n, required)
+
+
+def requirement_query_map(
+    requirements: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for requirement in requirements:
+        requirement_id = str(requirement.get("requirement_id") or "").strip()
+        query = str(
+            requirement.get("question") or requirement.get("retrieval_query") or ""
+        ).strip()
+        if requirement_id and query:
+            result[requirement_id] = query
+    return result
+
+
+def _matched_requirements(doc: Mapping[str, Any]) -> set[str]:
+    retrieval = doc.get("retrieval")
+    values = (
+        retrieval.get("matched_requirement_ids")
+        if isinstance(retrieval, Mapping)
+        else ()
+    )
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        return set()
+    return {str(value).strip() for value in values if str(value).strip()}
+
+
+def _requirement_first_order(
+    docs: Sequence[RetrievedDoc],
+    requirement_ids: Sequence[str],
+    *,
+    per_requirement: int,
+) -> list[int]:
+    """Reserve the best attributed candidates, then fill by global relevance."""
+
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    matches = [_matched_requirements(doc) for doc in docs]
+    for requirement_id in requirement_ids:
+        eligible = [
+            index for index, matched in enumerate(matches) if requirement_id in matched
+        ]
+        eligible.sort(
+            key=lambda index: float(
+                docs[index]
+                .get("retrieval", {})
+                .get("requirement_rerank_scores", {})
+                .get(requirement_id, float("-inf"))
+            ),
+            reverse=True,
+        )
+        for index in eligible[:per_requirement]:
+            if index not in selected_set:
+                selected.append(index)
+                selected_set.add(index)
+    selected.extend(index for index in range(len(docs)) if index not in selected_set)
+    return selected
+
+
+def rerank_with_requirement_policy(
+    *,
+    query: str,
+    docs: List[RetrievedDoc],
+    requirement_queries: Mapping[str, str],
+    top_n: int,
+    allow_cpu: bool,
+    per_requirement: int = 1,
+) -> RerankExecution:
+    """Batch global and per-requirement cross-encoder scores under one device policy."""
+
+    if not docs or top_n <= 0:
+        return RerankExecution([], BGEReranker.default_device())
+    target_device = BGEReranker.default_device()
+    requirement_ids = list(requirement_queries)
+    if target_device == "cpu" and not allow_cpu:
+        skipped = skipped_cpu_rerank_docs(docs, len(docs), "cpu_disabled")
+        order = _requirement_first_order(
+            skipped, requirement_ids, per_requirement=per_requirement
+        )
+        return RerankExecution(
+            [skipped[index] for index in order[:top_n]],
+            target_device,
+            "cpu_disabled",
+        )
+
+    pairs: list[tuple[str, str]] = [(query, str(doc.get("text") or "")) for doc in docs]
+    requirement_pair_keys: list[tuple[int, str]] = []
+    for index, doc in enumerate(docs):
+        matched = _matched_requirements(doc)
+        for requirement_id in requirement_ids:
+            if requirement_id in matched:
+                pairs.append(
+                    (requirement_queries[requirement_id], str(doc.get("text") or ""))
+                )
+                requirement_pair_keys.append((index, requirement_id))
+    scores = BGEReranker.score_pairs(pairs, device=target_device)
+    ranked: list[RetrievedDoc] = []
+    for index, doc in enumerate(docs):
+        copied = copy.deepcopy(doc)
+        copied.setdefault("retrieval", {})["rerank_score"] = scores[index]
+        copied["retrieval"]["requirement_rerank_scores"] = {}
+        ranked.append(copied)
+    offset = len(docs)
+    for pair_offset, (index, requirement_id) in enumerate(requirement_pair_keys):
+        ranked[index]["retrieval"]["requirement_rerank_scores"][requirement_id] = (
+            scores[offset + pair_offset]
+        )
+    ranked.sort(
+        key=lambda doc: float(
+            doc.get("retrieval", {}).get("rerank_score", float("-inf"))
+        ),
+        reverse=True,
+    )
+    order = _requirement_first_order(
+        ranked, requirement_ids, per_requirement=per_requirement
+    )
+    return RerankExecution([ranked[index] for index in order[:top_n]], target_device)
+
+
+def rerank_with_device_policy(
+    *,
+    query: str,
+    docs: List[RetrievedDoc],
+    top_n: int,
+    allow_cpu: bool,
+) -> RerankExecution:
+    """Apply the production CPU/GPU policy and expose the actual execution path.
+
+    Keeping this decision next to the reranker prevents offline evaluation from
+    silently running a CPU cross-encoder that production is configured to skip.
+    """
+
+    target_device = BGEReranker.default_device()
+    if target_device == "cpu" and not allow_cpu:
+        reason = "cpu_disabled"
+        return RerankExecution(
+            docs=skipped_cpu_rerank_docs(docs, top_n, reason),
+            device=target_device,
+            skipped_reason=reason,
+        )
+    return RerankExecution(
+        docs=BGEReranker.rerank(
+            query=query,
+            docs=docs,
+            top_n=top_n,
+            device=target_device,
+        ),
+        device=target_device,
+    )

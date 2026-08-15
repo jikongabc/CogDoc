@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import os
 import queue
@@ -11,6 +12,7 @@ from collections.abc import Mapping, Sequence
 try:
     import streamlit as st
 except ModuleNotFoundError:
+
     class _MissingStreamlit:
         def __getattr__(self, name):
             raise ModuleNotFoundError(
@@ -28,7 +30,7 @@ from cogdoc.frontend.api_client import (
 )
 
 DEFAULT_API_URL = os.getenv("COGDOC_API_URL", "http://localhost:8000")
-MAIN_VIEWS = ["对话", "研究", "派生知识", "调试"]
+MAIN_VIEWS = ["对话", "研究", "派生知识", "证据审核", "调试"]
 STREAM_RERUN_INTERVAL_SECONDS = 0.8
 STREAM_PREVIEW_HEAD_CHARS = 1200
 STREAM_PREVIEW_TAIL_CHARS = 3600
@@ -83,14 +85,10 @@ def _research_requirement_editor_lines(
         retrieval_query = " ".join(
             str(requirement.get("retrieval_query") or question).split()
         )
-        recovery_query = " ".join(
-            str(requirement.get("recovery_query") or "").split()
-        )
-        if (
-            not recovery_query
-            or _research_contract_key(retrieval_query)
-            == _research_contract_key(recovery_query)
-        ):
+        recovery_query = " ".join(str(requirement.get("recovery_query") or "").split())
+        if not recovery_query or _research_contract_key(
+            retrieval_query
+        ) == _research_contract_key(recovery_query):
             recovery_query = _distinct_recovery_query(question, retrieval_query)
         questions.append(question)
         retrieval_queries.append(retrieval_query)
@@ -126,20 +124,14 @@ def _build_edited_research_requirements(
             if position < len(original_requirements)
             else {}
         )
-        original_question = " ".join(
-            str(original.get("question") or "").split()
-        )
+        original_question = " ".join(str(original.get("question") or "").split())
         original_retrieval = " ".join(
             str(original.get("retrieval_query") or original_question).split()
         )
-        original_recovery = " ".join(
-            str(original.get("recovery_query") or "").split()
-        )
-        if (
-            not original_recovery
-            or _research_contract_key(original_recovery)
-            == _research_contract_key(original_retrieval)
-        ):
+        original_recovery = " ".join(str(original.get("recovery_query") or "").split())
+        if not original_recovery or _research_contract_key(
+            original_recovery
+        ) == _research_contract_key(original_retrieval):
             original_recovery = _distinct_recovery_query(
                 original_question, original_retrieval
             )
@@ -149,9 +141,9 @@ def _build_edited_research_requirements(
         entered_recovery = (
             recovery_rows[position] if position < len(recovery_rows) else ""
         )
-        question_changed = _research_contract_key(
-            question
-        ) != _research_contract_key(original_question)
+        question_changed = _research_contract_key(question) != _research_contract_key(
+            original_question
+        )
         retrieval_was_edited = bool(entered_retrieval) and (
             _research_contract_key(entered_retrieval)
             != _research_contract_key(original_retrieval)
@@ -170,11 +162,9 @@ def _build_edited_research_requirements(
             if not question_changed or recovery_was_edited
             else _distinct_recovery_query(question, retrieval_query)
         )
-        if (
-            not recovery_query
-            or _research_contract_key(recovery_query)
-            == _research_contract_key(retrieval_query)
-        ):
+        if not recovery_query or _research_contract_key(
+            recovery_query
+        ) == _research_contract_key(retrieval_query):
             recovery_query = _distinct_recovery_query(question, retrieval_query)
         edited.append(
             {
@@ -211,7 +201,10 @@ def _research_summary_progress_label(summary: Mapping) -> str:
     completed = counts.get("completed")
     running = counts.get("running")
     failed = counts.get("failed")
-    if any(type(value) is not int or value < 0 for value in (total, completed, running, failed)):
+    if any(
+        type(value) is not int or value < 0
+        for value in (total, completed, running, failed)
+    ):
         return "章节进度未知"
     label = f"章节 {completed}/{total}"
     if running:
@@ -357,6 +350,9 @@ def _init_state() -> None:
     st.session_state.setdefault("research_summary_cache", {})
     st.session_state.setdefault("research_summary_pages", {})
     st.session_state.setdefault("research_open_job_by_kb", {})
+    st.session_state.setdefault("eval_review_key", "")
+    st.session_state.setdefault("eval_candidate_cache", {})
+    st.session_state.setdefault("eval_export_jsonl", "")
     # 兼容旧状态：升级前只有一份全局消息，迁移到当前上下文桶里。
     if "messages" in st.session_state:
         if st.session_state.kb_id and st.session_state.messages:
@@ -471,12 +467,15 @@ def _reset_user_context() -> None:
         ("research_summary_cache", {}),
         ("research_summary_pages", {}),
         ("research_open_job_by_kb", {}),
+        ("eval_candidate_cache", {}),
         ("known_sessions", {}),
     ):
         st.session_state[name] = empty
     st.session_state.kb_id = None
     st.session_state.active_trace_id = ""
     st.session_state.research_notice = None
+    st.session_state.eval_review_key = ""
+    st.session_state.eval_export_jsonl = ""
     # An invite is a one-time workspace capability. Never carry it across an
     # identity/workspace/role boundary where it could be shown under the wrong
     # tenant and delivered to the wrong recipient.
@@ -731,9 +730,7 @@ def _render_auth_screen(config: Mapping) -> None:
                 password = st.text_input(
                     "密码（至少 12 位）", type="password", key="register-password"
                 )
-                submitted = st.form_submit_button(
-                    "创建账号", use_container_width=True
-                )
+                submitted = st.form_submit_button("创建账号", use_container_width=True)
             if submitted:
                 try:
                     response = public_client.register(
@@ -750,9 +747,7 @@ def _render_auth_screen(config: Mapping) -> None:
             token = st.text_input("邀请令牌", type="password", key="invite-token")
             email = st.text_input("受邀邮箱", key="invite-email")
             display_name = st.text_input("显示名称", key="invite-name")
-            password = st.text_input(
-                "密码", type="password", key="invite-password"
-            )
+            password = st.text_input("密码", type="password", key="invite-password")
             submitted = st.form_submit_button("接受邀请", use_container_width=True)
         if submitted:
             try:
@@ -3241,29 +3236,21 @@ def _render_workspace_members(client: CogDocClient, workspace_id: str) -> None:
             key=f"member-role-{workspace_id}-{member_id}",
             label_visibility="collapsed",
         )
-        if controls[1].button(
-            "保存", key=f"member-save-{workspace_id}-{member_id}"
-        ):
+        if controls[1].button("保存", key=f"member-save-{workspace_id}-{member_id}"):
             response = client.update_workspace_member(
                 workspace_id, member_id, selected_role
             )
             if response.status_code == 200:
                 _invalidate_auth_profile()
-                _clear_api_cache(
-                    ("workspace-members", client.base_url, workspace_id)
-                )
+                _clear_api_cache(("workspace-members", client.base_url, workspace_id))
                 st.rerun()
             else:
                 st.error(_response_error(response, "更新成员失败"))
-        if controls[2].button(
-            "移除", key=f"member-remove-{workspace_id}-{member_id}"
-        ):
+        if controls[2].button("移除", key=f"member-remove-{workspace_id}-{member_id}"):
             response = client.remove_workspace_member(workspace_id, member_id)
             if response.status_code == 204:
                 _invalidate_auth_profile()
-                _clear_api_cache(
-                    ("workspace-members", client.base_url, workspace_id)
-                )
+                _clear_api_cache(("workspace-members", client.base_url, workspace_id))
                 st.rerun()
             else:
                 st.error(_response_error(response, "移除成员失败"))
@@ -3272,9 +3259,7 @@ def _render_workspace_members(client: CogDocClient, workspace_id: str) -> None:
 def _render_workspace_invites(client: CogDocClient, workspace_id: str) -> None:
     with st.form(f"workspace-invite-{workspace_id}", clear_on_submit=True):
         email = st.text_input("邀请邮箱")
-        role = st.selectbox(
-            "邀请角色", ["viewer", "reviewer", "editor", "admin"]
-        )
+        role = st.selectbox("邀请角色", ["viewer", "reviewer", "editor", "admin"])
         submitted = st.form_submit_button("创建邀请", use_container_width=True)
     if submitted:
         response = client.create_workspace_invite(workspace_id, email.strip(), role)
@@ -3324,9 +3309,7 @@ def _render_workspace_invites(client: CogDocClient, workspace_id: str) -> None:
         ):
             response = client.revoke_workspace_invite(workspace_id, invite_id)
             if response.status_code == 204:
-                _clear_api_cache(
-                    ("workspace-invites", client.base_url, workspace_id)
-                )
+                _clear_api_cache(("workspace-invites", client.base_url, workspace_id))
                 st.rerun()
             else:
                 st.error(_response_error(response, "撤销邀请失败"))
@@ -3352,7 +3335,9 @@ def _render_account_sidebar(client: CogDocClient) -> None:
         if isinstance(item, Mapping) and item.get("workspace_id")
     ]
     current_id = str(workspace.get("workspace_id") or "")
-    if current_id and all(item.get("workspace_id") != current_id for item in workspaces):
+    if current_id and all(
+        item.get("workspace_id") != current_id for item in workspaces
+    ):
         workspaces.append(workspace)
     workspace_ids = [str(item["workspace_id"]) for item in workspaces]
     names = {
@@ -3459,7 +3444,9 @@ def _render_resource_access_controls(
             "知识库可见性",
             ["workspace", "private"],
             index=1 if current_policy == "private" else 0,
-            format_func=lambda value: "仅授权成员" if value == "private" else "工作区成员",
+            format_func=lambda value: (
+                "仅授权成员" if value == "private" else "工作区成员"
+            ),
             key=f"kb-policy-{kb_id}",
         )
         if st.button("保存知识库权限", key=f"save-kb-policy-{kb_id}"):
@@ -3519,8 +3506,7 @@ def _render_resource_access_controls(
         grant_payload = response_payload(grant_response)
         grants = (
             grant_payload.get("grants", [])
-            if grant_response.status_code == 200
-            and isinstance(grant_payload, Mapping)
+            if grant_response.status_code == 200 and isinstance(grant_payload, Mapping)
             else []
         )
         for grant in grants:
@@ -3531,9 +3517,7 @@ def _render_resource_access_controls(
             row[0].caption(
                 f"{member_labels.get(granted_subject, granted_subject)} · {grant.get('role') or '-'}"
             )
-            if row[1].button(
-                "撤销", key=f"kb-grant-revoke-{kb_id}-{granted_subject}"
-            ):
+            if row[1].button("撤销", key=f"kb-grant-revoke-{kb_id}-{granted_subject}"):
                 response = client.revoke_kb_access(kb_id, granted_subject)
                 if response.status_code == 204:
                     st.rerun()
@@ -3581,9 +3565,7 @@ def _render_resource_access_controls(
                 kb_id,
                 document_id,
                 selected_document_policy,
-                source=None
-                if document_configured
-                else document_options[document_id],
+                source=None if document_configured else document_options[document_id],
             )
             if response.status_code == 200:
                 _clear_api_cache()
@@ -3634,8 +3616,7 @@ def _render_resource_access_controls(
                 if row[1].button(
                     "撤销",
                     key=(
-                        f"document-grant-revoke-{kb_id}-{document_id}-"
-                        f"{granted_subject}"
+                        f"document-grant-revoke-{kb_id}-{document_id}-{granted_subject}"
                     ),
                 ):
                     response = client.revoke_document_access(
@@ -3695,12 +3676,12 @@ def _sidebar() -> None:
             new_kb_policy = st.selectbox(
                 "初始权限",
                 ["workspace", "private"],
-                format_func=lambda value: "仅自己/授权成员" if value == "private" else "工作区成员",
+                format_func=lambda value: (
+                    "仅自己/授权成员" if value == "private" else "工作区成员"
+                ),
             )
             if st.form_submit_button("创建") and new_kb:
-                resp = client.create_knowledge_base(
-                    new_kb, access_policy=new_kb_policy
-                )
+                resp = client.create_knowledge_base(new_kb, access_policy=new_kb_policy)
                 if resp.status_code == 201:
                     _clear_api_cache(("kbs", client.base_url))
                     st.success(f"已创建 {new_kb}")
@@ -4124,9 +4105,7 @@ def _research_area(kb_id: str | None) -> None:
             "payload": dict(payload),
         }
     summaries = [item for item in payload.get("jobs", []) if isinstance(item, Mapping)]
-    selected_job_id = str(
-        st.session_state.research_open_job_by_kb.get(kb_id) or ""
-    )
+    selected_job_id = str(st.session_state.research_open_job_by_kb.get(kb_id) or "")
 
     st.markdown("#### 案卷索引")
     st.caption("索引只显示进度与审阅信号；打开一份案卷后才读取计划、证据和报告。")
@@ -4189,9 +4168,7 @@ def _research_area(kb_id: str | None) -> None:
         page_state["cursor"] = next_cursor
         st.rerun()
 
-    selected_job_id = str(
-        st.session_state.research_open_job_by_kb.get(kb_id) or ""
-    )
+    selected_job_id = str(st.session_state.research_open_job_by_kb.get(kb_id) or "")
     if not selected_job_id:
         return
     st.divider()
@@ -4231,11 +4208,11 @@ def _research_area(kb_id: str | None) -> None:
         provenance_status = str(job.get("provenance_status") or "untracked")
         provenance_stale = provenance_status == "stale"
         revision = int(job.get("revision") or 1)
-        with st.expander(
-            f"{title_label} · {status} · r{revision}", expanded=True
-        ):
+        with st.expander(f"{title_label} · {status} · r{revision}", expanded=True):
             st.write(str(job.get("objective") or ""))
-            st.caption(f"任务 ID：`{job_id}` · 最后更新：{job.get('updated_at') or '-'}")
+            st.caption(
+                f"任务 ID：`{job_id}` · 最后更新：{job.get('updated_at') or '-'}"
+            )
             st.caption(
                 "执行后端：" + ("本地 Ollama" if job.get("is_local") else "云端模型")
             )
@@ -4258,10 +4235,7 @@ def _research_area(kb_id: str | None) -> None:
                 )
             action_columns = st.columns(3)
             requested_action = None
-            if (
-                provenance_stale
-                and str(job.get("review_status") or "") != "published"
-            ):
+            if provenance_stale and str(job.get("review_status") or "") != "published":
                 if action_columns[0].button(
                     "按当前索引重新取证",
                     key=f"research-refresh-evidence-{job_id}-{revision}",
@@ -4280,8 +4254,12 @@ def _research_area(kb_id: str | None) -> None:
                 )
             ):
                 requested_action = "generate"
-            elif status == "failed" and report_status == "failed" and action_columns[0].button(
-                "重试报告生成", key=f"research-regenerate-{job_id}-{revision}"
+            elif (
+                status == "failed"
+                and report_status == "failed"
+                and action_columns[0].button(
+                    "重试报告生成", key=f"research-regenerate-{job_id}-{revision}"
+                )
             ):
                 requested_action = "generate"
             elif status in {"planned", "failed"} and action_columns[0].button(
@@ -4303,9 +4281,10 @@ def _research_area(kb_id: str | None) -> None:
                     "取消任务", key=f"research-cancel-{job_id}-{revision}"
                 ):
                     requested_action = "cancel"
-            plan_locked = status in {"running", "generating"} or str(
-                job.get("review_status") or ""
-            ) == "published"
+            plan_locked = (
+                status in {"running", "generating"}
+                or str(job.get("review_status") or "") == "published"
+            )
             if not plan_locked and action_columns[2].button(
                 "AI 规划大纲",
                 key=f"research-auto-plan-{job_id}-{revision}",
@@ -4412,8 +4391,7 @@ def _research_area(kb_id: str | None) -> None:
                         }
                     )
                     st.caption(
-                        "证据状态："
-                        f"{section.get('evidence_status') or 'unsearched'}"
+                        f"证据状态：{section.get('evidence_status') or 'unsearched'}"
                     )
                     if section.get("verification_status"):
                         st.caption(
@@ -4435,9 +4413,8 @@ def _research_area(kb_id: str | None) -> None:
                             )
                         )
                     coverage_audit = section.get("coverage_audit")
-                    if (
-                        isinstance(coverage_audit, Mapping)
-                        and coverage_audit.get("status")
+                    if isinstance(coverage_audit, Mapping) and coverage_audit.get(
+                        "status"
                     ):
                         missing_ids = coverage_audit.get("missing_requirement_ids")
                         missing_label = (
@@ -4482,9 +4459,7 @@ def _research_area(kb_id: str | None) -> None:
                 ):
                     st.warning("章节标题和研究问题都不能为空。")
                     continue
-                if any(
-                    not item["evidence_requirements"] for item in edited_sections
-                ):
+                if any(not item["evidence_requirements"] for item in edited_sections):
                     st.warning("每个章节至少需要一条原子证据需求。")
                     continue
                 update_response = client.update_research_plan(
@@ -4516,9 +4491,7 @@ def _research_area(kb_id: str | None) -> None:
                     if str(section_id)
                 ]
                 if last_regenerated:
-                    st.caption(
-                        "本版本仅重生成章节：" + "、".join(last_regenerated)
-                    )
+                    st.caption("本版本仅重生成章节：" + "、".join(last_regenerated))
                 if report_status == "ready_with_gaps":
                     st.warning("部分章节因证据不足、冲突或生成错误被明确留空。")
                 report_content = str(report.get("content") or "")
@@ -4601,8 +4574,7 @@ def _research_area(kb_id: str | None) -> None:
                         if not review_decisions:
                             st.warning("请至少选择一个审阅决定。")
                         elif any(
-                            item["decision"]
-                            in {"changes_requested", "accepted_gap"}
+                            item["decision"] in {"changes_requested", "accepted_gap"}
                             and not item["note"]
                             for item in review_decisions
                         ):
@@ -4717,6 +4689,489 @@ def _research_area(kb_id: str | None) -> None:
                             )
 
 
+def _eval_review_client() -> CogDocClient:
+    review_key = str(st.session_state.get("eval_review_key") or "").strip()
+    return CogDocClient(
+        str(st.session_state.api_url),
+        api_key=review_key or _current_api_credential(),
+        workspace_id=_current_workspace_id(),
+    )
+
+
+def _eval_response_detail(response, fallback: str) -> str:
+    payload = response_payload(response)
+    if isinstance(payload, Mapping):
+        detail = payload.get("detail")
+        if isinstance(detail, Mapping):
+            message = str(detail.get("message") or fallback)
+            reasons = detail.get("reasons")
+            if isinstance(reasons, list) and reasons:
+                return f"{message}：{'、'.join(str(item) for item in reasons)}"
+            return message
+        if detail:
+            return str(detail)
+    return _response_error(response, fallback)
+
+
+def _eval_candidate_identity(candidate: Mapping, *, include_span: bool) -> dict:
+    identity = {
+        "chunk_id": str(candidate.get("chunk_id") or ""),
+        "source": str(candidate.get("source") or ""),
+        "source_sha256": str(candidate.get("source_sha256") or ""),
+    }
+    parent_chunk_id = str(candidate.get("parent_chunk_id") or "")
+    if parent_chunk_id:
+        identity["parent_chunk_id"] = parent_chunk_id
+    if include_span:
+        identity["start"] = int(candidate["_selected_start"])
+        identity["end"] = int(candidate["_selected_end"])
+    return identity
+
+
+def _eval_paper(candidate: Mapping) -> None:
+    source = html.escape(str(candidate.get("source") or "未知来源"))
+    section = html.escape(str(candidate.get("section_title") or ""))
+    page = _page_range_label(
+        candidate.get("page_start", candidate.get("page")),
+        candidate.get("page_end"),
+    )
+    text = html.escape(str(candidate.get("text") or "（空文本）"))
+    chunk_id = html.escape(str(candidate.get("chunk_id") or "缺少 chunk_id"))
+    meta = " · ".join(item for item in (source, page, section) if item)
+    st.markdown(
+        f"""
+        <article class="evidence-paper">
+          <div class="evidence-rail">#{int(candidate.get("rank") or 0):02d}</div>
+          <div class="evidence-sheet">
+            <div class="evidence-meta">{meta}</div>
+            <div class="evidence-text">{text}</div>
+            <div class="evidence-id">{chunk_id}</div>
+          </div>
+        </article>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_eval_unit(
+    draft: Mapping, unit: Mapping, candidates: Sequence[Mapping]
+) -> dict:
+    draft_id = str(draft.get("draft_id") or "")
+    revision = int(draft.get("revision") or 1)
+    unit_id = str(unit.get("unit_id") or "unit")
+    widget_prefix = f"eval-{draft_id}-{revision}-{unit_id}"
+    st.markdown(
+        f"<div class='requirement-kicker'>判题单 · {html.escape(unit_id)}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"#### {str(unit.get('label') or '未命名需求')}")
+    st.caption("需求原意不可在审核中改写；若题目本身错误，请驳回并重新生成草稿。")
+    expected_status = st.radio(
+        "证据预期",
+        ["supported", "no_evidence"],
+        index=(
+            1
+            if str(unit.get("expected_status") or "") == "no_evidence"
+            or (unit.get("expected_status") is None and draft.get("no_answer"))
+            else 0
+        ),
+        horizontal=True,
+        format_func=lambda value: "应有证据" if value == "supported" else "应无证据",
+        key=f"{widget_prefix}-status",
+    )
+    query_columns = st.columns(2)
+    retrieval_query = query_columns[0].text_input(
+        "首轮检索词",
+        value=str(unit.get("retrieval_query") or ""),
+        key=f"{widget_prefix}-retrieval",
+    )
+    recovery_query = query_columns[1].text_input(
+        "补救检索词",
+        value=str(unit.get("recovery_query") or ""),
+        key=f"{widget_prefix}-recovery",
+    )
+
+    acceptable: list[dict] = []
+    negatives: list[dict] = []
+    unit_errors: list[str] = []
+    selected_gold_count = 0
+    existing_acceptable = {
+        str(item.get("chunk_id") or ""): item
+        for item in unit.get("acceptable_evidence") or []
+        if isinstance(item, Mapping)
+    }
+    existing_negatives = {
+        str(item.get("chunk_id") or "")
+        for item in unit.get("hard_negative_chunks") or []
+        if isinstance(item, Mapping)
+    }
+    if expected_status == "no_evidence":
+        st.info("这道题标为“应无证据”；通过时不应选择正确证据。")
+    for candidate in candidates:
+        rank = int(candidate.get("rank") or 0)
+        source = str(candidate.get("source") or "未知来源")
+        page = _page_range_label(
+            candidate.get("page_start", candidate.get("page")),
+            candidate.get("page_end"),
+        )
+        matched = candidate.get("matched_requirement_ids") or []
+        relevant = not matched or unit_id in matched
+        chunk_id = str(candidate.get("chunk_id") or "")
+        existing_target = existing_acceptable.get(chunk_id)
+        default_choice = (
+            "gold"
+            if existing_target is not None
+            else "negative"
+            if chunk_id in existing_negatives
+            else "skip"
+        )
+        with st.expander(
+            f"#{rank:02d} · {source} · {page}{'' if relevant else ' · 其他需求召回'}",
+            expanded=rank <= 2 and relevant,
+        ):
+            _eval_paper(candidate)
+            choice = st.radio(
+                "这段原文对当前需求是什么？",
+                ["skip", "gold", "negative"],
+                index=["skip", "gold", "negative"].index(default_choice),
+                horizontal=True,
+                format_func={
+                    "skip": "不标注",
+                    "gold": "正确证据",
+                    "negative": "误导项",
+                }.get,
+                key=f"{widget_prefix}-candidate-{rank}",
+            )
+            if choice == "gold":
+                selected_gold_count += 1
+                if expected_status == "no_evidence":
+                    st.warning("“应无证据”不能同时选择正确证据。")
+                quote = st.text_input(
+                    "关键句（可选，复制上方连续原文后会自动定位字符区间）",
+                    value=(
+                        str(candidate.get("text") or "")[
+                            int(existing_target["start"]) : int(existing_target["end"])
+                        ]
+                        if isinstance(existing_target, Mapping)
+                        and isinstance(existing_target.get("start"), int)
+                        and isinstance(existing_target.get("end"), int)
+                        else ""
+                    ),
+                    key=f"{widget_prefix}-quote-{rank}",
+                )
+                selected = dict(candidate)
+                if quote:
+                    start = str(candidate.get("text") or "").find(quote)
+                    if start < 0:
+                        st.error("关键句不在这段原文中；请保持原文字符完全一致。")
+                        unit_errors.append(f"{unit_id}：关键句不在候选原文中")
+                    else:
+                        selected["_selected_start"] = start
+                        selected["_selected_end"] = start + len(quote)
+                        st.caption(f"已定位字符区间 [{start}, {start + len(quote)})")
+                        acceptable.append(
+                            _eval_candidate_identity(selected, include_span=True)
+                        )
+                else:
+                    acceptable.append(
+                        _eval_candidate_identity(selected, include_span=False)
+                    )
+                missing_identity = [
+                    field
+                    for field in ("chunk_id", "source", "source_sha256")
+                    if not candidate.get(field)
+                ]
+                if missing_identity:
+                    st.error("候选证据身份不完整，不能作为正式证据。")
+                    unit_errors.append(
+                        f"{unit_id}：正确证据缺少 {', '.join(missing_identity)}"
+                    )
+            elif choice == "negative":
+                negatives.append(
+                    _eval_candidate_identity(candidate, include_span=False)
+                )
+                missing_identity = [
+                    field
+                    for field in ("chunk_id", "source", "source_sha256")
+                    if not candidate.get(field)
+                ]
+                if missing_identity:
+                    st.error("误导项身份不完整，不能提交。")
+                    unit_errors.append(
+                        f"{unit_id}：误导项缺少 {', '.join(missing_identity)}"
+                    )
+    if not retrieval_query.strip():
+        unit_errors.append(f"{unit_id}：首轮检索词不能为空")
+    if not recovery_query.strip():
+        unit_errors.append(f"{unit_id}：补救检索词不能为空")
+    if expected_status == "supported" and not acceptable:
+        unit_errors.append(f"{unit_id}：应有证据，但尚未选择有效的正确证据")
+    if expected_status == "no_evidence" and selected_gold_count:
+        unit_errors.append(f"{unit_id}：应无证据，不能同时选择正确证据")
+    return {
+        "unit_id": unit_id,
+        "retrieval_query": retrieval_query,
+        "recovery_query": recovery_query,
+        "expected_status": expected_status,
+        "acceptable_evidence": acceptable if expected_status == "supported" else [],
+        "hard_negative_chunks": negatives,
+        "_ui_errors": unit_errors,
+    }
+
+
+def _retrieval_eval_review_area(kb_id: str | None) -> None:
+    st.markdown(
+        """
+        <style>
+        .review-hero {border-top:4px solid #1b7268;padding:.8rem 0 .35rem 0;margin-bottom:.5rem}
+        .review-eyebrow,.requirement-kicker,.evidence-meta,.evidence-id {
+          font-family:"IBM Plex Mono","SFMono-Regular",Consolas,monospace;
+          letter-spacing:.06em;text-transform:uppercase
+        }
+        .review-eyebrow {color:#1b7268;font-size:.72rem;font-weight:700}
+        .review-hero h2 {font-family:"Noto Sans SC","PingFang SC",sans-serif;
+          font-weight:760;letter-spacing:-.035em;margin:.12rem 0}
+        .review-hero p {color:#52606d;max-width:58rem;margin:.15rem 0}
+        .queue-ledger {font-family:"IBM Plex Mono","SFMono-Regular",monospace;
+          color:#263442;border-bottom:1px solid #aebbc4;padding:.45rem 0;margin-bottom:.65rem}
+        .requirement-kicker {font-size:.68rem;color:#1b7268;margin-top:.5rem}
+        .evidence-paper {display:grid;grid-template-columns:3.3rem 1fr;background:#f3f7f6;
+          border:1px solid #b8c9c6;border-left:4px solid #1b7268;margin:.25rem 0 .75rem 0}
+        .evidence-rail {font-family:"IBM Plex Mono","SFMono-Regular",monospace;
+          color:#1b7268;padding:.8rem .55rem;border-right:1px solid #b8c9c6;font-weight:700}
+        .evidence-sheet {padding:.75rem .9rem}
+        .evidence-meta {font-size:.68rem;color:#526d69;margin-bottom:.55rem}
+        .evidence-text {font-family:"Noto Sans SC","PingFang SC",sans-serif;color:#182528;
+          line-height:1.75;white-space:pre-wrap;overflow-wrap:anywhere}
+        .evidence-id {font-size:.62rem;color:#71807e;margin-top:.65rem}
+        @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+        </style>
+        <section class="review-hero">
+          <div class="review-eyebrow">Retrieval evidence desk</div>
+          <h2>证据判卷台</h2>
+          <p>逐条核对“这段原文能不能支撑这道题”。只有人工确认的证据，才会进入正式评测集。</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.text_input(
+        "评测审核密钥",
+        type="password",
+        key="eval_review_key",
+        help="使用有审核权限的账号时可留空；旧版部署请填写独立审核密钥。",
+    )
+    client = _eval_review_client()
+    controls = st.columns([2, 2, 3])
+    status_filter = controls[0].selectbox(
+        "状态",
+        ["pending", "approved", "rejected", "all"],
+        format_func={
+            "pending": "待审核",
+            "approved": "已通过",
+            "rejected": "已驳回",
+            "all": "全部",
+        }.get,
+    )
+    partition_filter = controls[1].selectbox(
+        "数据分区",
+        ["all", "release_gate", "training"],
+        format_func={
+            "all": "全部",
+            "release_gate": "发布门禁",
+            "training": "训练集",
+        }.get,
+    )
+    current_kb_only = controls[2].toggle(
+        "只看当前知识库", value=bool(kb_id), disabled=not kb_id
+    )
+    try:
+        response = client.list_retrieval_eval_drafts(
+            kb_id=kb_id if current_kb_only else None,
+            status=None if status_filter == "all" else status_filter,
+            dataset_partition=None if partition_filter == "all" else partition_filter,
+            limit=500,
+        )
+    except Exception as exc:
+        st.error(f"连接审核接口失败：{exc}")
+        return
+    if response.status_code != 200:
+        st.error(_eval_response_detail(response, "读取证据草稿失败"))
+        st.caption("账号需具备审核权限；旧版部署需填写独立审核密钥。")
+        return
+    payload = response_payload(response)
+    drafts = payload.get("drafts", []) if isinstance(payload, Mapping) else []
+    counts = {
+        status: sum(1 for row in drafts if row.get("status") == status)
+        for status in ("pending", "approved", "rejected")
+    }
+    stale_count = sum(1 for row in drafts if row.get("is_stale"))
+    st.markdown(
+        "<div class='queue-ledger'>"
+        f"QUEUE {len(drafts):03d}　PENDING {counts['pending']:03d}　"
+        f"APPROVED {counts['approved']:03d}　REJECTED {counts['rejected']:03d}　"
+        f"STALE {stale_count:03d}</div>",
+        unsafe_allow_html=True,
+    )
+    if not drafts:
+        st.info(
+            "当前筛选条件下没有草稿。对一次错误回答点“检索问题”反馈后，这里会出现待审任务。"
+        )
+        return
+
+    def draft_label(row: Mapping) -> str:
+        units = row.get("units") or []
+        first_label = str(units[0].get("label") or "未命名需求") if units else "无需求"
+        status = {"pending": "待审", "approved": "通过", "rejected": "驳回"}.get(
+            str(row.get("status")), "未知"
+        )
+        stale = " · 已过期" if row.get("is_stale") else ""
+        return (
+            f"{status}{stale} · {first_label} · {str(row.get('draft_id') or '')[:10]}"
+        )
+
+    draft_by_id = {str(row.get("draft_id")): row for row in drafts}
+    selected_id = st.selectbox(
+        "审核队列",
+        list(draft_by_id),
+        format_func=lambda value: draft_label(draft_by_id[value]),
+    )
+    draft = draft_by_id[selected_id]
+    units = [unit for unit in draft.get("units") or [] if isinstance(unit, Mapping)]
+    if not units:
+        st.error("这份草稿没有可审核的原子需求，不能继续处理。")
+        return
+    if draft.get("is_stale"):
+        st.error("这份草稿对应的索引已变化，不能继续标注。请由新反馈生成新草稿。")
+        st.code("\n".join(str(item) for item in draft.get("stale_reasons") or []))
+        return
+
+    cache_key = (
+        f"{client.base_url}:{client.auth_cache_identity}:"
+        f"{client.workspace_id or '-'}:{selected_id}:{draft.get('revision')}"
+    )
+    candidate_payload = st.session_state.eval_candidate_cache.get(cache_key)
+    if candidate_payload is None:
+        try:
+            with st.spinner("正在调取候选原文…"):
+                candidate_response = client.get_retrieval_eval_candidates(selected_id)
+        except Exception as exc:
+            st.error(f"调取候选原文失败：{exc}")
+            return
+        if candidate_response.status_code != 200:
+            st.error(_eval_response_detail(candidate_response, "读取候选原文失败"))
+            return
+        candidate_payload = response_payload(candidate_response)
+        st.session_state.eval_candidate_cache[cache_key] = candidate_payload
+    candidates = (
+        candidate_payload.get("candidates", [])
+        if isinstance(candidate_payload, Mapping)
+        else []
+    )
+    st.caption(
+        f"草稿 {selected_id} · revision {draft.get('revision')} · "
+        f"{len(units)} 道需求 · {len(candidates)} 段候选原文"
+    )
+    if not candidates:
+        st.warning(
+            "本轮没有召回候选原文。若确认知识库确实无证据，可将需求标为“应无证据”。"
+        )
+
+    tabs = st.tabs(
+        [
+            f"{index + 1}. {str(unit.get('label') or unit.get('unit_id'))[:24]}"
+            for index, unit in enumerate(units)
+        ]
+    )
+    annotations = []
+    for tab, unit in zip(tabs, units):
+        with tab:
+            annotations.append(_render_eval_unit(draft, unit, candidates))
+
+    if str(draft.get("status") or "") != "pending":
+        st.info(f"这份草稿已经{draft_label(draft).split(' · ')[0]}，仅供查阅。")
+    else:
+        st.divider()
+        reason = st.text_area(
+            "驳回原因",
+            placeholder="驳回时必填：说明题目、查询词或证据哪里不对。",
+            key=f"eval-reject-reason-{selected_id}-{draft.get('revision')}",
+        )
+        action_columns = st.columns([2, 2, 3])
+        approve = action_columns[0].button(
+            "确认并通过", type="primary", use_container_width=True
+        )
+        reject = action_columns[1].button("驳回草稿", use_container_width=True)
+        if approve or reject:
+            annotation_errors = [
+                str(error)
+                for annotation in annotations
+                for error in annotation.get("_ui_errors", [])
+            ]
+            if approve and annotation_errors:
+                st.error("还不能通过：\n\n- " + "\n- ".join(annotation_errors))
+            elif reject and not reason.strip():
+                st.error("驳回原因不能为空。")
+            else:
+                clean_annotations = [
+                    {
+                        key: value
+                        for key, value in annotation.items()
+                        if key != "_ui_errors"
+                    }
+                    for annotation in annotations
+                ]
+                try:
+                    review_response = client.review_retrieval_eval_draft(
+                        selected_id,
+                        decision="approved" if approve else "rejected",
+                        expected_revision=int(draft.get("revision") or 1),
+                        annotations={"units": clean_annotations} if approve else None,
+                        reason=reason.strip(),
+                    )
+                except Exception as exc:
+                    st.error(f"保存审核结果失败：{exc}")
+                    return
+                if review_response.status_code == 200:
+                    st.session_state.eval_candidate_cache.pop(cache_key, None)
+                    st.success(
+                        "已通过并写入正式评测集。" if approve else "已驳回草稿。"
+                    )
+                    st.rerun()
+                else:
+                    st.error(_eval_response_detail(review_response, "保存审核结果失败"))
+
+    st.divider()
+    export_columns = st.columns([2, 3])
+    if export_columns[0].button("准备发布门禁集", use_container_width=True):
+        try:
+            export_response = client.export_retrieval_eval_drafts()
+        except Exception as exc:
+            st.error(f"导出评测集失败：{exc}")
+            return
+        if export_response.status_code != 200:
+            st.error(_eval_response_detail(export_response, "导出评测集失败"))
+        else:
+            export_payload = response_payload(export_response)
+            items = (
+                export_payload.get("items", [])
+                if isinstance(export_payload, Mapping)
+                else []
+            )
+            st.session_state.eval_export_jsonl = "\n".join(
+                json.dumps(item, ensure_ascii=False) for item in items
+            ) + ("\n" if items else "")
+            st.success(f"已准备 {len(items)} 条发布门禁样本。")
+    if st.session_state.eval_export_jsonl:
+        export_columns[1].download_button(
+            "下载 retrieval_eval.jsonl",
+            data=st.session_state.eval_export_jsonl,
+            file_name="retrieval_eval.jsonl",
+            mime="application/x-ndjson",
+            use_container_width=True,
+        )
+
+
 # 处理对话区。
 def _chat_area() -> None:
     # 主对话区按上下文还原历史并渲染气泡。
@@ -4795,6 +5250,8 @@ def _chat_area() -> None:
         _research_area(kb_id)
     elif view == "派生知识":
         _knowledge_area(kb_id)
+    elif view == "证据审核":
+        _retrieval_eval_review_area(kb_id)
     else:
         _debug_area(kb_id)
 

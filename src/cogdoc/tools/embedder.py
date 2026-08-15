@@ -65,6 +65,25 @@ class Embedder:
         cls.validate_embeddings([vector])
         return vector
 
+    # 批量问题向量化；与单问题入口保持相同的 query 编码契约。
+    @classmethod
+    def embed_queries(cls, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        with model_inference_semaphore("embedder"):
+            vectors = (
+                cls.get_model()
+                .encode(
+                    texts,
+                    batch_size=64,
+                    normalize_embeddings=cls.NORMALIZE,
+                    show_progress_bar=False,
+                )
+                .tolist()
+            )
+        cls.validate_embeddings(vectors)
+        return vectors
+
     # 文档向量化。
     @classmethod
     def embed_documents(cls, texts: List[str]) -> List[List[float]]:

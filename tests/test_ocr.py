@@ -163,3 +163,21 @@ def test_ocr_disabled_preserves_previous_empty_scan_page_behavior(monkeypatch):
     assert engine.calls == 0
     assert pages[0]["text"] == ""
     assert pages[0]["ocr_status"] == "disabled"
+
+
+def test_ocr_disabled_preserves_short_native_text(monkeypatch):
+    short_text = "截止日期：8月31日"
+    monkeypatch.setattr(
+        parser.fitz,
+        "open",
+        lambda path: FakeDocument([FakePage(short_text, [(0, 0, 200, 20, short_text)])]),
+    )
+
+    pages = parser.smart_parse(
+        "short-native.pdf",
+        settings=_settings(cogdoc_ocr_enabled=False),
+    )
+
+    assert pages[0]["text"] == short_text
+    assert pages[0]["extraction_method"] == "native"
+    assert pages[0]["ocr_status"] == "disabled"

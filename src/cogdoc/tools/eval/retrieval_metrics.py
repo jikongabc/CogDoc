@@ -46,6 +46,7 @@ LOWER_IS_BETTER_PREFIXES = (
     "no_answer_false_positive@",
     "no_evidence_unit_false_positive@",
     "evidence_span_fallback_rate",
+    "requirement_coverage_abstention_rate",
 )
 
 

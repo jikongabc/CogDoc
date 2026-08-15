@@ -1,5 +1,7 @@
 import hashlib
 import json
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import anyio.to_thread
 import pytest
@@ -117,6 +119,70 @@ def _gold_annotations():
     }
 
 
+def test_candidate_retrieval_uses_both_query_passes_and_returns_stable_identity(
+    monkeypatch,
+):
+    import cogdoc.api.routes.retrieval_eval_drafts as route
+
+    captured = {}
+
+    @contextmanager
+    def fake_lease(kb_id):
+        captured["lease"] = kb_id
+        yield
+
+    def fake_pool(engine, derived, feedback, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            docs=[
+                {
+                    "text": "核心证据",
+                    "meta": {
+                        "chunk_id": "c1",
+                        "parent_chunk_id": "p1",
+                        "source": "a.pdf",
+                        "source_sha256": "sha-a",
+                        "page_start": 3,
+                        "page_end": 4,
+                    },
+                    "retrieval": {
+                        "matched_requirement_ids": ["r1"],
+                        "query_hit_count": 2,
+                        "private_backend_field": "must-not-leak",
+                    },
+                }
+            ],
+            queries=kwargs["queries"],
+            ranking_count=3,
+            channel_counts={"hybrid": 3, "derived_knowledge": 0},
+            feedback_error="",
+        )
+
+    monkeypatch.setattr(route, "kb_read_lease", fake_lease)
+    monkeypatch.setattr(route.RetrieverFactory, "get_engine", lambda kb_id: object())
+    monkeypatch.setattr(route, "retrieve_candidate_pool", fake_pool)
+    monkeypatch.setattr(
+        route, "get_settings", lambda: SimpleNamespace(hybrid_rrf_k=60.0)
+    )
+    runtime = SimpleNamespace(
+        derived_knowledge_retriever=object(), retrieval_feedback_store=object()
+    )
+    result = route._retrieve_draft_candidates(
+        _pending().model_dump(mode="json"),
+        runtime=runtime,
+        retrieval_scope=route.RetrievalScope(include_derived_knowledge=False),
+        top_k=8,
+    )
+
+    query_texts = [query.text for query in captured["queries"]]
+    assert query_texts == ["问题", "核心结论", "a.pdf 核心结论"]
+    assert captured["lease"] == "kb"
+    assert captured["scope"].include_derived_knowledge is False
+    assert result["candidates"][0]["source_sha256"] == "sha-a"
+    assert result["candidates"][0]["matched_requirement_ids"] == ["r1"]
+    assert "private_backend_field" not in result["candidates"][0]["retrieval"]
+
+
 @pytest.mark.anyio
 async def test_review_auth_stays_off_anyio_worker_pool(tmp_path, monkeypatch):
     import cogdoc.api.routes.retrieval_eval_drafts as route
@@ -183,6 +249,96 @@ async def test_review_routes_require_independent_review_key(tmp_path, monkeypatc
         assert "未启用" in response.json()["detail"]
     finally:
         _close_app(disabled)
+
+
+@pytest.mark.anyio
+async def test_review_candidates_are_scoped_versioned_and_never_auto_gold(
+    tmp_path, monkeypatch
+):
+    import cogdoc.api.routes.retrieval_eval_drafts as route
+
+    monkeypatch.setattr(route, "current_index_provenance", lambda kb_id: _snapshot())
+    calls = []
+
+    def fake_candidates(row, *, runtime, retrieval_scope, top_k):
+        calls.append((row["draft_id"], retrieval_scope, top_k))
+        return {
+            "queries": ["问题", "核心结论"],
+            "ranking_count": 2,
+            "channel_counts": {"hybrid": 2, "derived_knowledge": 0},
+            "feedback_error": "",
+            "candidates": [
+                {
+                    "rank": 1,
+                    "text": "前文 核心证据 后文",
+                    "text_length": 10,
+                    "chunk_id": "c1",
+                    "parent_chunk_id": "p1",
+                    "source": "a.pdf",
+                    "source_sha256": "sha-a",
+                    "page": 2,
+                    "page_start": 2,
+                    "page_end": 2,
+                    "section_title": "结论",
+                    "matched_requirement_ids": ["r1"],
+                    "retrieval": {"query_hit_count": 2},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(route, "_retrieve_draft_candidates", fake_candidates)
+    app, store = _make_app(tmp_path)
+    pending = store.ensure(_pending())
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            ordinary = await client.get(
+                f"/v1/retrieval-eval-drafts/{pending['draft_id']}/candidates",
+                headers={"Authorization": "Bearer normal-key"},
+            )
+            reviewer = await client.get(
+                f"/v1/retrieval-eval-drafts/{pending['draft_id']}/candidates",
+                params={"top_k": 7},
+                headers={"Authorization": "Bearer review-key"},
+            )
+        assert ordinary.status_code == 403
+        assert reviewer.status_code == 200
+        payload = reviewer.json()
+        assert payload["candidates"][0]["text"] == "前文 核心证据 后文"
+        assert payload["candidates"][0]["source_sha256"] == "sha-a"
+        assert calls[0][2] == 7
+        assert store.get(pending["draft_id"])["units"][0]["acceptable_evidence"] == []
+    finally:
+        _close_app(app)
+
+
+@pytest.mark.anyio
+async def test_review_candidates_reject_stale_draft_before_retrieval(
+    tmp_path, monkeypatch
+):
+    import cogdoc.api.routes.retrieval_eval_drafts as route
+
+    monkeypatch.setattr(route, "current_index_provenance", lambda kb_id: _snapshot())
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("stale draft must not run retrieval")
+
+    monkeypatch.setattr(route, "_retrieve_draft_candidates", fail_if_called)
+    app, store = _make_app(tmp_path)
+    stale = store.ensure(_pending(generation="old-gen"))
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get(
+                f"/v1/retrieval-eval-drafts/{stale['draft_id']}/candidates",
+                headers={"X-API-Key": "review-key"},
+            )
+        assert response.status_code == 409
+        assert "index_generation_changed" in response.json()["detail"]["reasons"]
+    finally:
+        _close_app(app)
 
 
 @pytest.mark.anyio

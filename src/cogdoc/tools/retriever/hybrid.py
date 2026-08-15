@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import List
 from cogdoc.config.settings import get_settings
 from cogdoc.graph.state import RetrievedDoc
@@ -127,3 +128,65 @@ class HybridRetriever(BaseRetriever):
         return rust_core.rrf_fusion_native(
             vector_results, bm25_results, float(self.k), top_k
         )
+
+    def search_many(
+        self,
+        queries: Sequence[str],
+        top_k: int = 3,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> List[List[RetrievedDoc]]:
+        """Batch the vector side while preserving per-query BM25/RRF semantics."""
+
+        normalized_queries = [str(query) for query in queries]
+        if not normalized_queries:
+            return []
+        if scope is not None and scope.denies_all:
+            return [[] for _ in normalized_queries]
+        self._ensure_servable()
+        recall_top_k = top_k * 3
+
+        vector_search_many = getattr(self.vector_retriever, "search_many", None)
+        if callable(vector_search_many):
+            vector_rankings = (
+                vector_search_many(normalized_queries, top_k=recall_top_k)
+                if scope is None
+                else vector_search_many(
+                    normalized_queries, top_k=recall_top_k, scope=scope
+                )
+            )
+            if len(vector_rankings) != len(normalized_queries):
+                raise RuntimeError("vector search_many returned an invalid row count")
+        else:
+            vector_rankings = [
+                (
+                    self.vector_retriever.search(query, top_k=recall_top_k)
+                    if scope is None
+                    else self.vector_retriever.search(
+                        query, top_k=recall_top_k, scope=scope
+                    )
+                )
+                for query in normalized_queries
+            ]
+
+        bm25_rankings = [
+            (
+                self.bm25_retriever.search(query, top_k=recall_top_k)
+                if scope is None
+                else self.bm25_retriever.search(
+                    query, top_k=recall_top_k, scope=scope
+                )
+            )
+            for query in normalized_queries
+        ]
+        return [
+            rust_core.rrf_fusion_native(
+                vector_docs,
+                bm25_docs,
+                float(self.k),
+                top_k,
+            )
+            for vector_docs, bm25_docs in zip(
+                vector_rankings, bm25_rankings, strict=True
+            )
+        ]

@@ -259,15 +259,46 @@ def retrieve_candidate_pool(
 
     rankings: list[RankedCandidateList] = []
     channel_counts = {HYBRID_CHANNEL: 0, DERIVED_KNOWLEDGE_CHANNEL: 0}
-    executed_queries: list[RetrievalQuery] = []
-    for query in queries:
-        if not query.text.strip():
-            continue
-        executed_queries.append(query)
-        hybrid_docs = (
-            engine.search(query=query.text, top_k=top_k)
+    executed_queries = [query for query in queries if query.text.strip()]
+    engine_search_many = getattr(engine, "search_many", None)
+    hybrid_rankings: Sequence[list[RetrievedDoc]] | None = None
+    if callable(engine_search_many) and executed_queries:
+        query_texts = [query.text for query in executed_queries]
+        hybrid_rankings = (
+            engine_search_many(query_texts, top_k=top_k)
             if scope is None
-            else engine.search(query=query.text, top_k=top_k, scope=scope)
+            else engine_search_many(query_texts, top_k=top_k, scope=scope)
+        )
+        if len(hybrid_rankings) != len(executed_queries):
+            raise RuntimeError("retriever search_many returned an invalid row count")
+
+    knowledge_search_many = getattr(derived_knowledge_retriever, "search_many", None)
+    knowledge_rankings: Sequence[list[RetrievedDoc]] | None = None
+    if (
+        callable(knowledge_search_many)
+        and executed_queries
+        and (scope is None or scope.include_derived_knowledge)
+    ):
+        query_texts = [query.text for query in executed_queries]
+        knowledge_rankings = (
+            knowledge_search_many(kb_id, query_texts, top_k=top_k)
+            if scope is None
+            else knowledge_search_many(kb_id, query_texts, top_k=top_k, scope=scope)
+        )
+        if len(knowledge_rankings) != len(executed_queries):
+            raise RuntimeError(
+                "derived knowledge search_many returned an invalid row count"
+            )
+
+    for query_index, query in enumerate(executed_queries):
+        hybrid_docs = (
+            list(hybrid_rankings[query_index])
+            if hybrid_rankings is not None
+            else (
+                engine.search(query=query.text, top_k=top_k)
+                if scope is None
+                else engine.search(query=query.text, top_k=top_k, scope=scope)
+            )
         )
         channel_counts[HYBRID_CHANNEL] += len(hybrid_docs)
         if hybrid_docs:
@@ -283,14 +314,18 @@ def retrieve_candidate_pool(
             )
 
         knowledge_docs = (
-            derived_knowledge_retriever.search(kb_id, query.text, top_k=top_k)
-            if scope is None
+            list(knowledge_rankings[query_index])
+            if knowledge_rankings is not None
             else (
-                derived_knowledge_retriever.search(
-                    kb_id, query.text, top_k=top_k, scope=scope
+                derived_knowledge_retriever.search(kb_id, query.text, top_k=top_k)
+                if scope is None
+                else (
+                    derived_knowledge_retriever.search(
+                        kb_id, query.text, top_k=top_k, scope=scope
+                    )
+                    if scope.include_derived_knowledge
+                    else []
                 )
-                if scope.include_derived_knowledge
-                else []
             )
         )
         channel_counts[DERIVED_KNOWLEDGE_CHANNEL] += len(knowledge_docs)

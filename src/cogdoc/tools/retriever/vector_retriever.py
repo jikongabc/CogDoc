@@ -1,6 +1,6 @@
 import os
 import chromadb
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, List, cast
 from cogdoc.config.settings import get_settings
 from cogdoc.graph.state import DocMeta, RetrievedDoc
@@ -196,15 +196,59 @@ class VectorRetriever(BaseRetriever):
             )
         # 返回结构保持与 BM25Retriever 一致。
         results = self.collection.query(**query_options)
-        if not results or not results["documents"] or not results["documents"][0]:
+        return self._materialize_search_row(results, 0)
+
+    def search_many(
+        self,
+        queries: Sequence[str],
+        top_k: int = 3,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> List[List[RetrievedDoc]]:
+        """Search several queries with one embedding batch and one Chroma call."""
+
+        normalized_queries = [str(query) for query in queries]
+        if not normalized_queries:
+            return []
+        if scope is not None and scope.denies_all:
+            return [[] for _ in normalized_queries]
+
+        query_options: dict[str, Any] = {
+            "query_embeddings": cast(
+                Any, Embedder.embed_queries(normalized_queries)
+            ),
+            "n_results": top_k,
+        }
+        if scope is not None and scope.is_source_restricted:
+            sources = list(scope.allowed_sources)
+            query_options["where"] = cast(
+                Any,
+                {"source": sources[0]}
+                if len(sources) == 1
+                else {"source": {"$in": sources}},
+            )
+        results = self.collection.query(**query_options)
+        return [
+            self._materialize_search_row(results, index)
+            for index in range(len(normalized_queries))
+        ]
+
+    @staticmethod
+    def _materialize_search_row(results: Any, row_index: int) -> List[RetrievedDoc]:
+        if (
+            not results
+            or not results.get("documents")
+            or row_index >= len(results["documents"])
+            or not results["documents"][row_index]
+        ):
             return []
 
         retrieved_docs: List[RetrievedDoc] = []
-        docs = cast(Any, results["documents"])[0]
-        ids = results["ids"][0]
-        metas = cast(Any, results["metadatas"])[0]
+        docs = cast(Any, results["documents"])[row_index]
+        ids = results["ids"][row_index]
+        metas = cast(Any, results["metadatas"])[row_index]
         distances = (
-            cast(Any, results["distances"])[0]
+            cast(Any, results["distances"])[row_index]
             if results.get("distances") is not None
             else [0.0] * len(ids)
         )

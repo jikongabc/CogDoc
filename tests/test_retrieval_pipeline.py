@@ -104,6 +104,26 @@ class _Knowledge:
         return self.results.get(query, [])
 
 
+class _BatchEngine(_Engine):
+    def search_many(self, queries, top_k):
+        self.calls.append((tuple(queries), top_k))
+        return [self.results.get(query, []) for query in queries]
+
+    def search(self, query, top_k):
+        raise AssertionError("batch-capable engine must not use scalar search")
+
+
+class _BatchKnowledge(_Knowledge):
+    def search_many(self, kb_id, queries, top_k):
+        self.calls.append((kb_id, tuple(queries), top_k))
+        return [self.results.get(query, []) for query in queries]
+
+    def search(self, kb_id, query, top_k):
+        raise AssertionError(
+            "batch-capable knowledge retriever must not use scalar search"
+        )
+
+
 class _Feedback:
     def __init__(self, boosts=None):
         self.boosts = boosts or {}
@@ -161,6 +181,55 @@ def test_pipeline_retrieves_both_channels_and_fuses_provenance():
     ]
     assert shared["retrieval"]["matched_requirement_ids"] == ["r1"]
     assert shared["retrieval"]["retrieval_round"] == 2
+
+
+def test_pipeline_uses_batch_search_without_changing_query_provenance():
+    engine = _BatchEngine(
+        {
+            "original": [_doc("shared")],
+            "focused": [_doc("shared"), _doc("focused")],
+        }
+    )
+    queries = [
+        RetrievalQuery("original", is_original=True),
+        RetrievalQuery("focused", requirement_ids=("r1",)),
+    ]
+
+    result = retrieve_candidate_pool(
+        engine,
+        _Knowledge({}),
+        None,
+        kb_id="kb",
+        original_query="original",
+        queries=queries,
+        top_k=3,
+        rrf_k=60,
+    )
+
+    assert engine.calls == [(("original", "focused"), 3)]
+    assert result.queries == queries
+    shared = next(doc for doc in result.docs if doc["meta"]["chunk_id"] == "shared")
+    assert shared["retrieval"]["matched_queries"] == ["original", "focused"]
+    assert shared["retrieval"]["matched_requirement_ids"] == ["r1"]
+
+
+def test_pipeline_batches_derived_knowledge_queries():
+    knowledge = _BatchKnowledge({"original": [_doc("k1")], "focused": [_doc("k2")]})
+    queries = [RetrievalQuery("original"), RetrievalQuery("focused")]
+
+    result = retrieve_candidate_pool(
+        _BatchEngine({}),
+        knowledge,
+        None,
+        kb_id="kb",
+        original_query="original",
+        queries=queries,
+        top_k=3,
+        rrf_k=60,
+    )
+
+    assert knowledge.calls == [("kb", ("original", "focused"), 3)]
+    assert result.channel_counts[DERIVED_KNOWLEDGE_CHANNEL] == 2
 
 
 def test_pipeline_applies_existing_feedback_boost_ordering():

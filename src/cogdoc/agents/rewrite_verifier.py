@@ -97,6 +97,26 @@ class RewriteVerifyAgent:
             return output
         if not rewrites and not raw_requirements:
             return {"rewritten_queries": rewrites}
+        if state.get("query_rewrite_fast_path"):
+            output: dict[str, Any] = {
+                "rewritten_queries": rewrites,
+                "query_rewrite_fast_path": True,
+                "steps_trace": [
+                    {
+                        "step_name": "verify_rewrite",
+                        "input_summary": json.dumps(rewrites, ensure_ascii=False),
+                        "output_summary": json.dumps(
+                            {"fast_path": True, "kept": rewrites},
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+            }
+            if raw_requirements:
+                output["evidence_requirements"] = requirements or [
+                    _original_requirement(query)
+                ]
+            return output
 
         # 有历史时用近期对话补全相似度基准，避免指代改写被裸省略句误杀。
         history_text = format_recent_chat_history(

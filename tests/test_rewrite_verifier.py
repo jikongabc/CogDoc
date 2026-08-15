@@ -169,6 +169,35 @@ def test_verify_rewrites_skips_empty_inputs(monkeypatch):
     ) == {"rewritten_queries": []}
 
 
+def test_fast_path_skips_redundant_embedding_verification(monkeypatch):
+    monkeypatch.setattr(
+        rewrite_verifier.Embedder,
+        "embed_documents",
+        lambda _texts: (_ for _ in ()).throw(
+            AssertionError("fast path must not embed duplicate query text")
+        ),
+    )
+
+    result = RewriteVerifyAgent.verify_rewrites(
+        {
+            "query": "报名截止日期是什么？",
+            "rewritten_queries": ["报名截止日期是什么？"],
+            "query_rewrite_fast_path": True,
+            "evidence_requirements": [
+                {
+                    "requirement_id": "r1",
+                    "question": "报名截止日期是什么？",
+                    "retrieval_query": "报名截止日期是什么？",
+                    "recovery_query": "报名截止日期是什么？",
+                }
+            ],
+        }
+    )
+
+    assert result["query_rewrite_fast_path"] is True
+    assert result["evidence_requirements"][0]["requirement_id"] == "r1"
+
+
 # 验证 verify rewrites handles empty embedding result 场景。
 def test_verify_rewrites_handles_empty_embedding_result(monkeypatch):
     # embedding 异常少返回空向量时，所有改写按低相似丢弃并写入 trace。

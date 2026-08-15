@@ -315,6 +315,7 @@ def test_percentile_and_metric_direction():
     assert metric_direction("latency_p95_ms") == "lower"
     assert metric_direction("no_answer_false_positive@5") == "lower"
     assert metric_direction("evidence_span_fallback_rate") == "lower"
+    assert metric_direction("requirement_coverage_abstention_rate") == "lower"
 
 
 # 验证空聚合结果为空字典。
@@ -644,6 +645,8 @@ def test_retrieval_run_eval_reports_layers_and_latency(monkeypatch):
             ),
             "parent_context_expanded_count": 1 if supported else 0,
             "neighbor_context_expanded_count": 0,
+            "rerank_devices": ["cpu"] if supported else [],
+            "rerank_skip_reasons": ["cpu_disabled"] if supported else [],
         }
 
     monkeypatch.setattr(
@@ -658,6 +661,14 @@ def test_retrieval_run_eval_reports_layers_and_latency(monkeypatch):
                 "query": "answerable",
                 "expected_sources": ["a.pdf"],
                 "layer": "single-source",
+                "evidence_requirements": [
+                    {
+                        "requirement_id": "r1",
+                        "question": "证据是什么",
+                        "retrieval_query": "证据",
+                        "recovery_query": "直接证据",
+                    }
+                ],
                 "gold_requirements": [
                     {
                         "requirement_id": "r1",
@@ -675,10 +686,14 @@ def test_retrieval_run_eval_reports_layers_and_latency(monkeypatch):
     assert report["aggregate"]["mrr"] == 1.0
     assert report["aggregate"]["no_answer_false_positive@5"] == 0.0
     assert report["aggregate"]["answerable_acceptance_rate"] == 1.0
+    assert report["aggregate"]["requirement_coverage_abstention_rate"] == 0.0
     assert report["aggregate"]["no_answer_abstention_rate"] == 1.0
     assert report["aggregate"]["answerable_first_stage_acceptance_rate"] == 1.0
     assert report["aggregate"]["no_answer_first_stage_abstention_rate"] == 1.0
     assert report["config"]["verify_evidence"] is True
+    assert report["config"]["rerank_devices"] == ["cpu"]
+    assert report["config"]["rerank_skip_reasons"] == ["cpu_disabled"]
+    assert report["config"]["rerank_skipped_query_count"] == 1
     assert report["aggregate"]["latency_p95_ms"] >= 0.0
     assert report["rows"][0]["metrics"]["generation_requirement_coverage"] == 1.0
     assert report["metric_denominators"]["generation_requirement_coverage"] == 1
@@ -716,6 +731,7 @@ def test_retrieve_result_adaptive_second_round_without_model_verifier(monkeypatc
         qa_evidence_span_context_sentences=1,
         qa_evidence_pack_max_docs=8,
         qa_evidence_pack_max_chars=7200,
+        qa_rerank_docs_per_requirement=2,
         hybrid_rrf_k=60,
     )
     requirements = [
@@ -777,7 +793,7 @@ def test_retrieve_result_adaptive_second_round_without_model_verifier(monkeypatc
     )
     decision_candidate_counts = []
 
-    def assess_support(docs, _settings):
+    def assess_support(docs, _settings, **_kwargs):
         decision_candidate_counts.append(len(docs))
         return SimpleNamespace(
             supported=bool(docs),
@@ -801,7 +817,7 @@ def test_retrieve_result_adaptive_second_round_without_model_verifier(monkeypatc
     assert result["retrieval_retry_count"] == 1
     assert result["adaptive_retrieval_rescued"] is True
     assert result["sources"] == ["b0.pdf", "b1.pdf", "b2.pdf"]
-    assert decision_candidate_counts == [0, 1]
+    assert decision_candidate_counts == [0, 3]
     assert result["retrieval_query_count"] == 6
     assert result["retrieval_ranking_count"] == 1
     assert result["retrieval_channel_counts"] == {
@@ -939,7 +955,7 @@ def test_retrieve_result_carries_verified_docs_into_second_round(monkeypatch):
     monkeypatch.setattr(
         confidence,
         "assess_retrieval_support",
-        lambda docs, _settings: SimpleNamespace(
+        lambda docs, _settings, **_kwargs: SimpleNamespace(
             supported=bool(docs),
             score=1.0 if docs else 0.0,
             reason="supported" if docs else "no_candidates",
@@ -1072,7 +1088,7 @@ def test_retrieve_result_hydrates_parent_context_before_verifier(monkeypatch):
     monkeypatch.setattr(
         confidence,
         "assess_retrieval_support",
-        lambda docs, _settings: SimpleNamespace(
+        lambda docs, _settings, **_kwargs: SimpleNamespace(
             supported=True,
             score=1.0,
             reason="supported",
@@ -1191,7 +1207,7 @@ def test_retrieve_result_fails_closed_before_verifier_when_pack_is_over_budget(
     monkeypatch.setattr(
         confidence,
         "assess_retrieval_support",
-        lambda docs, _settings: SimpleNamespace(
+        lambda docs, _settings, **_kwargs: SimpleNamespace(
             supported=True,
             score=1.0,
             reason="supported",

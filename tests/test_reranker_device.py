@@ -1,6 +1,11 @@
 import pytest
 from cogdoc.tools import device, reranker
-from cogdoc.tools.reranker import BGEReranker
+from cogdoc.tools.reranker import (
+    BGEReranker,
+    dynamic_rerank_top_n,
+    rerank_with_device_policy,
+    rerank_with_requirement_policy,
+)
 
 
 # 恢复重排器全局状态。
@@ -166,3 +171,93 @@ def test_local_then_cloud_switch_restores_default_device():
 
     BGEReranker.set_device(default)
     assert BGEReranker.device == default
+
+
+def test_rerank_policy_skips_cpu_when_production_disallows_it(monkeypatch):
+    docs = [{"text": "candidate", "meta": {"chunk_id": "c1"}}]
+    monkeypatch.setattr(BGEReranker, "default_device", lambda: "cpu")
+
+    result = rerank_with_device_policy(
+        query="query",
+        docs=docs,
+        top_n=1,
+        allow_cpu=False,
+    )
+
+    assert result.device == "cpu"
+    assert result.skipped_reason == "cpu_disabled"
+    assert result.docs[0]["retrieval"]["rerank_skipped_reason"] == "cpu_disabled"
+
+
+def test_rerank_policy_runs_cross_encoder_when_cpu_is_allowed(monkeypatch):
+    docs = [{"text": "candidate", "meta": {"chunk_id": "c1"}}]
+    ranked = [{"text": "ranked", "meta": {"chunk_id": "c1"}}]
+    calls = []
+    monkeypatch.setattr(BGEReranker, "default_device", lambda: "cpu")
+
+    def fake_rerank(*, query, docs, top_n, device):
+        calls.append((query, docs, top_n, device))
+        return ranked
+
+    monkeypatch.setattr(BGEReranker, "rerank", fake_rerank)
+
+    result = rerank_with_device_policy(
+        query="query",
+        docs=docs,
+        top_n=1,
+        allow_cpu=True,
+    )
+
+    assert result.docs == ranked
+    assert result.device == "cpu"
+    assert result.skipped_reason == ""
+    assert calls == [("query", docs, 1, "cpu")]
+
+
+def test_requirement_rerank_batches_pairs_and_reserves_each_requirement(monkeypatch):
+    docs = [
+        {
+            "text": "A",
+            "meta": {"chunk_id": "a"},
+            "retrieval": {"matched_requirement_ids": ["r1"]},
+        },
+        {
+            "text": "B",
+            "meta": {"chunk_id": "b"},
+            "retrieval": {"matched_requirement_ids": ["r2"]},
+        },
+        {"text": "global", "meta": {"chunk_id": "g"}, "retrieval": {}},
+    ]
+    monkeypatch.setattr(BGEReranker, "default_device", lambda: "cuda")
+    seen = []
+
+    def score_pairs(pairs, *, device=None):
+        seen.extend(pairs)
+        # Global scores favor g, requirement scores favor their attributed docs.
+        return [0.2, 0.1, 0.9, 0.8, 0.7]
+
+    monkeypatch.setattr(BGEReranker, "score_pairs", score_pairs)
+    result = rerank_with_requirement_policy(
+        query="all",
+        docs=docs,
+        requirement_queries={"r1": "need A", "r2": "need B"},
+        top_n=3,
+        allow_cpu=False,
+        per_requirement=1,
+    )
+
+    assert [doc["meta"]["chunk_id"] for doc in result.docs] == ["a", "b", "g"]
+    assert len(seen) == 5
+    assert result.docs[0]["retrieval"]["requirement_rerank_scores"] == {"r1": 0.8}
+
+
+def test_dynamic_rerank_budget_is_bounded_by_evidence_pack():
+    assert (
+        dynamic_rerank_top_n(
+            base_top_n=3,
+            max_docs=8,
+            requirement_count=3,
+            docs_per_requirement=2,
+        )
+        == 6
+    )
