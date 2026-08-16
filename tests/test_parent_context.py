@@ -168,6 +168,23 @@ def test_partial_or_corrupt_parent_order_requires_neighbor_fallback(order_field)
     assert selection.reason == REASON_INCOMPLETE_PARENT_STRUCTURE
 
 
+def test_declared_parent_child_count_detects_missing_tail_child():
+    source_chunks = [_doc(index, child_index=index) for index in range(2)]
+    for doc in source_chunks:
+        doc["meta"]["parent_child_count"] = 3
+
+    selection = select_parent_context(
+        source_chunks,
+        "c0",
+        max_chunks=3,
+        max_chars=100,
+    )
+
+    assert selection.docs == []
+    assert selection.fallback_required is True
+    assert selection.reason == REASON_INCOMPLETE_PARENT_STRUCTURE
+
+
 def test_character_budget_includes_section_and_locator_context():
     source_chunks = [
         _doc(0, text="AAAA", child_index=0),

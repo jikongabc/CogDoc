@@ -721,6 +721,7 @@ def rerank_node(state: GraphState) -> dict:
             docs,
             max_candidates=max_candidates,
             requirement_ids=requirement_ids,
+            per_channel=getattr(settings, "qa_rerank_docs_per_route", 1),
         )
         if max_candidates > 0
         else docs

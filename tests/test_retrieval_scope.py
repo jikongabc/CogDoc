@@ -281,10 +281,40 @@ def test_hybrid_search_many_batches_vector_and_preserves_per_query_bm25():
 
     rows = retriever.search_many(["q1", "q2"], top_k=1)
 
-    assert vector.calls == [(('q1', 'q2'), 3)]
+    assert vector.calls == [(("q1", "q2"), 3)]
     assert bm25.calls == [("q1", 3), ("q2", 3)]
     assert len(rows) == 2
     assert all(len(row) == 1 for row in rows)
+
+
+def test_hybrid_search_many_channels_preserves_unfused_rankings():
+    vector = _BatchVectorChannel("vector")
+    bm25 = _ScalarChannel("bm25")
+    retriever = HybridRetriever(vector, bm25)
+
+    rows = retriever.search_many_channels(["q1", "q2"], top_k=1)
+
+    assert [[doc["meta"]["chunk_id"] for doc in row["vector"]] for row in rows] == [
+        ["vector-q1"],
+        ["vector-q2"],
+    ]
+    assert [[doc["meta"]["chunk_id"] for doc in row["bm25"]] for row in rows] == [
+        ["bm25-q1"],
+        ["bm25-q2"],
+    ]
+
+
+def test_hybrid_route_failure_degrades_to_the_healthy_route():
+    class FailingVector(_ScalarChannel):
+        def search(self, query, top_k):
+            raise RuntimeError("vector backend unavailable")
+
+    retriever = HybridRetriever(FailingVector("vector"), _ScalarChannel("bm25"))
+
+    routes = retriever.search_channels("query", top_k=1)
+
+    assert routes["vector"] == []
+    assert [doc["meta"]["chunk_id"] for doc in routes["bm25"]] == ["bm25-query"]
 
 
 class _KnowledgeStore:

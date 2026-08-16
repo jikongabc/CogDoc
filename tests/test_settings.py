@@ -19,8 +19,13 @@ def test_settings_defaults_match_current_runtime_contract():
     assert settings.llm_model_name == "deepseek-chat"
     assert settings.ollama_model_name == "qwen2.5:7b"
     assert settings.qa_retrieval_top_k == 9
+    assert settings.qa_rag_vector_route_weight == 1.0
+    assert settings.qa_rag_bm25_route_weight == 1.0
+    assert settings.qa_derived_knowledge_vector_route_weight == 0.9
+    assert settings.qa_derived_knowledge_lexical_route_weight == 0.8
     assert settings.qa_rerank_top_n == 3
     assert settings.qa_rerank_docs_per_requirement == 2
+    assert settings.qa_rerank_docs_per_route == 1
     assert settings.qa_query_rewrite_fast_path_enabled is True
     assert settings.qa_parent_context_enabled is True
     assert settings.qa_parent_context_max_chunks == 5
@@ -90,6 +95,9 @@ def test_settings_reads_environment_overrides(monkeypatch):
     monkeypatch.setenv("COGDOC_DOC_DIR", "papers")
     monkeypatch.setenv("LLM_MODEL_NAME", "custom-model")
     monkeypatch.setenv("QA_RETRIEVAL_TOP_K", "11")
+    monkeypatch.setenv("QA_RAG_VECTOR_ROUTE_WEIGHT", "1.2")
+    monkeypatch.setenv("QA_DERIVED_KNOWLEDGE_LEXICAL_ROUTE_WEIGHT", "0.6")
+    monkeypatch.setenv("QA_RERANK_DOCS_PER_ROUTE", "2")
     monkeypatch.setenv("QA_PARENT_CONTEXT_ENABLED", "false")
     monkeypatch.setenv("QA_PARENT_CONTEXT_MAX_CHUNKS", "7")
     monkeypatch.setenv("QA_PARENT_CONTEXT_MAX_CHARS", "4200")
@@ -121,6 +129,9 @@ def test_settings_reads_environment_overrides(monkeypatch):
     assert settings.cogdoc_doc_dir == "papers"
     assert settings.llm_model_name == "custom-model"
     assert settings.qa_retrieval_top_k == 11
+    assert settings.qa_rag_vector_route_weight == 1.2
+    assert settings.qa_derived_knowledge_lexical_route_weight == 0.6
+    assert settings.qa_rerank_docs_per_route == 2
     assert settings.qa_parent_context_enabled is False
     assert settings.qa_parent_context_max_chunks == 7
     assert settings.qa_parent_context_max_chars == 4200
@@ -198,14 +209,8 @@ def test_api_principal_map_parses_json_without_exposing_legacy_keys(monkeypatch)
         "[]",
         '"not-an-object"',
         '{"key":"not-an-object"}',
-        (
-            '{"key":{"tenant_id":"t","subject_id":"s",'
-            '"role":"viewer","rol":"owner"}}'
-        ),
-        (
-            '{"key":{"tenant_id":"t","subject_id":"s",'
-            '"role":"viewer","role":"owner"}}'
-        ),
+        ('{"key":{"tenant_id":"t","subject_id":"s","role":"viewer","rol":"owner"}}'),
+        ('{"key":{"tenant_id":"t","subject_id":"s","role":"viewer","role":"owner"}}'),
         (
             '{" key ":{"tenant_id":"t","subject_id":"s","role":"viewer"},'
             '"key":{"tenant_id":"t","subject_id":"s","role":"owner"}}'
@@ -373,9 +378,7 @@ def test_settings_resolves_research_planner_backend(monkeypatch):
     monkeypatch.setenv("OLLAMA_RESEARCH_PLANNER_MODEL_NAME", "plan-review:7b")
 
     settings = get_settings()
-    is_local = settings.is_local_for_node(
-        "research_planner", request_is_local=False
-    )
+    is_local = settings.is_local_for_node("research_planner", request_is_local=False)
 
     assert is_local is True
     assert (

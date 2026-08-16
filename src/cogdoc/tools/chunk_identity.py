@@ -2,11 +2,13 @@ DEFAULT_CHUNK_CHAR_SIZE = 600
 DEFAULT_CHUNK_CHAR_OVERLAP = 60
 MIN_CHUNK_CHARS = 30
 DEFAULT_CHUNK_CONTEXT_CHARS = 160
+CHUNKING_STRATEGY_VERSION = "adaptive-structural-v2"
 DOCUMENT_ID_VERSION = "source-name-v1"
 
 # 切块和检索索引输入变化时必须同步更新版本。
 CHUNK_IDENTITY_BASE_VERSION = (
-    "source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index"
+    "source_sha256_name_page_span_local_v7_document_acl_"
+    "parent_child_section_index_adaptive_blocks"
 )
 CHUNK_IDENTITY_VERSION = (
     f"{CHUNK_IDENTITY_BASE_VERSION}"
@@ -14,6 +16,7 @@ CHUNK_IDENTITY_VERSION = (
     f"_ov{DEFAULT_CHUNK_CHAR_OVERLAP}"
     f"_min{MIN_CHUNK_CHARS}"
     f"_ctx{DEFAULT_CHUNK_CONTEXT_CHARS}"
+    f"_strategy_{CHUNKING_STRATEGY_VERSION}"
 )
 
 

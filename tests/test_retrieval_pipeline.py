@@ -1,6 +1,10 @@
 from cogdoc.service.retrieval_pipeline import (
+    DERIVED_KNOWLEDGE_LEXICAL_CHANNEL,
     DERIVED_KNOWLEDGE_CHANNEL,
+    DERIVED_KNOWLEDGE_VECTOR_CHANNEL,
     HYBRID_CHANNEL,
+    RAG_LEXICAL_CHANNEL,
+    RAG_VECTOR_CHANNEL,
     RetrievalQuery,
     RetrievalScope,
     build_retrieval_queries,
@@ -124,6 +128,28 @@ class _BatchKnowledge(_Knowledge):
         )
 
 
+class _MultiRouteEngine:
+    def search_many_channels(self, queries, top_k):
+        return [
+            {
+                "vector": [_doc(f"vector-{query}"), _doc("shared")],
+                "bm25": [_doc(f"lexical-{query}"), _doc("shared")],
+            }
+            for query in queries
+        ]
+
+
+class _MultiRouteKnowledge:
+    def search_many_channels(self, kb_id, queries, top_k):
+        return [
+            {
+                "embedding": [_doc(f"knowledge-vector-{query}")],
+                "lexical": [_doc(f"knowledge-lexical-{query}")],
+            }
+            for query in queries
+        ]
+
+
 class _Feedback:
     def __init__(self, boosts=None):
         self.boosts = boosts or {}
@@ -181,6 +207,54 @@ def test_pipeline_retrieves_both_channels_and_fuses_provenance():
     ]
     assert shared["retrieval"]["matched_requirement_ids"] == ["r1"]
     assert shared["retrieval"]["retrieval_round"] == 2
+
+
+def test_pipeline_keeps_all_four_production_routes_visible_until_fusion():
+    result = retrieve_candidate_pool(
+        _MultiRouteEngine(),
+        _MultiRouteKnowledge(),
+        None,
+        kb_id="kb",
+        original_query="query",
+        queries=[RetrievalQuery("query", is_original=True)],
+        top_k=3,
+        rrf_k=60,
+    )
+
+    assert result.ranking_count == 4
+    assert result.channel_counts == {
+        RAG_VECTOR_CHANNEL: 2,
+        RAG_LEXICAL_CHANNEL: 2,
+        DERIVED_KNOWLEDGE_VECTOR_CHANNEL: 1,
+        DERIVED_KNOWLEDGE_LEXICAL_CHANNEL: 1,
+    }
+    shared = next(doc for doc in result.docs if doc["meta"]["chunk_id"] == "shared")
+    assert shared["retrieval"]["matched_channels"] == [
+        RAG_VECTOR_CHANNEL,
+        RAG_LEXICAL_CHANNEL,
+    ]
+    assert set(shared["retrieval"]["channel_contributions"]) == {
+        RAG_VECTOR_CHANNEL,
+        RAG_LEXICAL_CHANNEL,
+    }
+
+
+def test_pipeline_route_weight_can_disable_one_route_without_skipping_others():
+    result = retrieve_candidate_pool(
+        _MultiRouteEngine(),
+        _MultiRouteKnowledge(),
+        None,
+        kb_id="kb",
+        original_query="query",
+        queries=[RetrievalQuery("query")],
+        top_k=3,
+        rrf_k=60,
+        route_weights={RAG_VECTOR_CHANNEL: 0.0},
+    )
+
+    assert "vector-query" not in _ids(result.docs)
+    assert "lexical-query" in _ids(result.docs)
+    assert result.channel_counts[RAG_VECTOR_CHANNEL] == 2
 
 
 def test_pipeline_uses_batch_search_without_changing_query_provenance():

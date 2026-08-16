@@ -536,6 +536,93 @@ class DerivedKnowledgeRetriever:
             )
         ]
 
+    def search_channels(
+        self,
+        kb_id: str,
+        query: str,
+        top_k: int = 3,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> dict[str, list[RetrievedDoc]]:
+        """Return embedding and lexical rankings as independent routes."""
+
+        rows = self.search_many_channels(
+            kb_id,
+            [query],
+            top_k=top_k,
+            scope=scope,
+        )
+        return rows[0] if rows else {"embedding": [], "lexical": []}
+
+    def search_many_channels(
+        self,
+        kb_id: str,
+        queries: Sequence[str],
+        top_k: int = 3,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> list[dict[str, list[RetrievedDoc]]]:
+        """Run both approved-knowledge routes, with independent degradation.
+
+        Lexical retrieval is intentionally executed even when the embedding
+        index succeeds: exact names, codes and policy terms are complementary
+        to semantic similarity and should participate in final fusion.
+        """
+
+        if not queries:
+            return []
+        if scope is not None and (
+            scope.denies_all or not scope.include_derived_knowledge
+        ):
+            return [{"embedding": [], "lexical": []} for _ in queries]
+
+        embedding_rows: list[list[RetrievedDoc]] = [[] for _ in queries]
+        index = self._index_or_none()
+        if index is not None:
+            try:
+                index.ensure_fresh(kb_id)
+                search_many = getattr(index, "search_many", None)
+                if callable(search_many):
+                    embedding_rows = (
+                        search_many(kb_id, queries, top_k)
+                        if scope is None
+                        else search_many(kb_id, queries, top_k, scope=scope)
+                    )
+                else:
+                    embedding_rows = [
+                        (
+                            index.search(kb_id, query, top_k)
+                            if scope is None
+                            else index.search(kb_id, query, top_k, scope=scope)
+                        )
+                        for query in queries
+                    ]
+                if len(embedding_rows) != len(queries):
+                    raise RuntimeError("derived index returned an invalid row count")
+            except Exception as exc:
+                log_event(
+                    "retrieval",
+                    "derived_knowledge_index_failed",
+                    {},
+                    level=logging.WARNING,
+                    kb_id=kb_id,
+                    error_class=type(exc).__name__,
+                )
+                embedding_rows = [[] for _ in queries]
+
+        return [
+            {
+                "embedding": list(embedding_docs),
+                "lexical": self._lexical_search(
+                    kb_id,
+                    query,
+                    top_k,
+                    scope=scope,
+                ),
+            }
+            for query, embedding_docs in zip(queries, embedding_rows, strict=True)
+        ]
+
     def _index_or_none(self) -> DerivedKnowledgeIndex | None:
         if not self._index_enabled:
             return None

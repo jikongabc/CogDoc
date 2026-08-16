@@ -22,6 +22,22 @@ def test_retrieval_text_keeps_sparse_legacy_docs_compatible():
     assert retrieval_text({"text": "正文", "meta": {}}) == "正文"
 
 
+def test_retrieval_text_contextualizes_page_span_and_structured_content_type():
+    indexed = retrieval_text(
+        {
+            "text": "| key | value |",
+            "meta": {
+                "source": "policy.pdf",
+                "page_start": 2,
+                "page_end": 3,
+                "chunk_type": "table",
+            },
+        }
+    )
+
+    assert indexed.startswith("来源：policy.pdf\n页码：2-3\n内容类型：table\n\n")
+
+
 def test_retrieval_text_does_not_add_internal_source_id_to_derived_knowledge():
     assert (
         retrieval_text(

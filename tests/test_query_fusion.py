@@ -90,6 +90,30 @@ def test_same_query_across_channels_scores_twice_but_counts_one_query_hit():
     assert retrieval["matched_channels"] == ["hybrid", "derived_knowledge"]
 
 
+def test_weighted_fusion_exposes_per_channel_contributions():
+    fused = fuse_ranked_candidates(
+        [
+            RankedCandidateList("query", "rag_vector", [_doc("vector")], weight=2.0),
+            RankedCandidateList("query", "rag_bm25", [_doc("lexical")], weight=1.0),
+        ],
+        rrf_k=10,
+    )
+
+    assert _ids(fused) == ["vector", "lexical"]
+    assert fused[0]["retrieval"]["channel_contributions"] == pytest.approx(
+        {"rag_vector": 2 / 11}
+    )
+
+
+@pytest.mark.parametrize("weight", [-1.0, float("inf"), float("nan")])
+def test_fusion_rejects_invalid_route_weight(weight):
+    with pytest.raises(ValueError, match="ranking weight"):
+        fuse_ranked_candidates(
+            [RankedCandidateList("query", "route", [_doc("c1")], weight=weight)],
+            rrf_k=60,
+        )
+
+
 def test_fusion_ties_are_deterministic_by_chunk_id():
     rankings = [
         RankedCandidateList("q1", "hybrid", [_doc("b"), _doc("a")]),
@@ -112,6 +136,46 @@ def test_requirement_quota_reserves_late_candidates_and_keeps_fused_order():
     )
 
     assert _ids(selected) == ["top-1", "r1", "r2"]
+
+
+def test_route_quota_reserves_a_candidate_for_each_recall_channel():
+    docs = [_doc("top-vector"), _doc("second-vector"), _doc("late-lexical")]
+    docs[0]["retrieval"] = {"matched_channels": ["rag_vector"]}
+    docs[1]["retrieval"] = {"matched_channels": ["rag_vector"]}
+    docs[2]["retrieval"] = {"matched_channels": ["rag_bm25"]}
+
+    selected = select_rerank_candidates(
+        docs,
+        max_candidates=2,
+        requirement_ids=(),
+        per_channel=1,
+    )
+
+    assert _ids(selected) == ["top-vector", "late-lexical"]
+
+
+def test_fusion_top_n_reserves_independent_route_before_truncation():
+    fused = fuse_ranked_candidates(
+        [
+            RankedCandidateList(
+                "query",
+                "rag_vector",
+                [_doc("shared"), _doc("vector-only")],
+                weight=2.0,
+            ),
+            RankedCandidateList(
+                "query",
+                "derived_knowledge_lexical",
+                [_doc("derived-only")],
+                weight=0.1,
+            ),
+        ],
+        rrf_k=60,
+        top_n=2,
+        per_channel_min=1,
+    )
+
+    assert _ids(fused) == ["shared", "derived-only"]
 
 
 def test_fusion_and_quota_do_not_modify_inputs():

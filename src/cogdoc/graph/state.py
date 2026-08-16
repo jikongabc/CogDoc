@@ -35,6 +35,13 @@ class DocMeta(TypedDict):
     section_path: NotRequired[str]
     section_level: NotRequired[int]
     child_index_in_parent: NotRequired[int]
+    parent_child_count: NotRequired[int]
+    parent_char_count: NotRequired[int]
+    chunk_type: NotRequired[str]
+    document_profile: NotRequired[str]
+    chunking_strategy_version: NotRequired[str]
+    chunk_char_count: NotRequired[int]
+    chunk_quality_score: NotRequired[float]
 
 
 # retrieval 只保存本次检索产生的动态指标。
@@ -51,6 +58,7 @@ class RetrievalMetrics(TypedDict, total=False):
     query_hit_count: int
     matched_queries: List[str]
     matched_channels: List[str]
+    channel_contributions: Dict[str, float]
     matched_requirement_ids: List[str]
     # 通用 Evidence Unit 命名；迁移期与 matched_requirement_ids 双写。
     matched_unit_ids: List[str]

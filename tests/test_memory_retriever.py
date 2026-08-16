@@ -40,6 +40,36 @@ def test_semantic_channel_beats_unrelated_priority_candidate():
     assert "高优先级无关事实" not in context[0]["content"]
 
 
+def test_memory_retrieval_result_reports_routes_and_selected_tiers():
+    policy = MemoryPolicy(
+        context_long_term_limit=1,
+        memory_retrieval_mid_limit=1,
+    )
+    retriever = MemoryRetriever(policy, embedding_fn=_embed)
+
+    result = retriever.retrieve_result(
+        "语义问题",
+        [{"role": "user", "content": "最近消息"}],
+        {"goals": ["完成检索"], "decisions": [], "summary": []},
+        [{"id": "fact", "content": "语义相关事实", "importance": 1.0}],
+    )
+
+    assert set(result.channel_counts) == {
+        "memory_recency",
+        "memory_lexical",
+        "memory_semantic",
+        "memory_long_importance",
+        "memory_mid_priority",
+    }
+    assert result.selected_tier_counts == {"short": 1, "mid": 1, "long": 1}
+    assert result.context == retriever.retrieve(
+        "语义问题",
+        [{"role": "user", "content": "最近消息"}],
+        {"goals": ["完成检索"], "decisions": [], "summary": []},
+        [{"id": "fact", "content": "语义相关事实", "importance": 1.0}],
+    )
+
+
 # 验证最终上下文保持 RRF 的长期事实顺序。
 def test_long_term_rrf_order_survives_context_assembly():
     policy = MemoryPolicy(

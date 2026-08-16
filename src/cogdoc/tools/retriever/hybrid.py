@@ -1,7 +1,10 @@
 from collections.abc import Sequence
+import logging
 from typing import List
+
 from cogdoc.config.settings import get_settings
 from cogdoc.graph.state import RetrievedDoc
+from cogdoc.observability.logger import log_event
 from cogdoc.tools.retriever.base_retriever import BaseRetriever
 from cogdoc.tools.retriever.scope import RetrievalScope
 from cogdoc.tools.rust_core_loader import ensure_rust_core
@@ -82,6 +85,36 @@ class HybridRetriever(BaseRetriever):
                 "retrieval index stores are inconsistent; rebuild required"
             )
 
+    @staticmethod
+    def _log_route_failure(channel: str, exc: Exception) -> None:
+        log_event(
+            "retrieval",
+            "retrieval_route_failed",
+            {},
+            level=logging.WARNING,
+            channel=channel,
+            error_class=type(exc).__name__,
+        )
+
+    def _search_one_route(
+        self,
+        retriever: BaseRetriever,
+        channel: str,
+        query: str,
+        top_k: int,
+        scope: RetrievalScope | None,
+    ) -> List[RetrievedDoc]:
+        try:
+            docs = (
+                retriever.search(query, top_k=top_k)
+                if scope is None
+                else retriever.search(query, top_k=top_k, scope=scope)
+            )
+        except Exception as exc:
+            self._log_route_failure(channel, exc)
+            return []
+        return list(docs)
+
     # 完成 max分块索引 处理。
     def max_chunk_index(self) -> int:
         # 增量续号用：现存最大展示编号。
@@ -110,24 +143,45 @@ class HybridRetriever(BaseRetriever):
         if scope is not None and scope.denies_all:
             return []
         # 两路召回后交给 native RRF 做去重融合。
-        self._ensure_servable()
-        recall_top_k = top_k * 3  # 扩大召回池提高融合质量
-
-        if scope is None:
-            # 不带 scope 时保持旧调用形状，兼容现有自定义 retriever。
-            vector_results = self.vector_retriever.search(query, top_k=recall_top_k)
-            bm25_results = self.bm25_retriever.search(query, top_k=recall_top_k)
-        else:
-            vector_results = self.vector_retriever.search(
-                query, top_k=recall_top_k, scope=scope
-            )
-            bm25_results = self.bm25_retriever.search(
-                query, top_k=recall_top_k, scope=scope
-            )
+        channels = self.search_channels(query, top_k=top_k, scope=scope)
 
         return rust_core.rrf_fusion_native(
-            vector_results, bm25_results, float(self.k), top_k
+            channels["vector"], channels["bm25"], float(self.k), top_k
         )
+
+    def search_channels(
+        self,
+        query: str,
+        top_k: int = 3,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> dict[str, List[RetrievedDoc]]:
+        """Return dense and lexical rankings before fusion.
+
+        The public ``search`` method remains backward compatible.  Retrieval
+        orchestration can use this method to weight, trace and degrade the two
+        independent routes without losing their provenance in an early merge.
+        """
+
+        if scope is not None and scope.denies_all:
+            return {"vector": [], "bm25": []}
+        self._ensure_servable()
+        recall_top_k = max(0, top_k) * 3
+        vector_results = self._search_one_route(
+            self.vector_retriever,
+            "rag_vector",
+            query,
+            recall_top_k,
+            scope,
+        )
+        bm25_results = self._search_one_route(
+            self.bm25_retriever,
+            "rag_bm25",
+            query,
+            recall_top_k,
+            scope,
+        )
+        return {"vector": list(vector_results), "bm25": list(bm25_results)}
 
     def search_many(
         self,
@@ -138,54 +192,84 @@ class HybridRetriever(BaseRetriever):
     ) -> List[List[RetrievedDoc]]:
         """Batch the vector side while preserving per-query BM25/RRF semantics."""
 
+        channel_rows = self.search_many_channels(queries, top_k=top_k, scope=scope)
+        return [
+            rust_core.rrf_fusion_native(
+                row["vector"],
+                row["bm25"],
+                float(self.k),
+                top_k,
+            )
+            for row in channel_rows
+        ]
+
+    def search_many_channels(
+        self,
+        queries: Sequence[str],
+        top_k: int = 3,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> List[dict[str, List[RetrievedDoc]]]:
+        """Batch dense retrieval and preserve one ranking per recall route."""
+
         normalized_queries = [str(query) for query in queries]
         if not normalized_queries:
             return []
         if scope is not None and scope.denies_all:
-            return [[] for _ in normalized_queries]
+            return [{"vector": [], "bm25": []} for _ in normalized_queries]
         self._ensure_servable()
-        recall_top_k = top_k * 3
+        recall_top_k = max(0, top_k) * 3
 
         vector_search_many = getattr(self.vector_retriever, "search_many", None)
         if callable(vector_search_many):
-            vector_rankings = (
-                vector_search_many(normalized_queries, top_k=recall_top_k)
-                if scope is None
-                else vector_search_many(
-                    normalized_queries, top_k=recall_top_k, scope=scope
+            try:
+                vector_rankings = (
+                    vector_search_many(normalized_queries, top_k=recall_top_k)
+                    if scope is None
+                    else vector_search_many(
+                        normalized_queries, top_k=recall_top_k, scope=scope
+                    )
                 )
-            )
-            if len(vector_rankings) != len(normalized_queries):
-                raise RuntimeError("vector search_many returned an invalid row count")
+                if len(vector_rankings) != len(normalized_queries):
+                    raise RuntimeError(
+                        "vector search_many returned an invalid row count"
+                    )
+            except Exception as exc:
+                self._log_route_failure("rag_vector", exc)
+                vector_rankings = [
+                    self._search_one_route(
+                        self.vector_retriever,
+                        "rag_vector",
+                        query,
+                        recall_top_k,
+                        scope,
+                    )
+                    for query in normalized_queries
+                ]
         else:
             vector_rankings = [
-                (
-                    self.vector_retriever.search(query, top_k=recall_top_k)
-                    if scope is None
-                    else self.vector_retriever.search(
-                        query, top_k=recall_top_k, scope=scope
-                    )
+                self._search_one_route(
+                    self.vector_retriever,
+                    "rag_vector",
+                    query,
+                    recall_top_k,
+                    scope,
                 )
                 for query in normalized_queries
             ]
 
         bm25_rankings = [
-            (
-                self.bm25_retriever.search(query, top_k=recall_top_k)
-                if scope is None
-                else self.bm25_retriever.search(
-                    query, top_k=recall_top_k, scope=scope
-                )
+            self._search_one_route(
+                self.bm25_retriever,
+                "rag_bm25",
+                query,
+                recall_top_k,
+                scope,
             )
             for query in normalized_queries
         ]
         return [
-            rust_core.rrf_fusion_native(
-                vector_docs,
-                bm25_docs,
-                float(self.k),
-                top_k,
-            )
+            {"vector": list(vector_docs), "bm25": list(bm25_docs)}
             for vector_docs, bm25_docs in zip(
                 vector_rankings, bm25_rankings, strict=True
             )

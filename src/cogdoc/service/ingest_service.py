@@ -22,8 +22,12 @@ from cogdoc.service.kb_locks import kb_write_lock
 from cogdoc.service.kb_readers import has_readers
 from cogdoc.service.purge_queue import shared_purge_queue
 from cogdoc.service.kb_state import KBState
-from cogdoc.tools.chunk_identity import CHUNK_IDENTITY_VERSION, build_chunk_id
-from cogdoc.tools.chunker import chunk_paper
+from cogdoc.tools.chunk_identity import (
+    CHUNKING_STRATEGY_VERSION,
+    CHUNK_IDENTITY_VERSION,
+    build_chunk_id,
+)
+from cogdoc.tools.chunker import chunk_paper, chunking_stats_dict
 from cogdoc.tools.manifest import (
     load_index_manifest,
     manifest_path,
@@ -103,8 +107,20 @@ def _merge_ocr_summary(target: dict, source: dict) -> None:
 # 成功构建后记录安全汇总；日志失败不能影响已提交索引。
 def _log_ocr_summary(result) -> None:
     try:
+        log_event("ingest", "ocr_summary", {}, kb_id=result.kb_id, **result.ocr_summary)
+    except Exception:
+        pass
+
+
+def _log_chunking_summary(source: str, chunks: list) -> None:
+    try:
         log_event(
-            "ingest", "ocr_summary", {}, kb_id=result.kb_id, **result.ocr_summary
+            "ingest",
+            "chunking_summary",
+            {},
+            source=source,
+            chunking_strategy_version=CHUNKING_STRATEGY_VERSION,
+            **chunking_stats_dict(chunks),
         )
     except Exception:
         pass
@@ -181,9 +197,7 @@ def _mark_stale_derived_knowledge(
     if not bindings:
         return 0
     marked = 0
-    store = (
-        knowledge_store if knowledge_store is not None else DerivedKnowledgeStore()
-    )
+    store = knowledge_store if knowledge_store is not None else DerivedKnowledgeStore()
     for source, old_hash in bindings:
         marked += len(store.mark_stale_for_source(kb_id, source, old_hash))
     return marked
@@ -257,9 +271,7 @@ def _review_changed_derived_knowledge(
             ),
             "rebound": 0,
         }
-    store = (
-        knowledge_store if knowledge_store is not None else DerivedKnowledgeStore()
-    )
+    store = knowledge_store if knowledge_store is not None else DerivedKnowledgeStore()
     grouped = _chunks_by_source(chunks)
     stale = 0
     rebound = 0
@@ -528,6 +540,7 @@ def _parse_and_chunk(
         if ocr_summary is not None:
             _merge_ocr_summary(ocr_summary, _summarize_ocr_pages(pages))
         chunks = chunk_paper(pages, source_sha256=source_hash_by_name[pdf])
+        _log_chunking_summary(pdf, chunks)
         for chunk in chunks:
             # 展示编号仅用于界面，分块标识才是身份键。
             chunk["meta"]["chunk_index"] = next_chunk_index
@@ -565,7 +578,9 @@ def _full_rebuild(
         raise
     save_index_manifest(manifest)
     _invalidate_engine_cache(kb_id)
-    return IngestResult(kb_id, len(pdf_files), len(all_chunks), doc_results, ocr_summary)
+    return IngestResult(
+        kb_id, len(pdf_files), len(all_chunks), doc_results, ocr_summary
+    )
 
 
 # 应用增量构建。
@@ -1024,7 +1039,9 @@ def _build_transactional_locked(
         except Exception:
             pass
 
-    return IngestResult(kb_id, len(pdf_files), len(all_chunks), doc_results, ocr_summary)
+    return IngestResult(
+        kb_id, len(pdf_files), len(all_chunks), doc_results, ocr_summary
+    )
 
 
 # 处理事务化空库。

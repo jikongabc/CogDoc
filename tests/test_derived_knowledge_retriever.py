@@ -143,3 +143,30 @@ def test_derived_knowledge_retriever_batches_index_and_falls_back_per_empty_row(
     assert rows[1][0]["retrieval"]["search_channel"] == "derived_knowledge"
     assert index.ensured == ["kb"]
     assert index.batch_calls == [("kb", ("indexed query", "合同审批法务"), 3)]
+
+
+def test_derived_knowledge_multi_route_runs_embedding_and_lexical_together(tmp_path):
+    store = DerivedKnowledgeStore(path=str(tmp_path / "knowledge.jsonl"))
+    lexical, _ = store.create(
+        {
+            "kb_id": "kb",
+            "text": "合同编号 ZX-42 必须完成法务复核。",
+            "status": "approved",
+        }
+    )
+    indexed = {
+        "text": "语义相近的审批要求",
+        "meta": {
+            "chunk_id": "knowledge:semantic",
+            "source_type": "derived_knowledge",
+        },
+        "retrieval": {"search_channel": "derived_knowledge_embedding"},
+    }
+
+    routes = DerivedKnowledgeRetriever(
+        store, index=FakeIndex([indexed])
+    ).search_channels("kb", "ZX-42", top_k=3)
+
+    assert routes["embedding"] == [indexed]
+    assert routes["lexical"][0]["meta"]["knowledge_id"] == lexical["knowledge_id"]
+    assert routes["lexical"][0]["retrieval"]["search_channel"] == ("derived_knowledge")

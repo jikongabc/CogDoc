@@ -4,6 +4,22 @@ from cogdoc.tools.retriever.bm25_retriever import BM25Retriever
 from cogdoc.tools.retriever.vector_retriever import VectorRetriever, _meta_from_stored
 
 
+_OPTIONAL_CHUNK_META_FIELDS = (
+    "parent_chunk_id",
+    "section_title",
+    "section_path",
+    "section_level",
+    "child_index_in_parent",
+    "parent_child_count",
+    "parent_char_count",
+    "chunk_type",
+    "document_profile",
+    "chunking_strategy_version",
+    "chunk_char_count",
+    "chunk_quality_score",
+)
+
+
 # BM25 新 native 接口返回 (doc_id, score)，测试只需要一个命中。
 class _DummyBM25:
     # BM25 新 native 接口返回 (doc_id, score)，测试只需要一个命中。
@@ -112,6 +128,13 @@ def _structured_doc(
             "section_path": "System / Design / Architecture",
             "section_level": 2,
             "child_index_in_parent": 1,
+            "parent_child_count": 4,
+            "parent_char_count": 420,
+            "chunk_type": "table",
+            "document_profile": "structured",
+            "chunking_strategy_version": "adaptive-structural-v2",
+            "chunk_char_count": len(text),
+            "chunk_quality_score": 0.95,
         },
     }
 
@@ -119,16 +142,7 @@ def _structured_doc(
 # Vector/BM25 的写入物化与读取重建必须完整保留结构字段。
 def test_retriever_storage_materialization_preserves_structure_metadata():
     doc = _structured_doc()
-    expected = {
-        key: doc["meta"][key]
-        for key in (
-            "parent_chunk_id",
-            "section_title",
-            "section_path",
-            "section_level",
-            "child_index_in_parent",
-        )
-    }
+    expected = {key: doc["meta"][key] for key in _OPTIONAL_CHUNK_META_FIELDS}
 
     cleaned_meta = BM25Retriever._clean_doc(doc)["meta"]
     vector = VectorRetriever.__new__(VectorRetriever)
@@ -146,13 +160,7 @@ def test_retriever_storage_materialization_preserves_structure_metadata():
 # 旧索引元数据不含新字段时不应被注入空值或默认结构。
 def test_retriever_storage_keeps_legacy_metadata_shape():
     doc = _structured_doc()
-    for key in (
-        "parent_chunk_id",
-        "section_title",
-        "section_path",
-        "section_level",
-        "child_index_in_parent",
-    ):
+    for key in _OPTIONAL_CHUNK_META_FIELDS:
         doc["meta"].pop(key)
 
     cleaned_meta = BM25Retriever._clean_doc(doc)["meta"]
@@ -160,13 +168,7 @@ def test_retriever_storage_keeps_legacy_metadata_shape():
     _, stored_metas, _ = vector._materialize([doc])
     restored_meta = _meta_from_stored(stored_metas[0])
 
-    for key in (
-        "parent_chunk_id",
-        "section_title",
-        "section_path",
-        "section_level",
-        "child_index_in_parent",
-    ):
+    for key in _OPTIONAL_CHUNK_META_FIELDS:
         assert key not in cleaned_meta
         assert key not in stored_metas[0]
         assert key not in restored_meta
@@ -180,13 +182,7 @@ def test_bm25_structure_metadata_round_trips_through_persistence(tmp_path):
     other_b = _structured_doc("chunk:other-b", "otherbeta")
     other_b["meta"]["source"] = "other-b.pdf"
     for doc in (other_a, other_b):
-        for key in (
-            "parent_chunk_id",
-            "section_title",
-            "section_path",
-            "section_level",
-            "child_index_in_parent",
-        ):
+        for key in _OPTIONAL_CHUNK_META_FIELDS:
             doc["meta"].pop(key)
 
     persist_directory = str(tmp_path / "bm25")
@@ -199,12 +195,6 @@ def test_bm25_structure_metadata_round_trips_through_persistence(tmp_path):
     hits = restored.search("structuralneedle", top_k=3)
     assert hits
     searched_meta = hits[0]["meta"]
-    for key in (
-        "parent_chunk_id",
-        "section_title",
-        "section_path",
-        "section_level",
-        "child_index_in_parent",
-    ):
+    for key in _OPTIONAL_CHUNK_META_FIELDS:
         assert loaded_meta[key] == structured["meta"][key]
         assert searched_meta[key] == structured["meta"][key]

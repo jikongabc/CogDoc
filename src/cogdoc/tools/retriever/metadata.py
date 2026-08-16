@@ -48,17 +48,24 @@ _STRUCTURE_STRING_META_FIELDS = (
     "parent_chunk_id",
     "section_title",
     "section_path",
+    "chunk_type",
+    "document_profile",
+    "chunking_strategy_version",
 )
 _STRUCTURE_INT_META_FIELDS = (
     "section_level",
     "child_index_in_parent",
+    "parent_child_count",
+    "parent_char_count",
+    "chunk_char_count",
 )
+_STRUCTURE_FLOAT_META_FIELDS = ("chunk_quality_score",)
 
 
 def copy_optional_structure_metadata(
     source: Mapping[str, Any], target: dict[str, Any]
 ) -> None:
-    """Copy explicitly present Parent–Child fields into persisted metadata."""
+    """Copy explicitly present chunk-structure fields into persisted metadata."""
 
     for field in _STRUCTURE_STRING_META_FIELDS:
         value = source.get(field)
@@ -68,6 +75,10 @@ def copy_optional_structure_metadata(
         value = source.get(field)
         if value is not None:
             target[field] = int(value)
+    for field in _STRUCTURE_FLOAT_META_FIELDS:
+        value = source.get(field)
+        if value is not None:
+            target[field] = float(value)
 
 
 # 提取安全检索元数据。

@@ -4,6 +4,7 @@ import hashlib
 import math
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from threading import RLock
 from typing import Any
 
@@ -16,6 +17,15 @@ from cogdoc.tools.tokenizer import tokenize_mixed_text
 
 
 EmbeddingFunction = Callable[[list[str]], Sequence[Sequence[float]]]
+
+
+@dataclass(frozen=True)
+class MemoryRetrievalResult:
+    """Auditable result for the conversation-memory trust domain."""
+
+    context: list[dict[str, Any]]
+    channel_counts: dict[str, int]
+    selected_tier_counts: dict[str, int]
 
 
 # 调用默认嵌入模型。
@@ -107,17 +117,17 @@ def _long_candidates(facts: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
 def _lexical_rank(
     query: str, candidates: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
-    query_tokens = Counter(tokenize_mixed_text(query))
+    query_tokens: Counter[str] = Counter(tokenize_mixed_text(query))
     if not query_tokens or not candidates:
         return []
-    documents = [
+    documents: list[Counter[str]] = [
         Counter(tokenize_mixed_text(str(item["content"]))) for item in candidates
     ]
     document_count = len(documents)
-    document_frequency = Counter()
+    document_frequency: Counter[str] = Counter()
     for tokens in documents:
         document_frequency.update(tokens.keys())
-    scored = []
+    scored: list[tuple[float, dict[str, Any]]] = []
     for candidate, tokens in zip(candidates, documents):
         score = 0.0
         for token, query_frequency in query_tokens.items():
@@ -257,48 +267,77 @@ class MemoryRetriever:
         mid_term: Mapping[str, Any] | None,
         long_term_facts: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
+        return self.retrieve_result(
+            query,
+            short_term,
+            mid_term,
+            long_term_facts,
+        ).context
+
+    def retrieve_result(
+        self,
+        query: str,
+        short_term: Sequence[Mapping[str, Any]],
+        mid_term: Mapping[str, Any] | None,
+        long_term_facts: Sequence[Mapping[str, Any]],
+    ) -> MemoryRetrievalResult:
+        """Retrieve memory routes while keeping memory separate from evidence."""
+
         if not query.strip() or not self.policy.memory_retrieval_enabled:
-            return build_memory_context(
-                short_term, mid_term, long_term_facts, self.policy
+            context = build_memory_context(
+                short_term,
+                mid_term,
+                long_term_facts,
+                self.policy,
+            )
+            return MemoryRetrievalResult(
+                context=context,
+                channel_counts={"memory_static": len(context)},
+                selected_tier_counts={
+                    "short": sum(
+                        1 for message in context if message.get("role") != "memory"
+                    ),
+                    "mid": sum(
+                        1
+                        for message in context
+                        if str(message.get("content", "")).startswith("【中期记忆】")
+                    ),
+                    "long": sum(
+                        1
+                        for message in context
+                        if str(message.get("content", "")).startswith("【长期记忆】")
+                    ),
+                },
             )
         short = _short_candidates(short_term)
         mid = _mid_candidates(mid_term)
         long = _long_candidates(long_term_facts)
         all_candidates = [*short, *mid, *long]
         scores: dict[str, float] = {}
-        self._merge_channel(
-            scores, list(reversed(short)), self.policy.memory_recency_weight
-        )
-        self._merge_channel(
-            scores,
-            _lexical_rank(query, all_candidates),
-            self.policy.memory_lexical_weight,
-        )
+        recency_ranked = list(reversed(short))
+        lexical_ranked = _lexical_rank(query, all_candidates)
+        self._merge_channel(scores, recency_ranked, self.policy.memory_recency_weight)
+        self._merge_channel(scores, lexical_ranked, self.policy.memory_lexical_weight)
         semantic_candidates = [*mid, *long]
         if self.policy.memory_semantic_include_short:
             semantic_candidates = [*short, *semantic_candidates]
+        semantic_ranked = self._semantic_rank(query, semantic_candidates)
+        importance_ranked = sorted(
+            long,
+            key=lambda item: (item["importance"], item["updated_at"]),
+            reverse=True,
+        )
+        mid_priority_ranked = sorted(
+            mid,
+            key=lambda item: (item["priority"], item["order"]),
+            reverse=True,
+        )
+        self._merge_channel(scores, semantic_ranked, self.policy.memory_semantic_weight)
         self._merge_channel(
-            scores,
-            self._semantic_rank(query, semantic_candidates),
-            self.policy.memory_semantic_weight,
+            scores, importance_ranked, self.policy.memory_importance_weight
         )
         self._merge_channel(
-            scores,
-            sorted(
-                long,
-                key=lambda item: (item["importance"], item["updated_at"]),
-                reverse=True,
-            ),
-            self.policy.memory_importance_weight,
-        )
-        self._merge_channel(
-            scores,
-            sorted(
-                mid,
-                key=lambda item: (item["priority"], item["order"]),
-                reverse=True,
-            ),
-            self.policy.memory_mid_priority_weight,
+            scores, mid_priority_ranked, self.policy.memory_mid_priority_weight
         )
         selected_mid = self._select(
             all_candidates,
@@ -319,11 +358,30 @@ class MemoryRetriever:
         )
         selected_short = self._select_short(all_candidates, scores, short_limit)
         selected_mid.sort(key=lambda item: (item["field"], item["order"]))
-        selected_mid_state = {"goals": [], "decisions": [], "summary": []}
+        selected_mid_state: dict[str, list[str]] = {
+            "goals": [],
+            "decisions": [],
+            "summary": [],
+        }
         for item in selected_mid:
             selected_mid_state[item["field"]].append(item["content"])
-        return assemble_memory_context(
+        context = assemble_memory_context(
             [item["payload"] for item in selected_short],
             selected_mid_state,
             [item["payload"] for item in selected_long],
+        )
+        return MemoryRetrievalResult(
+            context=context,
+            channel_counts={
+                "memory_recency": len(recency_ranked),
+                "memory_lexical": len(lexical_ranked),
+                "memory_semantic": len(semantic_ranked),
+                "memory_long_importance": len(importance_ranked),
+                "memory_mid_priority": len(mid_priority_ranked),
+            },
+            selected_tier_counts={
+                "short": len(selected_short),
+                "mid": len(selected_mid),
+                "long": len(selected_long),
+            },
         )

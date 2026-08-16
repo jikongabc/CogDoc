@@ -1,13 +1,14 @@
 import pytest
 from cogdoc.tools.chunk_identity import build_chunk_id, build_parent_chunk_id
 from cogdoc.tools.chunk_identity import (
+    CHUNKING_STRATEGY_VERSION,
     DEFAULT_CHUNK_CONTEXT_CHARS,
     CHUNK_IDENTITY_VERSION,
     DEFAULT_CHUNK_CHAR_OVERLAP,
     DEFAULT_CHUNK_CHAR_SIZE,
     MIN_CHUNK_CHARS,
 )
-from cogdoc.tools.chunker import chunk_paper
+from cogdoc.tools.chunker import chunk_paper, summarize_chunks
 
 
 SOURCE_SHA = "a" * 64
@@ -49,6 +50,7 @@ def test_chunk_identity_version_includes_chunking_parameters():
     assert f"min{MIN_CHUNK_CHARS}" in CHUNK_IDENTITY_VERSION
     assert f"ctx{DEFAULT_CHUNK_CONTEXT_CHARS}" in CHUNK_IDENTITY_VERSION
     assert "parent_child_section_index" in CHUNK_IDENTITY_VERSION
+    assert CHUNKING_STRATEGY_VERSION in CHUNK_IDENTITY_VERSION
 
 
 # 验证章节父块使用文件身份和章节序号构造稳定标识。
@@ -195,6 +197,11 @@ def test_chunker_writes_parent_child_structure_without_crossing_sections():
         == list(range(len(siblings)))
         for siblings in grouped.values()
     )
+    assert all(
+        all(doc["meta"]["parent_child_count"] == len(siblings) for doc in siblings)
+        for siblings in grouped.values()
+    )
+    assert all(chunk["meta"]["parent_char_count"] > 0 for chunk in chunks)
     introduction_chunks = [
         chunk for chunk in chunks if chunk["meta"]["section_title"] == "Introduction"
     ]
@@ -269,3 +276,94 @@ def test_chunker_rejects_overlap_not_smaller_than_chunk_size(overlap):
             chunk_char_size=80,
             chunk_char_overlap=overlap,
         )
+
+
+def test_chunker_isolates_tables_lists_and_fenced_code_with_auditable_metadata():
+    text = (
+        "# API Guide\n\n"
+        "Intro paragraph explains authentication and endpoint behavior in detail.\n\n"
+        "| Field | Type | Meaning |\n"
+        "|---|---|---|\n"
+        "| user_id | string | User identity |\n"
+        "| limit | integer | Result limit |\n\n"
+        "Steps:\n"
+        "- Create a token\n"
+        "- Send the request\n"
+        "- Check the response\n\n"
+        "```python\n"
+        "def fetch(user_id):\n"
+        "    return client.get(f'/users/{user_id}')\n"
+        "```\n\n"
+        "Final paragraph contains troubleshooting and operational guidance."
+    )
+
+    chunks = chunk_paper(
+        [_page(1, text)],
+        source_sha256=SOURCE_SHA,
+        chunk_char_size=140,
+        chunk_char_overlap=20,
+    )
+
+    by_type = {chunk["meta"]["chunk_type"]: chunk for chunk in chunks}
+    assert {"prose", "table", "list", "code"}.issubset(by_type)
+    assert by_type["table"]["text"].startswith("| Field |")
+    assert by_type["list"]["text"].startswith("Steps:\n- Create")
+    assert by_type["code"]["text"].startswith("```python")
+    assert by_type["code"]["text"].endswith("```")
+    assert all(
+        chunk["meta"]["chunk_char_count"] == len(chunk["text"]) for chunk in chunks
+    )
+    assert all(0.0 < chunk["meta"]["chunk_quality_score"] <= 1.0 for chunk in chunks)
+    assert all(
+        chunk["meta"]["chunking_strategy_version"] == CHUNKING_STRATEGY_VERSION
+        for chunk in chunks
+    )
+
+
+def test_chunker_adapts_dense_cjk_prose_but_keeps_structured_blocks_hard_bounded():
+    prose = "这是用于验证中文高信息密度自适应切块的完整句子。" * 30
+    chunks = chunk_paper(
+        [_page(1, prose)],
+        source_sha256=SOURCE_SHA,
+        chunk_char_size=100,
+        chunk_char_overlap=0,
+    )
+
+    assert chunks
+    assert all(len(chunk["text"]) <= 85 for chunk in chunks)
+    assert {chunk["meta"]["document_profile"] for chunk in chunks} == {"cjk_prose"}
+
+
+def test_chunker_filters_noise_and_exact_duplicates_within_one_parent():
+    text = (
+        "# Notes\n\n"
+        "------------------------\n\n"
+        "同一条有效说明用于测试重复过滤。\n\n"
+        "同一条有效说明用于测试重复过滤。"
+    )
+    chunks = chunk_paper(
+        [_page(1, text)],
+        source_sha256=SOURCE_SHA,
+        chunk_char_size=20,
+        chunk_char_overlap=0,
+    )
+
+    combined = "\n".join(chunk["text"] for chunk in chunks)
+    assert "------------------------" not in combined
+    assert combined.count("同一条有效说明用于测试重复过滤。") == 1
+
+
+def test_chunking_stats_are_stable_and_contain_no_document_text():
+    chunks = chunk_paper(
+        [_page(1, "1 Introduction\n" + "背景说明用于统计。" * 20)],
+        source_sha256=SOURCE_SHA,
+        chunk_char_size=80,
+        chunk_char_overlap=0,
+    )
+
+    stats = summarize_chunks(chunks)
+
+    assert stats.chunk_count == len(chunks)
+    assert stats.char_count == sum(len(chunk["text"]) for chunk in chunks)
+    assert stats.max_chunk_chars <= 80
+    assert sum(stats.chunk_type_counts.values()) == len(chunks)

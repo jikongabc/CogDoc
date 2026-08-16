@@ -453,6 +453,32 @@ class Settings(BaseSettings):
 
     # 检索与生成控制。
     qa_retrieval_top_k: int = Field(default=9, validation_alias="QA_RETRIEVAL_TOP_K")
+    # 多路召回在统一 RRF 前独立调权；原始文档默认等权，已审核派生知识
+    # 略低，避免摘要性知识在原文证据充分时反客为主。
+    qa_rag_vector_route_weight: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=5.0,
+        validation_alias="QA_RAG_VECTOR_ROUTE_WEIGHT",
+    )
+    qa_rag_bm25_route_weight: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=5.0,
+        validation_alias="QA_RAG_BM25_ROUTE_WEIGHT",
+    )
+    qa_derived_knowledge_vector_route_weight: float = Field(
+        default=0.9,
+        ge=0.0,
+        le=5.0,
+        validation_alias="QA_DERIVED_KNOWLEDGE_VECTOR_ROUTE_WEIGHT",
+    )
+    qa_derived_knowledge_lexical_route_weight: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=5.0,
+        validation_alias="QA_DERIVED_KNOWLEDGE_LEXICAL_ROUTE_WEIGHT",
+    )
     qa_rerank_top_n: int = Field(default=3, validation_alias="QA_RERANK_TOP_N")
     qa_rerank_max_candidates: int = Field(
         default=12, validation_alias="QA_RERANK_MAX_CANDIDATES"
@@ -464,6 +490,12 @@ class Settings(BaseSettings):
         ge=1,
         le=5,
         validation_alias="QA_RERANK_DOCS_PER_REQUIREMENT",
+    )
+    qa_rerank_docs_per_route: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        validation_alias="QA_RERANK_DOCS_PER_ROUTE",
     )
     # 简短、无指代、无并列需求的问题直接使用原问题检索，省去一次 LLM 改写。
     qa_query_rewrite_fast_path_enabled: bool = Field(

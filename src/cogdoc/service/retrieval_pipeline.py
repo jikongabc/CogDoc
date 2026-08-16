@@ -17,6 +17,38 @@ from cogdoc.tools.retriever.scope import RetrievalScope
 
 HYBRID_CHANNEL = "hybrid"
 DERIVED_KNOWLEDGE_CHANNEL = "derived_knowledge"
+RAG_VECTOR_CHANNEL = "rag_vector"
+RAG_LEXICAL_CHANNEL = "rag_bm25"
+DERIVED_KNOWLEDGE_VECTOR_CHANNEL = "derived_knowledge_vector"
+DERIVED_KNOWLEDGE_LEXICAL_CHANNEL = "derived_knowledge_lexical"
+
+DEFAULT_ROUTE_WEIGHTS: dict[str, float] = {
+    HYBRID_CHANNEL: 1.0,
+    DERIVED_KNOWLEDGE_CHANNEL: 0.9,
+    RAG_VECTOR_CHANNEL: 1.0,
+    RAG_LEXICAL_CHANNEL: 1.0,
+    DERIVED_KNOWLEDGE_VECTOR_CHANNEL: 0.9,
+    DERIVED_KNOWLEDGE_LEXICAL_CHANNEL: 0.8,
+}
+
+
+def configured_route_weights() -> dict[str, float]:
+    """Resolve route weights once from the application retrieval settings."""
+
+    from cogdoc.config.settings import get_settings
+
+    settings = get_settings()
+    return {
+        **DEFAULT_ROUTE_WEIGHTS,
+        RAG_VECTOR_CHANNEL: settings.qa_rag_vector_route_weight,
+        RAG_LEXICAL_CHANNEL: settings.qa_rag_bm25_route_weight,
+        DERIVED_KNOWLEDGE_VECTOR_CHANNEL: (
+            settings.qa_derived_knowledge_vector_route_weight
+        ),
+        DERIVED_KNOWLEDGE_LEXICAL_CHANNEL: (
+            settings.qa_derived_knowledge_lexical_route_weight
+        ),
+    }
 
 
 class _DocumentRetriever(Protocol):
@@ -38,6 +70,27 @@ class _DerivedKnowledgeRetriever(Protocol):
         *,
         scope: RetrievalScope | None = None,
     ) -> list[RetrievedDoc]: ...
+
+
+class _DocumentChannelSearch(Protocol):
+    def __call__(
+        self,
+        query: str,
+        top_k: int = 3,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> Mapping[str, Sequence[RetrievedDoc]]: ...
+
+
+class _KnowledgeChannelSearch(Protocol):
+    def __call__(
+        self,
+        kb_id: str,
+        query: str,
+        top_k: int = 3,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> Mapping[str, Sequence[RetrievedDoc]]: ...
 
 
 class _RetrievalFeedbackStore(Protocol):
@@ -246,6 +299,8 @@ def retrieve_candidate_pool(
     retrieval_round: int = 0,
     fusion_top_n: int | None = None,
     scope: RetrievalScope | None = None,
+    route_weights: Mapping[str, float] | None = None,
+    route_min_candidates: int = 1,
 ) -> RetrievalPipelineResult:
     """Retrieve allowed channels for each query, fuse them, then apply feedback.
 
@@ -256,13 +311,48 @@ def retrieve_candidate_pool(
 
     if top_k < 0:
         raise ValueError("top_k must be non-negative")
+    if route_min_candidates < 0:
+        raise ValueError("route_min_candidates must be non-negative")
+
+    weights = configured_route_weights()
+    if route_weights is not None:
+        weights.update({str(key): float(value) for key, value in route_weights.items()})
 
     rankings: list[RankedCandidateList] = []
-    channel_counts = {HYBRID_CHANNEL: 0, DERIVED_KNOWLEDGE_CHANNEL: 0}
     executed_queries = [query for query in queries if query.text.strip()]
+
+    engine_search_many_channels = getattr(engine, "search_many_channels", None)
+    engine_search_channels = getattr(engine, "search_channels", None)
+    uses_document_routes = callable(engine_search_many_channels) or callable(
+        engine_search_channels
+    )
+    channel_counts = (
+        {RAG_VECTOR_CHANNEL: 0, RAG_LEXICAL_CHANNEL: 0}
+        if uses_document_routes
+        else {HYBRID_CHANNEL: 0}
+    )
+
+    document_channel_rows: Sequence[Mapping[str, list[RetrievedDoc]]] | None = None
+    if callable(engine_search_many_channels) and executed_queries:
+        query_texts = [query.text for query in executed_queries]
+        document_channel_rows = (
+            engine_search_many_channels(query_texts, top_k=top_k)
+            if scope is None
+            else engine_search_many_channels(query_texts, top_k=top_k, scope=scope)
+        )
+        if len(document_channel_rows) != len(executed_queries):
+            raise RuntimeError(
+                "retriever search_many_channels returned an invalid row count"
+            )
+
     engine_search_many = getattr(engine, "search_many", None)
     hybrid_rankings: Sequence[list[RetrievedDoc]] | None = None
-    if callable(engine_search_many) and executed_queries:
+    if (
+        document_channel_rows is None
+        and not callable(engine_search_channels)
+        and callable(engine_search_many)
+        and executed_queries
+    ):
         query_texts = [query.text for query in executed_queries]
         hybrid_rankings = (
             engine_search_many(query_texts, top_k=top_k)
@@ -272,10 +362,50 @@ def retrieve_candidate_pool(
         if len(hybrid_rankings) != len(executed_queries):
             raise RuntimeError("retriever search_many returned an invalid row count")
 
+    knowledge_search_many_channels = getattr(
+        derived_knowledge_retriever, "search_many_channels", None
+    )
+    knowledge_search_channels = getattr(
+        derived_knowledge_retriever, "search_channels", None
+    )
+    uses_knowledge_routes = callable(knowledge_search_many_channels) or callable(
+        knowledge_search_channels
+    )
+    if uses_knowledge_routes:
+        channel_counts.update(
+            {
+                DERIVED_KNOWLEDGE_VECTOR_CHANNEL: 0,
+                DERIVED_KNOWLEDGE_LEXICAL_CHANNEL: 0,
+            }
+        )
+    else:
+        channel_counts[DERIVED_KNOWLEDGE_CHANNEL] = 0
+
+    knowledge_channel_rows: Sequence[Mapping[str, list[RetrievedDoc]]] | None = None
+    if (
+        callable(knowledge_search_many_channels)
+        and executed_queries
+        and (scope is None or scope.include_derived_knowledge)
+    ):
+        query_texts = [query.text for query in executed_queries]
+        knowledge_channel_rows = (
+            knowledge_search_many_channels(kb_id, query_texts, top_k=top_k)
+            if scope is None
+            else knowledge_search_many_channels(
+                kb_id, query_texts, top_k=top_k, scope=scope
+            )
+        )
+        if len(knowledge_channel_rows) != len(executed_queries):
+            raise RuntimeError(
+                "derived knowledge search_many_channels returned an invalid row count"
+            )
+
     knowledge_search_many = getattr(derived_knowledge_retriever, "search_many", None)
     knowledge_rankings: Sequence[list[RetrievedDoc]] | None = None
     if (
-        callable(knowledge_search_many)
+        knowledge_channel_rows is None
+        and not callable(knowledge_search_channels)
+        and callable(knowledge_search_many)
         and executed_queries
         and (scope is None or scope.include_derived_knowledge)
     ):
@@ -290,61 +420,105 @@ def retrieve_candidate_pool(
                 "derived knowledge search_many returned an invalid row count"
             )
 
-    for query_index, query in enumerate(executed_queries):
-        hybrid_docs = (
-            list(hybrid_rankings[query_index])
-            if hybrid_rankings is not None
-            else (
-                engine.search(query=query.text, top_k=top_k)
-                if scope is None
-                else engine.search(query=query.text, top_k=top_k, scope=scope)
-            )
-        )
-        channel_counts[HYBRID_CHANNEL] += len(hybrid_docs)
-        if hybrid_docs:
+    def add_ranking(
+        query: RetrievalQuery,
+        channel: str,
+        docs: Sequence[RetrievedDoc],
+    ) -> None:
+        materialized = list(docs)
+        channel_counts[channel] = channel_counts.get(channel, 0) + len(materialized)
+        if materialized:
             rankings.append(
                 RankedCandidateList(
                     query=query.text,
-                    channel=HYBRID_CHANNEL,
-                    docs=hybrid_docs,
+                    channel=channel,
+                    docs=materialized,
                     requirement_ids=query.requirement_ids,
                     is_original=query.is_original,
                     retrieval_round=retrieval_round,
+                    weight=weights.get(channel, 1.0),
                 )
             )
 
-        knowledge_docs = (
-            list(knowledge_rankings[query_index])
-            if knowledge_rankings is not None
-            else (
-                derived_knowledge_retriever.search(kb_id, query.text, top_k=top_k)
-                if scope is None
+    for query_index, query in enumerate(executed_queries):
+        if uses_document_routes:
+            document_channel_search = cast(
+                _DocumentChannelSearch, engine_search_channels
+            )
+            document_routes = (
+                document_channel_rows[query_index]
+                if document_channel_rows is not None
                 else (
-                    derived_knowledge_retriever.search(
-                        kb_id, query.text, top_k=top_k, scope=scope
+                    document_channel_search(query.text, top_k=top_k)
+                    if scope is None
+                    else document_channel_search(query.text, top_k=top_k, scope=scope)
+                )
+            )
+            add_ranking(query, RAG_VECTOR_CHANNEL, document_routes.get("vector", ()))
+            add_ranking(query, RAG_LEXICAL_CHANNEL, document_routes.get("bm25", ()))
+        else:
+            hybrid_docs = (
+                list(hybrid_rankings[query_index])
+                if hybrid_rankings is not None
+                else (
+                    engine.search(query=query.text, top_k=top_k)
+                    if scope is None
+                    else engine.search(query=query.text, top_k=top_k, scope=scope)
+                )
+            )
+            add_ranking(query, HYBRID_CHANNEL, hybrid_docs)
+
+        knowledge_allowed = scope is None or scope.include_derived_knowledge
+        if uses_knowledge_routes:
+            knowledge_channel_search = cast(
+                _KnowledgeChannelSearch, knowledge_search_channels
+            )
+            knowledge_routes: Mapping[str, Sequence[RetrievedDoc]] = {}
+            if knowledge_allowed:
+                knowledge_routes = (
+                    knowledge_channel_rows[query_index]
+                    if knowledge_channel_rows is not None
+                    else (
+                        knowledge_channel_search(kb_id, query.text, top_k=top_k)
+                        if scope is None
+                        else knowledge_channel_search(
+                            kb_id, query.text, top_k=top_k, scope=scope
+                        )
                     )
-                    if scope.include_derived_knowledge
-                    else []
+                )
+            add_ranking(
+                query,
+                DERIVED_KNOWLEDGE_VECTOR_CHANNEL,
+                knowledge_routes.get("embedding", ()),
+            )
+            add_ranking(
+                query,
+                DERIVED_KNOWLEDGE_LEXICAL_CHANNEL,
+                knowledge_routes.get("lexical", ()),
+            )
+        else:
+            knowledge_docs = (
+                list(knowledge_rankings[query_index])
+                if knowledge_rankings is not None
+                else (
+                    derived_knowledge_retriever.search(kb_id, query.text, top_k=top_k)
+                    if scope is None
+                    else (
+                        derived_knowledge_retriever.search(
+                            kb_id, query.text, top_k=top_k, scope=scope
+                        )
+                        if scope.include_derived_knowledge
+                        else []
+                    )
                 )
             )
-        )
-        channel_counts[DERIVED_KNOWLEDGE_CHANNEL] += len(knowledge_docs)
-        if knowledge_docs:
-            rankings.append(
-                RankedCandidateList(
-                    query=query.text,
-                    channel=DERIVED_KNOWLEDGE_CHANNEL,
-                    docs=knowledge_docs,
-                    requirement_ids=query.requirement_ids,
-                    is_original=query.is_original,
-                    retrieval_round=retrieval_round,
-                )
-            )
+            add_ranking(query, DERIVED_KNOWLEDGE_CHANNEL, knowledge_docs)
 
     fused = fuse_ranked_candidates(
         rankings,
         rrf_k=rrf_k,
         top_n=fusion_top_n,
+        per_channel_min=route_min_candidates,
     )
     # A retriever implementation is not an authorization authority.  Apply a
     # second guard after channel fusion so a stale/custom backend cannot smuggle

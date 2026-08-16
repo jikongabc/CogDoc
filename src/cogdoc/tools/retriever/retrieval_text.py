@@ -8,6 +8,7 @@ def retrieval_text(doc: RetrievedDoc) -> str:
     source = str(meta.get("source", "") or "").strip()
     source_type = str(meta.get("source_type", "document") or "document")
     section_path = str(meta.get("section_path", "") or "").strip()
+    chunk_type = str(meta.get("chunk_type", "") or "").strip()
     context = str(meta.get("context", "") or "").strip()
     text = str(doc.get("text", "") or "").strip()
     location = []
@@ -15,4 +16,13 @@ def retrieval_text(doc: RetrievedDoc) -> str:
         location.append(f"来源：{source}")
     if section_path:
         location.append(f"章节：{section_path}")
+    page_start = meta.get("page_start")
+    page_end = meta.get("page_end")
+    if source_type != "derived_knowledge" and page_start is not None:
+        page_label = str(page_start)
+        if page_end is not None and str(page_end) != page_label:
+            page_label = f"{page_label}-{page_end}"
+        location.append(f"页码：{page_label}")
+    if chunk_type and chunk_type != "prose":
+        location.append(f"内容类型：{chunk_type}")
     return "\n\n".join(part for part in ("\n".join(location), context, text) if part)

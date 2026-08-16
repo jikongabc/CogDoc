@@ -65,6 +65,17 @@ def _ordered_parent_children(
     ):
         return None
 
+    declared_counts = [
+        _order_value(doc, "parent_child_count")
+        for doc in children
+        if _meta(doc).get("parent_child_count") is not None
+    ]
+    if declared_counts:
+        if len(declared_counts) != len(children):
+            return None
+        if len(set(declared_counts)) != 1 or declared_counts[0] != len(children):
+            return None
+
     child_orders = [_order_value(doc, "child_index_in_parent") for doc in children]
     chunk_orders = [_order_value(doc, "chunk_index") for doc in children]
     if all(value is not None for value in child_orders):
