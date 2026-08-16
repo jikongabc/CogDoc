@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
 from cogdoc.graph.state import RetrievalMetrics, RetrievedDoc
@@ -111,6 +112,7 @@ class RetrievalPipelineResult:
     ranking_count: int
     channel_counts: dict[str, int]
     feedback_error: str = ""
+    route_rankings: list[RankedCandidateList] = field(default_factory=list)
 
 
 def _clean_query_text(value: Any) -> str:
@@ -300,7 +302,7 @@ def retrieve_candidate_pool(
     fusion_top_n: int | None = None,
     scope: RetrievalScope | None = None,
     route_weights: Mapping[str, float] | None = None,
-    route_min_candidates: int = 1,
+    route_min_candidates: int | None = None,
 ) -> RetrievalPipelineResult:
     """Retrieve allowed channels for each query, fuse them, then apply feedback.
 
@@ -311,12 +313,26 @@ def retrieve_candidate_pool(
 
     if top_k < 0:
         raise ValueError("top_k must be non-negative")
-    if route_min_candidates < 0:
+    if route_min_candidates is not None and route_min_candidates < 0:
         raise ValueError("route_min_candidates must be non-negative")
 
     weights = configured_route_weights()
     if route_weights is not None:
         weights.update({str(key): float(value) for key, value in route_weights.items()})
+    if route_min_candidates is None:
+        from cogdoc.config.settings import get_settings
+
+        route_min_candidates = get_settings().qa_retrieval_docs_per_route
+
+    def accepts_channels(callable_object: Any) -> bool:
+        try:
+            parameters = inspect.signature(callable_object).parameters
+        except (TypeError, ValueError):
+            return False
+        return "channels" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
 
     rankings: list[RankedCandidateList] = []
     executed_queries = [query for query in queries if query.text.strip()]
@@ -333,13 +349,23 @@ def retrieve_candidate_pool(
     )
 
     document_channel_rows: Sequence[Mapping[str, list[RetrievedDoc]]] | None = None
-    if callable(engine_search_many_channels) and executed_queries:
+    enabled_document_channels = {
+        channel
+        for channel, route in (("vector", RAG_VECTOR_CHANNEL), ("bm25", RAG_LEXICAL_CHANNEL))
+        if weights.get(route, 1.0) > 0
+    }
+    if not enabled_document_channels and uses_document_routes:
+        document_channel_rows = [
+            {"vector": [], "bm25": []} for _ in executed_queries
+        ]
+    elif callable(engine_search_many_channels) and executed_queries:
         query_texts = [query.text for query in executed_queries]
-        document_channel_rows = (
-            engine_search_many_channels(query_texts, top_k=top_k)
-            if scope is None
-            else engine_search_many_channels(query_texts, top_k=top_k, scope=scope)
-        )
+        kwargs: dict[str, Any] = {"top_k": top_k}
+        if scope is not None:
+            kwargs["scope"] = scope
+        if accepts_channels(engine_search_many_channels):
+            kwargs["channels"] = enabled_document_channels
+        document_channel_rows = engine_search_many_channels(query_texts, **kwargs)
         if len(document_channel_rows) != len(executed_queries):
             raise RuntimeError(
                 "retriever search_many_channels returned an invalid row count"
@@ -382,18 +408,33 @@ def retrieve_candidate_pool(
         channel_counts[DERIVED_KNOWLEDGE_CHANNEL] = 0
 
     knowledge_channel_rows: Sequence[Mapping[str, list[RetrievedDoc]]] | None = None
+    enabled_knowledge_channels = {
+        channel
+        for channel, route in (
+            ("embedding", DERIVED_KNOWLEDGE_VECTOR_CHANNEL),
+            ("lexical", DERIVED_KNOWLEDGE_LEXICAL_CHANNEL),
+        )
+        if weights.get(route, 1.0) > 0
+    }
+    if not enabled_knowledge_channels and uses_knowledge_routes:
+        knowledge_channel_rows = [
+            {"embedding": [], "lexical": []} for _ in executed_queries
+        ]
     if (
+        knowledge_channel_rows is None
+        and
         callable(knowledge_search_many_channels)
         and executed_queries
         and (scope is None or scope.include_derived_knowledge)
     ):
         query_texts = [query.text for query in executed_queries]
-        knowledge_channel_rows = (
-            knowledge_search_many_channels(kb_id, query_texts, top_k=top_k)
-            if scope is None
-            else knowledge_search_many_channels(
-                kb_id, query_texts, top_k=top_k, scope=scope
-            )
+        kwargs = {"top_k": top_k}
+        if scope is not None:
+            kwargs["scope"] = scope
+        if accepts_channels(knowledge_search_many_channels):
+            kwargs["channels"] = enabled_knowledge_channels
+        knowledge_channel_rows = knowledge_search_many_channels(
+            kb_id, query_texts, **kwargs
         )
         if len(knowledge_channel_rows) != len(executed_queries):
             raise RuntimeError(
@@ -425,6 +466,8 @@ def retrieve_candidate_pool(
         channel: str,
         docs: Sequence[RetrievedDoc],
     ) -> None:
+        if weights.get(channel, 1.0) <= 0:
+            return
         materialized = list(docs)
         channel_counts[channel] = channel_counts.get(channel, 0) + len(materialized)
         if materialized:
@@ -538,4 +581,5 @@ def retrieve_candidate_pool(
         ranking_count=len(rankings),
         channel_counts=channel_counts,
         feedback_error=feedback_error,
+        route_rankings=rankings,
     )

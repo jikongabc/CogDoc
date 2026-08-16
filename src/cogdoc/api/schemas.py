@@ -1072,6 +1072,96 @@ class RetrievalEvalDraftReviewRequest(ApiModel):
     reason: str = ""
 
 
+class RetrievalDiagnosticRequirement(ApiModel):
+    requirement_id: str = Field(min_length=1, max_length=100)
+    question: str = Field(min_length=1, max_length=2000)
+    retrieval_query: str = Field(default="", max_length=2000)
+    recovery_query: str = Field(default="", max_length=2000)
+
+
+class RetrievalDiagnosticRequest(QueryDocRequest):
+    top_k: int = Field(default=12, ge=1, le=50)
+    rerank: bool = True
+    rerank_top_n: int | None = Field(default=None, ge=1, le=50)
+    route_weights: dict[str, float] | None = None
+    route_min_candidates: int = Field(default=1, ge=0, le=10)
+    requirements: list[RetrievalDiagnosticRequirement] = Field(
+        default_factory=list, max_length=10
+    )
+
+    @field_validator("route_weights")
+    @classmethod
+    def _validate_route_weights(
+        cls, value: dict[str, float] | None
+    ) -> dict[str, float] | None:
+        allowed = {
+            "rag_vector",
+            "rag_bm25",
+            "derived_knowledge_vector",
+            "derived_knowledge_lexical",
+        }
+        if value is None:
+            return None
+        if set(value) - allowed:
+            raise ValueError("route_weights contains an unknown route")
+        if any(not math.isfinite(weight) or weight < 0 or weight > 5 for weight in value.values()):
+            raise ValueError("route weights must be finite numbers between 0 and 5")
+        return value
+
+
+class RetrievalDiagnosticEvidence(ApiModel):
+    chunk_id: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    source_sha256: str = Field(min_length=1)
+    parent_chunk_id: str = ""
+
+
+class RetrievalDiagnosticLabelRequest(QueryDocRequest):
+    requirement_id: str = Field(default="r1", min_length=1, max_length=100)
+    requirement_label: str = Field(default="", max_length=2000)
+    no_answer: bool = False
+    acceptable_evidence: list[RetrievalDiagnosticEvidence] = Field(
+        default_factory=list, max_length=50
+    )
+    hard_negative_evidence: list[RetrievalDiagnosticEvidence] = Field(
+        default_factory=list, max_length=50
+    )
+
+    @model_validator(mode="after")
+    def _validate_diagnostic_label(self):
+        if self.no_answer and self.acceptable_evidence:
+            raise ValueError("no-answer labels cannot include acceptable evidence")
+        if not self.no_answer and not self.acceptable_evidence:
+            raise ValueError("supported labels require acceptable evidence")
+        return self
+
+
+class IndexMigrationRequest(ApiModel):
+    kb_ids: list[str] = Field(default_factory=list, max_length=500)
+    include_current: bool = False
+
+    @field_validator("kb_ids")
+    @classmethod
+    def _normalize_migration_kb_ids(cls, values: list[str]) -> list[str]:
+        normalized = []
+        for value in values:
+            item = value.strip()
+            if not item:
+                raise ValueError("kb_ids cannot contain blank values")
+            if item not in normalized:
+                normalized.append(item)
+        return normalized
+
+
+class IndexMigrationRollbackRequest(ApiModel):
+    kb_ids: list[str] = Field(default_factory=list, max_length=500)
+
+    @field_validator("kb_ids")
+    @classmethod
+    def _normalize_rollback_kb_ids(cls, values: list[str]) -> list[str]:
+        return IndexMigrationRequest._normalize_migration_kb_ids(values)
+
+
 # 反馈列表响应。
 class FeedbackListResponse(ApiModel):
     schema_version: Literal["v1"] = API_SCHEMA_VERSION

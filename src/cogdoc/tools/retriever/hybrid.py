@@ -155,6 +155,7 @@ class HybridRetriever(BaseRetriever):
         top_k: int = 3,
         *,
         scope: RetrievalScope | None = None,
+        channels: set[str] | None = None,
     ) -> dict[str, List[RetrievedDoc]]:
         """Return dense and lexical rankings before fusion.
 
@@ -167,19 +168,20 @@ class HybridRetriever(BaseRetriever):
             return {"vector": [], "bm25": []}
         self._ensure_servable()
         recall_top_k = max(0, top_k) * 3
-        vector_results = self._search_one_route(
-            self.vector_retriever,
-            "rag_vector",
-            query,
-            recall_top_k,
-            scope,
+        enabled = channels if channels is not None else {"vector", "bm25"}
+        vector_results = (
+            self._search_one_route(
+                self.vector_retriever, "rag_vector", query, recall_top_k, scope
+            )
+            if "vector" in enabled
+            else []
         )
-        bm25_results = self._search_one_route(
-            self.bm25_retriever,
-            "rag_bm25",
-            query,
-            recall_top_k,
-            scope,
+        bm25_results = (
+            self._search_one_route(
+                self.bm25_retriever, "rag_bm25", query, recall_top_k, scope
+            )
+            if "bm25" in enabled
+            else []
         )
         return {"vector": list(vector_results), "bm25": list(bm25_results)}
 
@@ -209,6 +211,7 @@ class HybridRetriever(BaseRetriever):
         top_k: int = 3,
         *,
         scope: RetrievalScope | None = None,
+        channels: set[str] | None = None,
     ) -> List[dict[str, List[RetrievedDoc]]]:
         """Batch dense retrieval and preserve one ranking per recall route."""
 
@@ -219,9 +222,13 @@ class HybridRetriever(BaseRetriever):
             return [{"vector": [], "bm25": []} for _ in normalized_queries]
         self._ensure_servable()
         recall_top_k = max(0, top_k) * 3
+        enabled = channels if channels is not None else {"vector", "bm25"}
 
         vector_search_many = getattr(self.vector_retriever, "search_many", None)
-        if callable(vector_search_many):
+        vector_rankings: Sequence[Sequence[RetrievedDoc]]
+        if "vector" not in enabled:
+            vector_rankings = [[] for _ in normalized_queries]
+        elif callable(vector_search_many):
             try:
                 vector_rankings = (
                     vector_search_many(normalized_queries, top_k=recall_top_k)
@@ -258,16 +265,20 @@ class HybridRetriever(BaseRetriever):
                 for query in normalized_queries
             ]
 
-        bm25_rankings = [
-            self._search_one_route(
-                self.bm25_retriever,
-                "rag_bm25",
-                query,
-                recall_top_k,
-                scope,
-            )
-            for query in normalized_queries
-        ]
+        bm25_rankings = (
+            [
+                self._search_one_route(
+                    self.bm25_retriever,
+                    "rag_bm25",
+                    query,
+                    recall_top_k,
+                    scope,
+                )
+                for query in normalized_queries
+            ]
+            if "bm25" in enabled
+            else [[] for _ in normalized_queries]
+        )
         return [
             {"vector": list(vector_docs), "bm25": list(bm25_docs)}
             for vector_docs, bm25_docs in zip(

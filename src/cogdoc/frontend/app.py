@@ -4753,6 +4753,305 @@ def _eval_paper(candidate: Mapping) -> None:
     )
 
 
+def _diagnostic_identity(hit: Mapping) -> dict:
+    return {
+        key: str(hit.get(key) or "")
+        for key in ("chunk_id", "source", "source_sha256", "parent_chunk_id")
+    }
+
+
+def _render_retrieval_diagnostic_console(
+    client: CogDocClient, kb_id: str | None
+) -> None:
+    with st.expander("打开检索路径诊断", expanded=False):
+        if not kb_id:
+            st.info("先选择一个知识库，再运行路径诊断。")
+            return
+        st.markdown(
+            "<div class='signal-path'><b>QUERY</b><span>→</span>"
+            "<i>VECTOR</i><i>BM25</i><i>KNOWLEDGE·V</i><i>KNOWLEDGE·L</i>"
+            "<span>→</span><b>RRF</b><span>→</span><b>RERANK</b>"
+            "<span>→</span><b>GATE</b></div>",
+            unsafe_allow_html=True,
+        )
+        with st.form(f"retrieval-diagnostic-run-{kb_id}"):
+            query = st.text_area(
+                "要检查的问题",
+                placeholder="例如：文档如何定义长期记忆，它与短期记忆有什么区别？",
+                height=86,
+            )
+            controls = st.columns([1, 1, 3])
+            top_k = controls[0].number_input("每路候选", 1, 50, 12)
+            rerank = controls[1].toggle("运行重排", value=True)
+            requirement_label = controls[2].text_input(
+                "原子需求（可选）", placeholder="留空时使用完整问题"
+            )
+            with st.expander("临时路权重"):
+                weight_columns = st.columns(4)
+                weights = {
+                    "rag_vector": weight_columns[0].number_input(
+                        "原文向量", 0.0, 5.0, 1.0, 0.1
+                    ),
+                    "rag_bm25": weight_columns[1].number_input(
+                        "原文词法", 0.0, 5.0, 1.0, 0.1
+                    ),
+                    "derived_knowledge_vector": weight_columns[2].number_input(
+                        "派生向量", 0.0, 5.0, 0.9, 0.1
+                    ),
+                    "derived_knowledge_lexical": weight_columns[3].number_input(
+                        "派生词法", 0.0, 5.0, 0.8, 0.1
+                    ),
+                }
+            run = st.form_submit_button(
+                "追踪这次检索", type="primary", use_container_width=True
+            )
+        state_key = f"retrieval-diagnostic-result-{kb_id}"
+        if run:
+            if not query.strip():
+                st.warning("请输入要检查的问题。")
+            else:
+                requirements = (
+                    [
+                        {
+                            "requirement_id": "r1",
+                            "question": requirement_label,
+                            "retrieval_query": query,
+                            "recovery_query": query,
+                        }
+                    ]
+                    if requirement_label.strip()
+                    else []
+                )
+                with st.spinner("正在追踪四路召回和融合贡献…"):
+                    response = client.diagnose_retrieval(
+                        kb_id,
+                        query,
+                        top_k=int(top_k),
+                        rerank=rerank,
+                        route_weights=weights,
+                        requirements=requirements,
+                    )
+                if response.status_code != 200:
+                    st.error(_eval_response_detail(response, "检索诊断失败"))
+                else:
+                    st.session_state[state_key] = response_payload(response)
+
+        result = st.session_state.get(state_key)
+        if not isinstance(result, Mapping):
+            st.caption("运行后会保留本次路径快照；切换页面前可将人工判断存入评测草稿。")
+            return
+        decision = result.get("decision") or {}
+        latency = result.get("latency_ms") or {}
+        channel_counts = result.get("channel_counts") or {}
+        summary = st.columns(4)
+        summary[0].metric(
+            "证据门",
+            "通过" if decision.get("supported") else "拒答",
+            str(decision.get("reason") or "-"),
+        )
+        summary[1].metric("融合候选", len(result.get("fused") or []))
+        summary[2].metric("最终证据", len(result.get("final") or []))
+        summary[3].metric("总耗时", f"{float(latency.get('total') or 0):.1f} ms")
+        st.caption(
+            " · ".join(
+                f"{name} {count}" for name, count in channel_counts.items()
+            )
+        )
+        missing = decision.get("missing_requirement_ids") or []
+        if missing:
+            st.warning(f"未覆盖需求：{'、'.join(str(item) for item in missing)}")
+
+        routes = result.get("routes") or []
+        route_names = []
+        grouped = {}
+        for route in routes:
+            name = str(route.get("channel") or "unknown")
+            if name not in grouped:
+                route_names.append(name)
+                grouped[name] = []
+            grouped[name].extend(route.get("hits") or [])
+        if route_names:
+            route_tabs = st.tabs(route_names)
+            for tab, name in zip(route_tabs, route_names, strict=True):
+                with tab:
+                    for hit in grouped[name][: int(top_k)]:
+                        st.markdown(
+                            f"**#{int(hit.get('rank') or 0):02d} · "
+                            f"{hit.get('source') or '未知来源'}**  "
+                            f"`{hit.get('chunk_id') or '-'}`"
+                        )
+                        st.caption(str(hit.get("text_preview") or ""))
+
+        st.markdown("#### 融合与重排位移")
+        final_hits = result.get("final") or []
+        for hit in final_hits:
+            retrieval = hit.get("retrieval") or {}
+            contributions = retrieval.get("channel_contributions") or {}
+            movement = int(hit.get("rank_delta") or 0)
+            movement_label = f"↑{movement}" if movement > 0 else f"↓{-movement}" if movement < 0 else "—"
+            with st.expander(
+                f"#{int(hit.get('rank') or 0):02d} {movement_label} · "
+                f"{hit.get('source') or '未知来源'}",
+                expanded=int(hit.get("rank") or 0) <= 3,
+            ):
+                st.caption(str(hit.get("text_preview") or ""))
+                st.code(
+                    json.dumps(contributions, ensure_ascii=False, indent=2),
+                    language="json",
+                )
+                st.selectbox(
+                    "人工判断",
+                    ["skip", "gold", "negative"],
+                    format_func={
+                        "skip": "暂不标注",
+                        "gold": "正确证据",
+                        "negative": "误导项",
+                    }.get,
+                    key=(
+                        f"diagnostic-label-{kb_id}-"
+                        f"{hit.get('chunk_id') or hit.get('rank')}"
+                    ),
+                )
+
+        no_answer = st.toggle(
+            "这个问题在当前知识库中应当拒答",
+            value=False,
+            key=f"diagnostic-no-answer-{kb_id}",
+        )
+        if st.button(
+            "保存为待审核评测题",
+            key=f"diagnostic-save-{kb_id}",
+            use_container_width=True,
+        ):
+            acceptable = []
+            negatives = []
+            for hit in final_hits:
+                choice = st.session_state.get(
+                    f"diagnostic-label-{kb_id}-"
+                    f"{hit.get('chunk_id') or hit.get('rank')}",
+                    "skip",
+                )
+                if choice == "gold":
+                    acceptable.append(_diagnostic_identity(hit))
+                elif choice == "negative":
+                    negatives.append(_diagnostic_identity(hit))
+            if no_answer:
+                acceptable = []
+            response = client.save_retrieval_diagnostic_label(
+                kb_id,
+                str(result.get("query") or ""),
+                no_answer=no_answer,
+                acceptable_evidence=acceptable,
+                hard_negative_evidence=negatives,
+                requirement_label=requirement_label,
+            )
+            if response.status_code == 200:
+                st.success("已进入待审核评测集；通过后才会进入正式数据集。")
+            else:
+                st.error(_eval_response_detail(response, "保存评测题失败"))
+
+
+def _render_index_migration_console(client: CogDocClient, kb_id: str | None) -> None:
+    with st.expander("索引代际控制", expanded=False):
+        st.caption("先检测版本，再迁移；新代验收前会保留旧代，支持原子回切。")
+        controls = st.columns(3)
+        if controls[0].button(
+            "检测当前知识库",
+            disabled=not kb_id,
+            key=f"migration-scan-{kb_id}",
+            use_container_width=True,
+        ):
+            response = client.scan_index_migrations()
+            if response.status_code == 200:
+                payload = response_payload(response)
+                items = payload.get("items", []) if isinstance(payload, Mapping) else []
+                st.session_state[f"migration-scan-result-{kb_id}"] = next(
+                    (
+                        item
+                        for item in items
+                        if isinstance(item, Mapping) and item.get("kb_id") == kb_id
+                    ),
+                    None,
+                )
+            else:
+                st.error(_eval_response_detail(response, "检测索引版本失败"))
+        if controls[1].button(
+            "开始迁移",
+            disabled=not kb_id,
+            type="primary",
+            key=f"migration-start-{kb_id}",
+            use_container_width=True,
+        ):
+            response = client.start_index_migration([str(kb_id)])
+            if response.status_code == 202:
+                payload = response_payload(response)
+                st.session_state[f"migration-run-id-{kb_id}"] = str(
+                    payload.get("run_id") or ""
+                )
+                st.success("迁移已进入后台队列。")
+            else:
+                st.error(_eval_response_detail(response, "启动索引迁移失败"))
+        run_id = str(st.session_state.get(f"migration-run-id-{kb_id}") or "")
+        if controls[2].button(
+            "刷新进度",
+            disabled=not run_id,
+            key=f"migration-refresh-{kb_id}",
+            use_container_width=True,
+        ):
+            response = client.get_index_migration(run_id)
+            if response.status_code == 200:
+                st.session_state[f"migration-run-result-{kb_id}"] = response_payload(
+                    response
+                )
+            else:
+                st.error(_eval_response_detail(response, "读取迁移进度失败"))
+
+        scan = st.session_state.get(f"migration-scan-result-{kb_id}")
+        if isinstance(scan, Mapping):
+            state = "需要迁移" if scan.get("needs_migration") else "已是当前版本"
+            st.markdown(
+                f"<div class='generation-track'><b>{html.escape(str(kb_id))}</b>"
+                f"<span>{html.escape(str(scan.get('active_generation_id') or '无活跃代'))}</span>"
+                f"<span>→ {html.escape(str(scan.get('target_chunk_identity_version') or '-'))}</span>"
+                f"<strong>{state}</strong></div>",
+                unsafe_allow_html=True,
+            )
+            reasons = scan.get("reasons") or []
+            if reasons:
+                st.caption("原因：" + "、".join(str(reason) for reason in reasons))
+
+        result = st.session_state.get(f"migration-run-result-{kb_id}")
+        if isinstance(result, Mapping):
+            status = str(result.get("status") or "unknown")
+            summary = result.get("summary") or {}
+            st.code(
+                f"RUN {str(result.get('run_id') or '')[:12]}  STATUS {status}\n"
+                + json.dumps(summary, ensure_ascii=False),
+                language=None,
+            )
+            action_columns = st.columns(2)
+            if action_columns[0].button(
+                "回滚到旧代",
+                disabled=status not in {"completed", "completed_with_failures"},
+                key=f"migration-rollback-{kb_id}",
+                use_container_width=True,
+            ):
+                response = client.rollback_index_migration(str(result["run_id"]))
+                if response.status_code == 200:
+                    st.success("已回切到迁移前索引代。")
+                else:
+                    st.error(_eval_response_detail(response, "索引回滚失败"))
+            if action_columns[1].button(
+                "验收并清理旧代",
+                disabled=status != "completed",
+                key=f"migration-finalize-{kb_id}",
+                use_container_width=True,
+            ):
+                response = client.finalize_index_migration(str(result["run_id"]))
+                if response.status_code == 200:
+                    st.success("旧代已清理，本次迁移完成验收。")
+                else:
+                    st.error(_eval_response_detail(response, "清理旧代失败"))
 def _render_eval_unit(
     draft: Mapping, unit: Mapping, candidates: Sequence[Mapping]
 ) -> dict:
@@ -4944,6 +5243,14 @@ def _retrieval_eval_review_area(kb_id: str | None) -> None:
         .evidence-text {font-family:"Noto Sans SC","PingFang SC",sans-serif;color:#182528;
           line-height:1.75;white-space:pre-wrap;overflow-wrap:anywhere}
         .evidence-id {font-size:.62rem;color:#71807e;margin-top:.65rem}
+        .signal-path {display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;
+          padding:.7rem .8rem;margin:.15rem 0 .8rem;background:#e8f1ef;border-left:4px solid #1b7268;
+          font-family:"IBM Plex Mono","SFMono-Regular",monospace;font-size:.72rem}
+        .signal-path i {font-style:normal;border:1px solid #8eaaa5;padding:.2rem .38rem;background:#fff}
+        .generation-track {display:grid;grid-template-columns:1.2fr 1fr 1fr auto;gap:.6rem;
+          align-items:center;border-left:4px solid #1b7268;background:#edf4f2;padding:.65rem .8rem;
+          font-family:"IBM Plex Mono","SFMono-Regular",monospace;font-size:.72rem}
+        .generation-track strong {color:#1b7268}
         @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
         </style>
         <section class="review-hero">
@@ -4962,6 +5269,8 @@ def _retrieval_eval_review_area(kb_id: str | None) -> None:
         help="使用有审核权限的账号时可留空；旧版部署请填写独立审核密钥。",
     )
     client = _eval_review_client()
+    _render_index_migration_console(client, kb_id)
+    _render_retrieval_diagnostic_console(client, kb_id)
     controls = st.columns([2, 2, 3])
     status_filter = controls[0].selectbox(
         "状态",

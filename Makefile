@@ -33,7 +33,7 @@ UVICORN_GRACEFUL_SHUTDOWN_SECONDS ?= 15
 # src-layout：包源码在 src/，入口经 PYTHONPATH 注入，无需先安装即可 run/serve/test。
 export PYTHONPATH := src
 
-.PHONY: help install native check lint typecheck-security test smoke-api smoke-account-auth reliability-gate run debug backup eval eval-coverage eval-retrieval-report eval-retrieval-baseline eval-retrieval-gate eval-quality eval-quality-coverage eval-suite eval-suite-run-retrieval eval-suite-report eval-suite-baseline eval-suite-update-baseline serve frontend
+.PHONY: help install native check lint typecheck-security test smoke-api smoke-account-auth reliability-gate run debug backup eval eval-coverage eval-retrieval-report eval-retrieval-baseline eval-retrieval-gate eval-multi-route calibrate-multi-route eval-quality eval-quality-coverage eval-suite eval-suite-run-retrieval eval-suite-report eval-suite-baseline eval-suite-update-baseline serve frontend
 
 help:
 	@echo "make install - 可编辑安装含开发依赖 (pip install -e '.[dev]')"
@@ -51,6 +51,8 @@ help:
 	@echo "make eval-retrieval-report - 用 100 条真实集运行检索并写入报告"
 	@echo "make eval-retrieval-baseline - 生成真实检索基线"
 	@echo "make eval-retrieval-gate - 对比真实检索基线并执行绝对门禁"
+	@echo "make eval-multi-route - 运行四路单路/leave-one-out 消融评测"
+	@echo "make calibrate-multi-route - 从四路报告生成可回滚参数建议"
 	@echo "make eval-quality - 离线质量评测 router/citation/faithfulness (scripts/eval_quality.py)"
 	@echo "make eval-quality-coverage - 检查质量评测集覆盖面"
 	@echo "make eval-suite - 运行组合评测门禁（覆盖审计 + 质量评测）"
@@ -125,6 +127,15 @@ eval-retrieval-baseline:
 
 eval-retrieval-gate:
 	$(PYTHON) scripts/eval_retrieval.py --coverage-profile baseline --check-coverage --rerank --gate eval/retrieval_gate.json --baseline eval/retrieval_eval_baseline.json --json eval/retrieval_eval_report.json
+
+MULTI_ROUTE_EVAL_REPORT ?= artifacts/reliability/multi-route-eval.json
+MULTI_ROUTE_CALIBRATION_REPORT ?= artifacts/reliability/multi-route-calibration.json
+
+eval-multi-route:
+	$(PYTHON) scripts/eval_multi_route_retrieval.py --eval-set eval/retrieval_eval.jsonl --output $(MULTI_ROUTE_EVAL_REPORT)
+
+calibrate-multi-route:
+	$(PYTHON) scripts/calibrate_multi_route_retrieval.py $(MULTI_ROUTE_EVAL_REPORT) --output $(MULTI_ROUTE_CALIBRATION_REPORT)
 
 eval-quality:
 	$(PYTHON) scripts/eval_quality.py

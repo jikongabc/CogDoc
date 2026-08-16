@@ -150,6 +150,38 @@ class _MultiRouteKnowledge:
         ]
 
 
+class _PrunableMultiRouteEngine(_MultiRouteEngine):
+    def __init__(self):
+        self.enabled_channels = None
+
+    def search_many_channels(self, queries, top_k, channels=None):
+        self.enabled_channels = channels
+        rows = super().search_many_channels(queries, top_k)
+        return [
+            {
+                key: value if key in (channels or {"vector", "bm25"}) else []
+                for key, value in row.items()
+            }
+            for row in rows
+        ]
+
+
+class _PrunableMultiRouteKnowledge(_MultiRouteKnowledge):
+    def __init__(self):
+        self.enabled_channels = None
+
+    def search_many_channels(self, kb_id, queries, top_k, channels=None):
+        self.enabled_channels = channels
+        rows = super().search_many_channels(kb_id, queries, top_k)
+        return [
+            {
+                key: value if key in (channels or {"embedding", "lexical"}) else []
+                for key, value in row.items()
+            }
+            for row in rows
+        ]
+
+
 class _Feedback:
     def __init__(self, boosts=None):
         self.boosts = boosts or {}
@@ -254,7 +286,30 @@ def test_pipeline_route_weight_can_disable_one_route_without_skipping_others():
 
     assert "vector-query" not in _ids(result.docs)
     assert "lexical-query" in _ids(result.docs)
-    assert result.channel_counts[RAG_VECTOR_CHANNEL] == 2
+    assert result.channel_counts[RAG_VECTOR_CHANNEL] == 0
+
+
+def test_pipeline_pushes_disabled_routes_into_channel_capable_retrievers():
+    engine = _PrunableMultiRouteEngine()
+    knowledge = _PrunableMultiRouteKnowledge()
+
+    retrieve_candidate_pool(
+        engine,
+        knowledge,
+        None,
+        kb_id="kb",
+        original_query="query",
+        queries=[RetrievalQuery("query")],
+        top_k=3,
+        rrf_k=60,
+        route_weights={
+            RAG_VECTOR_CHANNEL: 0.0,
+            DERIVED_KNOWLEDGE_VECTOR_CHANNEL: 0.0,
+        },
+    )
+
+    assert engine.enabled_channels == {"bm25"}
+    assert knowledge.enabled_channels == {"lexical"}
 
 
 def test_pipeline_uses_batch_search_without_changing_query_provenance():

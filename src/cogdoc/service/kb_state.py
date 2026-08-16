@@ -200,6 +200,34 @@ class KBState:
             self._save(data)
             return previous if previous != gen_id else None
 
+    def rollback_active(self, gen_id: str) -> str:
+        """Atomically reactivate one retained superseded generation.
+
+        Rollback deliberately accepts only a superseded generation.  Building,
+        failed, and unrelated ready generations are never valid rollback
+        targets, which keeps this operation distinct from a normal commit.
+        Generation storage must have been retained by the caller.
+        """
+
+        with self._lock:
+            data = self._load()
+            target = data["generations"].get(gen_id)
+            if target is None:
+                raise KeyError(gen_id)
+            if target["status"] != GENERATION_SUPERSEDED:
+                raise ValueError("only a superseded generation can be rolled back")
+            current_id = data["active_generation"]
+            if current_id is None:
+                raise ValueError("cannot roll back without an active generation")
+            current = data["generations"].get(current_id)
+            if current is None or current["status"] != GENERATION_READY:
+                raise ValueError("active generation state is invalid")
+            current["status"] = GENERATION_SUPERSEDED
+            target["status"] = GENERATION_READY
+            data["active_generation"] = gen_id
+            self._save(data)
+            return current_id
+
     # 查询和回收。
 
     # active：处理对应功能。

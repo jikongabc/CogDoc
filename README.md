@@ -843,6 +843,14 @@ Quality cases can also carry runtime `claim_audit` data directly, under `output.
 
 Run `python scripts/eval_retrieval.py --rerank --verify-evidence` to include the cloud evidence verifier in final acceptance/abstention metrics; add `--local-verifier` to use Ollama. This mode makes model calls and is intentionally excluded from the default retrieval gate.
 
+### v7 migration and four-route calibration
+
+Use `python scripts/migrate_v7_indexes.py scan` before rollout, then `run` to rebuild stale KBs transactionally while retaining the previous generation. A recorded run can be reverted with `rollback <run_id>` and, after acceptance, its retained generations can be removed with `finalize <run_id>`.
+
+Authorized reviewers can run the same single-flight workflow through `/v1/index-migrations` or the Evidence Review Desk's generation control. Tenant filtering is enforced and physical storage IDs are never returned. `make eval-multi-route` and `make calibrate-multi-route` expose the evaluation and calibration workflow as standard development targets.
+
+Run `scripts/eval_multi_route_retrieval.py` to produce full, per-route, and leave-one-out evaluations with layered ranking, coverage, abstention, and latency metrics. Feed that report to `scripts/calibrate_multi_route_retrieval.py` to generate a versioned, rollbackable recommendation for route weights, top-k, per-route quota, and abstention thresholds. The evaluator and calibrator write artifacts only; they never change live settings. The Evidence Review Desk in the web UI now includes a retrieval path console for raw routes, RRF contributions, rerank movement, gate decisions, and review-gated human labels.
+
 Every chat request gets a `request_id`/`trace_id`. When `COGDOC_TRACE_ENABLED=true`, the service writes JSON traces under `COGDOC_TRACE_DIR` (default `logs/traces`), and the same safe payload is available through `GET /v1/traces/{trace_id}`. `GET /v1/traces` lists recent traces and can be scoped by `doc_id` and `session_id`, which is how the Streamlit Trace panel shows only the current conversation. Trace files include `schema_version`, `status` (`ok`, `degraded`, or `failed`), total `duration_ms`, a safe config snapshot, step summaries, rewrite summaries, error summaries, and only truncated evidence previews rather than full document text. QA rerank steps additionally expose Evidence Pack input/kept/dropped counts and characters, overlap removed, drop-reason counts, anchor/pinned counts, and the hard-constraint `over_budget` decision. The standalone Debug console reads the same trace format.
 
 Backup/restore and index rebuild rules are covered in [PRODUCTION_zh-CN.md](docs/PRODUCTION_zh-CN.md).

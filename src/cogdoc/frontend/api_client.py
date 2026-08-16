@@ -1106,6 +1106,91 @@ class CogDocClient:
             headers=self._headers,
         )
 
+    def diagnose_retrieval(
+        self,
+        kb_id: str,
+        query: str,
+        *,
+        top_k: int = 12,
+        rerank: bool = True,
+        route_weights: Mapping[str, float] | None = None,
+        requirements: list[dict[str, Any]] | None = None,
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url("/v1/retrieval-diagnostics"),
+            json={
+                "doc_id": kb_id,
+                "query": query,
+                "top_k": top_k,
+                "rerank": rerank,
+                "route_weights": dict(route_weights) if route_weights else None,
+                "requirements": requirements or [],
+            },
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def scan_index_migrations(self) -> httpx.Response:
+        return httpx.get(
+            self._url("/v1/index-migrations/scan"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def start_index_migration(self, kb_ids: list[str]) -> httpx.Response:
+        return httpx.post(
+            self._url("/v1/index-migrations"),
+            json={"kb_ids": kb_ids},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_index_migration(self, run_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/index-migrations/{run_id}"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def rollback_index_migration(self, run_id: str) -> httpx.Response:
+        return httpx.post(
+            self._url(f"/v1/index-migrations/{run_id}/rollback"),
+            json={"kb_ids": []},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def finalize_index_migration(self, run_id: str) -> httpx.Response:
+        return httpx.post(
+            self._url(f"/v1/index-migrations/{run_id}/finalize"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def save_retrieval_diagnostic_label(
+        self,
+        kb_id: str,
+        query: str,
+        *,
+        no_answer: bool,
+        acceptable_evidence: list[dict[str, Any]],
+        hard_negative_evidence: list[dict[str, Any]],
+        requirement_label: str = "",
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url("/v1/retrieval-diagnostics/labels"),
+            json={
+                "doc_id": kb_id,
+                "query": query,
+                "no_answer": no_answer,
+                "acceptable_evidence": acceptable_evidence,
+                "hard_negative_evidence": hard_negative_evidence,
+                "requirement_label": requirement_label,
+            },
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
     def get_retrieval_eval_candidates(
         self, draft_id: str, *, top_k: int = 12
     ) -> httpx.Response:

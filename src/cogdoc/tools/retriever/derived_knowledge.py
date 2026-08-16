@@ -543,6 +543,7 @@ class DerivedKnowledgeRetriever:
         top_k: int = 3,
         *,
         scope: RetrievalScope | None = None,
+        channels: set[str] | None = None,
     ) -> dict[str, list[RetrievedDoc]]:
         """Return embedding and lexical rankings as independent routes."""
 
@@ -551,6 +552,7 @@ class DerivedKnowledgeRetriever:
             [query],
             top_k=top_k,
             scope=scope,
+            channels=channels,
         )
         return rows[0] if rows else {"embedding": [], "lexical": []}
 
@@ -561,6 +563,7 @@ class DerivedKnowledgeRetriever:
         top_k: int = 3,
         *,
         scope: RetrievalScope | None = None,
+        channels: set[str] | None = None,
     ) -> list[dict[str, list[RetrievedDoc]]]:
         """Run both approved-knowledge routes, with independent degradation.
 
@@ -576,8 +579,9 @@ class DerivedKnowledgeRetriever:
         ):
             return [{"embedding": [], "lexical": []} for _ in queries]
 
+        enabled = channels if channels is not None else {"embedding", "lexical"}
         embedding_rows: list[list[RetrievedDoc]] = [[] for _ in queries]
-        index = self._index_or_none()
+        index = self._index_or_none() if "embedding" in enabled else None
         if index is not None:
             try:
                 index.ensure_fresh(kb_id)
@@ -613,11 +617,10 @@ class DerivedKnowledgeRetriever:
         return [
             {
                 "embedding": list(embedding_docs),
-                "lexical": self._lexical_search(
-                    kb_id,
-                    query,
-                    top_k,
-                    scope=scope,
+                "lexical": (
+                    self._lexical_search(kb_id, query, top_k, scope=scope)
+                    if "lexical" in enabled
+                    else []
                 ),
             }
             for query, embedding_docs in zip(queries, embedding_rows, strict=True)

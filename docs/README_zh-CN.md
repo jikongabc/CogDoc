@@ -845,6 +845,29 @@ GitHub CI 会执行 Rust 格式/单测、构建并运行时校验 native wheel�
 
 运行 `python scripts/eval_retrieval.py --rerank --verify-evidence` 可把云端证据校验纳入最终放行率/拒答率统计；加 `--local-verifier` 则使用 Ollama。该模式会发起模型调用，因此有意不纳入默认检索门禁。
 
+### v7 索引迁移与四路召回标定
+
+先运行 `python scripts/migrate_v7_indexes.py scan` 检查各知识库的 chunk 身份与构建版本。`run` 会逐库事务化重建、持续写入进度和失败记录、刷新派生知识索引，并保留迁移前一代；验收异常时用 `rollback <run_id>` 原子回切，稳定后再用 `finalize <run_id>` 清理旧代。未执行 `finalize` 前会占用两代向量、BM25 和快照存储，这是可回滚性的成本。
+
+授权审核者也可通过 `GET /v1/index-migrations/scan`、`POST /v1/index-migrations` 以及 run 的查询/回滚/finalize 端点后台执行同一流程。API 同一时间只接受一个代际操作，按租户授权过滤知识库，并且不会返回物理 storage ID。网页端“证据判卷台 → 索引代际控制”提供对应操作。
+
+四路召回评测与校准分两步：
+
+```bash
+python scripts/eval_multi_route_retrieval.py \
+  --eval-set eval/retrieval_eval.jsonl \
+  --output artifacts/reliability/multi-route-eval.json
+python scripts/calibrate_multi_route_retrieval.py \
+  artifacts/reliability/multi-route-eval.json \
+  --output artifacts/reliability/multi-route-calibration.json
+```
+
+也可依次运行 `make eval-multi-route` 和 `make calibrate-multi-route`。
+
+评测同时生成全路、四个单路和四个 leave-one-out 视图，按 query/doc/chunk 类型汇总 Recall@K、MRR、nDCG、需求覆盖、拒答准确率与 P50/P95 延迟；权重为零的路线不会访问底层索引。校准报告搜索路权重、top-k、融合保底配额和四类拒答阈值，输出 `recommended_env`，同时保留 `current_config` / `rollback_config`；它只产出建议，不会自动修改线上环境。
+
+网页端“证据判卷台”中的“检索路径诊断”可查看四路原始排名、逐块 RRF 贡献、重排位移、拒答原因和缺失需求。人工选择的正确证据/误导项先写入待审核评测草稿，仍需通过现有审核后才能导出到正式评测集。
+
 每次对话都会生成 `request_id` / `trace_id`。`COGDOC_TRACE_ENABLED=true` 时，服务会把 JSON trace 写入 `COGDOC_TRACE_DIR`（默认 `logs/traces`），同一份安全载荷也可通过 `GET /v1/traces/{trace_id}` 查询；`GET /v1/traces` 可按 `doc_id` 和 `session_id` 限定范围，Streamlit Trace 面板正是用它只展示当前对话。trace 文件包含 `schema_version`、`status`（`ok`、`degraded` 或 `failed`）、总 `duration_ms`、安全配置快照、步骤摘要、改写摘要、错误摘要，并且只保存截断后的 evidence preview，不写入完整文档正文。QA rerank 步骤还会暴露 Evidence Pack 的输入/保留/丢弃数与字符数、移除的 overlap、分原因丢弃计数、anchor/pinned 数，以及硬约束的 `over_budget` 决策。独立 Debug 控制台读取同一套 trace 格式。
 
 备份恢复和索引重建规则见 [PRODUCTION_zh-CN.md](PRODUCTION_zh-CN.md)。

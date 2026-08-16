@@ -173,6 +173,23 @@ def test_switch_supersedes_old_active_and_returns_it(tmp_path):
     assert g2 not in st.stale_generation_ids()
 
 
+def test_rollback_active_reactivates_retained_superseded_generation(tmp_path):
+    st = _state(tmp_path)
+    g1 = st.begin_generation("embed", "build-v1", "chunk-v6")
+    st.mark_ready(g1, 1, [])
+    st.switch_active(g1)
+    g2 = st.begin_generation("embed", "build-v2", "chunk-v7")
+    st.mark_ready(g2, 1, [])
+    st.switch_active(g2)
+
+    replaced = st.rollback_active(g1)
+
+    assert replaced == g2
+    assert st.active()["id"] == g1
+    assert st.get(g1)["status"] == "ready"
+    assert st.get(g2)["status"] == "superseded"
+
+
 # 验证 mark ready rejects negative count。
 def test_mark_ready_rejects_negative_count(tmp_path):
     st = _state(tmp_path)

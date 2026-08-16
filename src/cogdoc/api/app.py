@@ -30,8 +30,10 @@ from cogdoc.api.routes import (
     documents_router,
     feedback_router,
     health_router,
+    index_migrations_router,
     knowledge_router,
     retrieval_eval_drafts_router,
+    retrieval_diagnostics_router,
     research_router,
     traces_router,
 )
@@ -332,6 +334,16 @@ def create_app(
                     error_class=type(exc).__name__,
                 )
             try:
+                app.state.index_migration_manager.shutdown(wait=True)
+            except Exception as exc:
+                log_event(
+                    "shutdown",
+                    "index_migration_shutdown_failed",
+                    {},
+                    level=logging.ERROR,
+                    error_class=type(exc).__name__,
+                )
+            try:
                 # 先排空请求卸载线程池。
                 app.state.offload_executor.shutdown(wait=True)
             except Exception as exc:
@@ -483,6 +495,15 @@ def create_app(
     app.state.session_store = session_store or SessionStore()
     # 入库注册表/任务管理器可注入，便于测试用假入库函数。
     app.state.kb_registry = kb_registry or KnowledgeBaseRegistry()
+    from cogdoc.service.index_migration import IndexMigrationManager, IndexMigrationRunner
+
+    app.state.index_migration_manager = IndexMigrationManager(
+        IndexMigrationRunner(
+            source_dir_for=app.state.kb_registry.source_dir,
+            knowledge_store=runtime.knowledge_store,
+            refresh_derived_knowledge=runtime.refresh_derived_knowledge_index,
+        )
+    )
     # 知识库存在性检查用于写入防复活，注入版由测试自行控制。
     if index_jobs is None:
         app.state.index_jobs = IndexJobManager(
@@ -713,10 +734,12 @@ def create_app(
     app.include_router(access_router)
     app.include_router(agent_router)
     app.include_router(health_router)
+    app.include_router(index_migrations_router)
     app.include_router(documents_router)
     app.include_router(feedback_router)
     app.include_router(knowledge_router)
     app.include_router(retrieval_eval_drafts_router)
+    app.include_router(retrieval_diagnostics_router)
     app.include_router(research_router)
     app.include_router(traces_router)
     return app

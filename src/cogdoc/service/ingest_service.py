@@ -148,6 +148,8 @@ class IngestResult:
     chunk_count: int
     documents: list[IngestDocResult] = field(default_factory=list)
     ocr_summary: dict = field(default_factory=_empty_ocr_summary)
+    generation_id: str | None = None
+    previous_generation_id: str | None = None
 
 
 # 写后两路索引不一致（如向量清理静默失败、部分写）：标记入库失败而非误报成功。
@@ -919,6 +921,7 @@ def build_kb_index_transactional(
     on_commit=None,
     *,
     knowledge_store: DerivedKnowledgeStore | None = None,
+    retain_previous_generation: bool = False,
 ) -> IngestResult:
     # 取知识库写锁串行化写操作，提交前回调失败会中止提交。
     with kb_write_lock(kb_id):
@@ -927,6 +930,7 @@ def build_kb_index_transactional(
             source_dir,
             on_commit,
             knowledge_store=knowledge_store,
+            retain_previous_generation=retain_previous_generation,
         )
     _log_ocr_summary(result)
     return result
@@ -939,6 +943,7 @@ def _build_transactional_locked(
     on_commit=None,
     *,
     knowledge_store: DerivedKnowledgeStore | None = None,
+    retain_previous_generation: bool = False,
 ) -> IngestResult:
     state = KBState(kb_id)
     pdf_files = list_pdf_files(source_dir)
@@ -954,6 +959,7 @@ def _build_transactional_locked(
             on_commit,
             previous_documents,
             knowledge_store=knowledge_store,
+            retain_previous_generation=retain_previous_generation,
         )
 
     rust_core = ensure_rust_core("scan_pdf_manifest_native")
@@ -1033,14 +1039,20 @@ def _build_transactional_locked(
         save_index_manifest(manifest)
     except Exception:
         pass
-    if old_gen:
+    if old_gen and not retain_previous_generation:
         try:
             _schedule_generation_cleanup(kb_id, old_gen)
         except Exception:
             pass
 
     return IngestResult(
-        kb_id, len(pdf_files), len(all_chunks), doc_results, ocr_summary
+        kb_id,
+        len(pdf_files),
+        len(all_chunks),
+        doc_results,
+        ocr_summary,
+        generation_id=gen_id,
+        previous_generation_id=old_gen,
     )
 
 
@@ -1052,6 +1064,7 @@ def _transactional_empty(
     previous_documents: list[dict] | None = None,
     *,
     knowledge_store: DerivedKnowledgeStore | None = None,
+    retain_previous_generation: bool = False,
 ) -> IngestResult:
     if previous_documents is None:
         active = state.active()
@@ -1091,9 +1104,16 @@ def _transactional_empty(
         _remove_manifest(kb_id)
     except Exception:
         pass
-    if old_gen:
+    if old_gen and not retain_previous_generation:
         try:
             _schedule_generation_cleanup(kb_id, old_gen)
         except Exception:
             pass
-    return IngestResult(kb_id, 0, 0, [])
+    return IngestResult(
+        kb_id,
+        0,
+        0,
+        [],
+        generation_id=gen_id,
+        previous_generation_id=old_gen,
+    )

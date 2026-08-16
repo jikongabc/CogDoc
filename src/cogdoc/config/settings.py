@@ -479,6 +479,12 @@ class Settings(BaseSettings):
         le=5.0,
         validation_alias="QA_DERIVED_KNOWLEDGE_LEXICAL_ROUTE_WEIGHT",
     )
+    qa_retrieval_docs_per_route: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        validation_alias="QA_RETRIEVAL_DOCS_PER_ROUTE",
+    )
     qa_rerank_top_n: int = Field(default=3, validation_alias="QA_RERANK_TOP_N")
     qa_rerank_max_candidates: int = Field(
         default=12, validation_alias="QA_RERANK_MAX_CANDIDATES"
