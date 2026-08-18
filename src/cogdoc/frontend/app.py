@@ -55,6 +55,12 @@ TRACE_NODE_LABELS = {
     "summary_subgraph": "摘要流程",
     "compare_subgraph": "对比流程",
 }
+CLAIM_VERDICT_LABELS = {
+    "supported": "证据支持",
+    "unsupported": "证据反驳",
+    "insufficient": "证据不足",
+    "not_factual": "非事实声明",
+}
 
 
 def _research_contract_key(value: object) -> str:
@@ -353,6 +359,9 @@ def _init_state() -> None:
     st.session_state.setdefault("eval_review_key", "")
     st.session_state.setdefault("eval_candidate_cache", {})
     st.session_state.setdefault("eval_export_jsonl", "")
+    st.session_state.setdefault("claim_review_pages", {})
+    st.session_state.setdefault("claim_review_export_jsonl", "")
+    st.session_state.setdefault("claim_review_export_scope", "")
     # 兼容旧状态：升级前只有一份全局消息，迁移到当前上下文桶里。
     if "messages" in st.session_state:
         if st.session_state.kb_id and st.session_state.messages:
@@ -468,6 +477,7 @@ def _reset_user_context() -> None:
         ("research_summary_pages", {}),
         ("research_open_job_by_kb", {}),
         ("eval_candidate_cache", {}),
+        ("claim_review_pages", {}),
         ("known_sessions", {}),
     ):
         st.session_state[name] = empty
@@ -476,6 +486,8 @@ def _reset_user_context() -> None:
     st.session_state.research_notice = None
     st.session_state.eval_review_key = ""
     st.session_state.eval_export_jsonl = ""
+    st.session_state.claim_review_export_jsonl = ""
+    st.session_state.claim_review_export_scope = ""
     # An invite is a one-time workspace capability. Never carry it across an
     # identity/workspace/role boundary where it could be shown under the wrong
     # tenant and delivered to the wrong recipient.
@@ -5218,7 +5230,7 @@ def _render_eval_unit(
     }
 
 
-def _retrieval_eval_review_area(kb_id: str | None) -> None:
+def _review_desk_header() -> None:
     st.markdown(
         """
         <style>
@@ -5251,12 +5263,30 @@ def _retrieval_eval_review_area(kb_id: str | None) -> None:
           align-items:center;border-left:4px solid #1b7268;background:#edf4f2;padding:.65rem .8rem;
           font-family:"IBM Plex Mono","SFMono-Regular",monospace;font-size:.72rem}
         .generation-track strong {color:#1b7268}
+        .claim-sheet {border:1px solid #b8c9c6;border-left:5px solid #1b7268;
+          background:#f7faf9;padding:1rem 1.1rem;margin:.45rem 0 .8rem}
+        .claim-sheet h3 {font-family:"Noto Sans SC","PingFang SC",sans-serif;
+          line-height:1.55;margin:.25rem 0 .55rem;color:#172624}
+        .claim-meta {font-family:"IBM Plex Mono","SFMono-Regular",monospace;
+          color:#526d69;font-size:.7rem;letter-spacing:.035em}
+        .verdict-chip {display:inline-block;padding:.2rem .45rem;margin-right:.35rem;
+          border:1px solid #8eaaa5;background:#edf4f2;font-size:.75rem}
+        .verdict-stamp {display:inline-block;padding:.22rem .5rem;margin:.1rem .35rem .1rem 0;
+          border:2px solid currentColor;font-family:"IBM Plex Mono","SFMono-Regular",monospace;
+          font-size:.7rem;font-weight:760;letter-spacing:.055em;text-transform:uppercase}
+        .verdict-supported {color:#176d63}.verdict-unsupported {color:#9b3a32}
+        .verdict-insufficient {color:#8a641b}.verdict-not-factual {color:#59646f}
         @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+        @media (max-width:640px){
+          .evidence-paper{grid-template-columns:1fr}
+          .evidence-rail{border-right:0;border-bottom:1px solid #b8c9c6;padding:.35rem .6rem}
+          .claim-sheet{padding:.8rem}.claim-sheet h3{font-size:1.05rem}
+        }
         </style>
         <section class="review-hero">
-          <div class="review-eyebrow">Retrieval evidence desk</div>
-          <h2>证据判卷台</h2>
-          <p>逐条核对“这段原文能不能支撑这道题”。只有人工确认的证据，才会进入正式评测集。</p>
+          <div class="review-eyebrow">Evidence &amp; claim review desk</div>
+          <h2>证据与声明判卷台</h2>
+          <p>把生产声明抽检与检索证据评测放进同一条人工审核闭环；所有内容仍受当前工作区和来源权限约束。</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -5268,7 +5298,343 @@ def _retrieval_eval_review_area(kb_id: str | None) -> None:
         key="eval_review_key",
         help="使用有审核权限的账号时可留空；旧版部署请填写独立审核密钥。",
     )
+
+
+def _claim_review_queue_label(row: Mapping) -> str:
+    status = "待审" if row.get("status") == "pending" else "已审"
+    verdict = CLAIM_VERDICT_LABELS.get(
+        str(row.get("actual_verdict") or ""), "未知判定"
+    )
+    claim = " ".join(str(row.get("claim") or "").split())
+    if len(claim) > 54:
+        claim = claim[:53] + "…"
+    return f"{status} · {verdict} · {claim or '空声明'}"
+
+
+def _claim_review_export_jsonl(items: Sequence[Mapping]) -> str:
+    lines = [json.dumps(dict(item), ensure_ascii=False) for item in items]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _claim_review_evidence_paper(evidence: Mapping, rank: int) -> None:
+    source = html.escape(str(evidence.get("source") or "未知来源"))
+    page_start = evidence.get("page_start")
+    if page_start is None:
+        page_start = evidence.get("page")
+    page = _page_range_label(
+        page_start,
+        evidence.get("page_end"),
+    )
+    text = html.escape(str(evidence.get("text") or "（空证据）"))
+    chunk_id = html.escape(str(evidence.get("chunk_id") or "缺少 chunk_id"))
+    truncated = " · 已截断" if evidence.get("text_truncated") else ""
+    st.markdown(
+        f"""
+        <article class="evidence-paper">
+          <div class="evidence-rail">#{rank:02d}</div>
+          <div class="evidence-sheet">
+            <div class="evidence-meta">{source} · {html.escape(page)}{truncated}</div>
+            <div class="evidence-text">{text}</div>
+            <div class="evidence-id">{chunk_id}</div>
+          </div>
+        </article>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _claim_verification_review_desk(client: CogDocClient) -> None:
+    try:
+        summary_response = client.claim_verification_review_summary()
+    except Exception as exc:
+        st.error(f"连接声明核验审核接口失败：{exc}")
+        return
+    if summary_response.status_code != 200:
+        st.error(_eval_response_detail(summary_response, "读取声明核验审核汇总失败"))
+        st.caption("账号需具备审核权限；旧版部署请填写独立审核密钥。")
+        return
+    summary = response_payload(summary_response)
+    if not isinstance(summary, Mapping):
+        st.error("声明核验审核汇总响应格式不符合预期。")
+        return
+
+    metrics = st.columns(4)
+    metrics[0].metric("待审核", int(summary.get("pending_count") or 0))
+    metrics[1].metric("已审核", int(summary.get("reviewed_count") or 0))
+    agreement_rate = summary.get("agreement_rate")
+    metrics[2].metric(
+        "人机一致率",
+        f"{float(agreement_rate):.1%}" if agreement_rate is not None else "尚无标注",
+    )
+    metrics[3].metric(
+        "证据不完整", int(summary.get("evidence_incomplete_count") or 0)
+    )
+    oldest_pending = str(summary.get("oldest_pending_at") or "")
+    st.caption(
+        f"SHADOW {int(summary.get('shadow_count') or 0):04d} · "
+        f"ENFORCE {int(summary.get('enforce_count') or 0):04d} · "
+        f"最早待审 {oldest_pending or '—'}"
+    )
+
+    filters = st.columns([2, 2, 4])
+    status_options: tuple[str, ...] = ("pending", "reviewed", "all")
+    status_filter = filters[0].selectbox(
+        "审核状态",
+        status_options,
+        format_func=lambda value: {
+            "pending": "待审核",
+            "reviewed": "已审核",
+            "all": "全部",
+        }.get(str(value), str(value)),
+        key="claim-review-status",
+    )
+    page_size = int(
+        filters[1].selectbox(
+            "每页",
+            [10, 25, 50, 100],
+            index=1,
+            key="claim-review-page-size",
+        )
+    )
+    filters[2].caption(
+        "列表不下发证据正文；只有选中一条任务后才按当前 KB/source ACL 读取详情。"
+    )
+
+    scope_key = (
+        f"{client.base_url}:{client.auth_cache_identity}:"
+        f"{client.workspace_id or '-'}:{status_filter}:{page_size}"
+    )
+    page_state = st.session_state.claim_review_pages.setdefault(
+        scope_key, {"index": 0, "cursors": [None]}
+    )
+    cursors = page_state.get("cursors")
+    if not isinstance(cursors, list) or not cursors:
+        cursors = [None]
+        page_state["cursors"] = cursors
+    page_index = max(0, min(int(page_state.get("index") or 0), len(cursors) - 1))
+    page_state["index"] = page_index
+    cursor = cursors[page_index]
+    try:
+        list_response = client.list_claim_verification_reviews(
+            status=None if status_filter == "all" else status_filter,
+            limit=page_size,
+            cursor=str(cursor) if cursor else None,
+        )
+    except Exception as exc:
+        st.error(f"读取声明核验审核队列失败：{exc}")
+        return
+    if list_response.status_code != 200:
+        st.error(_eval_response_detail(list_response, "读取声明核验审核队列失败"))
+        return
+    payload = response_payload(list_response)
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("items"), list):
+        st.error("声明核验审核队列响应格式不符合预期。")
+        return
+    rows = [row for row in payload["items"] if isinstance(row, Mapping)]
+    next_cursor = payload.get("next_cursor")
+
+    navigation = st.columns([1, 2, 1])
+    if navigation[0].button(
+        "← 上一页",
+        disabled=page_index == 0,
+        key=f"claim-review-prev-{scope_key}",
+        use_container_width=True,
+    ):
+        page_state["index"] = page_index - 1
+        st.rerun()
+    navigation[1].markdown(
+        f"<div class='queue-ledger'>PAGE {page_index + 1:03d}　"
+        f"VISIBLE {len(rows):03d}　TOTAL {int(summary.get('total_count') or 0):04d}</div>",
+        unsafe_allow_html=True,
+    )
+    if navigation[2].button(
+        "下一页 →",
+        disabled=not next_cursor,
+        key=f"claim-review-next-{scope_key}",
+        use_container_width=True,
+    ):
+        following_index = page_index + 1
+        if following_index < len(cursors):
+            cursors[following_index] = str(next_cursor)
+            del cursors[following_index + 1 :]
+        else:
+            cursors.append(str(next_cursor))
+        page_state["index"] = following_index
+        st.rerun()
+
+    if not rows:
+        st.info(
+            "当前筛选下没有可见任务。可切换审核状态；若队列始终为空，请确认已启用声明抽样且账号拥有对应来源权限。"
+        )
+    else:
+        row_by_id = {str(row.get("review_id") or ""): row for row in rows}
+        selected_id = st.selectbox(
+            "声明审核队列",
+            list(row_by_id),
+            format_func=lambda value: _claim_review_queue_label(row_by_id[value]),
+            key=f"claim-review-selected-{scope_key}-{page_index}",
+        )
+        try:
+            detail_response = client.get_claim_verification_review(selected_id)
+        except Exception as exc:
+            st.error(f"读取声明与证据详情失败：{exc}")
+            return
+        if detail_response.status_code != 200:
+            st.error(_eval_response_detail(detail_response, "读取声明与证据详情失败"))
+            return
+        detail = response_payload(detail_response)
+        if not isinstance(detail, Mapping):
+            st.error("声明核验详情响应格式不符合预期。")
+            return
+
+        claim = html.escape(str(detail.get("claim") or "（空声明）"))
+        review_id = html.escape(str(detail.get("review_id") or ""))
+        task_type = html.escape(str(detail.get("task_type") or "unknown"))
+        policy_id = html.escape(str(detail.get("policy_id") or ""))
+        actual_verdict = str(detail.get("actual_verdict") or "")
+        verdict_class = {
+            "supported": "verdict-supported",
+            "unsupported": "verdict-unsupported",
+            "insufficient": "verdict-insufficient",
+            "not_factual": "verdict-not-factual",
+        }.get(actual_verdict, "verdict-not-factual")
+        st.markdown(
+            f"""
+            <section class="claim-sheet">
+              <div class="claim-meta">{task_type} · {policy_id} · {review_id}</div>
+              <h3>{claim}</h3>
+              <span class="verdict-stamp {verdict_class}">MODEL / {html.escape(CLAIM_VERDICT_LABELS.get(actual_verdict, '未知'))}</span>
+              <span class="verdict-chip">模式：{html.escape(str(detail.get('effective_mode') or ''))}</span>
+              <span class="verdict-chip">决策：{html.escape(str(detail.get('decision') or ''))}</span>
+            </section>
+            """,
+            unsafe_allow_html=True,
+        )
+        confidence = detail.get("confidence")
+        duration = detail.get("duration_ms")
+        st.caption(
+            f"模型理由：{str(detail.get('reason') or '—')} · "
+            f"置信度 {float(confidence):.2f} · "
+            f"耗时 {float(duration):.1f} ms"
+            if confidence is not None and duration is not None
+            else f"模型理由：{str(detail.get('reason') or '—')}"
+        )
+        if not detail.get("evidence_complete"):
+            st.warning("引用证据快照不完整；标注时应把缺失证据纳入判断。")
+        evidence = [
+            item
+            for item in detail.get("evidence") or []
+            if isinstance(item, Mapping)
+        ]
+        st.markdown(f"#### 精确引用证据 · {len(evidence)} 段")
+        if evidence:
+            for rank, item in enumerate(evidence, start=1):
+                _claim_review_evidence_paper(item, rank)
+        else:
+            st.warning("这条声明没有可展示的引用证据快照。")
+
+        current_expected = str(detail.get("expected_verdict") or "")
+        options = list(CLAIM_VERDICT_LABELS)
+        with st.form(
+            f"claim-review-label-{selected_id}-{detail.get('revision')}"
+        ):
+            expected = st.radio(
+                "人工结论",
+                options,
+                index=(
+                    options.index(current_expected)
+                    if current_expected in options
+                    else None
+                ),
+                horizontal=True,
+                format_func=CLAIM_VERDICT_LABELS.get,
+            )
+            if expected is None:
+                st.caption("请先独立判断，再选择人工结论；系统不会默认沿用模型判定。")
+            note = st.text_area(
+                "审核备注",
+                value=str(detail.get("review_note") or ""),
+                placeholder="说明支持、反驳或证据不足的关键依据（可选）",
+            )
+            submitted = st.form_submit_button(
+                "保存人工结论",
+                type="primary",
+                use_container_width=True,
+                disabled=expected is None,
+            )
+        if submitted and expected is not None:
+            try:
+                label_response = client.label_claim_verification_review(
+                    selected_id,
+                    expected_verdict=expected,
+                    expected_revision=int(detail.get("revision") or 1),
+                    review_note=note.strip(),
+                )
+            except Exception as exc:
+                st.error(f"保存人工结论失败：{exc}")
+                return
+            if label_response.status_code == 200:
+                st.success("人工结论已保存；汇总指标和发布门禁数据已更新。")
+                st.rerun()
+            elif label_response.status_code == 409:
+                st.warning("这条任务已被其他审核者更新，请刷新后基于最新 revision 重审。")
+            else:
+                st.error(_eval_response_detail(label_response, "保存人工结论失败"))
+
+    st.divider()
+    export_scope = (
+        f"{client.base_url}:{client.auth_cache_identity}:"
+        f"{client.workspace_id or '-'}"
+    )
+    if st.session_state.get("claim_review_export_scope") != export_scope:
+        st.session_state.claim_review_export_jsonl = ""
+        st.session_state.claim_review_export_scope = export_scope
+    export_columns = st.columns([2, 3])
+    if export_columns[0].button(
+        "准备声明核验门禁集",
+        key="claim-review-export",
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner("正在遍历已审核分页…"):
+                export_items = client.export_all_claim_verification_reviews()
+        except Exception as exc:
+            st.error(f"导出声明核验门禁集失败：{exc}")
+        else:
+            st.session_state.claim_review_export_jsonl = (
+                _claim_review_export_jsonl(export_items)
+            )
+            st.session_state.claim_review_export_scope = export_scope
+            st.success(f"已准备 {len(export_items)} 条人工判卷样本。")
+    if st.session_state.claim_review_export_jsonl:
+        export_columns[1].download_button(
+            "下载 claim_verification_eval.jsonl",
+            data=st.session_state.claim_review_export_jsonl,
+            file_name="claim_verification_eval.jsonl",
+            mime="application/x-ndjson",
+            use_container_width=True,
+        )
+
+
+def _evidence_review_area(kb_id: str | None) -> None:
+    _review_desk_header()
     client = _eval_review_client()
+    desk = st.radio(
+        "审核工作台",
+        ["声明核验", "检索证据"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="evidence-review-desk",
+    )
+    if desk == "声明核验":
+        _claim_verification_review_desk(client)
+    else:
+        _retrieval_eval_review_desk(kb_id, client)
+
+
+def _retrieval_eval_review_desk(
+    kb_id: str | None, client: CogDocClient
+) -> None:
     _render_index_migration_console(client, kb_id)
     _render_retrieval_diagnostic_console(client, kb_id)
     controls = st.columns([2, 2, 3])
@@ -5560,7 +5926,7 @@ def _chat_area() -> None:
     elif view == "派生知识":
         _knowledge_area(kb_id)
     elif view == "证据审核":
-        _retrieval_eval_review_area(kb_id)
+        _evidence_review_area(kb_id)
     else:
         _debug_area(kb_id)
 

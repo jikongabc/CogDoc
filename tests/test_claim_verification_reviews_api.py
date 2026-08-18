@@ -203,6 +203,10 @@ async def test_review_api_rechecks_source_acl_across_list_detail_label_and_expor
                 headers={"X-API-Key": "a-reviewer"},
                 json={"expected_verdict": "supported", "expected_revision": 2},
             )
+            summary = await client.get(
+                "/v1/claim-verification/reviews/summary",
+                headers={"X-API-Key": "a-reviewer"},
+            )
             exported = await client.get(
                 "/v1/claim-verification/reviews/export",
                 headers={"X-API-Key": "a-reviewer"},
@@ -216,7 +220,39 @@ async def test_review_api_rechecks_source_acl_across_list_detail_label_and_expor
     ]
     assert hidden_detail.status_code == 404
     assert hidden_label.status_code == 404
+    assert summary.status_code == 200
+    assert summary.json()["total_count"] == 2
+    assert summary.json()["pending_count"] == 2
+    assert summary.json()["reviewed_count"] == 0
+    assert summary.json()["actual_verdict_counts"]["supported"] == 2
     assert exported.json()["items"] == []
+
+
+@pytest.mark.anyio
+async def test_review_summary_uses_store_aggregate_instead_of_evidence_pages(
+    monkeypatch, tmp_path,
+):
+    class AggregateOnlyStore(ClaimVerificationReviewStore):
+        def list_page(self, *args, **kwargs):
+            raise AssertionError("summary must not load evidence pages")
+
+    store = AggregateOnlyStore()
+    app, tenant_a_kb, _ = _app(monkeypatch, store, tmp_path)
+    store.record_candidates(
+        "tenant-a", [_candidate("7" * 32, kb_id=tenant_a_kb)]
+    )
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            summary = await client.get(
+                "/v1/claim-verification/reviews/summary",
+                headers={"X-API-Key": "a-reviewer"},
+            )
+
+    assert summary.status_code == 200
+    assert summary.json()["total_count"] == 1
 
 
 @pytest.mark.anyio
@@ -259,6 +295,10 @@ async def test_review_label_conflict_and_export_are_closed_and_tenant_scoped(
                 "/v1/claim-verification/reviews/export",
                 headers={"X-API-Key": "b-reviewer"},
             )
+            summary = await client.get(
+                "/v1/claim-verification/reviews/summary",
+                headers={"X-API-Key": "a-reviewer"},
+            )
 
     assert labeled.status_code == 200
     assert labeled.json()["revision"] == 2
@@ -272,6 +312,9 @@ async def test_review_label_conflict_and_export_are_closed_and_tenant_scoped(
     report = run_eval(exported.json()["items"], bootstrap_iterations=5)
     assert report["config"]["num_cases"] == 1
     assert other_export.json()["count"] == 0
+    assert summary.json()["agreement_count"] == 0
+    assert summary.json()["disagreement_count"] == 1
+    assert summary.json()["agreement_rate"] == 0.0
 
 
 def _runner(doc_id, query, is_local, chat_history, forced_task):
@@ -424,3 +467,32 @@ async def test_review_sampling_failure_never_breaks_chat(monkeypatch, tmp_path):
 
     assert chat.status_code == 200
     assert chat.json()["answer"].startswith("报名截止日期")
+
+
+def test_review_summary_merges_bucket_without_counting_pending_as_labeled():
+    from cogdoc.api.routes.claim_verification import _review_queue_summary
+
+    summary = _review_queue_summary(
+        "tenant-a",
+        [
+            {
+                "total_count": 1,
+                "pending_count": 1,
+                "reviewed_count": 0,
+                "shadow_count": 1,
+                "enforce_count": 0,
+                "evidence_incomplete_count": 0,
+                "agreement_count": 0,
+                "disagreement_count": 0,
+                "oldest_pending_at": "2026-08-19T00:00:00+00:00",
+                "actual_verdict_counts": {"supported": 1},
+                "expected_verdict_counts": {},
+            }
+        ],
+    )
+
+    assert summary["total_count"] == 1
+    assert summary["agreement_count"] == 0
+    assert summary["disagreement_count"] == 0
+    assert summary["agreement_rate"] is None
+    assert summary["expected_verdict_counts"]["unsupported"] == 0

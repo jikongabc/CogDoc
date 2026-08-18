@@ -890,6 +890,101 @@ def test_review_queue_summary_client_method_calls_expected_endpoint(monkeypatch)
     }
 
 
+def test_claim_verification_review_client_calls_stable_endpoints(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(("GET", url, kwargs))
+        return httpx.Response(200, json={"items": [], "next_cursor": None})
+
+    def fake_post(url, **kwargs):
+        calls.append(("POST", url, kwargs))
+        return httpx.Response(200, json={"review_id": "a" * 32})
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", fake_get)
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.post", fake_post)
+    client = CogDocClient(
+        "http://api", api_key="secret", workspace_id="workspace-a"
+    )
+
+    client.claim_verification_review_summary()
+    client.list_claim_verification_reviews(
+        status="pending", limit=20, cursor="cursor-1"
+    )
+    client.get_claim_verification_review("a" * 32)
+    client.label_claim_verification_review(
+        "a" * 32,
+        expected_verdict="unsupported",
+        expected_revision=3,
+        review_note="证据不支持日期",
+    )
+    client.export_claim_verification_reviews(limit=500, cursor="cursor-2")
+
+    headers = {
+        "Authorization": "Bearer secret",
+        "X-CogDoc-Workspace": "workspace-a",
+    }
+    assert calls[0] == (
+        "GET",
+        "http://api/v1/claim-verification/reviews/summary",
+        {"timeout": 180.0, "headers": headers},
+    )
+    assert calls[1][0:2] == (
+        "GET",
+        "http://api/v1/claim-verification/reviews",
+    )
+    assert calls[1][2]["params"] == {
+        "status": "pending",
+        "limit": 20,
+        "cursor": "cursor-1",
+    }
+    assert calls[2][0:2] == (
+        "GET",
+        f"http://api/v1/claim-verification/reviews/{'a' * 32}",
+    )
+    assert calls[3][0:2] == (
+        "POST",
+        f"http://api/v1/claim-verification/reviews/{'a' * 32}/label",
+    )
+    assert calls[3][2]["json"] == {
+        "expected_verdict": "unsupported",
+        "expected_revision": 3,
+        "review_note": "证据不支持日期",
+    }
+    assert calls[4][0:2] == (
+        "GET",
+        "http://api/v1/claim-verification/reviews/export",
+    )
+    assert calls[4][2]["params"] == {"limit": 500, "cursor": "cursor-2"}
+
+
+def test_claim_verification_export_client_collects_bounded_pages(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(kwargs["params"])
+        cursor = kwargs["params"].get("cursor")
+        if cursor is None:
+            return httpx.Response(
+                200,
+                json={"items": [{"id": "first"}], "next_cursor": "next"},
+            )
+        return httpx.Response(
+            200,
+            json={"items": [{"id": "second"}], "next_cursor": None},
+        )
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", fake_get)
+    client = CogDocClient("http://api")
+
+    items = client.export_all_claim_verification_reviews(
+        page_size=2000, max_items=10
+    )
+
+    assert items == [{"id": "first"}, {"id": "second"}]
+    assert calls == [{"limit": 1000}, {"limit": 1000, "cursor": "next"}]
+
+
 # 验证知识审核指标客户端方法调用稳定端点场景。
 def test_knowledge_metrics_client_methods_call_expected_endpoints(monkeypatch):
     calls = []

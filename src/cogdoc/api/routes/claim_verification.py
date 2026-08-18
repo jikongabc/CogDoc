@@ -17,6 +17,7 @@ from cogdoc.api.schemas import (
     ClaimVerificationReviewLabelRequest,
     ClaimVerificationReviewListResponse,
     ClaimVerificationReviewSummary,
+    ClaimVerificationReviewSummaryResponse,
     ErrorCode,
     build_error_response,
 )
@@ -111,6 +112,34 @@ def _review_is_authorized(
     return True
 
 
+def _review_summary_is_authorized(
+    request: Request,
+    row: Mapping[str, object],
+    *,
+    scope_cache: dict[str, Any | None],
+) -> bool:
+    kb_id = str(row.get("kb_id") or "")
+    if kb_id not in scope_cache:
+        scope = scope_for_storage_id(request, kb_id) if kb_id else None
+        scope_cache[kb_id] = (
+            retrieval_scope_for_request(request, scope)
+            if scope is not None
+            else None
+        )
+    retrieval_scope = scope_cache[kb_id]
+    if retrieval_scope is None or retrieval_scope.denies_all:
+        return False
+    sources = row.get("authorization_sources")
+    if not isinstance(sources, list):
+        return False
+    return all(
+        isinstance(source, str)
+        and bool(source)
+        and retrieval_scope.allows_source(source)
+        for source in sources
+    )
+
+
 async def _authorized_review_page(
     request: Request,
     store,
@@ -148,6 +177,73 @@ async def _authorized_review_page(
         else None
     )
     return {"items": authorized[:limit], "next_cursor": next_cursor}
+
+
+async def _authorized_review_summary_buckets(
+    request: Request, store, tenant_id: str
+) -> list[dict]:
+    buckets = await run_sync(
+        request.app.state.offload_executor,
+        store.summary_buckets,
+        tenant_id,
+    )
+    scope_cache: dict[str, Any | None] = {}
+    return [
+        bucket
+        for bucket in buckets
+        if _review_summary_is_authorized(
+            request, bucket, scope_cache=scope_cache
+        )
+    ]
+
+
+def _review_queue_summary(tenant_id: str, buckets: list[dict]) -> dict:
+    verdicts = ("supported", "unsupported", "insufficient", "not_factual")
+    actual_counts = {verdict: 0 for verdict in verdicts}
+    expected_counts = {verdict: 0 for verdict in verdicts}
+    total = 0
+    pending = reviewed = shadow = enforce = incomplete = 0
+    agreement = disagreement = 0
+    oldest_pending_at: str | None = None
+    for bucket in buckets:
+        total += int(bucket.get("total_count") or 0)
+        pending += int(bucket.get("pending_count") or 0)
+        reviewed += int(bucket.get("reviewed_count") or 0)
+        shadow += int(bucket.get("shadow_count") or 0)
+        enforce += int(bucket.get("enforce_count") or 0)
+        incomplete += int(bucket.get("evidence_incomplete_count") or 0)
+        agreement += int(bucket.get("agreement_count") or 0)
+        disagreement += int(bucket.get("disagreement_count") or 0)
+        bucket_oldest = str(bucket.get("oldest_pending_at") or "")
+        if bucket_oldest and (
+            oldest_pending_at is None or bucket_oldest < oldest_pending_at
+        ):
+            oldest_pending_at = bucket_oldest
+        bucket_actual = bucket.get("actual_verdict_counts")
+        bucket_expected = bucket.get("expected_verdict_counts")
+        for verdict in verdicts:
+            if isinstance(bucket_actual, Mapping):
+                actual_counts[verdict] += int(bucket_actual.get(verdict) or 0)
+            if isinstance(bucket_expected, Mapping):
+                expected_counts[verdict] += int(
+                    bucket_expected.get(verdict) or 0
+                )
+    labeled = agreement + disagreement
+    return {
+        "tenant_id": tenant_id,
+        "total_count": total,
+        "pending_count": pending,
+        "reviewed_count": reviewed,
+        "shadow_count": shadow,
+        "enforce_count": enforce,
+        "evidence_incomplete_count": incomplete,
+        "agreement_count": agreement,
+        "disagreement_count": disagreement,
+        "agreement_rate": agreement / labeled if labeled else None,
+        "oldest_pending_at": oldest_pending_at,
+        "actual_verdict_counts": actual_counts,
+        "expected_verdict_counts": expected_counts,
+    }
 
 
 @router.get(
@@ -304,6 +400,36 @@ async def list_claim_verification_reviews(
             for row in page["items"]
         ],
         next_cursor=page["next_cursor"],
+    )
+
+
+@router.get(
+    "/reviews/summary",
+    response_model=ClaimVerificationReviewSummaryResponse,
+)
+async def summarize_claim_verification_reviews(request: Request):
+    store = _review_store(request)
+    if store is None:
+        return JSONResponse(
+            status_code=503,
+            content=build_error_response(
+                ErrorCode.INTERNAL_ERROR, "声明核验判卷存储不可用"
+            ).model_dump(),
+        )
+    principal = request_principal(request)
+    try:
+        buckets = await _authorized_review_summary_buckets(
+            request, store, principal.tenant_id
+        )
+    except Exception:
+        return JSONResponse(
+            status_code=503,
+            content=build_error_response(
+                ErrorCode.INTERNAL_ERROR, "声明核验判卷汇总暂时不可用"
+            ).model_dump(),
+        )
+    return ClaimVerificationReviewSummaryResponse(
+        **_review_queue_summary(principal.tenant_id, buckets)
     )
 
 

@@ -1240,6 +1240,107 @@ class CogDocClient:
             headers=self._headers,
         )
 
+    def claim_verification_review_summary(self) -> httpx.Response:
+        return httpx.get(
+            self._url("/v1/claim-verification/reviews/summary"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_claim_verification_reviews(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 25,
+        cursor: str | None = None,
+    ) -> httpx.Response:
+        params = {"status": status, "limit": limit, "cursor": cursor}
+        return httpx.get(
+            self._url("/v1/claim-verification/reviews"),
+            params={key: value for key, value in params.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_claim_verification_review(self, review_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/claim-verification/reviews/{review_id}"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def label_claim_verification_review(
+        self,
+        review_id: str,
+        *,
+        expected_verdict: str,
+        expected_revision: int,
+        review_note: str = "",
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url(f"/v1/claim-verification/reviews/{review_id}/label"),
+            json={
+                "expected_verdict": expected_verdict,
+                "expected_revision": expected_revision,
+                "review_note": review_note,
+            },
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def export_claim_verification_reviews(
+        self,
+        *,
+        limit: int = 1000,
+        cursor: str | None = None,
+    ) -> httpx.Response:
+        params = {"limit": limit, "cursor": cursor}
+        return httpx.get(
+            self._url("/v1/claim-verification/reviews/export"),
+            params={key: value for key, value in params.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def export_all_claim_verification_reviews(
+        self,
+        *,
+        page_size: int = 1000,
+        max_items: int = 10_000,
+    ) -> list[dict[str, Any]]:
+        bounded_page_size = max(1, min(1000, int(page_size)))
+        bounded_max_items = max(1, min(10_000, int(max_items)))
+        items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            response = self.export_claim_verification_reviews(
+                limit=bounded_page_size,
+                cursor=cursor,
+            )
+            payload = _checked_json(response)
+            if not isinstance(payload, Mapping):
+                raise CogDocAPIError("声明核验导出响应格式不符合预期")
+            page_items = payload.get("items")
+            if not isinstance(page_items, list) or not all(
+                isinstance(item, Mapping) for item in page_items
+            ):
+                raise CogDocAPIError("声明核验导出 items 格式不符合预期")
+            if len(items) + len(page_items) > bounded_max_items:
+                raise CogDocAPIError(
+                    f"声明核验导出超过客户端上限 {bounded_max_items} 条"
+                )
+            items.extend(dict(item) for item in page_items)
+            next_cursor = payload.get("next_cursor")
+            if next_cursor is None:
+                return items
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise CogDocAPIError("声明核验导出 next_cursor 格式不符合预期")
+            if next_cursor in seen_cursors:
+                raise CogDocAPIError("声明核验导出分页游标发生循环")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
     def create_research_job(
         self,
         kb_id: str,

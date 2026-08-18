@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from cogdoc.api.claim_verification_review_store import (
@@ -59,6 +61,58 @@ def test_memory_review_store_is_tenant_scoped_idempotent_and_paginated():
     assert store.list_page("tenant-b")["items"][0]["review_id"] == first_id
     with pytest.raises(ValueError, match="cursor"):
         store.list_page("tenant-a", cursor="not-a-cursor")
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        lambda path: ClaimVerificationReviewStore(),
+        lambda path: SqliteClaimVerificationReviewStore(path),
+    ],
+)
+def test_review_summary_buckets_exclude_evidence_text(tmp_path, store_factory):
+    store = store_factory(str(tmp_path / "state.db"))
+    store.record_candidates("tenant-a", [_candidate("9" * 32)])
+
+    try:
+        buckets = store.summary_buckets("tenant-a")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    assert buckets[0]["authorization_sources"] == ["guide.pdf"]
+    assert buckets[0]["total_count"] == 1
+    assert buckets[0]["pending_count"] == 1
+    assert buckets[0]["actual_verdict_counts"]["supported"] == 1
+    assert "evidence" not in buckets[0]
+    assert "claim" not in buckets[0]
+    assert "reason" not in buckets[0]
+
+
+def test_sqlite_review_store_backfills_compact_authorization_sources(tmp_path):
+    path = str(tmp_path / "state.db")
+    first = SqliteClaimVerificationReviewStore(path)
+    first.record_candidates("tenant-a", [_candidate("8" * 32)])
+    first.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "ALTER TABLE claim_verification_reviews "
+            "DROP COLUMN authorization_sources"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SqliteClaimVerificationReviewStore(path)
+    try:
+        assert migrated.summary_buckets("tenant-a")[0][
+            "authorization_sources"
+        ] == ["guide.pdf"]
+    finally:
+        migrated.close()
 
 
 def test_review_label_uses_revision_and_exports_gate_compatible_rows():

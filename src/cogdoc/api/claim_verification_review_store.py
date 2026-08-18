@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 import json
 import math
@@ -17,6 +17,7 @@ from cogdoc.tools.eval.claim_verification_eval import CLAIM_VERDICTS
 
 _STATUSES = frozenset({"pending", "reviewed"})
 _TASK_TYPES = frozenset({"qa", "summary", "compare"})
+_SUMMARY_VERDICTS = ("supported", "unsupported", "insufficient", "not_factual")
 
 
 class ClaimReviewRevisionConflictError(ValueError):
@@ -204,6 +205,108 @@ def _public_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _authorization_sources(evidence: object) -> list[str] | None:
+    if not isinstance(evidence, Sequence) or isinstance(
+        evidence, (str, bytes, bytearray)
+    ):
+        return None
+    sources: list[str] = []
+    seen: set[str] = set()
+    for item in evidence:
+        if not isinstance(item, Mapping):
+            return None
+        source = str(
+            item.get("authorization_source") or item.get("source") or ""
+        )
+        if source not in seen:
+            seen.add(source)
+            sources.append(source)
+    return sources
+
+
+def _decode_authorization_sources(value: object) -> list[str] | None:
+    try:
+        decoded = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, list) or not all(
+        isinstance(item, str) for item in decoded
+    ):
+        return None
+    return decoded
+
+
+def _summary_projection(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "kb_id": str(row.get("kb_id") or ""),
+        "observed_at": _utc_iso(float(row["observed_at"])),
+        "effective_mode": str(row.get("effective_mode") or ""),
+        "evidence_complete": bool(row.get("evidence_complete")),
+        "status": str(row.get("status") or ""),
+        "actual_verdict": row.get("actual_verdict"),
+        "expected_verdict": row.get("expected_verdict"),
+        "authorization_sources": _authorization_sources(row.get("evidence")),
+    }
+
+
+def _summary_buckets(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[tuple[str, tuple[str, ...] | None], dict[str, Any]] = {}
+    for source_row in rows:
+        row = _summary_projection(source_row)
+        sources = row["authorization_sources"]
+        key = (
+            str(row["kb_id"]),
+            tuple(sources) if isinstance(sources, list) else None,
+        )
+        bucket = buckets.setdefault(
+            key,
+            {
+                "kb_id": row["kb_id"],
+                "authorization_sources": sources,
+                "total_count": 0,
+                "pending_count": 0,
+                "reviewed_count": 0,
+                "shadow_count": 0,
+                "enforce_count": 0,
+                "evidence_incomplete_count": 0,
+                "agreement_count": 0,
+                "disagreement_count": 0,
+                "oldest_pending_at": None,
+                "actual_verdict_counts": {
+                    verdict: 0 for verdict in _SUMMARY_VERDICTS
+                },
+                "expected_verdict_counts": {
+                    verdict: 0 for verdict in _SUMMARY_VERDICTS
+                },
+            },
+        )
+        bucket["total_count"] += 1
+        status = str(row["status"])
+        bucket["pending_count"] += int(status == "pending")
+        bucket["reviewed_count"] += int(status == "reviewed")
+        bucket["shadow_count"] += int(row["effective_mode"] == "shadow")
+        bucket["enforce_count"] += int(row["effective_mode"] == "enforce")
+        bucket["evidence_incomplete_count"] += int(
+            not bool(row["evidence_complete"])
+        )
+        if status == "pending":
+            observed_at = str(row["observed_at"])
+            oldest = bucket["oldest_pending_at"]
+            if oldest is None or observed_at < oldest:
+                bucket["oldest_pending_at"] = observed_at
+        actual = str(row["actual_verdict"] or "")
+        expected = str(row["expected_verdict"] or "")
+        if actual in _SUMMARY_VERDICTS:
+            bucket["actual_verdict_counts"][actual] += 1
+        if status == "reviewed" and expected in _SUMMARY_VERDICTS:
+            bucket["expected_verdict_counts"][expected] += 1
+            if actual == expected:
+                bucket["agreement_count"] += 1
+            else:
+                bucket["disagreement_count"] += 1
+    return list(buckets.values())
+
+
 def _export_case(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "id": str(row["review_id"]),
@@ -365,6 +468,19 @@ class ClaimVerificationReviewStore:
         rows.sort(key=lambda row: str(row["review_id"]))
         return [_export_case(row) for row in rows]
 
+    def summary_buckets(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Aggregate an ACL-filterable summary without cloning evidence text."""
+        cutoff = self._clock() - self.retention_seconds
+        with self._lock:
+            return _summary_buckets(
+                (
+                    row
+                    for row in self._rows.values()
+                    if row["tenant_id"] == tenant_id
+                    and float(row["observed_at"]) >= cutoff
+                )
+            )
+
     def _purge_locked(self, now: float) -> None:
         cutoff = now - self.retention_seconds
         self._rows = {
@@ -399,6 +515,7 @@ class SqliteClaimVerificationReviewStore:
             "actual_verdict TEXT NOT NULL, reason TEXT NOT NULL, confidence REAL, "
             "duration_ms REAL, cited_chunk_ids TEXT NOT NULL, "
             "supporting_chunk_ids TEXT NOT NULL, evidence TEXT NOT NULL, "
+            "authorization_sources TEXT NOT NULL DEFAULT '[]', "
             "evidence_complete INTEGER NOT NULL, status TEXT NOT NULL, "
             "expected_verdict TEXT, reviewer TEXT NOT NULL, review_note TEXT NOT NULL, "
             "reviewed_at REAL, revision INTEGER NOT NULL, "
@@ -415,6 +532,19 @@ class SqliteClaimVerificationReviewStore:
                 "ALTER TABLE claim_verification_reviews "
                 "ADD COLUMN kb_id TEXT NOT NULL DEFAULT ''"
             )
+        if "authorization_sources" not in columns:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "ALTER TABLE claim_verification_reviews "
+                    "ADD COLUMN authorization_sources TEXT NOT NULL DEFAULT '[]'"
+                )
+                self._backfill_authorization_sources()
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            else:
+                self._conn.execute("COMMIT")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_claim_reviews_tenant_status_time "
             "ON claim_verification_reviews(tenant_id,status,observed_at DESC,review_id DESC)"
@@ -423,6 +553,32 @@ class SqliteClaimVerificationReviewStore:
             "CREATE INDEX IF NOT EXISTS idx_claim_reviews_observed_at "
             "ON claim_verification_reviews(observed_at)"
         )
+
+    def _backfill_authorization_sources(self) -> None:
+        last_rowid = 0
+        while True:
+            rows = self._conn.execute(
+                "SELECT rowid,evidence FROM claim_verification_reviews "
+                "WHERE rowid>? ORDER BY rowid LIMIT 200",
+                (last_rowid,),
+            ).fetchall()
+            if not rows:
+                return
+            updates: list[tuple[str, int]] = []
+            for rowid, raw_evidence in rows:
+                try:
+                    evidence = json.loads(str(raw_evidence))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    sources = None
+                else:
+                    sources = _authorization_sources(evidence)
+                updates.append((json.dumps(sources), int(rowid)))
+            self._conn.executemany(
+                "UPDATE claim_verification_reviews "
+                "SET authorization_sources=? WHERE rowid=?",
+                updates,
+            )
+            last_rowid = int(rows[-1][0])
 
     def record_candidates(
         self, tenant_id: str, candidates: Sequence[Mapping[str, Any]]
@@ -446,9 +602,10 @@ class SqliteClaimVerificationReviewStore:
                     "review_id,tenant_id,observed_at,task_type,policy_id,effective_mode,"
                     "kb_id,"
                     "decision,claim_id,claim,actual_verdict,reason,confidence,duration_ms,"
-                    "cited_chunk_ids,supporting_chunk_ids,evidence,evidence_complete,status,"
+                    "cited_chunk_ids,supporting_chunk_ids,evidence,authorization_sources,"
+                    "evidence_complete,status,"
                     "expected_verdict,reviewer,review_note,reviewed_at,revision) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         row["review_id"], row["tenant_id"], row["observed_at"],
                         row["task_type"], row["policy_id"], row["effective_mode"],
@@ -458,6 +615,7 @@ class SqliteClaimVerificationReviewStore:
                         row["duration_ms"], json.dumps(row["cited_chunk_ids"]),
                         json.dumps(row["supporting_chunk_ids"]),
                         json.dumps(row["evidence"], ensure_ascii=False),
+                        json.dumps(_authorization_sources(row["evidence"])),
                         int(row["evidence_complete"]), row["status"], None, "", "",
                         None, row["revision"],
                     ),
@@ -474,6 +632,7 @@ class SqliteClaimVerificationReviewStore:
     @staticmethod
     def _from_sql(row: sqlite3.Row | tuple[Any, ...], names: list[str]) -> dict[str, Any]:
         result = dict(zip(names, row, strict=True))
+        result.pop("authorization_sources", None)
         for key in ("cited_chunk_ids", "supporting_chunk_ids", "evidence"):
             result[key] = json.loads(result[key])
         result["evidence_complete"] = bool(result["evidence_complete"])
@@ -591,6 +750,67 @@ class SqliteClaimVerificationReviewStore:
             _export_case(row)
             for row in rows
             if review_ids is None or str(row["review_id"]) in review_ids
+        ]
+
+    def summary_buckets(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Aggregate queue metrics in SQL by the fields required for ACL checks."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT kb_id,authorization_sources,COUNT(*),"
+                "SUM(status='pending'),SUM(status='reviewed'),"
+                "SUM(effective_mode='shadow'),SUM(effective_mode='enforce'),"
+                "SUM(evidence_complete=0),"
+                "SUM(status='reviewed' AND expected_verdict IN "
+                "('supported','unsupported','insufficient','not_factual') "
+                "AND actual_verdict=expected_verdict),"
+                "SUM(status='reviewed' AND expected_verdict IN "
+                "('supported','unsupported','insufficient','not_factual') "
+                "AND actual_verdict<>expected_verdict),"
+                "MIN(CASE WHEN status='pending' THEN observed_at END),"
+                "SUM(actual_verdict='supported'),"
+                "SUM(actual_verdict='unsupported'),"
+                "SUM(actual_verdict='insufficient'),"
+                "SUM(actual_verdict='not_factual'),"
+                "SUM(status='reviewed' AND expected_verdict='supported'),"
+                "SUM(status='reviewed' AND expected_verdict='unsupported'),"
+                "SUM(status='reviewed' AND expected_verdict='insufficient'),"
+                "SUM(status='reviewed' AND expected_verdict='not_factual') "
+                "FROM claim_verification_reviews "
+                "WHERE tenant_id=? AND observed_at>=? "
+                "GROUP BY kb_id,authorization_sources",
+                (tenant_id, self._clock() - self.retention_seconds),
+            ).fetchall()
+        return [
+            {
+                "kb_id": str(row[0] or ""),
+                "authorization_sources": _decode_authorization_sources(row[1]),
+                "total_count": int(row[2] or 0),
+                "pending_count": int(row[3] or 0),
+                "reviewed_count": int(row[4] or 0),
+                "shadow_count": int(row[5] or 0),
+                "enforce_count": int(row[6] or 0),
+                "evidence_incomplete_count": int(row[7] or 0),
+                "agreement_count": int(row[8] or 0),
+                "disagreement_count": int(row[9] or 0),
+                "oldest_pending_at": (
+                    _utc_iso(float(row[10])) if row[10] is not None else None
+                ),
+                "actual_verdict_counts": dict(
+                    zip(
+                        _SUMMARY_VERDICTS,
+                        (int(value or 0) for value in row[11:15]),
+                        strict=True,
+                    )
+                ),
+                "expected_verdict_counts": dict(
+                    zip(
+                        _SUMMARY_VERDICTS,
+                        (int(value or 0) for value in row[15:19]),
+                        strict=True,
+                    )
+                ),
+            }
+            for row in rows
         ]
 
     def close(self) -> None:

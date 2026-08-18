@@ -340,6 +340,30 @@ class ClaimVerificationReviewListResponse(ApiModel):
     next_cursor: str | None = None
 
 
+class ClaimVerificationReviewVerdictCounts(ApiModel):
+    supported: int = Field(default=0, ge=0)
+    unsupported: int = Field(default=0, ge=0)
+    insufficient: int = Field(default=0, ge=0)
+    not_factual: int = Field(default=0, ge=0)
+
+
+class ClaimVerificationReviewSummaryResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    tenant_id: str
+    total_count: int = Field(ge=0)
+    pending_count: int = Field(ge=0)
+    reviewed_count: int = Field(ge=0)
+    shadow_count: int = Field(ge=0)
+    enforce_count: int = Field(ge=0)
+    evidence_incomplete_count: int = Field(ge=0)
+    agreement_count: int = Field(ge=0)
+    disagreement_count: int = Field(ge=0)
+    agreement_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    oldest_pending_at: str | None = None
+    actual_verdict_counts: ClaimVerificationReviewVerdictCounts
+    expected_verdict_counts: ClaimVerificationReviewVerdictCounts
+
+
 class ClaimVerificationReviewLabelRequest(ApiModel):
     schema_version: Literal["v1"] = API_SCHEMA_VERSION
     expected_verdict: ClaimVerdict
