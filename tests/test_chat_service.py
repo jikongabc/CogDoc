@@ -703,6 +703,52 @@ class ClaimGateStreamingApp:
         )
 
 
+class ShadowFailedClaimApp:
+    def stream(self, initial_state, config, stream_mode, subgraphs):
+        yield (
+            (),
+            "updates",
+            {"intent_router": {"task_type": "qa", "router_reason": "文档问答"}},
+        )
+        answer = "灰度期间仍交付的候选答案。[a.pdf:P1]"
+        yield (
+            (),
+            "updates",
+            {
+                "qa_subgraph": {
+                    "answer": answer,
+                    "critique": "",
+                    "reranked_docs": [_doc()],
+                    "sources": [_doc()["meta"]],
+                    "evidence": [
+                        {"chunk_id": "chunk:a:1", "source": "a.pdf", "page": 1}
+                    ],
+                    "citation_ledger": _public_ledger(answer),
+                }
+            },
+        )
+        yield (
+            (),
+            "updates",
+            {
+                "claim_audit_node": {
+                    "claim_audit_required": True,
+                    "claim_audit_passed": False,
+                    "claim_audit": {
+                        "status": "failed",
+                        "reason_code": "unsupported_claims",
+                        "counts": {
+                            "claim_count": 1,
+                            "supported": 0,
+                            "unsupported": 1,
+                            "insufficient": 0,
+                        },
+                    },
+                }
+            },
+        )
+
+
 class ClaimGateCitationRetryApp:
     def stream(self, initial_state, config, stream_mode, subgraphs):
         yield (
@@ -961,6 +1007,118 @@ def test_claim_gate_hides_candidate_token_and_emits_only_verified_answer(monkeyp
         "final",
     ]
     assert events[-1].payload["result"].answer == "最终验证答案。[a.pdf:P1]"
+
+
+def test_shadow_claim_gate_records_intervention_but_releases_original_answer(
+    monkeypatch,
+):
+    settings = Settings(_env_file=None, claim_verification_mode="shadow")
+    exported = []
+    monkeypatch.setattr(chat_service, "app", ShadowFailedClaimApp())
+    monkeypatch.setattr(chat_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(chat_service, "configure_logging", lambda: None)
+    monkeypatch.setattr(chat_service, "log_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        chat_service, "export_trace", lambda **kwargs: exported.append(kwargs)
+    )
+
+    events = list(chat_service.run_chat("kb", "报名要求是什么", is_local=False))
+
+    token = next(event for event in events if event.type == "token")
+    assert token.payload == {
+        "content": "灰度期间仍交付的候选答案。[a.pdf:P1]",
+        "verification_mode": "shadow",
+        "shadow_would_intervene": True,
+    }
+    result = next(event.payload["result"] for event in events if event.type == "final")
+    rollout = result.raw_output["claim_verification_rollout"]
+    assert result.answer == "灰度期间仍交付的候选答案。[a.pdf:P1]"
+    assert result.is_valid is True
+    assert result.chat_messages == []
+    assert rollout["mode"] == "shadow"
+    assert rollout["decision"] == "would_repair"
+    assert rollout["released"] is True
+    assert exported[0]["output_payload"]["claim_verification_rollout"] == rollout
+
+
+def test_shadow_mode_release_guard_never_replaces_failed_candidate():
+    settings = Settings(_env_file=None, claim_verification_mode="shadow")
+    answer = "保留候选。[a.pdf:P1]"
+    output = {
+        "answer": answer,
+        "claim_audit": {
+            "status": "failed",
+            "reason_code": "unsupported_claims",
+        },
+    }
+
+    blocked = chat_service._enforce_claim_gate_release("qa", output, settings)
+
+    assert blocked is False
+    assert output["answer"] == answer
+
+
+def test_enforce_release_guard_preserves_frozen_rollout_policy():
+    settings = Settings(_env_file=None, claim_verification_mode="enforce")
+    output = {
+        "answer": "不受支持的候选。[a.pdf:P1]",
+        "claim_audit": {
+            "status": "failed",
+            "reason_code": "unsupported_claims",
+        },
+    }
+    policy = {
+        "configured_mode": "enforce",
+        "effective_mode": "enforce",
+        "rollout_percent": 25.0,
+        "cohort_bucket": 1234,
+        "cohort_selected": True,
+        "fallback_mode": "shadow",
+        "policy_id": "2222222222222222",
+    }
+
+    blocked = chat_service._enforce_claim_gate_release(
+        "qa", output, settings, mode="enforce", policy=policy
+    )
+
+    assert blocked is True
+    rollout = output["claim_verification_rollout"]
+    assert rollout["configured_mode"] == "enforce"
+    assert rollout["rollout_percent"] == 25.0
+    assert rollout["cohort_bucket"] == 1234
+    assert rollout["policy_id"] == "2222222222222222"
+
+
+def test_partial_enforce_rollout_falls_back_to_shadow_without_blocking(monkeypatch):
+    settings = Settings(
+        _env_file=None,
+        claim_verification_mode="enforce",
+        claim_verification_rollout_percent=0.0,
+        claim_verification_rollout_seed="test-policy",
+    )
+    monkeypatch.setattr(chat_service, "app", ShadowFailedClaimApp())
+    monkeypatch.setattr(chat_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(chat_service, "configure_logging", lambda: None)
+    monkeypatch.setattr(chat_service, "log_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(chat_service, "export_trace", lambda **kwargs: None)
+
+    events = list(
+        chat_service.run_chat(
+            "kb", "报名要求是什么", is_local=False, session_id="sticky-session"
+        )
+    )
+
+    started = next(event for event in events if event.type == "request_started")
+    result = next(event.payload["result"] for event in events if event.type == "final")
+    rollout = result.raw_output["claim_verification_rollout"]
+    assert started.payload["claim_verification_configured_mode"] == "enforce"
+    assert started.payload["claim_verification_mode"] == "shadow"
+    assert result.answer == "灰度期间仍交付的候选答案。[a.pdf:P1]"
+    assert rollout["configured_mode"] == "enforce"
+    assert rollout["mode"] == "shadow"
+    assert rollout["fallback_mode"] == "shadow"
+    assert rollout["cohort_selected"] is False
+    assert rollout["decision"] == "would_repair"
 
 
 @pytest.mark.parametrize("claim_gate_enabled", [False, True])

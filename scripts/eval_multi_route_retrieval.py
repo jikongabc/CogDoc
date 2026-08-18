@@ -11,6 +11,7 @@ if str(ROOT / "src") not in sys.path:
 
 from cogdoc.api.ingest import KnowledgeBaseRegistry  # noqa: E402
 from cogdoc.config.settings import get_settings  # noqa: E402
+from cogdoc.service.index_migration import inspect_index_generation  # noqa: E402
 from cogdoc.service.kb_readers import kb_read_lease  # noqa: E402
 from cogdoc.service.retrieval_diagnostics import run_retrieval_diagnostics  # noqa: E402
 from cogdoc.service.retrieval_pipeline import build_retrieval_queries  # noqa: E402
@@ -51,6 +52,22 @@ def _gold(case):
     return chunks, sources, requirements
 
 
+def _is_no_answer(case, chunks, sources):
+    if "no_answer" in case:
+        return bool(case["no_answer"])
+    return not bool(chunks or sources)
+
+
+def _require_current_index(storage_id):
+    inspection = inspect_index_generation(storage_id)
+    if inspection["needs_migration"]:
+        reasons = ", ".join(inspection.get("reasons") or ["unknown"])
+        raise RuntimeError(
+            f"evaluation index {storage_id!r} is stale ({reasons}); "
+            "run scripts/migrate_v7_indexes.py run first"
+        )
+
+
 def _route_hits(result):
     routes = {}
     for ranking in result["routes"]:
@@ -66,6 +83,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--top-k", type=int, default=settings.qa_retrieval_top_k)
     parser.add_argument("--rerank", action="store_true")
+    parser.add_argument("--require-current-index", action="store_true")
     args = parser.parse_args()
 
     runtime = default_state_runtime()
@@ -73,12 +91,17 @@ def main() -> int:
     configs = ablation_configs()
     observations = {name: [] for name in configs}
     raw_cases = []
+    checked_indexes = set()
     for position, case in enumerate(_load(args.eval_set), start=1):
         logical_id = str(case.get("doc_id") or case.get("kb_id") or "")
         record = registry.resolve(logical_id)
         storage_id = str((record or {}).get("storage_id") or logical_id)
+        if args.require_current_index and storage_id not in checked_indexes:
+            _require_current_index(storage_id)
+            checked_indexes.add(storage_id)
         query = str(case.get("query") or "")
         chunks, sources, gold_requirements = _gold(case)
+        expected_no_answer = _is_no_answer(case, chunks, sources)
         requirements = case.get("evidence_requirements") or []
         query_plan = build_retrieval_queries(
             query, evidence_requirements=requirements, max_queries=max(1, len(requirements) * 2 + 1)
@@ -90,7 +113,7 @@ def main() -> int:
             "expected_chunk_ids": chunks,
             "expected_sources": sources,
             "gold_requirements": gold_requirements,
-            "no_answer": bool(case.get("no_answer")),
+            "no_answer": expected_no_answer,
             "query_type": str(case.get("query_type") or case.get("layer") or "unknown"),
             "doc_type": str(case.get("doc_type") or "unknown"),
             "results": {},
@@ -117,7 +140,6 @@ def main() -> int:
             metrics = ranking_metrics(hits, case_record, k=args.top_k)
             metrics["requirement_coverage"] = requirement_coverage(hits, gold_requirements)
             metrics["abstention_rate"] = float(not result["decision"]["supported"])
-            expected_no_answer = bool(case.get("no_answer"))
             metrics["abstention_accuracy"] = float(
                 expected_no_answer == (not result["decision"]["supported"])
             )

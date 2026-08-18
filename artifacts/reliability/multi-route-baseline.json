@@ -1,0 +1,548 @@
+{
+  "schema_version": "multi_route_baseline_v1",
+  "created_at": "2026-08-17T15:09:51.554379+00:00",
+  "source_report_sha256": "80ca3f0d0b0b9f4b4ae8c987f335371769ff287226bba27e3f1b96fc02c61056",
+  "source_calibration_schema": "v3",
+  "split": {
+    "seed": "cogdoc-multi-route-v1",
+    "validation_fraction": 0.2,
+    "validation_case_ids": [
+      "2",
+      "single-011",
+      "single-015",
+      "single-016",
+      "single-022",
+      "single-030",
+      "single-035",
+      "single-038",
+      "multi-005",
+      "multi-010",
+      "multi-011",
+      "multi-014",
+      "hard-003",
+      "hard-008",
+      "hard-011",
+      "hard-017",
+      "no-answer-004",
+      "no-answer-007",
+      "no-answer-008",
+      "no-answer-017"
+    ]
+  },
+  "accepted_config": {
+    "top_k": 12,
+    "route_min_candidates": 1,
+    "route_weights": {
+      "rag_vector": 1.0,
+      "rag_bm25": 1.0,
+      "derived_knowledge_vector": 1.5,
+      "derived_knowledge_lexical": 1.5
+    },
+    "abstention_thresholds": {
+      "vector_distance_max": 0.734978199005127,
+      "bm25_score_min": 11.752383961264671,
+      "knowledge_vector_score_min": 0.5,
+      "knowledge_lexical_score_min": 0.5
+    }
+  },
+  "accepted_env": {
+    "QA_RETRIEVAL_TOP_K": 12,
+    "QA_RAG_VECTOR_ROUTE_WEIGHT": 1.0,
+    "QA_RAG_BM25_ROUTE_WEIGHT": 1.0,
+    "QA_DERIVED_KNOWLEDGE_VECTOR_ROUTE_WEIGHT": 1.5,
+    "QA_DERIVED_KNOWLEDGE_LEXICAL_ROUTE_WEIGHT": 1.5,
+    "QA_RETRIEVAL_DOCS_PER_ROUTE": 1,
+    "QA_ABSTAIN_MAX_VECTOR_DISTANCE": 0.734978199005127,
+    "QA_ABSTAIN_MIN_BM25_SCORE": 11.752383961264671,
+    "QA_ABSTAIN_MIN_KNOWLEDGE_VECTOR_SCORE": 0.5,
+    "QA_ABSTAIN_MIN_KNOWLEDGE_LEXICAL_SCORE": 0.5
+  },
+  "validation_metrics": {
+    "abstention_accuracy": 0.95,
+    "recall": 1.0,
+    "mrr": 1.0,
+    "ndcg": 0.9868991549718441,
+    "requirement_coverage": 1.0,
+    "latency_p50_ms": 140.26261400431395,
+    "latency_p95_ms": 171.0219340166077,
+    "sample_count": 20.0,
+    "answerable_sample_count": 16.0,
+    "no_answer_sample_count": 4.0
+  },
+  "confidence": {
+    "method": "deterministic_percentile_bootstrap",
+    "level": 0.95,
+    "iterations": 2000,
+    "candidate": {
+      "abstention_accuracy": {
+        "estimate": 0.95,
+        "lower": 0.85,
+        "upper": 1.0,
+        "sample_count": 20.0
+      },
+      "mrr": {
+        "estimate": 1.0,
+        "lower": 1.0,
+        "upper": 1.0,
+        "sample_count": 16.0
+      },
+      "ndcg": {
+        "estimate": 0.9868991549718441,
+        "lower": 0.9580772959099012,
+        "upper": 1.0,
+        "sample_count": 16.0
+      },
+      "recall": {
+        "estimate": 1.0,
+        "lower": 1.0,
+        "upper": 1.0,
+        "sample_count": 16.0
+      },
+      "requirement_coverage": {
+        "estimate": 1.0,
+        "lower": 1.0,
+        "upper": 1.0,
+        "sample_count": 16.0
+      },
+      "latency_p95_ms": {
+        "estimate": 171.0219340166077,
+        "lower": 145.03913698717952,
+        "upper": 207.3127629701048,
+        "sample_count": 20.0
+      }
+    },
+    "candidate_minus_current": {
+      "abstention_accuracy": {
+        "estimate": 0.0,
+        "lower": 0.0,
+        "upper": 0.0,
+        "sample_count": 20.0
+      },
+      "mrr": {
+        "estimate": 0.0,
+        "lower": 0.0,
+        "upper": 0.0,
+        "sample_count": 20.0
+      },
+      "ndcg": {
+        "estimate": 0.011165686545776505,
+        "lower": 0.0,
+        "upper": 0.03544785735680955,
+        "sample_count": 20.0
+      },
+      "recall": {
+        "estimate": 0.031498903963039025,
+        "lower": 0.0,
+        "upper": 0.1,
+        "sample_count": 20.0
+      },
+      "requirement_coverage": {
+        "estimate": 0.0,
+        "lower": 0.0,
+        "upper": 0.0,
+        "sample_count": 20.0
+      },
+      "latency_p95_ms": {
+        "estimate": 0.0,
+        "lower": 0.0,
+        "upper": 0.0,
+        "sample_count": 20.0
+      }
+    }
+  },
+  "gate": {
+    "passed": true,
+    "checks": [
+      {
+        "kind": "minimum",
+        "metric": "recall",
+        "actual": 1.0,
+        "threshold": 0.95,
+        "reference": null,
+        "point_estimate": 1.0,
+        "bound": "lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum",
+        "metric": "mrr",
+        "actual": 1.0,
+        "threshold": 0.95,
+        "reference": null,
+        "point_estimate": 1.0,
+        "bound": "lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum",
+        "metric": "ndcg",
+        "actual": 0.9580772959099012,
+        "threshold": 0.9,
+        "reference": null,
+        "point_estimate": 0.9868991549718441,
+        "bound": "lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum",
+        "metric": "requirement_coverage",
+        "actual": 1.0,
+        "threshold": 0.9,
+        "reference": null,
+        "point_estimate": 1.0,
+        "bound": "lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum",
+        "metric": "abstention_accuracy",
+        "actual": 0.85,
+        "threshold": 0.8,
+        "reference": null,
+        "point_estimate": 0.95,
+        "bound": "lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum",
+        "metric": "latency_p95_ms",
+        "actual": 207.3127629701048,
+        "threshold": 750.0,
+        "reference": null,
+        "point_estimate": 171.0219340166077,
+        "bound": "upper",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum_regression",
+        "metric": "recall",
+        "actual": -0.0,
+        "threshold": 0.01,
+        "reference": 0.96875,
+        "point_estimate": -0.03125,
+        "bound": "paired_lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum_regression",
+        "metric": "mrr",
+        "actual": -0.0,
+        "threshold": 0.01,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": "paired_lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum_regression",
+        "metric": "ndcg",
+        "actual": -0.0,
+        "threshold": 0.01,
+        "reference": 0.9758216995478411,
+        "point_estimate": -0.011077455424002958,
+        "bound": "paired_lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum_regression",
+        "metric": "requirement_coverage",
+        "actual": -0.0,
+        "threshold": 0.01,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": "paired_lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": -0.0,
+        "threshold": 0.01,
+        "reference": 0.95,
+        "point_estimate": 0.0,
+        "bound": "paired_lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum_samples",
+        "metric": "sample_count",
+        "actual": 20.0,
+        "threshold": 20.0,
+        "reference": null,
+        "point_estimate": null,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum_samples",
+        "metric": "answerable_sample_count",
+        "actual": 16.0,
+        "threshold": 15.0,
+        "reference": null,
+        "point_estimate": null,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum_samples",
+        "metric": "no_answer_sample_count",
+        "actual": 4.0,
+        "threshold": 4.0,
+        "reference": null,
+        "point_estimate": null,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "recall",
+        "actual": 0.0,
+        "threshold": 0.15,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "hard",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "mrr",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "hard",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "ndcg",
+        "actual": 0.0,
+        "threshold": 0.15,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "hard",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "requirement_coverage",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "hard",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": 0.0,
+        "threshold": 0.25,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "hard",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "recall",
+        "actual": -0.125,
+        "threshold": 0.15,
+        "reference": 0.875,
+        "point_estimate": -0.125,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "multi-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "mrr",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "multi-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "ndcg",
+        "actual": -0.04430982169601194,
+        "threshold": 0.15,
+        "reference": 0.9032867981913646,
+        "point_estimate": -0.04430982169601194,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "multi-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "requirement_coverage",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "multi-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": 0.0,
+        "threshold": 0.25,
+        "reference": 0.75,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "multi-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": 0.0,
+        "threshold": 0.25,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "no-answer",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "recall",
+        "actual": 0.0,
+        "threshold": 0.15,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "single-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "mrr",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "single-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "ndcg",
+        "actual": 0.0,
+        "threshold": 0.15,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "single-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "requirement_coverage",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "single-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": 0.0,
+        "threshold": 0.25,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "single-source",
+        "passed": true,
+        "failure_reason": null
+      }
+    ]
+  }
+}

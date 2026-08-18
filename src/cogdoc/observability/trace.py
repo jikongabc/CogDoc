@@ -5,6 +5,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from cogdoc.config.settings import Settings, get_settings
+from cogdoc.service.claim_verification_policy import (
+    claim_verification_policy_projection,
+)
+from cogdoc.service.claim_verification_rollout import ROLLOUT_DECISIONS
 from cogdoc.tools.retriever.metadata import safe_retrieval_metadata
 
 
@@ -330,6 +334,29 @@ def build_trace_step(
                 if isinstance(claim, Mapping)
             ],
         }
+    if isinstance(output.get("claim_verification_rollout"), Mapping):
+        rollout = output["claim_verification_rollout"]
+        rollout_mode = str(rollout.get("mode") or "off")
+        if rollout_mode not in {"off", "shadow", "enforce"}:
+            rollout_mode = "off"
+        policy = claim_verification_policy_projection(
+            rollout, effective_mode=rollout_mode
+        )
+        step["claim_verification"] = {
+            "version": "v1",
+            "mode": rollout_mode,
+            **policy,
+            "decision": _preview(rollout.get("decision"), 32),
+            "executed": bool(rollout.get("executed", False)),
+            "enforced": bool(rollout.get("enforced", False)),
+            "released": bool(rollout.get("released", True)),
+            "would_intervene": bool(rollout.get("would_intervene", False)),
+            "would_repair": bool(rollout.get("would_repair", False)),
+            "would_block": bool(rollout.get("would_block", False)),
+            "audit_status": _preview(rollout.get("audit_status"), 32),
+            "reason_code": _preview(rollout.get("reason_code"), 128),
+            "repair_count": _nonnegative_int(rollout.get("repair_count")),
+        }
     if output.get("rewritten_queries"):
         step["rewritten_queries"] = [
             _preview(query, 120)
@@ -601,6 +628,38 @@ def _claim_audit_summary(output_payload: Mapping[str, Any] | None) -> dict | Non
     }
 
 
+def _claim_verification_summary(
+    output_payload: Mapping[str, Any] | None,
+) -> dict | None:
+    if not isinstance(output_payload, Mapping):
+        return None
+    rollout = output_payload.get("claim_verification_rollout")
+    if not isinstance(rollout, Mapping):
+        return None
+    mode = str(rollout.get("mode") or "off")
+    if mode not in {"off", "shadow", "enforce"}:
+        mode = "off"
+    decision = str(rollout.get("decision") or "skipped")
+    if decision not in ROLLOUT_DECISIONS:
+        decision = "skipped"
+    policy = claim_verification_policy_projection(rollout, effective_mode=mode)
+    return {
+        "version": "v1",
+        "mode": mode,
+        **policy,
+        "decision": decision,
+        "executed": bool(rollout.get("executed", False)),
+        "enforced": bool(rollout.get("enforced", False)),
+        "released": bool(rollout.get("released", True)),
+        "would_intervene": bool(rollout.get("would_intervene", False)),
+        "would_repair": bool(rollout.get("would_repair", False)),
+        "would_block": bool(rollout.get("would_block", False)),
+        "audit_status": _preview(rollout.get("audit_status"), 32),
+        "reason_code": _preview(rollout.get("reason_code"), 128),
+        "repair_count": _nonnegative_int(rollout.get("repair_count")),
+    }
+
+
 # 构建跟踪导出载荷。
 def build_trace_payload(
     trace_id: str,
@@ -639,6 +698,9 @@ def build_trace_payload(
     claim_summary = _claim_audit_summary(output_payload)
     if claim_summary is not None:
         summary["claim_audit"] = claim_summary
+    verification_summary = _claim_verification_summary(output_payload)
+    if verification_summary is not None:
+        summary["claim_verification"] = verification_summary
     return {
         "schema_version": TRACE_SCHEMA_VERSION,
         "trace_id": trace_id,

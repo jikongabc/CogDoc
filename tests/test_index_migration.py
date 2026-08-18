@@ -1,4 +1,7 @@
+import sys
 from types import SimpleNamespace
+
+from scripts import migrate_v7_indexes
 
 from cogdoc.service import index_migration
 from cogdoc.service.index_migration import (
@@ -83,3 +86,123 @@ def test_migration_manager_returns_durable_queued_run_before_background_work(
     completed = manager.get(queued["run_id"])
     assert completed["status"] == "completed"
     assert completed["summary"] == {"skipped": 1}
+
+
+def test_migration_cli_uses_runtime_knowledge_store(monkeypatch, capsys):
+    knowledge_store = object()
+    refresh = object()
+    captured = {}
+
+    class Registry:
+        def list(self):
+            return [{"kb_id": "kb", "storage_id": "storage"}]
+
+    class Runner:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def plan(self, records):
+            assert records == [{"kb_id": "kb", "storage_id": "storage"}]
+            return {"status": "completed", "items": []}
+
+    monkeypatch.setattr(migrate_v7_indexes, "KnowledgeBaseRegistry", Registry)
+    monkeypatch.setattr(
+        migrate_v7_indexes,
+        "default_state_runtime",
+        lambda: SimpleNamespace(
+            knowledge_store=knowledge_store,
+            refresh_derived_knowledge_index=refresh,
+        ),
+    )
+    monkeypatch.setattr(migrate_v7_indexes, "IndexMigrationRunner", Runner)
+    monkeypatch.setattr(sys, "argv", ["migrate_v7_indexes.py", "scan"])
+
+    assert migrate_v7_indexes.main() == 0
+    assert captured == {
+        "knowledge_store": knowledge_store,
+        "refresh_derived_knowledge": refresh,
+    }
+    assert '"status": "completed"' in capsys.readouterr().out
+
+
+def test_rollback_restores_manifest_contract_and_reverts_on_manifest_failure(
+    tmp_path, monkeypatch
+):
+    active_id = {"value": "new"}
+    generations = {
+        "old": {
+            "id": "old",
+            "documents": [{"name": "paper.pdf", "sha256": "old-sha"}],
+            "chunk_identity_version": "v6",
+            "index_build_version": "build-v6",
+        },
+        "new": {
+            "id": "new",
+            "documents": [{"name": "paper.pdf", "sha256": "old-sha"}],
+            "chunk_identity_version": "v7",
+            "index_build_version": "build-v7",
+        },
+    }
+
+    class State:
+        def __init__(self, storage_id):
+            assert storage_id == "storage"
+
+        def rollback_active(self, generation_id):
+            replaced = active_id["value"]
+            active_id["value"] = generation_id
+            return replaced
+
+        def active(self):
+            return generations[active_id["value"]]
+
+    monkeypatch.setattr(index_migration, "KBState", State)
+    monkeypatch.setattr(index_migration, "kb_write_lock", lambda _storage_id: _null_context())
+    monkeypatch.setattr(index_migration.RetrieverFactory, "invalidate", lambda _storage_id: None)
+    store = IndexMigrationStore(tmp_path)
+    run = {
+        "run_id": "a" * 32,
+        "items": [
+            {
+                "storage_id": "storage",
+                "status": "succeeded",
+                "previous_generation_id": "old",
+            }
+        ],
+    }
+    store.save(run)
+    manifests = []
+    runner = IndexMigrationRunner(store=store, save_manifest=manifests.append)
+
+    result = runner.rollback(run["run_id"])
+    assert active_id["value"] == "old"
+    assert manifests == [
+        {
+            "doc_id": "storage",
+            "documents": [{"name": "paper.pdf", "sha256": "old-sha"}],
+            "chunk_identity_version": "v6",
+            "index_build_version": "build-v6",
+        }
+    ]
+    assert result["items"][0]["status"] == "rolled_back"
+
+    active_id["value"] = "new"
+    run["items"][0]["status"] = "succeeded"
+    store.save(run)
+
+    def fail_manifest(_manifest):
+        raise OSError("disk full")
+
+    failed = IndexMigrationRunner(store=store, save_manifest=fail_manifest).rollback(
+        run["run_id"]
+    )
+    assert active_id["value"] == "new"
+    assert "OSError: disk full" in failed["items"][0]["rollback_error"]
+
+
+class _null_context:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False

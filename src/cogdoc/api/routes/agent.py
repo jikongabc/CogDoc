@@ -5,6 +5,9 @@ from typing import Any
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 from cogdoc.api.error_mapping import classify_error_code, status_for_code
+from cogdoc.api.claim_verification_observability import (
+    record_claim_verification_observation,
+)
 from cogdoc.api.offload import run_sync
 from cogdoc.api.runners import run_with_optional_session
 from cogdoc.api.schemas import (
@@ -146,6 +149,11 @@ async def _task_endpoint(
         result.task_type,
         result.raw_output.get("claim_audit"),
     )
+    request.app.state.metrics.observe_claim_verification_rollout(
+        result.task_type,
+        result.raw_output.get("claim_verification_rollout"),
+    )
+    record_claim_verification_observation(request, result)
     request.app.state.metrics.observe_retrieval(result.task_type, result.raw_output)
     task_response = chat_result_to_response(
         result, doc_id=external_doc_id, session_id=body.session_id

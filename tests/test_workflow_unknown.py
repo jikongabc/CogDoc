@@ -120,6 +120,80 @@ def test_claim_audit_route_is_bounded_and_fail_closed(monkeypatch):
     )
 
 
+def test_shadow_claim_audit_records_would_repair_and_never_mutates_answer(
+    monkeypatch,
+):
+    settings = Settings(
+        _env_file=None,
+        claim_verification_mode="shadow",
+        claim_verification_max_repair_attempts=1,
+    )
+    calls = []
+    monkeypatch.setattr(workflow, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        workflow.ClaimEvidenceVerifierAgent,
+        "audit",
+        staticmethod(
+            lambda state, force_enabled=False: calls.append(force_enabled)
+            or {
+                "claim_audit": {
+                    "status": "failed",
+                    "reason_code": "unsupported_claims",
+                },
+                "claim_audit_passed": False,
+            }
+        ),
+    )
+    state = {
+        "task_type": "qa",
+        "answer": "原始候选答案。[a.pdf:P1]",
+        "claim_verification_mode": "shadow",
+        "claim_verification_policy": {
+            "configured_mode": "enforce",
+            "effective_mode": "shadow",
+            "rollout_percent": 25.0,
+            "cohort_bucket": 4321,
+            "cohort_selected": False,
+            "fallback_mode": "shadow",
+            "policy_id": "2222222222222222",
+        },
+    }
+
+    output = workflow.claim_audit_node(state)
+
+    assert calls == [True]
+    assert output.get("answer") is None
+    assert output["claim_verification_rollout"]["decision"] == "would_repair"
+    assert output["claim_verification_rollout"]["configured_mode"] == "enforce"
+    assert output["claim_verification_rollout"]["policy_id"] == "2222222222222222"
+    assert workflow.claim_audit_check(output) == "citation_finalize_node"
+
+
+def test_enforce_rollout_routes_repair_and_block_explicitly():
+    assert (
+        workflow.claim_audit_check(
+            {
+                "claim_verification_rollout": {
+                    "mode": "enforce",
+                    "decision": "repair",
+                }
+            }
+        )
+        == "claim_repair_node"
+    )
+    assert (
+        workflow.claim_audit_check(
+            {
+                "claim_verification_rollout": {
+                    "mode": "enforce",
+                    "decision": "block",
+                }
+            }
+        )
+        == "claim_block_node"
+    )
+
+
 def test_citation_finalizer_renders_eid_and_builds_occurrence_ledger():
     result = workflow.citation_finalize_node(
         {

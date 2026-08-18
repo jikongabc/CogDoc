@@ -1,12 +1,20 @@
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterator
-from cogdoc.config.settings import get_settings
+from cogdoc.config.settings import get_settings, resolve_claim_verification_mode
 from cogdoc.agents.conversation_memory import extract_chat_turn, extract_final_answer
 from cogdoc.agents.router import FORCED_TASK_TYPES
 from cogdoc.observability.logger import configure_logging, log_event, new_trace_id
 from cogdoc.observability.trace import build_trace_step, export_trace, monotonic_ms
 from cogdoc.service.index_provenance import current_index_provenance
+from cogdoc.service.claim_verification_rollout import (
+    build_claim_verification_rollout,
+    ensure_claim_verification_rollout,
+)
+from cogdoc.service.claim_verification_policy import (
+    ClaimVerificationPolicy,
+    resolve_claim_verification_policy,
+)
 from cogdoc.tools.public_citation_ledger import (
     contains_internal_evidence_identifier,
     contains_internal_evidence_reference,
@@ -132,11 +140,15 @@ def _enforce_claim_gate_release(
     task_type: str,
     task_output: dict[str, Any],
     settings: Any,
+    *,
+    mode: str | None = None,
+    policy: dict[str, Any] | None = None,
 ) -> bool:
     """Block a candidate if an enabled claim gate did not reach a releasable state."""
 
+    effective_mode = mode or resolve_claim_verification_mode(settings)
     if (
-        not settings.claim_verification_enabled
+        effective_mode != "enforce"
         or task_type not in _CLAIM_AUDITED_TASKS
         or not extract_final_answer(task_type, task_output)
     ):
@@ -178,6 +190,14 @@ def _enforce_claim_gate_release(
         )
     )
     task_output["citation_ledger"] = []
+    if policy is not None:
+        task_output["claim_verification_policy"] = dict(policy)
+    task_output["claim_verification_mode"] = effective_mode
+    task_output["claim_verification_rollout"] = build_claim_verification_rollout(
+        task_output,
+        mode=effective_mode,
+        max_repair_attempts=settings.claim_verification_max_repair_attempts,
+    )
     return True
 
 
@@ -250,7 +270,13 @@ def _trace_config(
     forced_task: str | None,
     settings: Any,
     session_id: str | None = None,
+    claim_verification_policy: ClaimVerificationPolicy | None = None,
 ) -> dict[str, Any]:
+    verification_policy = (
+        claim_verification_policy.to_state()
+        if claim_verification_policy is not None
+        else {}
+    )
     return {
         "doc_id": doc_id,
         **current_index_provenance(doc_id),
@@ -301,6 +327,19 @@ def _trace_config(
         ),
         "qa_adaptive_retrieval_max_top_k": (settings.qa_adaptive_retrieval_max_top_k),
         "claim_verification_enabled": settings.claim_verification_enabled,
+        "claim_verification_mode": verification_policy.get(
+            "effective_mode", resolve_claim_verification_mode(settings)
+        ),
+        "claim_verification_configured_mode": verification_policy.get(
+            "configured_mode", resolve_claim_verification_mode(settings)
+        ),
+        "claim_verification_rollout_percent": verification_policy.get(
+            "rollout_percent", settings.claim_verification_rollout_percent
+        ),
+        "claim_verification_policy_id": verification_policy.get("policy_id", ""),
+        "claim_verification_cohort_bucket": verification_policy.get(
+            "cohort_bucket", 0
+        ),
         "claim_verification_max_claims": settings.claim_verification_max_claims,
         "claim_verification_max_claims_per_batch": (
             settings.claim_verification_max_claims_per_batch
@@ -352,11 +391,23 @@ def run_chat(
 
         state_runtime = default_state_runtime()
     trace_id = new_trace_id()
+    claim_verification_policy = resolve_claim_verification_policy(
+        settings,
+        cohort_key=f"{doc_id}\0{session_id or trace_id}",
+    )
+    claim_verification_policy_state = claim_verification_policy.to_state()
+    claim_verification_mode = claim_verification_policy.effective_mode
     trace_steps: list[dict[str, Any]] = []
     request_start_ms = monotonic_ms()
     last_trace_ms = None
     trace_config = _trace_config(
-        doc_id, query, is_local, forced_task, settings, session_id=session_id
+        doc_id,
+        query,
+        is_local,
+        forced_task,
+        settings,
+        session_id=session_id,
+        claim_verification_policy=claim_verification_policy,
     )
     stream_error: dict[str, Any] | None = None
     initial_state = {
@@ -374,6 +425,8 @@ def run_chat(
         "trace_id": trace_id,
         "session_id": session_id,
         "retrieval_scope": retrieval_scope,
+        "claim_verification_mode": claim_verification_mode,
+        "claim_verification_policy": claim_verification_policy_state,
     }
 
     configurable = {
@@ -418,6 +471,14 @@ def run_chat(
             "doc_id": doc_id,
             "is_local": is_local,
             "forced_task": forced_task,
+            "claim_verification_mode": claim_verification_mode,
+            "claim_verification_configured_mode": (
+                claim_verification_policy.configured_mode
+            ),
+            "claim_verification_policy_id": claim_verification_policy.policy_id,
+            "claim_verification_cohort_bucket": (
+                claim_verification_policy.cohort_bucket
+            ),
         },
     )
 
@@ -441,7 +502,7 @@ def run_chat(
                     if token:
                         if (
                             current_task in _CLAIM_AUDITED_TASKS
-                            or settings.claim_verification_enabled
+                            or claim_verification_mode != "off"
                         ):
                             buffered_model_tokens = True
                         else:
@@ -626,7 +687,7 @@ def run_chat(
                         # Debug 预览也是发布通道；被审计任务的候选可能带内部 EID。
                         if (
                             current_task not in _CLAIM_AUDITED_TASKS
-                            and not settings.claim_verification_enabled
+                            and claim_verification_mode == "off"
                         ):
                             rejection_payload["round_answer"] = round_answer
                         yield ChatEvent(
@@ -691,12 +752,20 @@ def run_chat(
                                 task_output.update(node_output)
                                 audit = node_output.get("claim_audit") or {}
                                 if node_name == "claim_audit_node":
+                                    rollout = node_output.get(
+                                        "claim_verification_rollout"
+                                    )
                                     yield ChatEvent(
                                         "claim_audit",
                                         {
                                             "status": audit.get("status", "not_run"),
                                             "counts": audit.get("counts", {}),
                                             "metrics": audit.get("metrics", {}),
+                                            "rollout": (
+                                                dict(rollout)
+                                                if isinstance(rollout, dict)
+                                                else {}
+                                            ),
                                         },
                                     )
                                 elif node_name == "claim_repair_node":
@@ -747,10 +816,21 @@ def run_chat(
             )
 
         task_output = final_outputs.get(current_task, {})
+        if current_task in _CLAIM_AUDITED_TASKS:
+            ensure_claim_verification_rollout(
+                task_output,
+                mode=claim_verification_mode,
+                max_repair_attempts=(
+                    settings.claim_verification_max_repair_attempts
+                ),
+                policy=claim_verification_policy_state,
+            )
         gate_forced_block = _enforce_claim_gate_release(
             current_task,
             task_output,
             settings,
+            mode=claim_verification_mode,
+            policy=claim_verification_policy_state,
         )
         if gate_forced_block:
             trace_steps.append(
@@ -864,7 +944,7 @@ def run_chat(
                 trace_path=trace_path,
             )
             return
-        emit_buffered_answer = settings.claim_verification_enabled or (
+        emit_buffered_answer = claim_verification_mode != "off" or (
             current_task in _CLAIM_AUDITED_TASKS and buffered_model_tokens
         )
         if emit_buffered_answer and result.answer.strip():
@@ -873,11 +953,18 @@ def run_chat(
                 str(audit.get("status") or "") if isinstance(audit, dict) else ""
             )
             token_payload: dict[str, Any] = {"content": result.answer}
-            if settings.claim_verification_enabled:
+            if claim_verification_mode == "enforce":
                 token_payload["verified"] = result.is_valid and audit_status in {
                     "passed",
                     "repaired",
                 }
+            elif claim_verification_mode == "shadow":
+                rollout = result.raw_output.get("claim_verification_rollout")
+                token_payload["verification_mode"] = "shadow"
+                token_payload["shadow_would_intervene"] = bool(
+                    isinstance(rollout, dict)
+                    and rollout.get("would_intervene")
+                )
             yield ChatEvent("token", token_payload)
         log_event(
             "runtime",

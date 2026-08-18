@@ -12,6 +12,7 @@ from prometheus_client import (
     generate_latest,
 )
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from cogdoc.service.claim_verification_rollout import ROLLOUT_DECISIONS
 from cogdoc.service.research_observability import (
     normalize_research_action,
     normalize_research_background_outcome,
@@ -33,6 +34,7 @@ _CLAIM_AUDIT_STATUSES = {
     "rejected",
     "error",
 }
+_CLAIM_VERIFICATION_MODES = {"off", "shadow", "enforce"}
 _REQUIREMENT_VERDICTS = {"supported", "missing", "contradictory"}
 
 
@@ -115,6 +117,18 @@ class Metrics:
             "cogdoc_claim_audit_duration_seconds",
             "最终一轮声明审计模型调用耗时",
             ["task_type"],
+            registry=self.registry,
+        )
+        self.claim_verification_rollouts = Counter(
+            "cogdoc_claim_verification_rollouts_total",
+            "声明语义核验按灰度模式与最终投影决策计数",
+            ["task_type", "mode", "decision"],
+            registry=self.registry,
+        )
+        self.claim_verification_cohorts = Counter(
+            "cogdoc_claim_verification_cohorts_total",
+            "声明语义核验按配置模式、实际模式与分桶命中结果计数",
+            ["task_type", "configured_mode", "effective_mode", "selected"],
             registry=self.registry,
         )
         self.retrieval_decisions = Counter(
@@ -244,6 +258,36 @@ class Metrics:
         # disabled/not_run 没有 verifier 调用，不能用 0 秒样本稀释真实延迟分布。
         if status != "not_run" and duration_ms is not None:
             self.claim_audit_duration.labels(task_type).observe(duration_ms / 1000.0)
+
+    def observe_claim_verification_rollout(self, task_type: str, rollout) -> None:
+        if not isinstance(rollout, Mapping):
+            return
+        raw_mode = str(rollout.get("mode") or "unknown")
+        mode = raw_mode if raw_mode in _CLAIM_VERIFICATION_MODES else "unknown"
+        raw_configured_mode = str(rollout.get("configured_mode") or mode)
+        configured_mode = (
+            raw_configured_mode
+            if raw_configured_mode in _CLAIM_VERIFICATION_MODES
+            else "unknown"
+        )
+        raw_decision = str(rollout.get("decision") or "unknown")
+        decision = (
+            raw_decision
+            if raw_decision in ROLLOUT_DECISIONS
+            else "unknown"
+        )
+        try:
+            self.claim_verification_rollouts.labels(
+                str(task_type or "unknown"), mode, decision
+            ).inc()
+            self.claim_verification_cohorts.labels(
+                str(task_type or "unknown"),
+                configured_mode,
+                mode,
+                str(bool(rollout.get("cohort_selected", True))).lower(),
+            ).inc()
+        except Exception:
+            return
 
     def observe_retrieval(self, task_type: str, output) -> None:
         # 只统计最终 QA 状态；畸形或其他任务输出不能污染检索质量序列。

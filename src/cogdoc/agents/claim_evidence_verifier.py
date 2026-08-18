@@ -16,7 +16,7 @@ from cogdoc.agents.answer_markers import (
 from cogdoc.agents.qa_generator import Generator
 from cogdoc.agents.no_evidence import is_no_evidence_statement
 from cogdoc.agents.structured_output import invoke_structured
-from cogdoc.config.settings import get_settings
+from cogdoc.config.settings import get_settings, resolve_claim_verification_mode
 from cogdoc.service.claim_audit_projection import (
     CLAIM_AUDIT_PROJECTION_STATE_KEY,
     ClaimAuditProjectionError,
@@ -690,7 +690,10 @@ class ClaimEvidenceVerifierAgent:
         """Audit one answer; contract-bound callers may force the gate on."""
 
         settings = get_settings()
-        if not settings.claim_verification_enabled and not force_enabled:
+        if (
+            resolve_claim_verification_mode(settings) == "off"
+            and not force_enabled
+        ):
             return _not_run("disabled")
         repair_count = int(state.get("claim_repair_count", 0) or 0)
         answer = str(state.get("answer") or "").strip()

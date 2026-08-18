@@ -41,7 +41,7 @@ def main() -> int:
     registry = KnowledgeBaseRegistry()
     runtime = default_state_runtime()
     runner = IndexMigrationRunner(
-        knowledge_store=runtime.derived_knowledge_store,
+        knowledge_store=runtime.knowledge_store,
         refresh_derived_knowledge=runtime.refresh_derived_knowledge_index,
     )
     if args.command == "scan":

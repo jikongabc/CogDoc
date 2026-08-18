@@ -108,6 +108,7 @@ def test_chat_result_to_response_maps_stable_fields_without_raw_text():
     assert "trace_path" not in payload
     assert "不应进入 API 响应的全文" not in str(payload)
     assert payload["claim_audit"] is None
+    assert payload["claim_verification"] is None
 
 
 def test_chat_result_to_response_whitelists_public_citation_ledger_fields():
@@ -477,6 +478,70 @@ def test_chat_result_to_response_exposes_only_safe_claim_audit_summary():
     assert "verifier" not in payload["claim_audit"]
 
 
+def test_chat_result_to_response_exposes_bounded_claim_rollout_summary():
+    result = ChatResult(
+        answer="灰度候选答案。",
+        task_type="qa",
+        citations=[],
+        evidence=[],
+        critique="",
+        is_valid=True,
+        trace_id="trace-shadow",
+        request_id="trace-shadow",
+        steps=[],
+        chat_messages=[],
+        raw_output={
+            "claim_verification_rollout": {
+                "version": "future-version",
+                "mode": "shadow",
+                "configured_mode": "enforce",
+                "rollout_percent": 25.0,
+                "cohort_bucket": 1234,
+                "cohort_selected": False,
+                "fallback_mode": "shadow",
+                "policy_id": "0123456789abcdef",
+                "decision": "would_block",
+                "executed": True,
+                "enforced": False,
+                "released": True,
+                "would_intervene": True,
+                "would_repair": False,
+                "would_block": True,
+                "audit_status": "error",
+                "reason_code": "verifier_timeout",
+                "repair_count": 2,
+                "private_claim": "不得进入公开响应的声明正文",
+            }
+        },
+    )
+
+    summary = chat_result_to_response(result, doc_id="kb").model_dump()[
+        "claim_verification"
+    ]
+
+    assert summary == {
+        "version": "v1",
+        "mode": "shadow",
+        "configured_mode": "enforce",
+        "rollout_percent": 25.0,
+        "cohort_bucket": 1234,
+        "cohort_selected": False,
+        "fallback_mode": "shadow",
+        "policy_id": "0123456789abcdef",
+        "decision": "would_block",
+        "executed": True,
+        "enforced": False,
+        "released": True,
+        "would_intervene": True,
+        "would_repair": False,
+        "would_block": True,
+        "audit_status": "error",
+        "reason_code": "verifier_timeout",
+        "repair_count": 2,
+    }
+    assert "private_claim" not in summary
+
+
 # 验证零事实声明的比率保持不可用，而不是伪装成零分或满分。
 def test_chat_result_to_response_preserves_none_rates_for_zero_claims():
     result = ChatResult(
@@ -589,4 +654,5 @@ def test_trace_response_uses_stable_contract():
     assert payload["summary"]["step_count"] == 1
     assert payload["summary"]["error_count"] == 0
     assert payload["summary"]["claim_audit"] is None
+    assert payload["summary"]["claim_verification"] is None
     assert payload["steps"][0]["node_name"] == "intent_router"

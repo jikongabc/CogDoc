@@ -1,0 +1,12 @@
+{"id":"qa-supported-zh","layer":"qa","language":"zh","expected_verdict":"supported","actual_verdict":"supported","duration_ms":118.4,"claim":"申请截止日期为 6 月 30 日。","reviewer":"example"}
+{"id":"qa-unsupported-zh","layer":"qa","language":"zh","expected_verdict":"unsupported","actual_verdict":"unsupported","duration_ms":121.7,"claim":"申请截止日期为 7 月 30 日。","reviewer":"example"}
+{"id":"qa-insufficient-en","layer":"qa","language":"en","expected_verdict":"insufficient","actual_verdict":"insufficient","duration_ms":109.2,"claim":"The policy applies in every country.","reviewer":"example"}
+{"id":"qa-not-factual-zh","layer":"qa","language":"zh","expected_verdict":"not_factual","actual_verdict":"not_factual","duration_ms":97.6,"claim":"以下是简要说明：","reviewer":"example"}
+{"id":"summary-supported-zh","layer":"summary","language":"zh","expected_verdict":"supported","actual_verdict":"supported","duration_ms":132.9,"claim":"文档将计划分为三个阶段。","reviewer":"example"}
+{"id":"summary-unsupported-en","layer":"summary","language":"en","expected_verdict":"unsupported","actual_verdict":"insufficient","duration_ms":140.3,"claim":"The report guarantees a 25% reduction.","reviewer":"example"}
+{"id":"summary-insufficient-zh","layer":"summary","language":"zh","expected_verdict":"insufficient","actual_verdict":"unsupported","duration_ms":128.1,"claim":"所有参与者都获得了补贴。","reviewer":"example"}
+{"id":"summary-not-factual-en","layer":"summary","language":"en","expected_verdict":"not_factual","actual_verdict":"not_factual","duration_ms":102.5,"claim":"Key findings:","reviewer":"example"}
+{"id":"compare-supported-en","layer":"compare","language":"en","expected_verdict":"supported","actual_verdict":"supported","duration_ms":151.2,"claim":"Document A uses monthly reporting while Document B uses quarterly reporting.","reviewer":"example"}
+{"id":"compare-unsupported-zh","layer":"compare","language":"zh","expected_verdict":"unsupported","actual_verdict":"unsupported","duration_ms":146.8,"claim":"两份文档采用了完全相同的考核周期。","reviewer":"example"}
+{"id":"compare-insufficient-en","layer":"compare","language":"en","expected_verdict":"insufficient","actual_verdict":"insufficient","duration_ms":155.6,"claim":"Document B was written before Document A.","reviewer":"example"}
+{"id":"trace-audit-shape","layer":"qa","language":"zh","claim_id":"c1","expected_verdict":"supported","claim_audit":{"status":"passed","claims":[{"claim_id":"c1","text":"材料清单包含身份证明。","verdict":"supported","cited_chunk_ids":["chunk-example-1"]}],"verifier":{"duration_ms":116.0}},"reviewer":"example"}

@@ -1,0 +1,60 @@
+{
+  "minimum_samples": {
+    "validation": 20,
+    "answerable": 15,
+    "no_answer": 4
+  },
+  "minimum": {
+    "recall": 0.95,
+    "mrr": 0.95,
+    "ndcg": 0.9,
+    "requirement_coverage": 0.9,
+    "abstention_accuracy": 0.8
+  },
+  "maximum": {
+    "latency_p95_ms": 750.0
+  },
+  "maximum_regression": {
+    "recall": 0.01,
+    "mrr": 0.01,
+    "ndcg": 0.01,
+    "requirement_coverage": 0.01,
+    "abstention_accuracy": 0.01
+  },
+  "baseline_maximum_regression": {
+    "recall": 0.01,
+    "mrr": 0.01,
+    "ndcg": 0.01,
+    "requirement_coverage": 0.01,
+    "abstention_accuracy": 0.01
+  },
+  "confidence_bounds": {
+    "minimum": [
+      "recall",
+      "mrr",
+      "ndcg",
+      "requirement_coverage",
+      "abstention_accuracy"
+    ],
+    "maximum": [
+      "latency_p95_ms"
+    ],
+    "maximum_regression": [
+      "recall",
+      "mrr",
+      "ndcg",
+      "requirement_coverage",
+      "abstention_accuracy"
+    ]
+  },
+  "minimum_slice_samples": 4,
+  "slice_maximum_regression": {
+    "query_type": {
+      "recall": 0.15,
+      "mrr": 0.1,
+      "ndcg": 0.15,
+      "requirement_coverage": 0.1,
+      "abstention_accuracy": 0.25
+    }
+  }
+}

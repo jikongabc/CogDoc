@@ -57,8 +57,14 @@ def ranking_metrics(
     recall = len(matched) / len(expected) if expected else 0.0
     reciprocal_rank = 0.0
     gains = []
+    seen_relevant: set[str] = set()
     for rank, hit in enumerate(hits[:k], start=1):
-        relevant = _relevant(hit, case)
+        identity = _identity(hit) if case.get("expected_chunk_ids") else str(
+            hit.get("source") or ""
+        )
+        relevant = _relevant(hit, case) and identity not in seen_relevant
+        if relevant:
+            seen_relevant.add(identity)
         gains.append(float(relevant))
         if relevant and reciprocal_rank == 0:
             reciprocal_rank = 1.0 / rank

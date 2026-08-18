@@ -19,6 +19,7 @@ RELIABILITY_NATIVE_TIMEOUT ?= 900
 RELIABILITY_SMOKE_TIMEOUT ?= 120
 RELIABILITY_TEST_TIMEOUT ?= 1200
 RELIABILITY_EVAL_TIMEOUT ?= 1800
+RELIABILITY_MULTI_ROUTE_TIMEOUT ?= 1800
 RELIABILITY_SOAK_TIMEOUT ?= 240
 RELIABILITY_API_HOST ?= 127.0.0.1
 RELIABILITY_API_PORT ?= 8000
@@ -33,7 +34,7 @@ UVICORN_GRACEFUL_SHUTDOWN_SECONDS ?= 15
 # src-layout：包源码在 src/，入口经 PYTHONPATH 注入，无需先安装即可 run/serve/test。
 export PYTHONPATH := src
 
-.PHONY: help install native check lint typecheck-security test smoke-api smoke-account-auth reliability-gate run debug backup eval eval-coverage eval-retrieval-report eval-retrieval-baseline eval-retrieval-gate eval-multi-route calibrate-multi-route eval-quality eval-quality-coverage eval-suite eval-suite-run-retrieval eval-suite-report eval-suite-baseline eval-suite-update-baseline serve frontend
+.PHONY: help install native check lint typecheck-security test smoke-api smoke-account-auth reliability-gate run debug backup eval eval-coverage eval-retrieval-report eval-retrieval-baseline eval-retrieval-gate eval-multi-route calibrate-multi-route eval-multi-route-gate eval-multi-route-promote eval-claim-verification eval-claim-verification-gate eval-claim-verification-promote eval-quality eval-quality-coverage eval-suite eval-suite-run-retrieval eval-suite-report eval-suite-baseline eval-suite-update-baseline serve frontend
 
 help:
 	@echo "make install - 可编辑安装含开发依赖 (pip install -e '.[dev]')"
@@ -53,6 +54,11 @@ help:
 	@echo "make eval-retrieval-gate - 对比真实检索基线并执行绝对门禁"
 	@echo "make eval-multi-route - 运行四路单路/leave-one-out 消融评测"
 	@echo "make calibrate-multi-route - 从四路报告生成可回滚参数建议"
+	@echo "make eval-multi-route-gate - 在分层 holdout 上校准并执行四路召回发布门禁"
+	@echo "make eval-multi-route-promote - 门禁通过后原子晋级四路召回基线"
+	@echo "make eval-claim-verification - 评估人工标注的声明语义核验结果"
+	@echo "make eval-claim-verification-gate - 执行声明误放率/召回率发布门禁"
+	@echo "make eval-claim-verification-promote - 门禁通过后原子晋级声明核验基线"
 	@echo "make eval-quality - 离线质量评测 router/citation/faithfulness (scripts/eval_quality.py)"
 	@echo "make eval-quality-coverage - 检查质量评测集覆盖面"
 	@echo "make eval-suite - 运行组合评测门禁（覆盖审计 + 质量评测）"
@@ -80,6 +86,7 @@ lint:
 		--extend-per-file-ignores "scripts/backup_state.py:E402" \
 		--extend-per-file-ignores "scripts/check_native.py:E402" \
 		--extend-per-file-ignores "scripts/eval_agent.py:E402" \
+		--extend-per-file-ignores "scripts/eval_claim_verification.py:E402" \
 		--extend-per-file-ignores "scripts/eval_quality.py:E402" \
 		--extend-per-file-ignores "scripts/eval_suite.py:E402"
 
@@ -107,6 +114,8 @@ reliability-gate: lint typecheck-security
 	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_SMOKE_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/account-smoke-timeout.json -- $(PYTHON) scripts/smoke_account_auth.py
 	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_TEST_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/test-timeout.json -- $(PYTHON) -m pytest
 	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_EVAL_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/eval-index-timeout.json -- env COGDOC_DATA_DIR=$(RELIABILITY_EVAL_DATA_DIR) $(PYTHON) scripts/prepare_eval_index.py --kb-id $(RELIABILITY_EVAL_KB_ID) --source-dir $(RELIABILITY_EVAL_SOURCE_DIR) --eval-set eval/retrieval_eval.jsonl --json $(RELIABILITY_DIR)/eval-index.json
+	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_MULTI_ROUTE_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/multi-route-eval-timeout.json -- env COGDOC_DATA_DIR=$(RELIABILITY_EVAL_DATA_DIR) $(PYTHON) scripts/eval_multi_route_retrieval.py --eval-set eval/retrieval_eval.jsonl --rerank --require-current-index --output $(RELIABILITY_DIR)/multi-route-eval.json
+	$(PYTHON) scripts/run_guarded.py --timeout 120 --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/multi-route-calibration-timeout.json -- $(PYTHON) scripts/calibrate_multi_route_retrieval.py $(RELIABILITY_DIR)/multi-route-eval.json --gate $(MULTI_ROUTE_GATE) $(MULTI_ROUTE_BASELINE_ARG) --summary --output $(RELIABILITY_DIR)/multi-route-calibration.json
 	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_EVAL_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/eval-timeout.json -- env COGDOC_DATA_DIR=$(RELIABILITY_EVAL_DATA_DIR) $(PYTHON) scripts/eval_suite.py $(EVAL_SUITE_RELEASE_ARGS) --json $(RELIABILITY_DIR)/eval-suite.json
 	$(PYTHON) scripts/run_guarded.py --timeout $(RELIABILITY_SOAK_TIMEOUT) --grace $(RELIABILITY_GRACE) --diagnostic $(RELIABILITY_DIR)/soak-timeout.json -- $(SHELL) -c 'set -euo pipefail; $(PYTHON) -m uvicorn cogdoc.api.app:app --host $(RELIABILITY_API_HOST) --port $(RELIABILITY_API_PORT) --timeout-graceful-shutdown $(UVICORN_GRACEFUL_SHUTDOWN_SECONDS) & pid=$$!; cleanup() { kill -TERM $$pid 2>/dev/null || true; wait $$pid 2>/dev/null || true; }; trap cleanup EXIT INT TERM; $(PYTHON) scripts/soak_api.py --url $(RELIABILITY_API_URL) --requests $(RELIABILITY_SOAK_REQUESTS) --concurrency $(RELIABILITY_SOAK_CONCURRENCY) --timeout $(RELIABILITY_REQUEST_TIMEOUT) --startup-timeout 30 --min-success-rate $(RELIABILITY_MIN_SUCCESS_RATE) --max-p95-ms $(RELIABILITY_MAX_P95_MS) --json $(RELIABILITY_DIR)/soak.json'
 
@@ -130,12 +139,41 @@ eval-retrieval-gate:
 
 MULTI_ROUTE_EVAL_REPORT ?= artifacts/reliability/multi-route-eval.json
 MULTI_ROUTE_CALIBRATION_REPORT ?= artifacts/reliability/multi-route-calibration.json
+MULTI_ROUTE_GATE ?= eval/multi_route_gate.json
+MULTI_ROUTE_PROMOTED_BASELINE ?= artifacts/reliability/multi-route-baseline.json
+MULTI_ROUTE_BASELINE ?= $(wildcard $(MULTI_ROUTE_PROMOTED_BASELINE))
+MULTI_ROUTE_DATA_DIR ?= $(abspath artifacts/reliability/eval-data)
+MULTI_ROUTE_BASELINE_ARG = $(if $(MULTI_ROUTE_BASELINE),--baseline $(MULTI_ROUTE_BASELINE),)
 
 eval-multi-route:
-	$(PYTHON) scripts/eval_multi_route_retrieval.py --eval-set eval/retrieval_eval.jsonl --output $(MULTI_ROUTE_EVAL_REPORT)
+	env COGDOC_DATA_DIR=$(MULTI_ROUTE_DATA_DIR) $(PYTHON) scripts/eval_multi_route_retrieval.py --eval-set eval/retrieval_eval.jsonl --output $(MULTI_ROUTE_EVAL_REPORT)
 
 calibrate-multi-route:
-	$(PYTHON) scripts/calibrate_multi_route_retrieval.py $(MULTI_ROUTE_EVAL_REPORT) --output $(MULTI_ROUTE_CALIBRATION_REPORT)
+	$(PYTHON) scripts/calibrate_multi_route_retrieval.py $(MULTI_ROUTE_EVAL_REPORT) --summary --output $(MULTI_ROUTE_CALIBRATION_REPORT)
+
+eval-multi-route-gate:
+	env COGDOC_DATA_DIR=$(MULTI_ROUTE_DATA_DIR) $(PYTHON) scripts/eval_multi_route_retrieval.py --eval-set eval/retrieval_eval.jsonl --rerank --require-current-index --output $(MULTI_ROUTE_EVAL_REPORT)
+	$(PYTHON) scripts/calibrate_multi_route_retrieval.py $(MULTI_ROUTE_EVAL_REPORT) --gate $(MULTI_ROUTE_GATE) $(MULTI_ROUTE_BASELINE_ARG) --summary --output $(MULTI_ROUTE_CALIBRATION_REPORT)
+
+eval-multi-route-promote:
+	env COGDOC_DATA_DIR=$(MULTI_ROUTE_DATA_DIR) $(PYTHON) scripts/eval_multi_route_retrieval.py --eval-set eval/retrieval_eval.jsonl --rerank --require-current-index --output $(MULTI_ROUTE_EVAL_REPORT)
+	$(PYTHON) scripts/calibrate_multi_route_retrieval.py $(MULTI_ROUTE_EVAL_REPORT) --gate $(MULTI_ROUTE_GATE) $(MULTI_ROUTE_BASELINE_ARG) --promote-baseline $(MULTI_ROUTE_PROMOTED_BASELINE) --summary --output $(MULTI_ROUTE_CALIBRATION_REPORT)
+
+CLAIM_VERIFICATION_EVAL_SET ?= $(firstword $(wildcard eval/claim_verification_eval.jsonl) eval/claim_verification_eval.example.jsonl)
+CLAIM_VERIFICATION_GATE ?= eval/claim_verification_gate.json
+CLAIM_VERIFICATION_REPORT ?= artifacts/reliability/claim-verification-eval.json
+CLAIM_VERIFICATION_PROMOTED_BASELINE ?= artifacts/reliability/claim-verification-baseline.json
+CLAIM_VERIFICATION_BASELINE ?= $(wildcard $(CLAIM_VERIFICATION_PROMOTED_BASELINE))
+CLAIM_VERIFICATION_BASELINE_ARG = $(if $(CLAIM_VERIFICATION_BASELINE),--baseline $(CLAIM_VERIFICATION_BASELINE),)
+
+eval-claim-verification:
+	$(PYTHON) scripts/eval_claim_verification.py --eval-set $(CLAIM_VERIFICATION_EVAL_SET) --summary --output $(CLAIM_VERIFICATION_REPORT)
+
+eval-claim-verification-gate:
+	$(PYTHON) scripts/eval_claim_verification.py --eval-set $(CLAIM_VERIFICATION_EVAL_SET) --gate $(CLAIM_VERIFICATION_GATE) $(CLAIM_VERIFICATION_BASELINE_ARG) --summary --output $(CLAIM_VERIFICATION_REPORT)
+
+eval-claim-verification-promote:
+	$(PYTHON) scripts/eval_claim_verification.py --eval-set $(CLAIM_VERIFICATION_EVAL_SET) --gate $(CLAIM_VERIFICATION_GATE) $(CLAIM_VERIFICATION_BASELINE_ARG) --promote-baseline $(CLAIM_VERIFICATION_PROMOTED_BASELINE) --summary --output $(CLAIM_VERIFICATION_REPORT)
 
 eval-quality:
 	$(PYTHON) scripts/eval_quality.py

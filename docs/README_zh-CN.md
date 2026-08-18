@@ -184,6 +184,7 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 | `POST /v1/research-jobs/{id}/generate`、`GET /v1/research-jobs/{id}/report` | 对章节证据执行闭集校验、生成带引用正文并下载 Markdown 报告 |
 | `PUT /v1/research-jobs/{id}/review`、`POST /v1/research-jobs/{id}/publish` | 带 revision 冲突保护地逐章审阅正文或证据缺口，并只发布完成全部审阅的报告 |
 | `GET /v1/research-jobs/{id}/published-report`、`/published-bundle` | 下载通过完整性校验的 Markdown 快照或确定性 ZIP 验证包 |
+| `GET /v1/claim-verification/observations/summary` | 仅 Reviewer 可读的租户级灰度窗口与运行就绪摘要 |
 | `GET /healthz`、`GET /readyz`、`GET /metrics` | 健康、就绪、Prometheus 指标 |
 
 `/v1/chat/stream` 始终会流式发送生命周期和节点进度事件。QA、Summary 和
@@ -563,7 +564,11 @@ chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{
 - **闭集证据校验 + 有界自适应恢复** — 开启证据校验后，符合二阶段条件的精确事实问题和所有多 requirement 问题，生成前都必须对每个需求给出一份 `supported` / `missing` / `contradictory` 结论，且只能使用给定 requirement ID 和 chunk ID。需求 ID 遗漏/重复/未知、伪造 chunk、未支持需求或无证据冲突都不能放行。若缺口可恢复，CogDoc 默认只重试一次：缺失 requirement 的 `recovery_query` 会紧随原问题优先执行，检索深度按有上限倍数扩大，融合/重排后重新校验。重试数、查询预算和 `top_k` 全部有界，verifier 异常不会重试；最终仍有 requirement 无有效支持时跳过生成，以稳定拒答 fail-closed。
 - **归因反馈权重** — 正向反馈（点赞或高于中性的评分）可提升其引用/evidence chunk。点踩、纠错和低于中性的评分只有在明确标记 `feedback_type=bad_retrieval` 时才生成负检索权重；其他答案质量问题不会误罚可能正确的证据。`skip_retrieval_feedback=true` 会让该条反馈的正负调权全部跳过。
 - **生成 + 引用自愈** — `Generator`（OpenAI 兼容；云端 `deepseek-chat` 或本地 `qwen2.5:7b`，`temperature = 0.2`）把文档包装为 `<Document source=… page=… chunk_id=…>` 并强制 `[source:Pn]` 标签。`validate_citations_native`（Rust）返回结构化的 `missing_citations` / `invalid_sources` / `invalid_pages`；`citation_node` 把失败转成 critique，循环 `generate → citation` 至 `max_iteration_count`（默认 `2`）。只有通过物理引用校验的回答才会离开任务子图。
-- **父图声明审计与有限修复（可选）** — 设置 `CLAIM_VERIFICATION_ENABLED=true` 后，QA、Summary、Compare 会在各自的物理引用校验之后进入父图 `claim_audit_node`。`ClaimEvidenceVerifierAgent` 把候选答案拆成事实声明，分批只依据每条声明显式引用的证据判定 `supported`、`unsupported` 或 `insufficient`。失败后进入 `claim_repair_node`；修订答案必须先通过确定性引用复检，再重新执行语义审计。修复次数由 `CLAIM_VERIFICATION_MAX_REPAIR_ATTEMPTS` 限定（默认 `1`）。校验器异常、修复器异常、修复后引用在次数耗尽时仍非法，或语义审计最终仍失败，都会通过 `claim_block_node` fail-closed：用稳定拒答替换候选答案，并清空其引用/evidence。语义门禁默认关闭，便于部署先建立经人工复核的基线再启用。
+- **父图声明核验的分阶段发布** — `CLAIM_VERIFICATION_MODE=off|shadow|enforce` 控制 QA、Summary、Compare 在物理引用校验后的行为。`CLAIM_VERIFICATION_ROLLOUT_PERCENT` 将确定性、按会话粘性的流量桶提升到配置模式：未命中的 `shadow` 流量回退 `off`，未命中的 `enforce` 流量回退 `shadow`；修改 `CLAIM_VERIFICATION_ROLLOUT_SEED` 会有意重新分桶。`off` 跳过模型校验器；`shadow` 执行同一套声明/证据审计，但绝不修复、阻断或改写实际交付答案，只记录 `would_allow`、`would_repair` 或 `would_block`，且会被拦截的候选不会进入 Agent 记忆；`enforce` 才启用有限修复与 fail-closed 拒答。`ClaimEvidenceVerifierAgent` 只依据每条声明显式引用的证据判定支持度。修订答案必须先通过确定性引用复检，再重新执行语义审计；修复次数由 `CLAIM_VERIFICATION_MAX_REPAIR_ATTEMPTS` 限定（默认 `1`）。仅当新 mode 未设置时，旧配置 `CLAIM_VERIFICATION_ENABLED=true` 才兼容映射为 `enforce`。
+
+  每个最终 Chat 响应的有界 `claim_verification` 投影会公开不含身份的策略 ID、配置/实际模式、百分比、桶位与决策；trace 保存同一份安全摘要。Prometheus 在原决策计数器之外提供 `cogdoc_claim_verification_cohorts_total{task_type,configured_mode,effective_mode,selected}`。建议按 `off → shadow 5/25/100% →` 通过人工基线发布门禁 `→ enforce 5/25/100%` 上线；提升百分比期间保持 seed 不变，已有会话才会保持粘性。
+
+  生产应用还会为每个终态 rollout 持久化一条有界、按租户隔离的观测记录。记录只含时间、任务/策略/模式/决策/状态与布尔结果，绝不保存 query、answer、evidence、文档、session 或原始分桶身份。具备 Reviewer 权限的主体可通过 `GET /v1/claim-verification/observations/summary` 查询有界时间窗，并可按实际模式过滤。接口默认只统计当前策略 ID，避免历史灰度配置污染就绪度；Reviewer 也可显式传入旧策略 ID 做历史查询。返回的 `operational_readiness` 只检查样本成熟度和 verifier 错误率；`semantic_release_gate_required` 永远为 true，因此不能替代人工标注发布门禁。观测写入失败不影响回答交付，观测存储不可读时摘要接口返回 `503`。
 
   QA、Summary 和 Compare 始终缓冲候选模型 token，因为中间文本可能包含内部 Evidence ID，且尚未完成最终渲染。开启本门禁后，它审计的其他路由候选也保持相同缓冲规则。节点进度事件仍会流式发送；父图后处理完成（通过、有意 `not_run` 或产生 fail-closed 拒答）后，服务会把最终答案作为单个 token 事件发送，随后照常发送 `final` 事件。
 
@@ -739,7 +744,14 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `QA_ADAPTIVE_RETRIEVAL_MAX_RETRIES` | `1` | 恢复轮次上限（`0` 关闭重试；校验范围 `0..2`） |
 | `QA_ADAPTIVE_RETRIEVAL_TOP_K_MULTIPLIER` | `2.0` | 每轮恢复检索应用的检索深度倍数 |
 | `QA_ADAPTIVE_RETRIEVAL_MAX_TOP_K` | `36` | 自适应扩大深度后的 `top_k` 硬上限 |
-| `CLAIM_VERIFICATION_ENABLED` | `false` | 开启生成后的逐声明语义门禁；开启后采用 fail-closed |
+| `CLAIM_VERIFICATION_MODE` | `off` | 声明核验发布模式：`off`、只观测的 `shadow` 或 fail-closed 的 `enforce` |
+| `CLAIM_VERIFICATION_ENABLED` | `false` | 旧版兼容回退：仅在 mode 未设置时，`true` 映射为 `enforce` |
+| `CLAIM_VERIFICATION_ROLLOUT_PERCENT` | `100` | 提升到配置模式的粘性流量桶比例；范围 `0..100` |
+| `CLAIM_VERIFICATION_ROLLOUT_SEED` | `cogdoc-v1` | 确定性分桶种子；修改它会有意重新分桶 |
+| `CLAIM_VERIFICATION_OBSERVATION_RETENTION_DAYS` | `30` | 仅元数据观测记录保留天数，范围 `1..365` |
+| `CLAIM_VERIFICATION_OBSERVATION_MAX_PER_TENANT` | `100000` | 每租户观测记录硬上限 |
+| `CLAIM_VERIFICATION_OPERATIONAL_MIN_SAMPLES` | `200` | 运行就绪所需的非 off 已执行审计样本数 |
+| `CLAIM_VERIFICATION_OPERATIONAL_MAX_ERROR_RATE` | `0.02` | 运行就绪允许的 verifier 最高错误率 |
 | `CLAIM_VERIFICATION_MAX_CLAIMS` | `40` | 每个答案最多可审计的声明片段数；超限内容不会静默放行 |
 | `CLAIM_VERIFICATION_MAX_CLAIMS_PER_BATCH` | `8` | 单次校验器调用最多发送的声明数 |
 | `CLAIM_VERIFICATION_MAX_DOCS_PER_BATCH` | `12` | 单次校验/修复调用最多可见的证据块数 |
@@ -777,6 +789,9 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `make eval-retrieval-report` | 按 100 条真实检索配置运行并写入报告 |
 | `make eval-retrieval-baseline` | 生成经复核的真实检索基线 |
 | `make eval-retrieval-gate` | 执行绝对阈值门禁并对比检索基线 |
+| `make eval-claim-verification` | 评估人工标注的声明语义核验结果 |
+| `make eval-claim-verification-gate` | 执行声明误放率、召回率、延迟与分层发布门禁 |
+| `make eval-claim-verification-promote` | 门禁通过后原子晋级声明核验基线 |
 | `make eval-quality` | 运行离线质量评测（路由、引用、人工忠实性台账） |
 | `make eval-quality-coverage` | 运行质量指标并检查覆盖维度 |
 | `make eval-suite` | 运行组合评测门禁（覆盖审计 + 质量指标） |
@@ -864,9 +879,19 @@ python scripts/calibrate_multi_route_retrieval.py \
 
 也可依次运行 `make eval-multi-route` 和 `make calibrate-multi-route`。
 
+发布验收运行 `make eval-multi-route-gate`。该目标会启用 reranker，并拒绝尚未迁移到 v7 的旧索引。校准先以固定种子按 query 类型、文档类型和是否无答案保留外层验证集，再在训练分区内执行 5 折分层交叉验证：融合参数按均值减波动惩罚选择，拒答阈值取各折训练结果的中位数。外层验证只负责最终验收，`eval/multi_route_gate.json` 会同时检查 percentile-bootstrap 置信界、成对回退界、样本成熟度、延迟和 query-type 分层回退。设置 `MULTI_ROUTE_BASELINE=<artifact>` 可与上一份 v2/v3 校准产物比较；验证集划分不一致时会 fail closed。`make eval-multi-route-promote` 仅在全部门禁通过后原子写入紧凑基线，失败候选不会覆盖已接受基线，也不会修改线上参数。
+
 评测同时生成全路、四个单路和四个 leave-one-out 视图，按 query/doc/chunk 类型汇总 Recall@K、MRR、nDCG、需求覆盖、拒答准确率与 P50/P95 延迟；权重为零的路线不会访问底层索引。校准报告搜索路权重、top-k、融合保底配额和四类拒答阈值，输出 `recommended_env`，同时保留 `current_config` / `rollback_config`；它只产出建议，不会自动修改线上环境。
 
 网页端“证据判卷台”中的“检索路径诊断”可查看四路原始排名、逐块 RRF 贡献、重排位移、拒答原因和缺失需求。人工选择的正确证据/误导项先写入待审核评测草稿，仍需通过现有审核后才能导出到正式评测集。
+
+### 声明语义核验发布门禁
+
+通用质量报告中的 claim audit 指标仍用于日常诊断；严格发布验收使用独立的 `eval/claim_verification_eval.jsonl` 人工标注集。真实集合默认被 Git 忽略，仓库只提供可运行的 `eval/claim_verification_eval.example.jsonl`。每行至少包含稳定 `id`、`layer` 和 `expected_verdict`；期望标签可取 `supported`、`unsupported`、`insufficient` 或 `not_factual`。实际结果既可由离线运行器写成 `actual_verdict`，也可直接携带生产 `claim_audit`，多声明审计用 `claim_id` 精确选择被判卷声明。缺失、错误或畸形审计一律形成拒绝决策，同时降低可观测率，不能伪装成正确判定。
+
+运行 `make eval-claim-verification` 生成混淆矩阵、支持精确率/召回率、危险声明误放率、不可观测 fail-closed 率和 verifier 延迟。`make eval-claim-verification-gate` 按 `eval/claim_verification_gate.json` 检查样本成熟度、分类比例的 Wilson 置信界、延迟的 percentile-bootstrap 置信界、QA/Summary/Compare 分层阈值及相对上一基线的回退；基线与评测输入契约哈希不一致时 fail closed，没有历史基线时只执行绝对门禁。`make eval-claim-verification-promote` 只有在全部检查通过后才原子替换 `artifacts/reliability/claim-verification-baseline.json`，失败候选不会破坏已接受基线。
+
+默认发布契约要求至少 360 条声明，其中至少 120 条 supported、200 条 unsupported/insufficient、40 条 not-factual，并要求三种生成路径各至少 100 条。200 条危险声明在零误放时才能使双侧 95% Wilson 上界低于 2%；示例集只验证格式和工具链，不满足发布样本数。建议人工集合额外覆盖中英文、数字/日期、跨文档比较、近似证据、无答案、引用正确但语义不支持和提示注入文本。
 
 每次对话都会生成 `request_id` / `trace_id`。`COGDOC_TRACE_ENABLED=true` 时，服务会把 JSON trace 写入 `COGDOC_TRACE_DIR`（默认 `logs/traces`），同一份安全载荷也可通过 `GET /v1/traces/{trace_id}` 查询；`GET /v1/traces` 可按 `doc_id` 和 `session_id` 限定范围，Streamlit Trace 面板正是用它只展示当前对话。trace 文件包含 `schema_version`、`status`（`ok`、`degraded` 或 `failed`）、总 `duration_ms`、安全配置快照、步骤摘要、改写摘要、错误摘要，并且只保存截断后的 evidence preview，不写入完整文档正文。QA rerank 步骤还会暴露 Evidence Pack 的输入/保留/丢弃数与字符数、移除的 overlap、分原因丢弃计数、anchor/pinned 数，以及硬约束的 `over_budget` 决策。独立 Debug 控制台读取同一套 trace 格式。
 
@@ -879,7 +904,7 @@ python scripts/calibrate_multi_route_retrieval.py \
 - Research 报告现已支持可编辑 AI 规划、原子证据需求、闭集校验、确定性引用、强制的章节局部声明审计与需求覆盖审计、一次共享的有限修复、逐章审阅、显式接受证据缺口、有界版本历史、选择性重新生成和冻结发布。原子需求是机器强制的完成契约；自由文本 `success_criteria` 只作为人工验收说明。选择性重生成只会检索、校验并改写 `changes_requested` 或旧版未审计章节；已批准章节和已接受缺口原样保留，同时重新构建并校验全文公开引用账本。冻结的 provenance（含检索/校验配置与模型路由）会阻止过期证据继续生成、审阅或发布，显式全量刷新会先归档旧报告。本地 Research 任务是隐私硬约束：规划、证据校验、写作、声明/覆盖审计与修复均拒绝云端节点覆盖。
 - v2 发布物的 SHA-256 会精确绑定 Markdown、引用账本、可追踪 provenance、有界 `verification.json` 声明/覆盖摘要、证据身份/文本哈希承诺、版本与生成时间；确定性 ZIP 另含逐文件哈希。旧版 Markdown 只能以 `legacy-unverified` 下载且不能生成验证包；畸形或被篡改的当前/已发布正文不会出现在列表、详情或下载响应中。
 - 本地 Compare 有意限制为 2 篇文档、4 个核心维度，并跳过额外结论生成，以降低 Ollama 内存压力。
-- 全局语义门禁关闭（默认）时，QA、Summary、Compare 的 Citation 校验只证明引用的 `source` / `page` 或知识 ID 物理合法，不证明周围声明获得语义支持，也不保证每条事实句都有引用；开启 `CLAIM_VERIFICATION_ENABLED` 后才会增加它们的模型门禁。Research 报告生成不受该灰度开关影响，始终只使用章节局部精确证据执行 fail-closed 声明支持与原子需求覆盖审计。模型校验仍应使用领域人工基线做标定。
+- `CLAIM_VERIFICATION_MODE=off`（默认）时，QA、Summary、Compare 的 Citation 校验只证明引用的 `source` / `page` 或知识 ID 物理合法，不证明语义支持。`shadow` 会测量模型声明门禁但不改变交付答案，因此该模式下答案仍不保证忠实；会触发强制干预的候选不会进入 Agent 记忆。`enforce` 才增加有限修复与 fail-closed 拒答。Research 报告生成不受该灰度开关影响，始终只使用章节局部精确证据执行声明支持与原子需求覆盖审计。模型校验仍应使用领域人工基线做标定。
 - Rewrite 相似度阈值默认 `0.5`，后续应基于真实数据标定。
 - 本地模型下载依赖网络或已有 Hugging Face 缓存。
 

@@ -53,6 +53,11 @@ artifacts/reliability/retrieval_eval_drafts.jsonl
 artifacts/reliability/retrieval_eval_pending_plans.jsonl
 artifacts/reliability/retrieval_eval_review_checklist.json
 artifacts/reliability/*-pending-plans.json
+# Multi-route raw evaluation contains per-case queries and retrieved source text.
+# Keep only the deliberately reviewed baseline/calibration summaries eligible.
+artifacts/reliability/multi-route-eval.json
+# Local reliability runs persist index-migration state under the workbench root.
+artifacts/reliability/eval-data/reliability/
 
 # Node / mermaid-cli 本地渲染依赖。
 node_modules/

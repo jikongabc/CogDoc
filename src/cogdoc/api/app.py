@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from cogdoc import __version__
@@ -12,6 +12,10 @@ from cogdoc.api.access_control import (
 )
 from cogdoc.api.audit import AuditStore
 from cogdoc.api.auth_store import AuthStore
+from cogdoc.api.claim_verification_store import (
+    ClaimVerificationObservationStore,
+    SqliteClaimVerificationObservationStore,
+)
 from cogdoc.api.derived_knowledge_store import DerivedKnowledgeStore
 from cogdoc.api.feedback_analysis_store import FeedbackAnalysisStore
 from cogdoc.api.feedback_store import FeedbackStore
@@ -27,6 +31,7 @@ from cogdoc.api.routes import (
     access_router,
     auth_router,
     chat_router,
+    claim_verification_router,
     documents_router,
     feedback_router,
     health_router,
@@ -205,6 +210,7 @@ def create_app(
     audit_store: AuditStore | None = None,
     auth_store: AuthStore | None = None,
     resource_access_store: ResourceAccessStore | None = None,
+    claim_verification_observation_store: Any | None = None,
     self_registration_enabled: bool | None = None,
     offload_workers: int | None = None,
 ) -> FastAPI:
@@ -403,6 +409,10 @@ def create_app(
             for store_name, ownership_name in (
                 ("auth_store", "close_auth_store_on_shutdown"),
                 ("resource_access_store", "close_resource_access_store_on_shutdown"),
+                (
+                    "claim_verification_observation_store",
+                    "close_claim_verification_observation_store_on_shutdown",
+                ),
             ):
                 try:
                     active_store = getattr(app.state, store_name, None)
@@ -451,6 +461,20 @@ def create_app(
     # closed explicitly by their process and can be shared by app factories.
     app.state.close_auth_store_on_shutdown = False
     app.state.close_resource_access_store_on_shutdown = False
+    observation_settings = get_settings()
+    app.state.claim_verification_observation_store = (
+        claim_verification_observation_store
+        if claim_verification_observation_store is not None
+        else ClaimVerificationObservationStore(
+            retention_days=(
+                observation_settings.claim_verification_observation_retention_days
+            ),
+            max_per_tenant=(
+                observation_settings.claim_verification_observation_max_per_tenant
+            ),
+        )
+    )
+    app.state.close_claim_verification_observation_store_on_shutdown = False
     # Create operational telemetry before background managers so both HTTP and
     # post-202 research work share one app-local Prometheus registry.
     app.state.metrics = Metrics()
@@ -730,6 +754,7 @@ def create_app(
         return _unhandled_error_response(exc)
 
     app.include_router(chat_router)
+    app.include_router(claim_verification_router)
     app.include_router(auth_router)
     app.include_router(access_router)
     app.include_router(agent_router)
@@ -766,6 +791,11 @@ _resource_access_store = (
     if _auth_store is not None
     else None
 )
+_claim_verification_observation_store = SqliteClaimVerificationObservationStore(
+    _db_path,
+    retention_days=_settings.claim_verification_observation_retention_days,
+    max_per_tenant=_settings.claim_verification_observation_max_per_tenant,
+)
 app = create_app(
     state_runtime=_state_runtime,
     close_state_runtime_on_shutdown=True,
@@ -779,7 +809,9 @@ app = create_app(
     audit_store=AuditStore(_settings.audit_log_path),
     auth_store=_auth_store,
     resource_access_store=_resource_access_store,
+    claim_verification_observation_store=_claim_verification_observation_store,
     self_registration_enabled=_settings.cogdoc_self_registration_enabled,
 )
 app.state.close_auth_store_on_shutdown = _auth_store is not None
 app.state.close_resource_access_store_on_shutdown = _resource_access_store is not None
+app.state.close_claim_verification_observation_store_on_shutdown = True

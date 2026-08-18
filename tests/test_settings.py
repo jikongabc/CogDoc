@@ -54,6 +54,14 @@ def test_settings_defaults_match_current_runtime_contract():
     assert settings.qa_adaptive_retrieval_top_k_multiplier == 2.0
     assert settings.qa_adaptive_retrieval_max_top_k == 36
     assert settings.claim_verification_enabled is False
+    assert settings.claim_verification_mode is None
+    assert settings.effective_claim_verification_mode == "off"
+    assert settings.claim_verification_rollout_percent == 100.0
+    assert settings.claim_verification_rollout_seed == "cogdoc-v1"
+    assert settings.claim_verification_observation_retention_days == 30
+    assert settings.claim_verification_observation_max_per_tenant == 100000
+    assert settings.claim_verification_operational_min_samples == 200
+    assert settings.claim_verification_operational_max_error_rate == 0.02
     assert settings.claim_verification_max_claims == 40
     assert settings.claim_verification_max_claims_per_batch == 8
     assert settings.claim_verification_max_docs_per_batch == 12
@@ -152,11 +160,53 @@ def test_settings_reads_environment_overrides(monkeypatch):
     assert settings.cogdoc_ocr_dpi == 240
     assert settings.cogdoc_ocr_required is True
     assert settings.claim_verification_enabled is True
+    assert settings.effective_claim_verification_mode == "enforce"
     assert settings.claim_verification_max_claims == 24
     assert settings.qa_adaptive_retrieval_max_retries == 2
     assert settings.qa_adaptive_retrieval_max_top_k == 24
     assert settings.eval_review_api_key_set == {"review-a", "review-b"}
     assert settings.cogdoc_chat_stream_idle_timeout_seconds == 45.0
+
+
+def test_claim_verification_mode_takes_precedence_over_legacy_boolean(monkeypatch):
+    monkeypatch.setenv("CLAIM_VERIFICATION_ENABLED", "true")
+    monkeypatch.setenv("CLAIM_VERIFICATION_MODE", "shadow")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.claim_verification_enabled is True
+    assert settings.claim_verification_mode == "shadow"
+    assert settings.effective_claim_verification_mode == "shadow"
+
+
+def test_claim_verification_rollout_settings_are_bounded():
+    assert (
+        Settings(_env_file=None, claim_verification_rollout_percent=0.0)
+        .claim_verification_rollout_percent
+        == 0.0
+    )
+    assert (
+        Settings(_env_file=None, claim_verification_rollout_percent=100.0)
+        .claim_verification_rollout_percent
+        == 100.0
+    )
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_rollout_percent=-0.1)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_rollout_percent=100.1)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_rollout_seed="")
+
+
+def test_claim_verification_observation_settings_are_bounded():
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_observation_retention_days=0)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_observation_max_per_tenant=99)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_operational_min_samples=0)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_operational_max_error_rate=1.1)
 
 
 def test_legacy_knowledge_threshold_falls_back_to_both_split_channels(monkeypatch):

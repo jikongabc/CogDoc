@@ -15,8 +15,15 @@ from cogdoc.agents.claim_evidence_verifier import (
     state_has_only_no_evidence_units,
 )
 from cogdoc.agents.citation_validator import CitationValidatorAgent
-from cogdoc.config.settings import get_settings
+from cogdoc.config.settings import (
+    CLAIM_VERIFICATION_MODES,
+    get_settings,
+    resolve_claim_verification_mode,
+)
 from cogdoc.observability.logger import log_event
+from cogdoc.service.claim_verification_rollout import (
+    build_claim_verification_rollout,
+)
 from cogdoc.tools.citation_ledger import (
     CitationLedgerError,
     render_display_citations,
@@ -54,8 +61,23 @@ def unknown_node(state: GraphState) -> dict:
 
 
 def claim_audit_node(state: GraphState) -> dict:
-    output = ClaimEvidenceVerifierAgent.audit(state)
+    settings = get_settings()
+    raw_state_mode = state.get("claim_verification_mode")
+    mode = (
+        str(raw_state_mode).strip().lower()
+        if str(raw_state_mode or "").strip().lower() in CLAIM_VERIFICATION_MODES
+        else resolve_claim_verification_mode(settings)
+    )
+    output = ClaimEvidenceVerifierAgent.audit(state, force_enabled=mode != "off")
+    output["claim_verification_mode"] = mode
+    rollout_state = {**state, **output}
+    output["claim_verification_rollout"] = build_claim_verification_rollout(
+        rollout_state,
+        mode=mode,
+        max_repair_attempts=settings.claim_verification_max_repair_attempts,
+    )
     audit = output.get("claim_audit") or {}
+    rollout = output["claim_verification_rollout"]
     metrics = audit.get("metrics") or {}
     counts = audit.get("counts") or {}
     log_event(
@@ -68,11 +90,25 @@ def claim_audit_node(state: GraphState) -> dict:
         citation_coverage=metrics.get("citation_coverage"),
         unsupported_claim_rate=metrics.get("unsupported_claim_rate"),
         verifier_error=output.get("claim_verifier_error", ""),
+        verification_mode=mode,
+        rollout_decision=rollout.get("decision", "skipped"),
     )
     return output
 
 
 def claim_audit_check(state: GraphState) -> str:
+    rollout = state.get("claim_verification_rollout")
+    if isinstance(rollout, dict):
+        mode = str(rollout.get("mode") or "off")
+        decision = str(rollout.get("decision") or "skipped")
+        if mode in {"off", "shadow"}:
+            return "citation_finalize_node"
+        if decision == "repair":
+            return "claim_repair_node"
+        if decision == "block":
+            return "claim_block_node"
+        if decision in {"allow", "allow_exempt"}:
+            return "citation_finalize_node"
     audit = state.get("claim_audit") or {}
     status = str(audit.get("status") or "not_run")
     if status in {"not_run", "passed", "repaired"}:
@@ -132,6 +168,18 @@ def claim_repair_citation_check(state: GraphState) -> str:
 
 def claim_block_node(state: GraphState) -> dict:
     output = block_unfaithful_answer(state)
+    mode = resolve_claim_verification_mode(
+        {
+            "claim_verification_mode": state.get("claim_verification_mode"),
+            "claim_verification_enabled": True,
+        }
+    )
+    output["claim_verification_mode"] = mode
+    output["claim_verification_rollout"] = build_claim_verification_rollout(
+        {**state, **output},
+        mode=mode,
+        max_repair_attempts=get_settings().claim_verification_max_repair_attempts,
+    )
     log_event(
         "claim_audit",
         "claim_audit_rejected",

@@ -7,6 +7,10 @@ from enum import Enum
 from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from cogdoc.config.settings import get_settings
+from cogdoc.service.claim_verification_policy import (
+    claim_verification_policy_projection,
+)
+from cogdoc.service.claim_verification_rollout import ROLLOUT_DECISIONS
 from cogdoc.tools.citation_ledger import is_valid_evidence_id
 from cogdoc.tools.public_citation_ledger import validate_public_citation_ledger
 from cogdoc.tools.retriever.metadata import safe_retrieval_metadata
@@ -214,6 +218,72 @@ class ClaimAuditSummary(ApiModel):
     duration_ms: float | None = None
 
 
+ClaimVerificationDecision = Literal[
+    "skipped",
+    "allow",
+    "allow_exempt",
+    "repair",
+    "block",
+    "would_allow",
+    "would_allow_exempt",
+    "would_repair",
+    "would_block",
+]
+
+
+class ClaimVerificationRolloutSummary(ApiModel):
+    version: Literal["v1"] = "v1"
+    mode: Literal["off", "shadow", "enforce"] = "off"
+    configured_mode: Literal["off", "shadow", "enforce"] = "off"
+    rollout_percent: float = Field(default=100.0, ge=0.0, le=100.0)
+    cohort_bucket: int = Field(default=0, ge=0, le=9999)
+    cohort_selected: bool = True
+    fallback_mode: Literal["off", "shadow"] = "off"
+    policy_id: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
+    decision: ClaimVerificationDecision = "skipped"
+    executed: bool = False
+    enforced: bool = False
+    released: bool = True
+    would_intervene: bool = False
+    would_repair: bool = False
+    would_block: bool = False
+    audit_status: str = Field(default="not_run", max_length=32)
+    reason_code: str = Field(default="", max_length=128)
+    repair_count: int = Field(default=0, ge=0)
+
+
+class ClaimVerificationOperationalReadiness(ApiModel):
+    ready: bool = False
+    sample_count: int = Field(default=0, ge=0)
+    minimum_samples: int = Field(default=0, ge=1)
+    verifier_error_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    maximum_verifier_error_rate: float = Field(default=0.02, ge=0.0, le=1.0)
+    blockers: list[Literal["minimum_samples", "verifier_error_rate"]] = Field(
+        default_factory=list
+    )
+    semantic_release_gate_required: Literal[True] = True
+
+
+class ClaimVerificationObservationSummaryResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    tenant_id: str
+    window_hours: int = Field(ge=1, le=720)
+    window_start: str
+    generated_at: str
+    effective_mode_filter: Literal["off", "shadow", "enforce"] | None = None
+    policy_id_filter: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{16}$"
+    )
+    total_count: int = Field(default=0, ge=0)
+    counts: dict[str, int] = Field(default_factory=dict)
+    rates: dict[str, float | None] = Field(default_factory=dict)
+    by_configured_mode: dict[str, int] = Field(default_factory=dict)
+    by_effective_mode: dict[str, int] = Field(default_factory=dict)
+    by_decision: dict[str, int] = Field(default_factory=dict)
+    by_task_type: dict[str, int] = Field(default_factory=dict)
+    operational_readiness: ClaimVerificationOperationalReadiness
+
+
 # 对话接口结构化响应。
 class ChatResponse(ApiModel):
     schema_version: Literal["v1"] = API_SCHEMA_VERSION
@@ -229,6 +299,7 @@ class ChatResponse(ApiModel):
     critique: str = ""
     is_valid: bool
     claim_audit: ClaimAuditSummary | None = None
+    claim_verification: ClaimVerificationRolloutSummary | None = None
 
 
 # 独立任务接口请求体，摘要和对比任务由路由层固定。
@@ -1429,6 +1500,7 @@ class TraceSummary(ApiModel):
     evidence_ref_count: int = 0
     node_names: list[str] = Field(default_factory=list)
     claim_audit: ClaimAuditSummary | None = None
+    claim_verification: ClaimVerificationRolloutSummary | None = None
 
 
 # 跟踪文件响应体。
@@ -1896,6 +1968,41 @@ def _claim_audit_summary_from_mapping(item: Any) -> ClaimAuditSummary | None:
     )
 
 
+def _claim_verification_rollout_summary_from_mapping(
+    item: Any,
+) -> ClaimVerificationRolloutSummary | None:
+    data = _as_mapping(item)
+    if not data:
+        return None
+    mode = str(data.get("mode") or "off")
+    if mode not in {"off", "shadow", "enforce"}:
+        mode = "off"
+    policy = claim_verification_policy_projection(data, effective_mode=mode)
+    decision = str(data.get("decision") or "skipped")
+    if decision not in ROLLOUT_DECISIONS:
+        decision = "skipped"
+    return ClaimVerificationRolloutSummary(
+        version="v1",
+        mode=mode,
+        configured_mode=policy["configured_mode"],
+        rollout_percent=policy["rollout_percent"],
+        cohort_bucket=policy["cohort_bucket"],
+        cohort_selected=policy["cohort_selected"],
+        fallback_mode=policy["fallback_mode"],
+        policy_id=policy["policy_id"],
+        decision=decision,
+        executed=bool(data.get("executed", False)),
+        enforced=bool(data.get("enforced", False)),
+        released=bool(data.get("released", True)),
+        would_intervene=bool(data.get("would_intervene", False)),
+        would_repair=bool(data.get("would_repair", False)),
+        would_block=bool(data.get("would_block", False)),
+        audit_status=str(data.get("audit_status") or "not_run")[:32],
+        reason_code=str(data.get("reason_code") or "")[:128],
+        repair_count=_nonnegative_int(data.get("repair_count")),
+    )
+
+
 # 把对话结果转换成响应。
 def chat_result_to_response(
     result: Any,
@@ -1941,6 +2048,9 @@ def chat_result_to_response(
         is_valid=bool(getattr(result, "is_valid", False))
         and ledger_validation.is_valid,
         claim_audit=_claim_audit_summary_from_mapping(raw_output.get("claim_audit")),
+        claim_verification=_claim_verification_rollout_summary_from_mapping(
+            raw_output.get("claim_verification_rollout")
+        ),
     )
 
 

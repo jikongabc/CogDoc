@@ -69,6 +69,22 @@ def _runner_with_claim_audit(doc_id, query, is_local, chat_history, forced_task)
                 },
                 "verifier": {"duration_ms": 250.0},
             },
+            "claim_verification_rollout": {
+                "version": "v1",
+                "mode": "enforce",
+                "configured_mode": "enforce",
+                "cohort_selected": True,
+                "decision": "allow",
+                "executed": True,
+                "enforced": True,
+                "released": True,
+                "would_intervene": False,
+                "would_repair": False,
+                "would_block": False,
+                "audit_status": "repaired",
+                "reason_code": "",
+                "repair_count": 1,
+            },
         },
     )
 
@@ -258,6 +274,15 @@ async def test_claim_audit_metrics_record_final_counts_repair_and_duration(monke
 
     assert response.status_code == 200
     assert response.json()["claim_audit"]["status"] == "repaired"
+    assert response.json()["claim_verification"]["decision"] == "allow"
+    assert (
+        'cogdoc_claim_verification_rollouts_total{decision="allow",mode="enforce",task_type="qa"} 1.0'
+        in scraped
+    )
+    assert (
+        'cogdoc_claim_verification_cohorts_total{configured_mode="enforce",effective_mode="enforce",selected="true",task_type="qa"} 1.0'
+        in scraped
+    )
     assert (
         'cogdoc_claim_audit_runs_total{status="repaired",task_type="qa"} 1.0' in scraped
     )
@@ -370,6 +395,25 @@ def test_not_run_claim_audit_does_not_observe_verifier_duration():
         'cogdoc_claim_audit_runs_total{status="not_run",task_type="qa"} 1.0' in scraped
     )
     assert 'cogdoc_claim_audit_duration_seconds_count{task_type="qa"}' not in scraped
+
+
+def test_claim_verification_metrics_bound_unknown_mode_and_decision():
+    metrics = Metrics()
+
+    metrics.observe_claim_verification_rollout(
+        "qa",
+        {"mode": "attacker-controlled", "decision": "unbounded-value"},
+    )
+
+    scraped = metrics.render().decode()
+    assert (
+        'cogdoc_claim_verification_rollouts_total{decision="unknown",mode="unknown",task_type="qa"} 1.0'
+        in scraped
+    )
+    assert (
+        'cogdoc_claim_verification_cohorts_total{configured_mode="unknown",effective_mode="unknown",selected="true",task_type="qa"} 1.0'
+        in scraped
+    )
 
 
 # 验证缺失显式终态的局部输出不会被误记为 accepted/rescued。

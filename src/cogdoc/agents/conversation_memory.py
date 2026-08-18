@@ -85,6 +85,16 @@ def extract_chat_turn(
     if output.get("critique"):
         return []
 
+    rollout = output.get("claim_verification_rollout")
+    if (
+        isinstance(rollout, Mapping)
+        and str(rollout.get("mode") or "") == "shadow"
+        and bool(rollout.get("would_intervene"))
+    ):
+        # Shadow mode releases the answer for observation, but a candidate that
+        # enforce mode would repair/block must never become Agent memory.
+        return []
+
     if task_type == "qa":
         if "critique" not in output:
             return []

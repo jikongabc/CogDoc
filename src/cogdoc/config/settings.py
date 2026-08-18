@@ -1,13 +1,31 @@
 from functools import lru_cache
 import json
 from pathlib import Path
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, Literal
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 # 仓库根目录，作为环境文件与默认数据目录的锚点。
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+CLAIM_VERIFICATION_MODES = frozenset({"off", "shadow", "enforce"})
+
+
+def resolve_claim_verification_mode(value: Any) -> str:
+    """Resolve the new rollout mode while preserving the legacy boolean."""
+
+    if isinstance(value, Mapping):
+        raw_mode = value.get("claim_verification_mode")
+        legacy_enabled = value.get("claim_verification_enabled", False)
+    else:
+        raw_mode = getattr(value, "claim_verification_mode", None)
+        legacy_enabled = getattr(value, "claim_verification_enabled", False)
+    mode = str(raw_mode or "").strip().lower()
+    if mode in CLAIM_VERIFICATION_MODES:
+        return mode
+    return "enforce" if bool(legacy_enabled) else "off"
 
 
 # 项目路径。
@@ -652,8 +670,48 @@ class Settings(BaseSettings):
         validation_alias="QA_ADAPTIVE_RETRIEVAL_MAX_TOP_K",
     )
     # 生成后逐声明证据校验；初次发布默认关闭，便于先建立人工基线。
+    # 新部署使用三态 mode；未设置时继续兼容旧 enabled=true => enforce。
+    claim_verification_mode: Literal["off", "shadow", "enforce"] | None = Field(
+        default=None, validation_alias="CLAIM_VERIFICATION_MODE"
+    )
     claim_verification_enabled: bool = Field(
         default=False, validation_alias="CLAIM_VERIFICATION_ENABLED"
+    )
+    claim_verification_rollout_percent: float = Field(
+        default=100.0,
+        ge=0.0,
+        le=100.0,
+        validation_alias="CLAIM_VERIFICATION_ROLLOUT_PERCENT",
+    )
+    claim_verification_rollout_seed: str = Field(
+        default="cogdoc-v1",
+        min_length=1,
+        max_length=128,
+        validation_alias="CLAIM_VERIFICATION_ROLLOUT_SEED",
+    )
+    claim_verification_observation_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        validation_alias="CLAIM_VERIFICATION_OBSERVATION_RETENTION_DAYS",
+    )
+    claim_verification_observation_max_per_tenant: int = Field(
+        default=100000,
+        ge=100,
+        le=1000000,
+        validation_alias="CLAIM_VERIFICATION_OBSERVATION_MAX_PER_TENANT",
+    )
+    claim_verification_operational_min_samples: int = Field(
+        default=200,
+        ge=1,
+        le=1000000,
+        validation_alias="CLAIM_VERIFICATION_OPERATIONAL_MIN_SAMPLES",
+    )
+    claim_verification_operational_max_error_rate: float = Field(
+        default=0.02,
+        ge=0.0,
+        le=1.0,
+        validation_alias="CLAIM_VERIFICATION_OPERATIONAL_MAX_ERROR_RATE",
     )
     claim_verification_max_claims: int = Field(
         default=40,
@@ -685,6 +743,10 @@ class Settings(BaseSettings):
         le=3,
         validation_alias="CLAIM_VERIFICATION_MAX_REPAIR_ATTEMPTS",
     )
+
+    @property
+    def effective_claim_verification_mode(self) -> str:
+        return resolve_claim_verification_mode(self)
     hybrid_rrf_k: int = Field(default=60, validation_alias="HYBRID_RRF_K")
     cloud_section_max_workers: int = Field(
         default=6, validation_alias="CLOUD_SECTION_MAX_WORKERS"

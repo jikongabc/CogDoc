@@ -519,6 +519,11 @@ def test_role_permission_matrix_is_explicit_and_least_privilege():
         ("PUT", "/v1/research-jobs/r-1/review", Permission.REVIEW),
         ("POST", "/v1/research-jobs/r-1/publish", Permission.PUBLISH),
         ("GET", "/v1/retrieval-eval-drafts/d-1", Permission.REVIEW),
+        (
+            "GET",
+            "/v1/claim-verification/observations/summary",
+            Permission.REVIEW,
+        ),
         ("POST", "/v1/principals", Permission.MANAGE_ACCESS),
         ("GET", "/v1/tenants/t-1", Permission.MANAGE_TENANT),
         ("CONNECT", "/v1/unknown", Permission.MANAGE_TENANT),

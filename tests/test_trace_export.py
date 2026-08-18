@@ -514,6 +514,45 @@ def test_build_trace_payload_includes_safe_claim_audit_summary():
     assert "claims" not in summary
 
 
+def test_trace_records_safe_claim_verification_rollout_projection():
+    rollout = {
+        "version": "v1",
+        "mode": "shadow",
+        "configured_mode": "enforce",
+        "rollout_percent": 25.0,
+        "cohort_bucket": 1234,
+        "cohort_selected": False,
+        "fallback_mode": "shadow",
+        "policy_id": "0123456789abcdef",
+        "decision": "would_repair",
+        "executed": True,
+        "enforced": False,
+        "released": True,
+        "would_intervene": True,
+        "would_repair": True,
+        "would_block": False,
+        "audit_status": "failed",
+        "reason_code": "unsupported_claims",
+        "repair_count": 0,
+        "private_claim": "不得复制到 trace 摘要",
+    }
+
+    step = build_trace_step(
+        "claim_audit_node", {"claim_verification_rollout": rollout}, 1.0
+    )
+    payload = build_trace_payload(
+        "trace-shadow",
+        "req-shadow",
+        "qa",
+        [step],
+        output_payload={"claim_verification_rollout": rollout},
+    )
+
+    assert step["claim_verification"] == payload["summary"]["claim_verification"]
+    assert step["claim_verification"]["decision"] == "would_repair"
+    assert "private_claim" not in step["claim_verification"]
+
+
 # 验证 trace 列表摘要对畸形数值容错，且仍只保留固定摘要键。
 def test_build_trace_payload_sanitizes_malformed_claim_audit_summary():
     payload = build_trace_payload(

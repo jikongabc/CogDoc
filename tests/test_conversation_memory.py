@@ -80,6 +80,26 @@ def test_extract_chat_turn_skips_any_task_with_critique():
     )
 
 
+def test_extract_chat_turn_skips_shadow_candidate_that_would_intervene():
+    assert (
+        extract_chat_turn(
+            "qa",
+            {
+                "answer": "可能不受证据支持的回答。",
+                "critique": "",
+                "reranked_docs": [{"text": "证据"}],
+                "claim_verification_rollout": {
+                    "mode": "shadow",
+                    "decision": "would_block",
+                    "would_intervene": True,
+                },
+            },
+            "问题",
+        )
+        == []
+    )
+
+
 # 验证 extract chat turn skips unknown task 场景。
 def test_extract_chat_turn_skips_unknown_task():
     assert (

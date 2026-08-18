@@ -1,0 +1,1997 @@
+{
+  "schema_version": "v3",
+  "created_at": "2026-08-17T15:10:41.294089+00:00",
+  "source_report": "artifacts/reliability/multi-route-eval.json",
+  "source_report_sha256": "80ca3f0d0b0b9f4b4ae8c987f335371769ff287226bba27e3f1b96fc02c61056",
+  "current_config": {
+    "top_k": 9,
+    "route_min_candidates": 1,
+    "route_weights": {
+      "rag_vector": 1.0,
+      "rag_bm25": 1.0,
+      "derived_knowledge_vector": 0.9,
+      "derived_knowledge_lexical": 0.8
+    },
+    "abstention_thresholds": {
+      "vector_distance_max": 0.7117711305618286,
+      "bm25_score_min": 12.328925491936891,
+      "knowledge_vector_score_min": 0.5,
+      "knowledge_lexical_score_min": 0.5
+    }
+  },
+  "recommended_config": {
+    "top_k": 12,
+    "route_min_candidates": 1,
+    "route_weights": {
+      "rag_vector": 1.0,
+      "rag_bm25": 1.0,
+      "derived_knowledge_vector": 1.5,
+      "derived_knowledge_lexical": 1.5
+    },
+    "abstention_thresholds": {
+      "vector_distance_max": 0.734978199005127,
+      "bm25_score_min": 11.752383961264671,
+      "knowledge_vector_score_min": 0.5,
+      "knowledge_lexical_score_min": 0.5
+    }
+  },
+  "recommended_env": {
+    "QA_RETRIEVAL_TOP_K": 12,
+    "QA_RAG_VECTOR_ROUTE_WEIGHT": 1.0,
+    "QA_RAG_BM25_ROUTE_WEIGHT": 1.0,
+    "QA_DERIVED_KNOWLEDGE_VECTOR_ROUTE_WEIGHT": 1.5,
+    "QA_DERIVED_KNOWLEDGE_LEXICAL_ROUTE_WEIGHT": 1.5,
+    "QA_RETRIEVAL_DOCS_PER_ROUTE": 1,
+    "QA_ABSTAIN_MAX_VECTOR_DISTANCE": 0.734978199005127,
+    "QA_ABSTAIN_MIN_BM25_SCORE": 11.752383961264671,
+    "QA_ABSTAIN_MIN_KNOWLEDGE_VECTOR_SCORE": 0.5,
+    "QA_ABSTAIN_MIN_KNOWLEDGE_LEXICAL_SCORE": 0.5
+  },
+  "rollback_config": {
+    "top_k": 9,
+    "route_min_candidates": 1,
+    "route_weights": {
+      "rag_vector": 1.0,
+      "rag_bm25": 1.0,
+      "derived_knowledge_vector": 0.9,
+      "derived_knowledge_lexical": 0.8
+    },
+    "abstention_thresholds": {
+      "vector_distance_max": 0.7117711305618286,
+      "bm25_score_min": 12.328925491936891,
+      "knowledge_vector_score_min": 0.5,
+      "knowledge_lexical_score_min": 0.5
+    }
+  },
+  "calibration": {
+    "strategy": "outer_holdout_inner_stratified_kfold_v1",
+    "inner_folds": 5,
+    "fusion": {
+      "objective": 0.983433615699382,
+      "robust_objective": 0.9798694496643983,
+      "objective_stdev": 0.014256664139935198,
+      "worst_fold_objective": 0.9604683118594601,
+      "route_weights": {
+        "rag_vector": 1.0,
+        "rag_bm25": 1.0,
+        "derived_knowledge_vector": 1.5,
+        "derived_knowledge_lexical": 1.5
+      },
+      "top_k": 12,
+      "route_min_candidates": 1,
+      "metrics": {
+        "recall": 0.98046875,
+        "mrr": 1.0,
+        "ndcg": 0.9601185358501393,
+        "coverage": 1.0
+      },
+      "folds": [
+        {
+          "fold": 0,
+          "sample_count": 12,
+          "objective": 0.9961677615780491,
+          "metrics": {
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 0.9808388078902451,
+            "coverage": 1.0
+          }
+        },
+        {
+          "fold": 1,
+          "sample_count": 13,
+          "objective": 0.9944201338807578,
+          "metrics": {
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 0.972100669403789,
+            "coverage": 1.0
+          }
+        },
+        {
+          "fold": 2,
+          "sample_count": 13,
+          "objective": 0.9729141940230349,
+          "metrics": {
+            "recall": 0.9615384615384616,
+            "mrr": 1.0,
+            "ndcg": 0.951109431653636,
+            "coverage": 1.0
+          }
+        },
+        {
+          "fold": 3,
+          "sample_count": 13,
+          "objective": 0.9604683118594601,
+          "metrics": {
+            "recall": 0.9423076923076923,
+            "mrr": 1.0,
+            "ndcg": 0.9321492516049927,
+            "coverage": 1.0
+          }
+        },
+        {
+          "fold": 4,
+          "sample_count": 13,
+          "objective": 0.9931976771556084,
+          "metrics": {
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 0.9659883857780415,
+            "coverage": 1.0
+          }
+        }
+      ],
+      "trial_count": 384,
+      "robustness_penalty": 0.25,
+      "cross_validation": {
+        "seed": "cogdoc-multi-route-v1:inner",
+        "fold_count": 5,
+        "fold_sizes": [
+          16,
+          16,
+          16,
+          16,
+          16
+        ],
+        "fold_case_ids": [
+          [
+            "6",
+            "9",
+            "single-009",
+            "single-019",
+            "single-024",
+            "single-028",
+            "single-036",
+            "multi-008",
+            "multi-016",
+            "multi-020",
+            "hard-005",
+            "hard-015",
+            "hard-019",
+            "no-answer-003",
+            "no-answer-005",
+            "no-answer-009"
+          ],
+          [
+            "1",
+            "3",
+            "5",
+            "8",
+            "single-018",
+            "single-021",
+            "single-027",
+            "single-031",
+            "multi-012",
+            "multi-019",
+            "hard-004",
+            "hard-014",
+            "hard-016",
+            "no-answer-015",
+            "no-answer-016",
+            "no-answer-020"
+          ],
+          [
+            "10",
+            "12",
+            "13",
+            "single-010",
+            "single-012",
+            "single-020",
+            "single-025",
+            "single-033",
+            "single-034",
+            "multi-006",
+            "multi-017",
+            "hard-007",
+            "hard-012",
+            "hard-013",
+            "no-answer-006",
+            "no-answer-013"
+          ],
+          [
+            "4",
+            "11",
+            "single-008",
+            "single-017",
+            "single-026",
+            "single-029",
+            "single-039",
+            "single-040",
+            "multi-013",
+            "multi-018",
+            "hard-006",
+            "hard-010",
+            "hard-018",
+            "no-answer-010",
+            "no-answer-011",
+            "no-answer-014"
+          ],
+          [
+            "7",
+            "single-013",
+            "single-014",
+            "single-023",
+            "single-032",
+            "single-037",
+            "multi-004",
+            "multi-007",
+            "multi-009",
+            "multi-015",
+            "hard-002",
+            "hard-009",
+            "hard-020",
+            "no-answer-012",
+            "no-answer-018",
+            "no-answer-019"
+          ]
+        ],
+        "strata_fold_counts": {
+          "hard|unknown|answerable": [
+            3,
+            3,
+            4,
+            3,
+            3
+          ],
+          "multi-source|unknown|answerable": [
+            3,
+            3,
+            3,
+            3,
+            4
+          ],
+          "no-answer|unknown|no_answer": [
+            4,
+            3,
+            3,
+            3,
+            3
+          ],
+          "single-source|unknown|answerable": [
+            6,
+            7,
+            6,
+            7,
+            6
+          ]
+        }
+      }
+    },
+    "abstention": {
+      "thresholds": {
+        "vector_distance_max": 0.734978199005127,
+        "bm25_score_min": 11.752383961264671,
+        "knowledge_vector_score_min": 0.5,
+        "knowledge_lexical_score_min": 0.5
+      },
+      "accuracy": 0.95,
+      "sample_count": 80,
+      "cross_validation": {
+        "seed": "cogdoc-multi-route-v1:inner",
+        "fold_count": 5,
+        "fold_sizes": [
+          16,
+          16,
+          16,
+          16,
+          16
+        ],
+        "fold_case_ids": [
+          [
+            "6",
+            "9",
+            "single-009",
+            "single-019",
+            "single-024",
+            "single-028",
+            "single-036",
+            "multi-008",
+            "multi-016",
+            "multi-020",
+            "hard-005",
+            "hard-015",
+            "hard-019",
+            "no-answer-003",
+            "no-answer-005",
+            "no-answer-009"
+          ],
+          [
+            "1",
+            "3",
+            "5",
+            "8",
+            "single-018",
+            "single-021",
+            "single-027",
+            "single-031",
+            "multi-012",
+            "multi-019",
+            "hard-004",
+            "hard-014",
+            "hard-016",
+            "no-answer-015",
+            "no-answer-016",
+            "no-answer-020"
+          ],
+          [
+            "10",
+            "12",
+            "13",
+            "single-010",
+            "single-012",
+            "single-020",
+            "single-025",
+            "single-033",
+            "single-034",
+            "multi-006",
+            "multi-017",
+            "hard-007",
+            "hard-012",
+            "hard-013",
+            "no-answer-006",
+            "no-answer-013"
+          ],
+          [
+            "4",
+            "11",
+            "single-008",
+            "single-017",
+            "single-026",
+            "single-029",
+            "single-039",
+            "single-040",
+            "multi-013",
+            "multi-018",
+            "hard-006",
+            "hard-010",
+            "hard-018",
+            "no-answer-010",
+            "no-answer-011",
+            "no-answer-014"
+          ],
+          [
+            "7",
+            "single-013",
+            "single-014",
+            "single-023",
+            "single-032",
+            "single-037",
+            "multi-004",
+            "multi-007",
+            "multi-009",
+            "multi-015",
+            "hard-002",
+            "hard-009",
+            "hard-020",
+            "no-answer-012",
+            "no-answer-018",
+            "no-answer-019"
+          ]
+        ],
+        "strata_fold_counts": {
+          "hard|unknown|answerable": [
+            3,
+            3,
+            4,
+            3,
+            3
+          ],
+          "multi-source|unknown|answerable": [
+            3,
+            3,
+            3,
+            3,
+            4
+          ],
+          "no-answer|unknown|no_answer": [
+            4,
+            3,
+            3,
+            3,
+            3
+          ],
+          "single-source|unknown|answerable": [
+            6,
+            7,
+            6,
+            7,
+            6
+          ]
+        },
+        "accuracy_mean": 0.9375,
+        "accuracy_stdev": 0.03952847075210474,
+        "accuracy_worst_fold": 0.875,
+        "current_accuracy_mean": 0.95,
+        "folds": [
+          {
+            "fold": 0,
+            "sample_count": 16,
+            "accuracy": 0.9375,
+            "current_accuracy": 0.9375,
+            "thresholds": {
+              "vector_distance_max": 0.7507824897766113,
+              "bm25_score_min": 11.752383961264671,
+              "knowledge_vector_score_min": 0.5,
+              "knowledge_lexical_score_min": 0.5
+            }
+          },
+          {
+            "fold": 1,
+            "sample_count": 16,
+            "accuracy": 0.9375,
+            "current_accuracy": 0.9375,
+            "thresholds": {
+              "vector_distance_max": 0.7507824897766113,
+              "bm25_score_min": 12.985139172260354,
+              "knowledge_vector_score_min": 0.5,
+              "knowledge_lexical_score_min": 0.5
+            }
+          },
+          {
+            "fold": 2,
+            "sample_count": 16,
+            "accuracy": 0.875,
+            "current_accuracy": 0.9375,
+            "thresholds": {
+              "vector_distance_max": 0.7347757816314697,
+              "bm25_score_min": 11.605992070289002,
+              "knowledge_vector_score_min": 0.5,
+              "knowledge_lexical_score_min": 0.5
+            }
+          },
+          {
+            "fold": 3,
+            "sample_count": 16,
+            "accuracy": 1.0,
+            "current_accuracy": 1.0,
+            "thresholds": {
+              "vector_distance_max": 0.734978199005127,
+              "bm25_score_min": 11.595772494193122,
+              "knowledge_vector_score_min": 0.5,
+              "knowledge_lexical_score_min": 0.5
+            }
+          },
+          {
+            "fold": 4,
+            "sample_count": 16,
+            "accuracy": 0.9375,
+            "current_accuracy": 0.9375,
+            "thresholds": {
+              "vector_distance_max": 0.7183566093444824,
+              "bm25_score_min": 12.921075221943497,
+              "knowledge_vector_score_min": 0.5,
+              "knowledge_lexical_score_min": 0.5
+            }
+          }
+        ]
+      }
+    }
+  },
+  "split": {
+    "seed": "cogdoc-multi-route-v1",
+    "validation_fraction": 0.2,
+    "train_count": 80,
+    "validation_count": 20,
+    "train_case_ids": [
+      "1",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9",
+      "10",
+      "11",
+      "12",
+      "13",
+      "single-008",
+      "single-009",
+      "single-010",
+      "single-012",
+      "single-013",
+      "single-014",
+      "single-017",
+      "single-018",
+      "single-019",
+      "single-020",
+      "single-021",
+      "single-023",
+      "single-024",
+      "single-025",
+      "single-026",
+      "single-027",
+      "single-028",
+      "single-029",
+      "single-031",
+      "single-032",
+      "single-033",
+      "single-034",
+      "single-036",
+      "single-037",
+      "single-039",
+      "single-040",
+      "multi-004",
+      "multi-006",
+      "multi-007",
+      "multi-008",
+      "multi-009",
+      "multi-012",
+      "multi-013",
+      "multi-015",
+      "multi-016",
+      "multi-017",
+      "multi-018",
+      "multi-019",
+      "multi-020",
+      "hard-002",
+      "hard-004",
+      "hard-005",
+      "hard-006",
+      "hard-007",
+      "hard-009",
+      "hard-010",
+      "hard-012",
+      "hard-013",
+      "hard-014",
+      "hard-015",
+      "hard-016",
+      "hard-018",
+      "hard-019",
+      "hard-020",
+      "no-answer-003",
+      "no-answer-005",
+      "no-answer-006",
+      "no-answer-009",
+      "no-answer-010",
+      "no-answer-011",
+      "no-answer-012",
+      "no-answer-013",
+      "no-answer-014",
+      "no-answer-015",
+      "no-answer-016",
+      "no-answer-018",
+      "no-answer-019",
+      "no-answer-020"
+    ],
+    "validation_case_ids": [
+      "2",
+      "single-011",
+      "single-015",
+      "single-016",
+      "single-022",
+      "single-030",
+      "single-035",
+      "single-038",
+      "multi-005",
+      "multi-010",
+      "multi-011",
+      "multi-014",
+      "hard-003",
+      "hard-008",
+      "hard-011",
+      "hard-017",
+      "no-answer-004",
+      "no-answer-007",
+      "no-answer-008",
+      "no-answer-017"
+    ],
+    "strata": {
+      "hard|unknown|answerable": {
+        "total": 20,
+        "train": 16,
+        "validation": 4
+      },
+      "multi-source|unknown|answerable": {
+        "total": 20,
+        "train": 16,
+        "validation": 4
+      },
+      "no-answer|unknown|no_answer": {
+        "total": 20,
+        "train": 16,
+        "validation": 4
+      },
+      "single-source|unknown|answerable": {
+        "total": 40,
+        "train": 32,
+        "validation": 8
+      }
+    }
+  },
+  "validation": {
+    "current": {
+      "overall": {
+        "abstention_accuracy": 0.95,
+        "recall": 0.96875,
+        "mrr": 1.0,
+        "ndcg": 0.9758216995478411,
+        "requirement_coverage": 1.0,
+        "latency_p50_ms": 140.26261400431395,
+        "latency_p95_ms": 171.0219340166077,
+        "sample_count": 20.0,
+        "answerable_sample_count": 16.0,
+        "no_answer_sample_count": 4.0
+      },
+      "slices": {
+        "query_type": {
+          "hard": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 143.39632308110595,
+            "latency_p95_ms": 171.0219340166077,
+            "sample_count": 4.0
+          },
+          "multi-source": {
+            "abstention_accuracy": 0.75,
+            "recall": 0.875,
+            "mrr": 1.0,
+            "ndcg": 0.9032867981913646,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 131.9954820210114,
+            "latency_p95_ms": 140.26261400431395,
+            "sample_count": 4.0
+          },
+          "no-answer": {
+            "abstention_accuracy": 1.0,
+            "latency_p50_ms": 142.71084195934236,
+            "latency_p95_ms": 207.3127629701048,
+            "sample_count": 4.0
+          },
+          "single-source": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 108.65491104777902,
+            "latency_p95_ms": 153.94218801520765,
+            "sample_count": 8.0
+          }
+        },
+        "doc_type": {
+          "unknown": {
+            "abstention_accuracy": 0.95,
+            "recall": 0.96875,
+            "mrr": 1.0,
+            "ndcg": 0.9758216995478411,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 140.26261400431395,
+            "latency_p95_ms": 171.0219340166077,
+            "sample_count": 20.0
+          }
+        },
+        "chunk_type": {
+          "list": {
+            "abstention_accuracy": 0.6666666666666666,
+            "recall": 0.8333333333333334,
+            "mrr": 1.0,
+            "ndcg": 0.8710490642551528,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 129.28707001265138,
+            "latency_p95_ms": 141.50689705275,
+            "sample_count": 3.0
+          },
+          "prose": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 140.50357602536678,
+            "latency_p95_ms": 207.3127629701048,
+            "sample_count": 17.0
+          }
+        }
+      },
+      "rows": [
+        {
+          "case_id": "2",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 98.09900098480284
+        },
+        {
+          "case_id": "single-011",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 101.65964404586703
+        },
+        {
+          "case_id": "single-015",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 108.65491104777902
+        },
+        {
+          "case_id": "single-016",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "list",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 103.7932860199362
+        },
+        {
+          "case_id": "single-022",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 136.7683820426464
+        },
+        {
+          "case_id": "single-030",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 145.03913698717952
+        },
+        {
+          "case_id": "single-035",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 153.94218801520765
+        },
+        {
+          "case_id": "single-038",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "list",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 141.50689705275
+        },
+        {
+          "case_id": "multi-005",
+          "query_type": "multi-source",
+          "doc_type": "unknown",
+          "chunk_type": "list",
+          "metrics": {
+            "abstention_accuracy": 0.0,
+            "recall": 0.5,
+            "mrr": 1.0,
+            "ndcg": 0.6131471927654584,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 129.28707001265138
+        },
+        {
+          "case_id": "multi-010",
+          "query_type": "multi-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 140.26261400431395
+        },
+        {
+          "case_id": "multi-011",
+          "query_type": "multi-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 133.89823003672063
+        },
+        {
+          "case_id": "multi-014",
+          "query_type": "multi-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 131.9954820210114
+        },
+        {
+          "case_id": "hard-003",
+          "query_type": "hard",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 140.50357602536678
+        },
+        {
+          "case_id": "hard-008",
+          "query_type": "hard",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 143.39632308110595
+        },
+        {
+          "case_id": "hard-011",
+          "query_type": "hard",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 145.23940603248775
+        },
+        {
+          "case_id": "hard-017",
+          "query_type": "hard",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 171.0219340166077
+        },
+        {
+          "case_id": "no-answer-004",
+          "query_type": "no-answer",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0
+          },
+          "latency_ms": 207.3127629701048
+        },
+        {
+          "case_id": "no-answer-007",
+          "query_type": "no-answer",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0
+          },
+          "latency_ms": 137.4400689965114
+        },
+        {
+          "case_id": "no-answer-008",
+          "query_type": "no-answer",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0
+          },
+          "latency_ms": 144.56827100366354
+        },
+        {
+          "case_id": "no-answer-017",
+          "query_type": "no-answer",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0
+          },
+          "latency_ms": 142.71084195934236
+        }
+      ]
+    },
+    "recommended": {
+      "overall": {
+        "abstention_accuracy": 0.95,
+        "recall": 1.0,
+        "mrr": 1.0,
+        "ndcg": 0.9868991549718441,
+        "requirement_coverage": 1.0,
+        "latency_p50_ms": 140.26261400431395,
+        "latency_p95_ms": 171.0219340166077,
+        "sample_count": 20.0,
+        "answerable_sample_count": 16.0,
+        "no_answer_sample_count": 4.0
+      },
+      "slices": {
+        "query_type": {
+          "hard": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 143.39632308110595,
+            "latency_p95_ms": 171.0219340166077,
+            "sample_count": 4.0
+          },
+          "multi-source": {
+            "abstention_accuracy": 0.75,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 0.9475966198873765,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 131.9954820210114,
+            "latency_p95_ms": 140.26261400431395,
+            "sample_count": 4.0
+          },
+          "no-answer": {
+            "abstention_accuracy": 1.0,
+            "latency_p50_ms": 142.71084195934236,
+            "latency_p95_ms": 207.3127629701048,
+            "sample_count": 4.0
+          },
+          "single-source": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 108.65491104777902,
+            "latency_p95_ms": 153.94218801520765,
+            "sample_count": 8.0
+          }
+        },
+        "doc_type": {
+          "unknown": {
+            "abstention_accuracy": 0.95,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 0.9868991549718441,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 140.26261400431395,
+            "latency_p95_ms": 171.0219340166077,
+            "sample_count": 20.0
+          }
+        },
+        "chunk_type": {
+          "list": {
+            "abstention_accuracy": 0.6666666666666666,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 0.9301288265165021,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 129.28707001265138,
+            "latency_p95_ms": 141.50689705275,
+            "sample_count": 3.0
+          },
+          "prose": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0,
+            "latency_p50_ms": 140.50357602536678,
+            "latency_p95_ms": 207.3127629701048,
+            "sample_count": 17.0
+          }
+        }
+      },
+      "rows": [
+        {
+          "case_id": "2",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 98.09900098480284
+        },
+        {
+          "case_id": "single-011",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 101.65964404586703
+        },
+        {
+          "case_id": "single-015",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 108.65491104777902
+        },
+        {
+          "case_id": "single-016",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "list",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 103.7932860199362
+        },
+        {
+          "case_id": "single-022",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 136.7683820426464
+        },
+        {
+          "case_id": "single-030",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 145.03913698717952
+        },
+        {
+          "case_id": "single-035",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 153.94218801520765
+        },
+        {
+          "case_id": "single-038",
+          "query_type": "single-source",
+          "doc_type": "unknown",
+          "chunk_type": "list",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 141.50689705275
+        },
+        {
+          "case_id": "multi-005",
+          "query_type": "multi-source",
+          "doc_type": "unknown",
+          "chunk_type": "list",
+          "metrics": {
+            "abstention_accuracy": 0.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 0.7903864795495061,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 129.28707001265138
+        },
+        {
+          "case_id": "multi-010",
+          "query_type": "multi-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 140.26261400431395
+        },
+        {
+          "case_id": "multi-011",
+          "query_type": "multi-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 133.89823003672063
+        },
+        {
+          "case_id": "multi-014",
+          "query_type": "multi-source",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 131.9954820210114
+        },
+        {
+          "case_id": "hard-003",
+          "query_type": "hard",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 140.50357602536678
+        },
+        {
+          "case_id": "hard-008",
+          "query_type": "hard",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 143.39632308110595
+        },
+        {
+          "case_id": "hard-011",
+          "query_type": "hard",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 145.23940603248775
+        },
+        {
+          "case_id": "hard-017",
+          "query_type": "hard",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0,
+            "recall": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "requirement_coverage": 1.0
+          },
+          "latency_ms": 171.0219340166077
+        },
+        {
+          "case_id": "no-answer-004",
+          "query_type": "no-answer",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0
+          },
+          "latency_ms": 207.3127629701048
+        },
+        {
+          "case_id": "no-answer-007",
+          "query_type": "no-answer",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0
+          },
+          "latency_ms": 137.4400689965114
+        },
+        {
+          "case_id": "no-answer-008",
+          "query_type": "no-answer",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0
+          },
+          "latency_ms": 144.56827100366354
+        },
+        {
+          "case_id": "no-answer-017",
+          "query_type": "no-answer",
+          "doc_type": "unknown",
+          "chunk_type": "prose",
+          "metrics": {
+            "abstention_accuracy": 1.0
+          },
+          "latency_ms": 142.71084195934236
+        }
+      ]
+    },
+    "comparison_to_current": {
+      "abstention_accuracy": {
+        "candidate": 0.95,
+        "reference": 0.95,
+        "delta": 0.0
+      },
+      "recall": {
+        "candidate": 1.0,
+        "reference": 0.96875,
+        "delta": 0.03125
+      },
+      "mrr": {
+        "candidate": 1.0,
+        "reference": 1.0,
+        "delta": 0.0
+      },
+      "ndcg": {
+        "candidate": 0.9868991549718441,
+        "reference": 0.9758216995478411,
+        "delta": 0.011077455424002958
+      },
+      "requirement_coverage": {
+        "candidate": 1.0,
+        "reference": 1.0,
+        "delta": 0.0
+      },
+      "latency_p50_ms": {
+        "candidate": 140.26261400431395,
+        "reference": 140.26261400431395,
+        "delta": 0.0
+      },
+      "latency_p95_ms": {
+        "candidate": 171.0219340166077,
+        "reference": 171.0219340166077,
+        "delta": 0.0
+      },
+      "sample_count": {
+        "candidate": 20.0,
+        "reference": 20.0,
+        "delta": 0.0
+      },
+      "answerable_sample_count": {
+        "candidate": 16.0,
+        "reference": 16.0,
+        "delta": 0.0
+      },
+      "no_answer_sample_count": {
+        "candidate": 4.0,
+        "reference": 4.0,
+        "delta": 0.0
+      }
+    },
+    "baseline": {
+      "abstention_accuracy": 0.95,
+      "recall": 1.0,
+      "mrr": 1.0,
+      "ndcg": 0.9868991549718441,
+      "requirement_coverage": 1.0,
+      "latency_p50_ms": 140.26261400431395,
+      "latency_p95_ms": 171.0219340166077,
+      "sample_count": 20.0,
+      "answerable_sample_count": 16.0,
+      "no_answer_sample_count": 4.0
+    },
+    "comparison_to_baseline": {
+      "abstention_accuracy": {
+        "candidate": 0.95,
+        "reference": 0.95,
+        "delta": 0.0
+      },
+      "recall": {
+        "candidate": 1.0,
+        "reference": 1.0,
+        "delta": 0.0
+      },
+      "mrr": {
+        "candidate": 1.0,
+        "reference": 1.0,
+        "delta": 0.0
+      },
+      "ndcg": {
+        "candidate": 0.9868991549718441,
+        "reference": 0.9868991549718441,
+        "delta": 0.0
+      },
+      "requirement_coverage": {
+        "candidate": 1.0,
+        "reference": 1.0,
+        "delta": 0.0
+      },
+      "latency_p50_ms": {
+        "candidate": 140.26261400431395,
+        "reference": 140.26261400431395,
+        "delta": 0.0
+      },
+      "latency_p95_ms": {
+        "candidate": 171.0219340166077,
+        "reference": 171.0219340166077,
+        "delta": 0.0
+      },
+      "sample_count": {
+        "candidate": 20.0,
+        "reference": 20.0,
+        "delta": 0.0
+      },
+      "answerable_sample_count": {
+        "candidate": 16.0,
+        "reference": 16.0,
+        "delta": 0.0
+      },
+      "no_answer_sample_count": {
+        "candidate": 4.0,
+        "reference": 4.0,
+        "delta": 0.0
+      }
+    },
+    "confidence": {
+      "method": "deterministic_percentile_bootstrap",
+      "level": 0.95,
+      "iterations": 2000,
+      "candidate": {
+        "abstention_accuracy": {
+          "estimate": 0.95,
+          "lower": 0.85,
+          "upper": 1.0,
+          "sample_count": 20.0
+        },
+        "mrr": {
+          "estimate": 1.0,
+          "lower": 1.0,
+          "upper": 1.0,
+          "sample_count": 16.0
+        },
+        "ndcg": {
+          "estimate": 0.9868991549718441,
+          "lower": 0.9580772959099012,
+          "upper": 1.0,
+          "sample_count": 16.0
+        },
+        "recall": {
+          "estimate": 1.0,
+          "lower": 1.0,
+          "upper": 1.0,
+          "sample_count": 16.0
+        },
+        "requirement_coverage": {
+          "estimate": 1.0,
+          "lower": 1.0,
+          "upper": 1.0,
+          "sample_count": 16.0
+        },
+        "latency_p95_ms": {
+          "estimate": 171.0219340166077,
+          "lower": 145.03913698717952,
+          "upper": 207.3127629701048,
+          "sample_count": 20.0
+        }
+      },
+      "candidate_minus_current": {
+        "abstention_accuracy": {
+          "estimate": 0.0,
+          "lower": 0.0,
+          "upper": 0.0,
+          "sample_count": 20.0
+        },
+        "mrr": {
+          "estimate": 0.0,
+          "lower": 0.0,
+          "upper": 0.0,
+          "sample_count": 20.0
+        },
+        "ndcg": {
+          "estimate": 0.011165686545776505,
+          "lower": 0.0,
+          "upper": 0.03544785735680955,
+          "sample_count": 20.0
+        },
+        "recall": {
+          "estimate": 0.031498903963039025,
+          "lower": 0.0,
+          "upper": 0.1,
+          "sample_count": 20.0
+        },
+        "requirement_coverage": {
+          "estimate": 0.0,
+          "lower": 0.0,
+          "upper": 0.0,
+          "sample_count": 20.0
+        },
+        "latency_p95_ms": {
+          "estimate": 0.0,
+          "lower": 0.0,
+          "upper": 0.0,
+          "sample_count": 20.0
+        }
+      }
+    }
+  },
+  "gate": {
+    "passed": true,
+    "checks": [
+      {
+        "kind": "minimum",
+        "metric": "recall",
+        "actual": 1.0,
+        "threshold": 0.95,
+        "reference": null,
+        "point_estimate": 1.0,
+        "bound": "lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum",
+        "metric": "mrr",
+        "actual": 1.0,
+        "threshold": 0.95,
+        "reference": null,
+        "point_estimate": 1.0,
+        "bound": "lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum",
+        "metric": "ndcg",
+        "actual": 0.9580772959099012,
+        "threshold": 0.9,
+        "reference": null,
+        "point_estimate": 0.9868991549718441,
+        "bound": "lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum",
+        "metric": "requirement_coverage",
+        "actual": 1.0,
+        "threshold": 0.9,
+        "reference": null,
+        "point_estimate": 1.0,
+        "bound": "lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum",
+        "metric": "abstention_accuracy",
+        "actual": 0.85,
+        "threshold": 0.8,
+        "reference": null,
+        "point_estimate": 0.95,
+        "bound": "lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum",
+        "metric": "latency_p95_ms",
+        "actual": 207.3127629701048,
+        "threshold": 750.0,
+        "reference": null,
+        "point_estimate": 171.0219340166077,
+        "bound": "upper",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum_regression",
+        "metric": "recall",
+        "actual": -0.0,
+        "threshold": 0.01,
+        "reference": 0.96875,
+        "point_estimate": -0.03125,
+        "bound": "paired_lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum_regression",
+        "metric": "mrr",
+        "actual": -0.0,
+        "threshold": 0.01,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": "paired_lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum_regression",
+        "metric": "ndcg",
+        "actual": -0.0,
+        "threshold": 0.01,
+        "reference": 0.9758216995478411,
+        "point_estimate": -0.011077455424002958,
+        "bound": "paired_lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum_regression",
+        "metric": "requirement_coverage",
+        "actual": -0.0,
+        "threshold": 0.01,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": "paired_lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": -0.0,
+        "threshold": 0.01,
+        "reference": 0.95,
+        "point_estimate": 0.0,
+        "bound": "paired_lower",
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "baseline_maximum_regression",
+        "metric": "recall",
+        "actual": 0.0,
+        "threshold": 0.01,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "baseline_maximum_regression",
+        "metric": "mrr",
+        "actual": 0.0,
+        "threshold": 0.01,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "baseline_maximum_regression",
+        "metric": "ndcg",
+        "actual": 0.0,
+        "threshold": 0.01,
+        "reference": 0.9868991549718441,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "baseline_maximum_regression",
+        "metric": "requirement_coverage",
+        "actual": 0.0,
+        "threshold": 0.01,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "baseline_maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": 0.0,
+        "threshold": 0.01,
+        "reference": 0.95,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum_samples",
+        "metric": "sample_count",
+        "actual": 20.0,
+        "threshold": 20.0,
+        "reference": null,
+        "point_estimate": null,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum_samples",
+        "metric": "answerable_sample_count",
+        "actual": 16.0,
+        "threshold": 15.0,
+        "reference": null,
+        "point_estimate": null,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "minimum_samples",
+        "metric": "no_answer_sample_count",
+        "actual": 4.0,
+        "threshold": 4.0,
+        "reference": null,
+        "point_estimate": null,
+        "bound": null,
+        "slice_dimension": null,
+        "slice_name": null,
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "recall",
+        "actual": 0.0,
+        "threshold": 0.15,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "hard",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "mrr",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "hard",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "ndcg",
+        "actual": 0.0,
+        "threshold": 0.15,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "hard",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "requirement_coverage",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "hard",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": 0.0,
+        "threshold": 0.25,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "hard",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "recall",
+        "actual": -0.125,
+        "threshold": 0.15,
+        "reference": 0.875,
+        "point_estimate": -0.125,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "multi-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "mrr",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "multi-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "ndcg",
+        "actual": -0.04430982169601194,
+        "threshold": 0.15,
+        "reference": 0.9032867981913646,
+        "point_estimate": -0.04430982169601194,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "multi-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "requirement_coverage",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "multi-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": 0.0,
+        "threshold": 0.25,
+        "reference": 0.75,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "multi-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": 0.0,
+        "threshold": 0.25,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "no-answer",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "recall",
+        "actual": 0.0,
+        "threshold": 0.15,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "single-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "mrr",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "single-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "ndcg",
+        "actual": 0.0,
+        "threshold": 0.15,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "single-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "requirement_coverage",
+        "actual": 0.0,
+        "threshold": 0.1,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "single-source",
+        "passed": true,
+        "failure_reason": null
+      },
+      {
+        "kind": "slice_maximum_regression",
+        "metric": "abstention_accuracy",
+        "actual": 0.0,
+        "threshold": 0.25,
+        "reference": 1.0,
+        "point_estimate": 0.0,
+        "bound": null,
+        "slice_dimension": "query_type",
+        "slice_name": "single-source",
+        "passed": true,
+        "failure_reason": null
+      }
+    ]
+  },
+  "promotion": {
+    "status": "eligible",
+    "eligible": true,
+    "failed_check_count": 0,
+    "baseline_written": false,
+    "baseline_path": null
+  }
+}

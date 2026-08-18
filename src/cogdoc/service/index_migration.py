@@ -21,6 +21,7 @@ from cogdoc.service.kb_locks import kb_write_lock
 from cogdoc.service.kb_state import KBState
 from cogdoc.service.retriever_factory import RetrieverFactory
 from cogdoc.tools.chunk_identity import CHUNK_IDENTITY_VERSION
+from cogdoc.tools.manifest import save_index_manifest
 
 
 ProgressCallback = Callable[[Mapping[str, Any]], None]
@@ -104,12 +105,14 @@ class IndexMigrationRunner:
         source_dir_for: Callable[[str], str] | None = None,
         knowledge_store: Any = None,
         refresh_derived_knowledge: Callable[[str], None] | None = None,
+        save_manifest: Callable[[dict[str, Any]], None] = save_index_manifest,
     ):
         self.store = store or IndexMigrationStore()
         self._build = build
         self._source_dir_for = source_dir_for or get_settings().kb_source_dir
         self._knowledge_store = knowledge_store
         self._refresh_derived = refresh_derived_knowledge
+        self._save_manifest = save_manifest
 
     def plan(self, records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         items = []
@@ -245,9 +248,31 @@ class IndexMigrationRunner:
             storage_id = str(item["storage_id"])
             try:
                 with kb_write_lock(storage_id):
-                    replaced = KBState(storage_id).rollback_active(
+                    state = KBState(storage_id)
+                    replaced = state.rollback_active(
                         str(item["previous_generation_id"])
                     )
+                    active = state.active()
+                    if active is None:
+                        raise RuntimeError("rolled-back generation is not active")
+                    try:
+                        self._save_manifest(
+                            {
+                                "doc_id": storage_id,
+                                "documents": list(active.get("documents") or []),
+                                "chunk_identity_version": str(
+                                    active.get("chunk_identity_version") or ""
+                                ),
+                                "index_build_version": str(
+                                    active.get("index_build_version") or ""
+                                ),
+                            }
+                        )
+                    except Exception:
+                        # Keep state and manifest on the migrated generation when
+                        # restoring the previous manifest cannot be committed.
+                        state.rollback_active(replaced)
+                        raise
                     RetrieverFactory.invalidate(storage_id)
                 item.update(
                     status="rolled_back",
