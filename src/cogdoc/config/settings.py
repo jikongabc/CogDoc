@@ -713,6 +713,50 @@ class Settings(BaseSettings):
         le=1.0,
         validation_alias="CLAIM_VERIFICATION_OPERATIONAL_MAX_ERROR_RATE",
     )
+    # Human review sampling is explicitly opt-in because sampled rows contain
+    # claim text and bounded cited-evidence excerpts.
+    claim_verification_review_sample_percent: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        validation_alias="CLAIM_VERIFICATION_REVIEW_SAMPLE_PERCENT",
+    )
+    claim_verification_review_sample_seed: str = Field(
+        default="cogdoc-review-v1",
+        min_length=1,
+        max_length=128,
+        validation_alias="CLAIM_VERIFICATION_REVIEW_SAMPLE_SEED",
+    )
+    claim_verification_review_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        validation_alias="CLAIM_VERIFICATION_REVIEW_RETENTION_DAYS",
+    )
+    claim_verification_review_max_per_tenant: int = Field(
+        default=10000,
+        ge=100,
+        le=100000,
+        validation_alias="CLAIM_VERIFICATION_REVIEW_MAX_PER_TENANT",
+    )
+    claim_verification_review_max_claims_per_response: int = Field(
+        default=5,
+        ge=1,
+        le=40,
+        validation_alias="CLAIM_VERIFICATION_REVIEW_MAX_CLAIMS_PER_RESPONSE",
+    )
+    claim_verification_review_max_evidence_per_claim: int = Field(
+        default=6,
+        ge=1,
+        le=12,
+        validation_alias="CLAIM_VERIFICATION_REVIEW_MAX_EVIDENCE_PER_CLAIM",
+    )
+    claim_verification_review_max_chars_per_evidence: int = Field(
+        default=1600,
+        ge=200,
+        le=8000,
+        validation_alias="CLAIM_VERIFICATION_REVIEW_MAX_CHARS_PER_EVIDENCE",
+    )
     claim_verification_max_claims: int = Field(
         default=40,
         ge=1,

@@ -565,6 +565,7 @@ chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{
 - **归因反馈权重** — 正向反馈（点赞或高于中性的评分）可提升其引用/evidence chunk。点踩、纠错和低于中性的评分只有在明确标记 `feedback_type=bad_retrieval` 时才生成负检索权重；其他答案质量问题不会误罚可能正确的证据。`skip_retrieval_feedback=true` 会让该条反馈的正负调权全部跳过。
 - **生成 + 引用自愈** — `Generator`（OpenAI 兼容；云端 `deepseek-chat` 或本地 `qwen2.5:7b`，`temperature = 0.2`）把文档包装为 `<Document source=… page=… chunk_id=…>` 并强制 `[source:Pn]` 标签。`validate_citations_native`（Rust）返回结构化的 `missing_citations` / `invalid_sources` / `invalid_pages`；`citation_node` 把失败转成 critique，循环 `generate → citation` 至 `max_iteration_count`（默认 `2`）。只有通过物理引用校验的回答才会离开任务子图。
 - **父图声明核验的分阶段发布** — `CLAIM_VERIFICATION_MODE=off|shadow|enforce` 控制 QA、Summary、Compare 在物理引用校验后的行为。`CLAIM_VERIFICATION_ROLLOUT_PERCENT` 将确定性、按会话粘性的流量桶提升到配置模式：未命中的 `shadow` 流量回退 `off`，未命中的 `enforce` 流量回退 `shadow`；修改 `CLAIM_VERIFICATION_ROLLOUT_SEED` 会有意重新分桶。`off` 跳过模型校验器；`shadow` 执行同一套声明/证据审计，但绝不修复、阻断或改写实际交付答案，只记录 `would_allow`、`would_repair` 或 `would_block`，且会被拦截的候选不会进入 Agent 记忆；`enforce` 才启用有限修复与 fail-closed 拒答。`ClaimEvidenceVerifierAgent` 只依据每条声明显式引用的证据判定支持度。修订答案必须先通过确定性引用复检，再重新执行语义审计；修复次数由 `CLAIM_VERIFICATION_MAX_REPAIR_ATTEMPTS` 限定（默认 `1`）。仅当新 mode 未设置时，旧配置 `CLAIM_VERIFICATION_ENABLED=true` 才兼容映射为 `enforce`。
+- **遵守 ACL 的声明核验人工判卷队列** — 人工抽样默认关闭；显式开启后只确定性保留声明、模型判定及该声明精确引用的有界证据快照，不保存问题、完整答案、会话、trace ID 或原始分桶身份。Reviewer 接口提供 keyset 分页、按需详情、乐观并发标注和评测兼容导出。每次列表、详情、标注及导出都会重新检查租户、KB 与 source ACL，因此权限撤销后旧快照立即不可见。
 
   每个最终 Chat 响应的有界 `claim_verification` 投影会公开不含身份的策略 ID、配置/实际模式、百分比、桶位与决策；trace 保存同一份安全摘要。Prometheus 在原决策计数器之外提供 `cogdoc_claim_verification_cohorts_total{task_type,configured_mode,effective_mode,selected}`。建议按 `off → shadow 5/25/100% →` 通过人工基线发布门禁 `→ enforce 5/25/100%` 上线；提升百分比期间保持 seed 不变，已有会话才会保持粘性。
 
@@ -752,6 +753,13 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `CLAIM_VERIFICATION_OBSERVATION_MAX_PER_TENANT` | `100000` | 每租户观测记录硬上限 |
 | `CLAIM_VERIFICATION_OPERATIONAL_MIN_SAMPLES` | `200` | 运行就绪所需的非 off 已执行审计样本数 |
 | `CLAIM_VERIFICATION_OPERATIONAL_MAX_ERROR_RATE` | `0.02` | 运行就绪允许的 verifier 最高错误率 |
+| `CLAIM_VERIFICATION_REVIEW_SAMPLE_PERCENT` | `0` | 确定性抽样进入人工判卷队列的比例；默认关闭，样本含声明正文与有界的精确引用证据 |
+| `CLAIM_VERIFICATION_REVIEW_SAMPLE_SEED` | `cogdoc-review-v1` | 独立的确定性判卷抽样种子 |
+| `CLAIM_VERIFICATION_REVIEW_RETENTION_DAYS` | `30` | 人工判卷记录保留天数，范围 `1..365` |
+| `CLAIM_VERIFICATION_REVIEW_MAX_PER_TENANT` | `10000` | 每租户人工判卷记录硬上限 |
+| `CLAIM_VERIFICATION_REVIEW_MAX_CLAIMS_PER_RESPONSE` | `5` | 单个完成响应最多抽取的声明数 |
+| `CLAIM_VERIFICATION_REVIEW_MAX_EVIDENCE_PER_CLAIM` | `6` | 每条声明最多保留的精确引用证据快照数 |
+| `CLAIM_VERIFICATION_REVIEW_MAX_CHARS_PER_EVIDENCE` | `1600` | 每份证据快照的字符上限 |
 | `CLAIM_VERIFICATION_MAX_CLAIMS` | `40` | 每个答案最多可审计的声明片段数；超限内容不会静默放行 |
 | `CLAIM_VERIFICATION_MAX_CLAIMS_PER_BATCH` | `8` | 单次校验器调用最多发送的声明数 |
 | `CLAIM_VERIFICATION_MAX_DOCS_PER_BATCH` | `12` | 单次校验/修复调用最多可见的证据块数 |

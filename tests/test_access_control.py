@@ -524,6 +524,12 @@ def test_role_permission_matrix_is_explicit_and_least_privilege():
             "/v1/claim-verification/observations/summary",
             Permission.REVIEW,
         ),
+        ("GET", "/v1/claim-verification/reviews", Permission.REVIEW),
+        (
+            "POST",
+            "/v1/claim-verification/reviews/r-1/label",
+            Permission.REVIEW,
+        ),
         ("POST", "/v1/principals", Permission.MANAGE_ACCESS),
         ("GET", "/v1/tenants/t-1", Permission.MANAGE_TENANT),
         ("CONNECT", "/v1/unknown", Permission.MANAGE_TENANT),

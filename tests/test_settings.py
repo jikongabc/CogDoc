@@ -62,6 +62,13 @@ def test_settings_defaults_match_current_runtime_contract():
     assert settings.claim_verification_observation_max_per_tenant == 100000
     assert settings.claim_verification_operational_min_samples == 200
     assert settings.claim_verification_operational_max_error_rate == 0.02
+    assert settings.claim_verification_review_sample_percent == 0.0
+    assert settings.claim_verification_review_sample_seed == "cogdoc-review-v1"
+    assert settings.claim_verification_review_retention_days == 30
+    assert settings.claim_verification_review_max_per_tenant == 10000
+    assert settings.claim_verification_review_max_claims_per_response == 5
+    assert settings.claim_verification_review_max_evidence_per_claim == 6
+    assert settings.claim_verification_review_max_chars_per_evidence == 1600
     assert settings.claim_verification_max_claims == 40
     assert settings.claim_verification_max_claims_per_batch == 8
     assert settings.claim_verification_max_docs_per_batch == 12
@@ -207,6 +214,19 @@ def test_claim_verification_observation_settings_are_bounded():
         Settings(_env_file=None, claim_verification_operational_min_samples=0)
     with pytest.raises(ValueError):
         Settings(_env_file=None, claim_verification_operational_max_error_rate=1.1)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_review_sample_percent=100.1)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_review_sample_seed="")
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_review_retention_days=0)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, claim_verification_review_max_per_tenant=99)
+    with pytest.raises(ValueError):
+        Settings(
+            _env_file=None,
+            claim_verification_review_max_chars_per_evidence=199,
+        )
 
 
 def test_legacy_knowledge_threshold_falls_back_to_both_split_channels(monkeypatch):

@@ -16,6 +16,10 @@ from cogdoc.api.claim_verification_store import (
     ClaimVerificationObservationStore,
     SqliteClaimVerificationObservationStore,
 )
+from cogdoc.api.claim_verification_review_store import (
+    ClaimVerificationReviewStore,
+    SqliteClaimVerificationReviewStore,
+)
 from cogdoc.api.derived_knowledge_store import DerivedKnowledgeStore
 from cogdoc.api.feedback_analysis_store import FeedbackAnalysisStore
 from cogdoc.api.feedback_store import FeedbackStore
@@ -211,6 +215,7 @@ def create_app(
     auth_store: AuthStore | None = None,
     resource_access_store: ResourceAccessStore | None = None,
     claim_verification_observation_store: Any | None = None,
+    claim_verification_review_store: Any | None = None,
     self_registration_enabled: bool | None = None,
     offload_workers: int | None = None,
 ) -> FastAPI:
@@ -413,6 +418,10 @@ def create_app(
                     "claim_verification_observation_store",
                     "close_claim_verification_observation_store_on_shutdown",
                 ),
+                (
+                    "claim_verification_review_store",
+                    "close_claim_verification_review_store_on_shutdown",
+                ),
             ):
                 try:
                     active_store = getattr(app.state, store_name, None)
@@ -475,6 +484,19 @@ def create_app(
         )
     )
     app.state.close_claim_verification_observation_store_on_shutdown = False
+    app.state.claim_verification_review_store = (
+        claim_verification_review_store
+        if claim_verification_review_store is not None
+        else ClaimVerificationReviewStore(
+            retention_days=(
+                observation_settings.claim_verification_review_retention_days
+            ),
+            max_per_tenant=(
+                observation_settings.claim_verification_review_max_per_tenant
+            ),
+        )
+    )
+    app.state.close_claim_verification_review_store_on_shutdown = False
     # Create operational telemetry before background managers so both HTTP and
     # post-202 research work share one app-local Prometheus registry.
     app.state.metrics = Metrics()
@@ -796,6 +818,11 @@ _claim_verification_observation_store = SqliteClaimVerificationObservationStore(
     retention_days=_settings.claim_verification_observation_retention_days,
     max_per_tenant=_settings.claim_verification_observation_max_per_tenant,
 )
+_claim_verification_review_store = SqliteClaimVerificationReviewStore(
+    _db_path,
+    retention_days=_settings.claim_verification_review_retention_days,
+    max_per_tenant=_settings.claim_verification_review_max_per_tenant,
+)
 app = create_app(
     state_runtime=_state_runtime,
     close_state_runtime_on_shutdown=True,
@@ -810,8 +837,10 @@ app = create_app(
     auth_store=_auth_store,
     resource_access_store=_resource_access_store,
     claim_verification_observation_store=_claim_verification_observation_store,
+    claim_verification_review_store=_claim_verification_review_store,
     self_registration_enabled=_settings.cogdoc_self_registration_enabled,
 )
 app.state.close_auth_store_on_shutdown = _auth_store is not None
 app.state.close_resource_access_store_on_shutdown = _resource_access_store is not None
 app.state.close_claim_verification_observation_store_on_shutdown = True
+app.state.close_claim_verification_review_store_on_shutdown = True

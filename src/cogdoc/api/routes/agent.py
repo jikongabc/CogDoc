@@ -153,7 +153,7 @@ async def _task_endpoint(
         result.task_type,
         result.raw_output.get("claim_verification_rollout"),
     )
-    record_claim_verification_observation(request, result)
+    record_claim_verification_observation(request, result, kb_id=body.doc_id)
     request.app.state.metrics.observe_retrieval(result.task_type, result.raw_output)
     task_response = chat_result_to_response(
         result, doc_id=external_doc_id, session_id=body.session_id

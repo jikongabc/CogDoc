@@ -80,6 +80,8 @@ class ErrorCode(str, Enum):
     RESEARCH_JOB_STATE_CONFLICT = "RESEARCH_JOB_STATE_CONFLICT"
     RESEARCH_EVIDENCE_STALE = "RESEARCH_EVIDENCE_STALE"
     RESEARCH_CAPACITY_EXHAUSTED = "RESEARCH_CAPACITY_EXHAUSTED"
+    CLAIM_REVIEW_REVISION_CONFLICT = "CLAIM_REVIEW_REVISION_CONFLICT"
+    CLAIM_REVIEW_NOT_FOUND = "CLAIM_REVIEW_NOT_FOUND"
 
 
 # 带查询和知识库标识的请求基类。
@@ -282,6 +284,93 @@ class ClaimVerificationObservationSummaryResponse(ApiModel):
     by_decision: dict[str, int] = Field(default_factory=dict)
     by_task_type: dict[str, int] = Field(default_factory=dict)
     operational_readiness: ClaimVerificationOperationalReadiness
+
+
+ClaimVerdict = Literal[
+    "supported", "unsupported", "insufficient", "not_factual"
+]
+
+
+class ClaimVerificationReviewEvidence(ApiModel):
+    chunk_id: str = Field(min_length=1, max_length=256)
+    source: str = Field(default="", max_length=512)
+    page: int | None = None
+    page_start: int | None = None
+    page_end: int | None = None
+    text: str = Field(default="", max_length=8000)
+    text_truncated: bool = False
+
+
+class ClaimVerificationReviewSummary(ApiModel):
+    review_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    tenant_id: str
+    observed_at: str
+    task_type: Literal["qa", "summary", "compare"]
+    policy_id: str = Field(pattern=r"^[0-9a-f]{16}$")
+    effective_mode: Literal["shadow", "enforce"]
+    decision: str = Field(default="", max_length=32)
+    claim_id: str = Field(min_length=1, max_length=64)
+    claim: str = Field(min_length=1, max_length=8000)
+    actual_verdict: ClaimVerdict
+    reason: str = Field(default="", max_length=1000)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    duration_ms: float | None = Field(default=None, ge=0.0)
+    evidence_complete: bool
+    evidence_count: int = Field(default=0, ge=0, le=12)
+    status: Literal["pending", "reviewed"]
+    expected_verdict: ClaimVerdict | None = None
+    reviewer: str = Field(default="", max_length=160)
+    review_note: str = Field(default="", max_length=2000)
+    reviewed_at: str | None = None
+    revision: int = Field(ge=1)
+
+
+class ClaimVerificationReviewDetail(ClaimVerificationReviewSummary):
+    cited_chunk_ids: list[str] = Field(default_factory=list, max_length=12)
+    supporting_chunk_ids: list[str] = Field(default_factory=list, max_length=12)
+    evidence: list[ClaimVerificationReviewEvidence] = Field(
+        default_factory=list, max_length=12
+    )
+
+
+class ClaimVerificationReviewListResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    tenant_id: str
+    items: list[ClaimVerificationReviewSummary] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class ClaimVerificationReviewLabelRequest(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    expected_verdict: ClaimVerdict
+    expected_revision: int = Field(ge=1)
+    review_note: str = Field(default="", max_length=2000)
+
+    @field_validator("review_note")
+    @classmethod
+    def _strip_review_note(cls, value: str) -> str:
+        return value.strip()
+
+
+class ClaimVerificationReviewExportItem(ApiModel):
+    id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    layer: Literal["qa", "summary", "compare"]
+    claim_id: str
+    claim: str
+    expected_verdict: ClaimVerdict
+    actual_verdict: ClaimVerdict
+    duration_ms: float | None = Field(default=None, ge=0.0)
+    reviewer: str
+    notes: str
+    policy_id: str = Field(pattern=r"^[0-9a-f]{16}$")
+
+
+class ClaimVerificationReviewExportResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    tenant_id: str
+    count: int = Field(ge=0)
+    items: list[ClaimVerificationReviewExportItem] = Field(default_factory=list)
+    next_cursor: str | None = None
 
 
 # 对话接口结构化响应。

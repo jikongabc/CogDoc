@@ -293,6 +293,8 @@ def required_permission(method: str, path: str) -> Permission:
         return Permission.REVIEW
     if normalized_path.startswith("/v1/claim-verification/observations"):
         return Permission.REVIEW
+    if normalized_path.startswith("/v1/claim-verification/reviews"):
+        return Permission.REVIEW
 
     research_permission = _is_research_review(normalized_path, normalized_method)
     if research_permission is not None:

@@ -129,7 +129,9 @@ async def chat(request_body: ChatRequest, request: Request, response: Response):
         result.task_type,
         result.raw_output.get("claim_verification_rollout"),
     )
-    record_claim_verification_observation(request, result)
+    record_claim_verification_observation(
+        request, result, kb_id=request_body.doc_id
+    )
     request.app.state.metrics.observe_retrieval(result.task_type, result.raw_output)
     chat_response = chat_result_to_response(
         result,
@@ -384,7 +386,7 @@ async def chat_stream(request_body: ChatRequest, request: Request):
                 result.task_type,
                 result.raw_output.get("claim_verification_rollout"),
             )
-            record_claim_verification_observation(request, result)
+            record_claim_verification_observation(request, result, kb_id=doc_id)
             request.app.state.metrics.observe_retrieval(
                 result.task_type, result.raw_output
             )
