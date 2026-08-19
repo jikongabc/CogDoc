@@ -119,9 +119,80 @@ class Citation(ApiModel):
     source_type: str = "document"
     knowledge_id: str = ""
     source: str = ""
+    source_id: str = Field(default="", exclude_if=lambda value: not value)
+    source_version_id: str = Field(default="", exclude_if=lambda value: not value)
+    media_type: str = Field(default="", exclude_if=lambda value: not value)
+    location: dict[str, Any] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
     page: int | None = None
     page_start: int | None = None
     page_end: int | None = None
+
+
+class ConnectionCreate(ApiModel):
+    connector_type: Literal[
+        "local-directory",
+        "git",
+        "url",
+        "zotero",
+        "notion",
+        "confluence",
+        "sharepoint",
+        "s3",
+    ]
+    name: str = Field(min_length=1, max_length=160)
+    config: dict[str, Any] = Field(default_factory=dict)
+    secret_env: dict[str, str] = Field(default_factory=dict)
+    workspace_visible: bool = False
+
+
+class ConnectionEnabledUpdate(ApiModel):
+    enabled: bool
+
+
+class Connection(ApiModel):
+    connection_id: str
+    kb_id: str
+    connector_type: str
+    name: str
+    config: dict[str, Any]
+    secret_fields: list[str]
+    workspace_visible: bool
+    enabled: bool
+    created_at: float
+    updated_at: float
+    revision: int
+
+
+class ConnectionList(ApiModel):
+    connections: list[Connection]
+
+
+class ConnectorSyncJob(ApiModel):
+    job_id: str
+    kb_id: str
+    connection_id: str
+    connector_type: str
+    status: str
+    attempt: int
+    pages_processed: int
+    documents_seen: int
+    documents_fetched: int
+    deleted_seen: int
+    bytes_fetched: int
+    error_code: str | None = None
+    error_message: str | None = None
+    retry_at: float | None = None
+    created_at: float
+    started_at: float | None = None
+    updated_at: float
+    finished_at: float | None = None
+    revision: int
+
+
+class ConnectorSyncJobList(ApiModel):
+    jobs: list[ConnectorSyncJob]
 
 
 # 单次引用在最终答案中的位置；偏移是 Unicode code point 的 0-based half-open 区间。
@@ -154,6 +225,12 @@ class CitationLedgerEntry(ApiModel):
     source_type: str = "document"
     knowledge_id: str = ""
     source: str = ""
+    source_id: str = Field(default="", exclude_if=lambda value: not value)
+    source_version_id: str = Field(default="", exclude_if=lambda value: not value)
+    media_type: str = Field(default="", exclude_if=lambda value: not value)
+    location: dict[str, Any] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
     page: int | None = Field(default=None, ge=0, strict=True)
     page_start: int | None = Field(default=None, ge=0, strict=True)
     page_end: int | None = Field(default=None, ge=0, strict=True)
@@ -182,8 +259,10 @@ class CitationLedgerEntry(ApiModel):
             if not self.knowledge_id.strip():
                 raise ValueError("derived knowledge citation requires knowledge_id")
         elif self.source_type == "document":
-            if not self.source.strip() or self.page is None:
-                raise ValueError("document citation requires source and page")
+            if not self.source.strip() or (self.page is None and not self.location):
+                raise ValueError("document citation requires source and location")
+            if self.location and not self.source_version_id.strip():
+                raise ValueError("universal citation requires source_version_id")
         else:
             raise ValueError("unsupported citation source_type")
         return self
@@ -201,6 +280,12 @@ class Evidence(ApiModel):
     knowledge_id: str = ""
     chunk_index: int | None = None
     source: str = ""
+    source_id: str = Field(default="", exclude_if=lambda value: not value)
+    source_version_id: str = Field(default="", exclude_if=lambda value: not value)
+    media_type: str = Field(default="", exclude_if=lambda value: not value)
+    location: dict[str, Any] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
     page: int | None = None
     page_start: int | None = None
     page_end: int | None = None
@@ -273,9 +358,7 @@ class ClaimVerificationObservationSummaryResponse(ApiModel):
     window_start: str
     generated_at: str
     effective_mode_filter: Literal["off", "shadow", "enforce"] | None = None
-    policy_id_filter: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{16}$"
-    )
+    policy_id_filter: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
     total_count: int = Field(default=0, ge=0)
     counts: dict[str, int] = Field(default_factory=dict)
     rates: dict[str, float | None] = Field(default_factory=dict)
@@ -286,9 +369,7 @@ class ClaimVerificationObservationSummaryResponse(ApiModel):
     operational_readiness: ClaimVerificationOperationalReadiness
 
 
-ClaimVerdict = Literal[
-    "supported", "unsupported", "insufficient", "not_factual"
-]
+ClaimVerdict = Literal["supported", "unsupported", "insufficient", "not_factual"]
 
 
 class ClaimVerificationReviewEvidence(ApiModel):
@@ -607,9 +688,7 @@ class ResearchReviewDecision(ApiModel):
     @model_validator(mode="after")
     def _require_decision_note(self):
         if self.decision in {"changes_requested", "accepted_gap"} and not self.note:
-            raise ValueError(
-                f"{self.decision} review requires a non-blank note"
-            )
+            raise ValueError(f"{self.decision} review requires a non-blank note")
         return self
 
 
@@ -661,15 +740,11 @@ class ResearchClaimAuditVerifier(_ResearchAuditPublicModel):
 class ResearchClaimAuditSummary(_ResearchAuditPublicModel):
     status: str = Field(default="not_run", max_length=32)
     reason_code: str = Field(default="", max_length=128)
-    counts: ResearchClaimAuditCounts = Field(
-        default_factory=ResearchClaimAuditCounts
-    )
+    counts: ResearchClaimAuditCounts = Field(default_factory=ResearchClaimAuditCounts)
     metrics: ResearchClaimAuditMetrics = Field(
         default_factory=ResearchClaimAuditMetrics
     )
-    repair: ResearchClaimAuditRepair = Field(
-        default_factory=ResearchClaimAuditRepair
-    )
+    repair: ResearchClaimAuditRepair = Field(default_factory=ResearchClaimAuditRepair)
     verifier: ResearchClaimAuditVerifier = Field(
         default_factory=ResearchClaimAuditVerifier
     )
@@ -688,9 +763,7 @@ class ResearchCoverageAuditSummary(_ResearchAuditPublicModel):
     requirement_count: int = Field(default=0, ge=0, le=16)
     covered_count: int = Field(default=0, ge=0, le=16)
     missing_requirement_ids: list[str] = Field(default_factory=list, max_length=16)
-    repair: ResearchClaimAuditRepair = Field(
-        default_factory=ResearchClaimAuditRepair
-    )
+    repair: ResearchClaimAuditRepair = Field(default_factory=ResearchClaimAuditRepair)
     auditor: ResearchCoverageAuditAuditor = Field(
         default_factory=ResearchCoverageAuditAuditor
     )
@@ -710,9 +783,9 @@ class ResearchPlanSection(ApiModel):
         "unsearched", "missing", "partial", "supported", "contradictory"
     ] = "unsearched"
     evidence_requirement_ids: list[str] = Field(default_factory=list)
-    evidence_requirement_results: list[
-        "ResearchVerificationRequirementResult"
-    ] = Field(default_factory=list)
+    evidence_requirement_results: list["ResearchVerificationRequirementResult"] = Field(
+        default_factory=list
+    )
     evidence: list["ResearchEvidenceItem"] = Field(default_factory=list)
     execution_metrics: dict[str, Any] = Field(default_factory=dict)
     citation_ledger: list[CitationLedgerEntry] = Field(default_factory=list)
@@ -757,6 +830,12 @@ class ResearchEvidenceItem(ApiModel):
     source_type: str = "document"
     knowledge_id: str = ""
     source: str = ""
+    source_id: str = Field(default="", exclude_if=lambda value: not value)
+    source_version_id: str = Field(default="", exclude_if=lambda value: not value)
+    media_type: str = Field(default="", exclude_if=lambda value: not value)
+    location: dict[str, Any] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
     source_sha256: str = ""
     text_hash: str = ""
     page: int | None = None
@@ -858,9 +937,7 @@ class ResearchVerificationSection(ApiModel):
     )
     claim_audit: ResearchClaimAuditSummary
     coverage_audit: ResearchCoverageAuditSummary
-    evidence_commitments: list[ResearchEvidenceCommitment] = Field(
-        default_factory=list
-    )
+    evidence_commitments: list[ResearchEvidenceCommitment] = Field(default_factory=list)
 
 
 class ResearchVerificationSnapshot(ApiModel):
@@ -937,9 +1014,7 @@ class ResearchJob(ApiModel):
         "failed",
     ] = "not_started"
     report_execution_id: str = ""
-    report_execution_nodes: list[ResearchVerificationNode] = Field(
-        default_factory=list
-    )
+    report_execution_nodes: list[ResearchVerificationNode] = Field(default_factory=list)
     report_completed_at: str | None = None
     report: ResearchReportArtifact | None = None
     report_version: int = Field(default=0, ge=0, strict=True)
@@ -1113,6 +1188,12 @@ class Document(ApiModel):
     name: str
     sha256: str = ""
     document_id: str = ""
+    source_id: str = ""
+    version_id: str = ""
+    connector_type: str = "legacy-upload"
+    media_type: str = "application/pdf"
+    kind: str = "file"
+    origin_uri: str | None = None
 
 
 # 知识库来源文件列表响应。
@@ -1288,7 +1369,10 @@ class RetrievalDiagnosticRequest(QueryDocRequest):
             return None
         if set(value) - allowed:
             raise ValueError("route_weights contains an unknown route")
-        if any(not math.isfinite(weight) or weight < 0 or weight > 5 for weight in value.values()):
+        if any(
+            not math.isfinite(weight) or weight < 0 or weight > 5
+            for weight in value.values()
+        ):
             raise ValueError("route weights must be finite numbers between 0 and 5")
         return value
 
@@ -1972,6 +2056,10 @@ def _citation_from_mapping(item: Any) -> Citation:
         source_type=str(data.get("source_type", "document") or "document"),
         knowledge_id=str(data.get("knowledge_id", "") or ""),
         source=str(data.get("source", "") or ""),
+        source_id=str(data.get("source_id", "") or ""),
+        source_version_id=str(data.get("source_version_id", "") or ""),
+        media_type=str(data.get("media_type", "") or ""),
+        location=dict(_as_mapping(data.get("location"))),
         page=page,
         page_start=_int_or_none(data.get("page_start", page)),
         page_end=_int_or_none(data.get("page_end", page)),
@@ -1995,6 +2083,10 @@ def _citation_ledger_entry_from_mapping(item: Any) -> CitationLedgerEntry:
         source_type=str(data.get("source_type", "document") or "document"),
         knowledge_id=str(data.get("knowledge_id", "") or ""),
         source=str(data.get("source", "") or ""),
+        source_id=str(data.get("source_id", "") or ""),
+        source_version_id=str(data.get("source_version_id", "") or ""),
+        media_type=str(data.get("media_type", "") or ""),
+        location=dict(_as_mapping(data.get("location"))),
         page=_int_or_none(data.get("page")),
         page_start=_int_or_none(data.get("page_start")),
         page_end=_int_or_none(data.get("page_end")),
@@ -2022,6 +2114,10 @@ def _evidence_from_mapping(item: Any) -> Evidence:
         knowledge_id=str(data.get("knowledge_id", "") or ""),
         chunk_index=_int_or_none(data.get("chunk_index")),
         source=str(data.get("source", "") or ""),
+        source_id=str(data.get("source_id", "") or ""),
+        source_version_id=str(data.get("source_version_id", "") or ""),
+        media_type=str(data.get("media_type", "") or ""),
+        location=dict(_as_mapping(data.get("location") or data.get("source_location"))),
         page=page,
         page_start=_int_or_none(data.get("page_start", page)),
         page_end=_int_or_none(data.get("page_end", page)),

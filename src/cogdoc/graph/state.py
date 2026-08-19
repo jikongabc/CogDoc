@@ -42,6 +42,19 @@ class DocMeta(TypedDict):
     chunking_strategy_version: NotRequired[str]
     chunk_char_count: NotRequired[int]
     chunk_quality_score: NotRequired[float]
+    source_location: NotRequired[Dict[str, Any]]
+    source_locations: NotRequired[List[Dict[str, Any]]]
+    line_start: NotRequired[int]
+    line_end: NotRequired[int]
+    slide: NotRequired[int]
+    sheet: NotRequired[str]
+    cell_range: NotRequired[str]
+    image: NotRequired[int]
+    source_id: NotRequired[str]
+    source_version_id: NotRequired[str]
+    media_type: NotRequired[str]
+    origin_uri: NotRequired[str]
+    connector_type: NotRequired[str]
 
 
 # retrieval 只保存本次检索产生的动态指标。
@@ -128,6 +141,10 @@ class Evidence(TypedDict, total=False):
     knowledge_id: str
     chunk_index: int
     source: str
+    source_id: str
+    source_version_id: str
+    media_type: str
+    location: Dict[str, Any]
     page: int
     page_start: int
     page_end: int
@@ -144,6 +161,10 @@ class EvidenceLedgerEntry(TypedDict, total=False):
     source_type: str
     knowledge_id: str
     source: str
+    source_id: str
+    source_version_id: str
+    media_type: str
+    location: Dict[str, Any]
     page: int
     page_start: int
     page_end: int
@@ -165,6 +186,10 @@ class CitationLedgerEntry(TypedDict, total=False):
     source_type: str
     knowledge_id: str
     source: str
+    source_id: str
+    source_version_id: str
+    media_type: str
+    location: Dict[str, Any]
     page: int
     page_start: int
     page_end: int
@@ -372,3 +397,12 @@ class ParsedPage(TypedDict):
     source: str
     text: str
     is_ocr_fallback: bool
+    extraction_method: NotRequired[str]
+    ocr_status: NotRequired[str]
+    ocr_provider: NotRequired[str]
+    location: NotRequired[Dict[str, Any]]
+    source_id: NotRequired[str]
+    source_version_id: NotRequired[str]
+    media_type: NotRequired[str]
+    origin_uri: NotRequired[str | None]
+    connector_type: NotRequired[str]

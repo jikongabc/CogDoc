@@ -56,6 +56,15 @@ class FakeEngine:
         return result
 
 
+class FakeTablePage:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def find_tables(self):
+        table = SimpleNamespace(extract=lambda: self._rows)
+        return SimpleNamespace(tables=[table])
+
+
 def _settings(**overrides):
     values = {
         "cogdoc_ocr_enabled": True,
@@ -70,6 +79,24 @@ def test_normalize_ocr_text_removes_form_feed_and_collapses_spacing():
     assert normalize_ocr_text("Ａ  B\r\n\r\n\r\n中文\x0c") == "A B\n\n中文"
 
 
+def test_native_table_dedupe_does_not_drop_table_embedded_in_prose():
+    page = FakeTablePage([["Metric", "Value"], ["Revenue", "42"]])
+
+    rendered = parser._native_tables(
+        page,
+        "The sentence Metric Value Revenue 42 is ordinary prose, not a table row.",
+    )
+
+    assert "| Metric | Value |" in rendered
+    assert "| Revenue | 42 |" in rendered
+
+
+def test_native_table_dedupe_skips_rows_already_emitted_as_lines():
+    page = FakeTablePage([["Metric", "Value"], ["Revenue", "42"]])
+
+    assert parser._native_tables(page, "Metric Value\nRevenue 42") == ""
+
+
 def test_tesseract_engine_uses_stdin_without_shell(monkeypatch):
     calls = []
 
@@ -77,7 +104,9 @@ def test_tesseract_engine_uses_stdin_without_shell(monkeypatch):
         calls.append((command, kwargs))
         return SimpleNamespace(returncode=0, stdout=b" OCR text\n", stderr=b"")
 
-    monkeypatch.setattr("cogdoc.tools.ocr.shutil.which", lambda binary: "/usr/bin/tesseract")
+    monkeypatch.setattr(
+        "cogdoc.tools.ocr.shutil.which", lambda binary: "/usr/bin/tesseract"
+    )
     engine = TesseractOcrEngine(OcrConfig(enabled=True), runner=runner)
 
     result = engine.extract(FakePage())
@@ -170,7 +199,9 @@ def test_ocr_disabled_preserves_short_native_text(monkeypatch):
     monkeypatch.setattr(
         parser.fitz,
         "open",
-        lambda path: FakeDocument([FakePage(short_text, [(0, 0, 200, 20, short_text)])]),
+        lambda path: FakeDocument(
+            [FakePage(short_text, [(0, 0, 200, 20, short_text)])]
+        ),
     )
 
     pages = parser.smart_parse(

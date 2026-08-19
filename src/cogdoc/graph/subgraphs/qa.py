@@ -1005,6 +1005,12 @@ def _generation_evidence(doc: RetrievedDoc) -> Evidence:
         "knowledge_id": str(meta.get("knowledge_id") or ""),
         "chunk_index": cast(int, meta.get("chunk_index", -1)),
         "source": str(meta.get("source") or ""),
+        "source_id": str(meta.get("source_id") or ""),
+        "source_version_id": str(meta.get("source_version_id") or ""),
+        "media_type": str(meta.get("media_type") or ""),
+        "location": dict(meta.get("source_location") or {})
+        if isinstance(meta.get("source_location"), Mapping)
+        else {},
         "page": cast(int, page),
         "page_start": cast(int, meta.get("page_start", page)),
         "page_end": cast(int, meta.get("page_end", page)),

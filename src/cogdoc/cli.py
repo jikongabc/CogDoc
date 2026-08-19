@@ -47,6 +47,7 @@ from cogdoc.tools.manifest import load_index_manifest
 from cogdoc.tools.reranker import BGEReranker
 from cogdoc.tools.retriever.derived_knowledge import DerivedKnowledgeIndex
 from cogdoc.tools.rust_core_loader import ensure_rust_core
+from cogdoc.tools.source_parser import SUPPORTED_EXTENSIONS
 
 # Tab 补全的命令与 /kb 子命令候选。
 COMPLETION_COMMANDS = [
@@ -160,9 +161,9 @@ HELP_TEXT = """\
     /kb use <名称>         切换当前知识库
     /kb rm  <名称>         删除知识库（需确认）
   文档（针对当前知识库）
-    /inbox                 列出 your_documents 收件箱里的 PDF
-    /add <文件名.pdf>      把收件箱里的 PDF 加入当前库并重建索引
-    /add                   把收件箱里所有尚未入库的 PDF 一次性加入
+    /inbox                 列出 your_documents 收件箱里的受支持文档
+    /add <文件名>          把收件箱里的文档加入当前库并重建索引
+    /add                   把收件箱里所有尚未入库的文档一次性加入
     /docs /ls              列出当前库内文档
     /rm  <文件名.pdf>      从当前库移除文档并重建索引
   对话（针对当前知识库，历史持久化）
@@ -254,13 +255,13 @@ class Console:
             return False
         return True
 
-    # 完成 收件箱PDF 列表 处理。
+    # 完成收件箱受支持文档列表处理（保留旧方法名兼容扩展调用）。
     def _inbox_pdfs(self) -> list[str]:
         os.makedirs(self.inbox_dir, exist_ok=True)
         return sorted(
             f
             for f in os.listdir(self.inbox_dir)
-            if f.lower().endswith(".pdf")
+            if os.path.splitext(f)[1].casefold() in SUPPORTED_EXTENSIONS
             and os.path.isfile(os.path.join(self.inbox_dir, f))
         )
 
@@ -297,7 +298,7 @@ class Console:
             print(f"❌ 索引重建失败: {e}")
             return
         if result.document_count == 0:
-            print("⚠️ 当前知识库已无 PDF，索引已清空。")
+            print("⚠️ 当前知识库已无文档，索引已清空。")
         else:
             for d in result.documents:
                 print(f"  -> {d.name}: {d.chunk_count} 个 Chunk")
@@ -406,7 +407,7 @@ class Console:
     def cmd_inbox(self) -> None:
         pdfs = self._inbox_pdfs()
         if not pdfs:
-            print(f"（收件箱 {self.inbox_dir} 里没有 PDF。把 PDF 放进去再 /add。）")
+            print(f"（收件箱 {self.inbox_dir} 里没有受支持文档。放入文件后再 /add。）")
             return
         in_kb = (
             {d.get("name") for d in _kb_documents(self.active_kb)}
@@ -424,25 +425,25 @@ class Console:
             return
         pdfs = self._inbox_pdfs()
         if not pdfs:
-            print(f"（收件箱 {self.inbox_dir} 里没有 PDF。）")
+            print(f"（收件箱 {self.inbox_dir} 里没有受支持文档。）")
             return
         if arg:
             name = os.path.basename(arg)
             if name not in pdfs:
-                print(f"⚠️ 收件箱里找不到该 PDF: {name}（用 /inbox 查看）")
+                print(f"⚠️ 收件箱里找不到该文档: {name}（用 /inbox 查看）")
                 return
             targets = [name]
         else:
             existing = {d.get("name") for d in _kb_documents(self.active_kb)}
             targets = [f for f in pdfs if f not in existing]
             if not targets:
-                print("收件箱里没有需要新增的 PDF。")
+                print("收件箱里没有需要新增的文档。")
                 return
         dst_dir = self.registry.source_dir(self.active_kb)
         os.makedirs(dst_dir, exist_ok=True)
         for f in targets:
             shutil.copy2(os.path.join(self.inbox_dir, f), os.path.join(dst_dir, f))
-        print(f"📎 已复制 {len(targets)} 个 PDF 进知识库源目录，开始同步重建索引...")
+        print(f"📎 已复制 {len(targets)} 个文档进知识库源目录，开始同步重建索引...")
         self._rebuild()
 
     # 完成 cmd文档列表 处理。
@@ -1696,10 +1697,7 @@ class Console:
             if len(tokens) == 1:
                 return KB_SUBCOMMANDS
             if len(tokens) == 2 and tokens[1].lower() in ("use", "rm"):
-                return [
-                    r["kb_id"]
-                    for r in self.registry.list(tenant_id="default")
-                ]
+                return [r["kb_id"] for r in self.registry.list(tenant_id="default")]
             return []
         if cmd in ("/dk", "/knowledge"):
             if len(tokens) == 1:
@@ -1945,7 +1943,7 @@ def main():
     print(BANNER)
     print("=" * 60)
     print("🚀 CogDoc 控制台 | 多知识库 + 多对话 | 输入 /help 查看命令")
-    print(f"📥 收件箱目录: {console.inbox_dir}（把 PDF 放进来，再 /add 入库）")
+    print(f"📥 收件箱目录: {console.inbox_dir}（放入受支持文档，再 /add 入库）")
     records = console.registry.list(tenant_id="default")
     if not records:
         print("ℹ️ 当前还没有知识库。用 /kb new <名称> 创建你的第一个知识库。")

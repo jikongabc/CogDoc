@@ -26,6 +26,10 @@ _SUSPICIOUS_EVIDENCE_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 _PAGE_CITATION_RE = re.compile(r"(?:^|[^A-Za-z0-9])P[\W_]*[0-9]+\s*$", re.IGNORECASE)
+_LOCATION_CITATION_RE = re.compile(
+    r"[^\]\r\n]{1,120}@(slide|sheet|lines|image|section|anchor|region)-",
+    re.IGNORECASE,
+)
 _KNOWLEDGE_CITATION_RE = re.compile(r"^\s*knowledge(?:[\W_]+)\S+", re.IGNORECASE)
 
 
@@ -93,6 +97,128 @@ def _non_negative_int(value: Any) -> int | None:
     return normalized if normalized >= 0 else None
 
 
+def _location(value: Any) -> dict[str, Any]:
+    """Return a bounded, JSON-safe source locator and discard unknown fields."""
+
+    raw = _mapping(value)
+    location: dict[str, Any] = {}
+    for field in (
+        "page_start",
+        "page_end",
+        "line_start",
+        "line_end",
+        "slide",
+        "image",
+    ):
+        normalized = _non_negative_int(raw.get(field))
+        if normalized is not None:
+            location[field] = normalized
+    for field in ("sheet", "cell_range", "anchor"):
+        text = str(raw.get(field) or "").strip()
+        if text:
+            location[field] = text[:512]
+    section_path = raw.get("section_path")
+    if isinstance(section_path, Sequence) and not isinstance(
+        section_path, (str, bytes)
+    ):
+        values = [str(item).strip()[:256] for item in section_path if str(item).strip()]
+        if values:
+            location["section_path"] = values[:32]
+    elif raw.get("section"):
+        location["section_path"] = [str(raw["section"]).strip()[:256]]
+    bbox = raw.get("bbox")
+    if (
+        isinstance(bbox, Sequence)
+        and not isinstance(bbox, (str, bytes))
+        and len(bbox) == 4
+    ):
+        try:
+            coordinates = [float(item) for item in bbox]
+        except (TypeError, ValueError):
+            coordinates = []
+        if coordinates and all(abs(item) < 1e12 for item in coordinates):
+            location["bbox"] = coordinates
+    return location
+
+
+def _locator_label(location: Mapping[str, Any]) -> str:
+    page = _non_negative_int(location.get("page_start"))
+    if page is not None:
+        page_end = _non_negative_int(location.get("page_end"))
+        return f"P{page}" if page_end in (None, page) else f"P{page}-{page_end}"
+    slide = _non_negative_int(location.get("slide"))
+    if slide is not None:
+        return f"slide-{slide}"
+    sheet = citation_source_label(location.get("sheet"))
+    if sheet:
+        cell_range = citation_source_label(location.get("cell_range"))
+        return f"sheet-{sheet}" + (f"!{cell_range}" if cell_range else "")
+    line_start = _non_negative_int(location.get("line_start"))
+    if line_start is not None:
+        line_end = _non_negative_int(location.get("line_end"))
+        return f"lines-{line_start}" + (
+            f"-{line_end}" if line_end not in (None, line_start) else ""
+        )
+    image = _non_negative_int(location.get("image"))
+    if image is not None:
+        return f"image-{image}"
+    section_path = location.get("section_path")
+    if isinstance(section_path, Sequence) and not isinstance(
+        section_path, (str, bytes)
+    ):
+        section = citation_source_label("/".join(str(item) for item in section_path))
+        if section:
+            return f"section-{section}"
+    anchor = citation_source_label(location.get("anchor"))
+    if anchor:
+        return f"anchor-{anchor}"
+    if location.get("bbox"):
+        return "region-bbox"
+    return ""
+
+
+def display_citation_for_entry(entry: Mapping[str, Any]) -> str:
+    """Build the canonical public citation for legacy or universal sources."""
+
+    source_type = str(entry.get("source_type") or "document")
+    if source_type == "derived_knowledge":
+        knowledge_id = str(entry.get("knowledge_id") or "").strip()
+        return f"[knowledge:{knowledge_id}]" if knowledge_id else ""
+    if source_type != "document":
+        return ""
+    source = citation_source_label(entry.get("source"))
+    if not source:
+        return ""
+    locator = _locator_label(_location(entry.get("location")))
+    if locator.startswith("P"):
+        return f"[{source}:{locator}]"
+    if locator:
+        return f"[{source}@{locator}]"
+    page = _non_negative_int(entry.get("page"))
+    return f"[{source}:P{page}]" if page is not None else ""
+
+
+def _document_location(meta: Mapping[str, Any]) -> dict[str, Any]:
+    location = _location(meta.get("source_location") or meta.get("location"))
+    if location:
+        return location
+    locations = meta.get("source_locations")
+    if isinstance(locations, Sequence) and not isinstance(locations, (str, bytes)):
+        normalized = [
+            _location(item) for item in locations if isinstance(item, Mapping)
+        ]
+        normalized = [item for item in normalized if item]
+        if normalized:
+            merged = dict(normalized[0])
+            last_page = normalized[-1].get("page_end") or normalized[-1].get(
+                "page_start"
+            )
+            if "page_start" in merged and last_page is not None:
+                merged["page_end"] = last_page
+            return merged
+    return {}
+
+
 def _chunk_id(doc: Mapping[str, Any]) -> str:
     return str(_mapping(doc.get("meta")).get("chunk_id") or "").strip()
 
@@ -142,11 +268,10 @@ def _display_citation(doc: Mapping[str, Any]) -> str:
             raise CitationLedgerError("derived evidence is missing knowledge_id")
         return f"[knowledge:{knowledge_id}]"
 
-    source = citation_source_label(meta.get("source"))
-    page = _non_negative_int(meta.get("page"))
-    if not source or page is None:
-        raise CitationLedgerError("document evidence is missing source or page")
-    return f"[{source}:P{page}]"
+    display = display_citation_for_entry({**meta, "location": _document_location(meta)})
+    if not display:
+        raise CitationLedgerError("document evidence is missing source or location")
+    return display
 
 
 def _ledger_entry(doc: Mapping[str, Any], evidence_id: str) -> EvidenceLedgerEntry:
@@ -161,6 +286,13 @@ def _ledger_entry(doc: Mapping[str, Any], evidence_id: str) -> EvidenceLedgerEnt
         "span_end": end,
         "display_citation": _display_citation(doc),
     }
+    for field in ("source_id", "source_version_id", "media_type"):
+        value = str(meta.get(field) or "").strip()
+        if value:
+            entry[field] = value
+    location = _document_location(meta)
+    if location:
+        entry["location"] = location
     knowledge_id = str(meta.get("knowledge_id") or "").strip()
     if knowledge_id:
         entry["knowledge_id"] = knowledge_id
@@ -269,6 +401,7 @@ def _looks_like_physical_citation(token: str) -> bool:
     normalized = unicodedata.normalize("NFKC", token)
     return bool(
         _PAGE_CITATION_RE.search(normalized)
+        or _LOCATION_CITATION_RE.search(normalized)
         or _KNOWLEDGE_CITATION_RE.search(normalized)
     )
 
@@ -325,9 +458,7 @@ def _normalized_ledger_entry(raw: Any, *, index: int) -> dict[str, Any]:
         knowledge_id = str(raw.get("knowledge_id") or "").strip()
         expected_display = f"[knowledge:{knowledge_id}]" if knowledge_id else ""
     elif source_type == "document":
-        source = citation_source_label(raw.get("source"))
-        page = _optional_non_negative_int(raw.get("page"), "page")
-        expected_display = f"[{source}:P{page}]" if source and page is not None else ""
+        expected_display = display_citation_for_entry(raw)
     else:
         expected_display = ""
     if not expected_display or display_citation != expected_display:
@@ -345,6 +476,21 @@ def _normalized_ledger_entry(raw: Any, *, index: int) -> dict[str, Any]:
             "display_citation": display_citation,
         }
     )
+    for field in ("source_id", "source_version_id", "media_type"):
+        value = str(raw.get(field) or "").strip()
+        if value:
+            entry[field] = value
+        else:
+            entry.pop(field, None)
+    location = _location(raw.get("location"))
+    if location:
+        if not str(raw.get("source_version_id") or "").strip():
+            raise CitationLedgerError(
+                f"ledger entry {index} universal location is not version-pinned"
+            )
+        entry["location"] = location
+    else:
+        entry.pop("location", None)
     for field in ("page", "page_start", "page_end"):
         normalized = _optional_non_negative_int(raw.get(field), field)
         if normalized is None:
@@ -529,6 +675,14 @@ def render_display_citations(
                 "span_end": int(raw["span_end"]),
                 "occurrences": occurrences,
             }
+            if raw.get("source_id"):
+                entry["source_id"] = str(raw["source_id"])
+            if raw.get("source_version_id"):
+                entry["source_version_id"] = str(raw["source_version_id"])
+            if raw.get("media_type"):
+                entry["media_type"] = str(raw["media_type"])
+            if raw.get("location"):
+                entry["location"] = dict(raw["location"])
             knowledge_id = str(raw.get("knowledge_id") or "").strip()
             if knowledge_id:
                 entry["knowledge_id"] = knowledge_id

@@ -336,6 +336,10 @@ def build_summary_evidence(docs: List[RetrievedDoc]) -> List[Evidence]:
             chunk_id=doc.get("meta", {}).get("chunk_id", ""),
             chunk_index=doc.get("meta", {}).get("chunk_index", -1),
             source=doc.get("meta", {}).get("source", ""),
+            source_id=doc.get("meta", {}).get("source_id", ""),
+            source_version_id=doc.get("meta", {}).get("source_version_id", ""),
+            media_type=doc.get("meta", {}).get("media_type", ""),
+            location=dict(doc.get("meta", {}).get("source_location") or {}),
             page=doc.get("meta", {}).get("page", 0),
             page_start=doc.get("meta", {}).get(
                 "page_start", doc.get("meta", {}).get("page", 0)
@@ -682,8 +686,7 @@ class GlobalSummaryAgent:
         section_contents = [result.get("content", "") for result in render_results]
         evidence_ledger = state.get("evidence_ledger")
         generated_sections = any(
-            result.get("status") in {None, "", "generated"}
-            for result in render_results
+            result.get("status") in {None, "", "generated"} for result in render_results
         )
         if generated_sections and not all_contents_no_evidence(section_contents):
             if evidence_ledger is None:

@@ -232,6 +232,41 @@ def test_display_citation_escapes_filename_syntax_characters() -> None:
     assert validation.is_valid is True
 
 
+def test_universal_spreadsheet_citation_is_version_pinned_and_publicly_valid() -> None:
+    doc = _doc("sheet-chunk", source="metrics.xlsx", page=1)
+    doc["meta"].update(
+        {
+            "source_id": "src-123",
+            "source_version_id": "sv-456",
+            "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "source_location": {"sheet": "FY26", "cell_range": "A1:C8"},
+        }
+    )
+    _, ledger = assign_evidence_ids([doc])
+    rendered = render_display_citations("收入增长。[E001]", ledger)
+
+    assert rendered.answer == "收入增长。[metrics.xlsx@sheet-FY26!A1:C8]"
+    assert rendered.entries[0]["source_id"] == "src-123"
+    assert rendered.entries[0]["source_version_id"] == "sv-456"
+    assert rendered.entries[0]["location"] == {
+        "sheet": "FY26",
+        "cell_range": "A1:C8",
+    }
+    validation = validate_public_citation_ledger(
+        rendered.answer, list(rendered.entries)
+    )
+    assert validation.is_valid is True
+
+
+def test_universal_location_without_source_version_is_rejected() -> None:
+    doc = _doc("slide-chunk", source="deck.pptx", page=1)
+    doc["meta"]["source_location"] = {"slide": 4}
+    _, ledger = assign_evidence_ids([doc])
+
+    with pytest.raises(CitationLedgerError, match="not version-pinned"):
+        render_display_citations("结论。[E001]", ledger)
+
+
 def test_public_ledger_never_contains_sensitive_evidence_text() -> None:
     secret = "PRIVATE-RAW-EVIDENCE-DO-NOT-EXPOSE"
     _, ledger = assign_evidence_ids(

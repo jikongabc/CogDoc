@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 from xml.sax.saxutils import escape
@@ -79,6 +80,16 @@ def render_evidence_block(
 
     source = meta.get("source", "未知文件")
     page = meta.get("page", 1)
+    source_version_id = str(meta.get("source_version_id") or "")
+    source_location = meta.get("source_location")
+    location_attribute = ""
+    if isinstance(source_location, Mapping) and source_location:
+        location_attribute = f' location="{_xml_attribute(json.dumps(dict(source_location), ensure_ascii=False, sort_keys=True, separators=(",", ":")))}"'
+    version_attribute = (
+        f' source_version_id="{_xml_attribute(source_version_id)}"'
+        if source_version_id
+        else ""
+    )
     chunk_id = meta.get("chunk_id", meta.get("chunk_index", 0))
     section_path = str(meta.get("section_path", "") or "").strip()
     chunk_context = str(meta.get("context", "") or "").strip()
@@ -90,6 +101,7 @@ def render_evidence_block(
         f'<Document source="{_xml_attribute(source)}" '
         f'page="{_xml_attribute(page)}" '
         f'chunk_id="{_xml_attribute(chunk_id)}"'
+        f"{version_attribute}{location_attribute}"
         f"{evidence_id_attribute}>\n"
         f"{_xml_text(body)}\n"
         "</Document>"

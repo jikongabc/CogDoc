@@ -45,6 +45,7 @@ from cogdoc.service.kb_locks import kb_write_lock
 from cogdoc.service.kb_state import KBState
 from cogdoc.tools.manifest import load_index_manifest
 from cogdoc.tools.chunk_identity import build_document_id
+from cogdoc.tools.source_parser import SUPPORTED_EXTENSIONS
 
 router = APIRouter(prefix="/v1", tags=["documents"])
 
@@ -204,6 +205,12 @@ def _kb_documents(kb_id: str) -> list[Document]:
             name=doc.get("name", ""),
             sha256=doc.get("sha256", ""),
             document_id=build_document_id(str(doc.get("name", ""))),
+            source_id=str(doc.get("source_id") or ""),
+            version_id=str(doc.get("version_id") or ""),
+            connector_type=str(doc.get("connector_type") or "legacy-upload"),
+            media_type=str(doc.get("media_type") or "application/pdf"),
+            kind=str(doc.get("kind") or "file"),
+            origin_uri=(str(doc.get("origin_uri")) if doc.get("origin_uri") else None),
         )
         for doc in documents
         if doc.get("name")
@@ -504,8 +511,13 @@ async def upload_document(kb_id: str, request: Request, file: UploadFile = File(
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
 
     filename = os.path.basename(file.filename or "")
-    if not filename.lower().endswith(".pdf"):
-        return _error(ErrorCode.INVALID_PDF, "只接受 .pdf 文件", 400)
+    suffix = os.path.splitext(filename)[1].casefold()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        return _error(
+            ErrorCode.INVALID_PDF,
+            "不支持该文件格式；可上传 PDF、Markdown、文本、HTML、Office 文档和图片",
+            400,
+        )
 
     principal = request_principal(request)
     access_store = getattr(request.app.state, "resource_access_store", None)
@@ -536,7 +548,9 @@ async def upload_document(kb_id: str, request: Request, file: UploadFile = File(
                 f"文件超过上限 {settings.max_upload_mb}MB",
                 413,
             )
-    if not content.startswith(_PDF_MAGIC):
+    if suffix != ".pdf" and content.startswith(_PDF_MAGIC):
+        return _error(ErrorCode.INVALID_PDF, "文件内容与扩展名不匹配", 400)
+    if suffix == ".pdf" and not content.startswith(_PDF_MAGIC):
         return _error(ErrorCode.INVALID_PDF, "文件不是合法 PDF", 400)
 
     if access_store is not None:

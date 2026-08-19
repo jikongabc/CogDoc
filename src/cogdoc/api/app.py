@@ -36,6 +36,7 @@ from cogdoc.api.routes import (
     auth_router,
     chat_router,
     claim_verification_router,
+    connections_router,
     documents_router,
     feedback_router,
     health_router,
@@ -218,6 +219,10 @@ def create_app(
     claim_verification_review_store: Any | None = None,
     self_registration_enabled: bool | None = None,
     offload_workers: int | None = None,
+    connection_store: Any | None = None,
+    connector_sync_store: Any | None = None,
+    source_catalog: Any | None = None,
+    sync_manager: Any | None = None,
 ) -> FastAPI:
     if auth_store is not None and resource_access_store is None:
         raise ValueError(
@@ -259,6 +264,7 @@ def create_app(
                 )
             # 必须在拿到单实例锁且变更日志恢复之后对账，避免误改其他实例的任务状态。
             app.state.index_jobs.reconcile_orphans()
+            app.state.sync_manager.recover()
             research_manager = getattr(app.state, "research_execution_manager", None)
             if research_manager is not None:
                 research_manager.reconcile_orphans()
@@ -355,6 +361,16 @@ def create_app(
                     error_class=type(exc).__name__,
                 )
             try:
+                app.state.sync_manager.shutdown(wait=True)
+            except Exception as exc:
+                log_event(
+                    "shutdown",
+                    "sync_manager_shutdown_failed",
+                    {},
+                    level=logging.ERROR,
+                    error_class=type(exc).__name__,
+                )
+            try:
                 # 先排空请求卸载线程池。
                 app.state.offload_executor.shutdown(wait=True)
             except Exception as exc:
@@ -421,6 +437,16 @@ def create_app(
                 (
                     "claim_verification_review_store",
                     "close_claim_verification_review_store_on_shutdown",
+                ),
+                ("connection_store", "close_connection_store_on_shutdown"),
+                (
+                    "connector_sync_store",
+                    "close_connector_sync_store_on_shutdown",
+                ),
+                ("source_catalog", "close_source_catalog_on_shutdown"),
+                (
+                    "external_acl_sync_store",
+                    "close_external_acl_sync_store_on_shutdown",
                 ),
             ):
                 try:
@@ -541,7 +567,10 @@ def create_app(
     app.state.session_store = session_store or SessionStore()
     # 入库注册表/任务管理器可注入，便于测试用假入库函数。
     app.state.kb_registry = kb_registry or KnowledgeBaseRegistry()
-    from cogdoc.service.index_migration import IndexMigrationManager, IndexMigrationRunner
+    from cogdoc.service.index_migration import (
+        IndexMigrationManager,
+        IndexMigrationRunner,
+    )
 
     app.state.index_migration_manager = IndexMigrationManager(
         IndexMigrationRunner(
@@ -569,6 +598,70 @@ def create_app(
                         pass
                 raise
         app.state.index_jobs = index_jobs
+    from cogdoc.connectors.connection_store import ConnectionStore
+    from cogdoc.connectors.manager import SyncManager
+    from cogdoc.connectors.materialized_sink import MaterializedSyncSink
+    from cogdoc.connectors.sync_runtime import ConnectorSyncRuntime
+    from cogdoc.connectors.sync_store import ConnectorSyncStore
+    from cogdoc.service.external_acl import (
+        ExternalAclSynchronizer,
+        ExternalAclSyncStore,
+        WorkspaceIdentityResolver,
+    )
+    from cogdoc.service.source_catalog import SourceCatalog
+
+    connector_db_path = get_settings().state_db_path
+    app.state.connection_store = connection_store or ConnectionStore(connector_db_path)
+    app.state.connector_sync_store = connector_sync_store or ConnectorSyncStore(
+        connector_db_path
+    )
+    app.state.source_catalog = source_catalog or SourceCatalog(connector_db_path)
+    # ``create_app`` is a reusable application-factory seam: a single app may
+    # enter its lifespan repeatedly in embedded deployments and tests. Keep
+    # these process-local SQLite handles alive just like the pre-existing
+    # observation stores; the owning process releases them on exit.
+    app.state.close_connection_store_on_shutdown = False
+    app.state.close_connector_sync_store_on_shutdown = False
+    app.state.close_source_catalog_on_shutdown = False
+    app.state.external_acl_sync_store = ExternalAclSyncStore(connector_db_path)
+    app.state.close_external_acl_sync_store_on_shutdown = False
+
+    class _UnavailableIdentityResolver:
+        def resolve(self, tenant_id, grant):
+            del tenant_id, grant
+            return None
+
+    acl_synchronizer = (
+        ExternalAclSynchronizer(
+            app.state.resource_access_store,
+            (
+                WorkspaceIdentityResolver(app.state.auth_store)
+                if app.state.auth_store is not None
+                else _UnavailableIdentityResolver()
+            ),
+            app.state.external_acl_sync_store,
+        )
+        if app.state.resource_access_store is not None
+        else None
+    )
+
+    def build_sync_sink(connection):
+        return MaterializedSyncSink(
+            source_dir=app.state.kb_registry.source_dir(connection["kb_id"]),
+            catalog=app.state.source_catalog,
+            index_submitter=app.state.index_jobs.submit,
+            index_status_reader=app.state.index_jobs.get,
+            owner_id=connection["owner_id"],
+            workspace_visible=connection["workspace_visible"],
+            acl_sync=acl_synchronizer,
+        )
+
+    app.state.sync_manager = sync_manager or SyncManager(
+        app.state.connection_store,
+        app.state.connector_sync_store,
+        ConnectorSyncRuntime(app.state.connector_sync_store),
+        build_sync_sink,
+    )
     # 有界线程池限制本地算力并发，缓解高并发下精排/嵌入的坏邻居效应。
     app.state.offload_executor = ThreadPoolExecutor(
         max_workers=offload_workers or get_settings().cogdoc_offload_workers,
@@ -777,6 +870,7 @@ def create_app(
 
     app.include_router(chat_router)
     app.include_router(claim_verification_router)
+    app.include_router(connections_router)
     app.include_router(auth_router)
     app.include_router(access_router)
     app.include_router(agent_router)

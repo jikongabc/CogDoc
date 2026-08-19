@@ -6,9 +6,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from cogdoc.tools.citation_ledger import citation_source_label, is_valid_evidence_id
+from cogdoc.tools.citation_ledger import (
+    display_citation_for_entry,
+    is_valid_evidence_id,
+)
 
-_DISPLAY_CITATION_RE = re.compile(r"\[(?:knowledge:[^\]\r\n]+|[^\]\r\n]+:P[0-9]+)\]")
+_DISPLAY_CITATION_RE = re.compile(
+    r"\[(?:knowledge:[^\]\r\n]+|[^\]\r\n]+(?::P[0-9]+(?:-[0-9]+)?|"
+    r"@(?:slide|sheet|lines|image|section|anchor|region)-[^\]\r\n]+))\]"
+)
 _CANONICAL_LIKE_EVIDENCE_ID_RE = re.compile(
     r"(?<![A-Za-z0-9])e[0-9]{3,}(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -63,19 +69,15 @@ def _strict_nonnegative_int(value: Any) -> int | None:
 
 
 def _meaningful(value: Any) -> bool:
-    return value not in (None, "")
+    if value in (None, ""):
+        return False
+    if isinstance(value, Mapping | Sequence) and not isinstance(value, str | bytes):
+        return bool(value)
+    return True
 
 
 def display_citation(entry: Mapping[str, Any]) -> str:
-    source_type = str(entry.get("source_type") or "document")
-    if source_type == "derived_knowledge":
-        knowledge_id = str(entry.get("knowledge_id") or "").strip()
-        return f"[knowledge:{knowledge_id}]" if knowledge_id else ""
-    if source_type != "document":
-        return ""
-    source = citation_source_label(entry.get("source"))
-    page = _strict_nonnegative_int(entry.get("page"))
-    return f"[{source}:P{page}]" if source and page is not None else ""
+    return display_citation_for_entry(entry)
 
 
 def public_citation_occurrences(answer: str) -> list[tuple[int, int, str]]:
@@ -177,7 +179,17 @@ def _evidence_matches(entry: Mapping[str, Any], evidence: Mapping[str, Any]) -> 
     if expected_ids and expected_ids != {str(entry.get("evidence_id") or "")}:
         return False
 
-    for key in ("source", "knowledge_id", "page", "page_start", "page_end"):
+    for key in (
+        "source",
+        "source_id",
+        "source_version_id",
+        "media_type",
+        "location",
+        "knowledge_id",
+        "page",
+        "page_start",
+        "page_end",
+    ):
         expected = evidence.get(key)
         if _meaningful(expected) and entry.get(key) != expected:
             return False
@@ -316,6 +328,11 @@ def validate_public_citation_ledger(
         display = display_citation(entry)
         if not display:
             errors.append("invalid_display_citation")
+        if (
+            entry.get("location")
+            and not str(entry.get("source_version_id") or "").strip()
+        ):
+            errors.append("unversioned_source_location")
 
         matched_evidence: Mapping[str, Any] | None = None
         if evidence_rows is not None:

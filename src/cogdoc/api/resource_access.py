@@ -248,6 +248,7 @@ class ResourceAccessStore:
                 subject_id TEXT NOT NULL,
                 role TEXT NOT NULL
                     CHECK (role IN ('owner', 'admin', 'editor', 'reviewer', 'viewer')),
+                managed_by TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (tenant_id, kb_id, document_key, subject_id)
@@ -314,6 +315,17 @@ class ResourceAccessStore:
                         }
                         if "owner_membership_id" not in refreshed:
                             raise
+            grant_columns = {
+                str(row[1])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(resource_access_subject_grants)"
+                )
+            }
+            if "managed_by" not in grant_columns:
+                self._conn.execute(
+                    "ALTER TABLE resource_access_subject_grants "
+                    "ADD COLUMN managed_by TEXT NOT NULL DEFAULT ''"
+                )
 
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
@@ -746,12 +758,16 @@ class ResourceAccessStore:
                         f"document policy does not exist: {document_key}"
                     )
             existing = self._conn.execute(
-                "SELECT role, created_at, updated_at "
+                "SELECT role, managed_by, created_at, updated_at "
                 "FROM resource_access_subject_grants "
                 "WHERE tenant_id=? AND kb_id=? AND document_key=? AND subject_id=?",
                 (tenant_id, kb_id, document_key, subject_id),
             ).fetchone()
-            changed = existing is None or existing["role"] != normalized_role.value
+            changed = (
+                existing is None
+                or existing["role"] != normalized_role.value
+                or str(existing["managed_by"] or "") != ""
+            )
             if changed:
                 created_at = (
                     str(existing["created_at"]) if existing is not None else now
@@ -759,10 +775,11 @@ class ResourceAccessStore:
                 updated_at = now
                 self._conn.execute(
                     "INSERT INTO resource_access_subject_grants "
-                    "(tenant_id, kb_id, document_key, subject_id, role, "
-                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "(tenant_id, kb_id, document_key, subject_id, role, managed_by, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, '', ?, ?) "
                     "ON CONFLICT(tenant_id, kb_id, document_key, subject_id) "
-                    "DO UPDATE SET role=excluded.role, updated_at=excluded.updated_at",
+                    "DO UPDATE SET role=excluded.role, managed_by='', "
+                    "updated_at=excluded.updated_at",
                     (
                         tenant_id,
                         kb_id,
@@ -790,6 +807,125 @@ class ResourceAccessStore:
         }
 
     set_subject_grant = grant_subject
+
+    def replace_managed_document_grants(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        document_id: str,
+        managed_by: str,
+        grants: Sequence[tuple[str, Role | str, str | None]],
+    ) -> dict[str, Any]:
+        """Atomically replace one provider's grants without deleting manual grants."""
+
+        tenant_id = _identity(tenant_id, field="tenant_id")
+        kb_id = _identity(kb_id, field="kb_id")
+        document_id = _identity(document_id, field="document_id")
+        managed_by = _identity(managed_by, field="managed_by")
+        desired: dict[str, tuple[Role, str | None]] = {}
+        for subject_id, role, membership_id in grants:
+            subject = _identity(subject_id, field="subject_id")
+            normalized_role = _role(role)
+            if normalized_role not in {Role.VIEWER, Role.REVIEWER, Role.EDITOR}:
+                raise ValueError("externally managed grants are capped at editor")
+            membership = (
+                _identity(membership_id, field="membership_id")
+                if membership_id is not None
+                else None
+            )
+            previous = desired.get(subject)
+            if previous is not None and previous != (normalized_role, membership):
+                raise ValueError("duplicate managed subject has conflicting grants")
+            desired[subject] = (normalized_role, membership)
+
+        now = _now_iso()
+        applied = 0
+        removed = 0
+        manual_preserved = 0
+        changed = False
+        with self._write_transaction():
+            document = self._conn.execute(
+                "SELECT 1 FROM resource_access_document_policies "
+                "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                (tenant_id, kb_id, document_id),
+            ).fetchone()
+            if document is None:
+                raise ResourceAccessNotFoundError(
+                    f"document policy does not exist: {document_id}"
+                )
+            existing_rows = self._conn.execute(
+                "SELECT subject_id,role,managed_by,created_at FROM "
+                "resource_access_subject_grants WHERE tenant_id=? AND kb_id=? "
+                "AND document_key=?",
+                (tenant_id, kb_id, document_id),
+            ).fetchall()
+            existing = {str(row["subject_id"]): row for row in existing_rows}
+            for subject, row in existing.items():
+                if (
+                    str(row["managed_by"] or "") == managed_by
+                    and subject not in desired
+                ):
+                    self._conn.execute(
+                        "DELETE FROM resource_access_subject_grants WHERE tenant_id=? "
+                        "AND kb_id=? AND document_key=? AND subject_id=? AND managed_by=?",
+                        (tenant_id, kb_id, document_id, subject, managed_by),
+                    )
+                    removed += 1
+                    changed = True
+            for subject, (role, membership_id) in desired.items():
+                self._reject_revoked_membership_locked(
+                    tenant_id, subject, membership_id
+                )
+                row = existing.get(subject)
+                if row is not None and str(row["managed_by"] or "") != managed_by:
+                    manual_preserved += 1
+                    continue
+                if row is None:
+                    self._conn.execute(
+                        "INSERT INTO resource_access_subject_grants "
+                        "(tenant_id,kb_id,document_key,subject_id,role,managed_by,created_at,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            tenant_id,
+                            kb_id,
+                            document_id,
+                            subject,
+                            role.value,
+                            managed_by,
+                            now,
+                            now,
+                        ),
+                    )
+                    changed = True
+                elif str(row["role"]) != role.value:
+                    self._conn.execute(
+                        "UPDATE resource_access_subject_grants SET role=?,updated_at=? "
+                        "WHERE tenant_id=? AND kb_id=? AND document_key=? "
+                        "AND subject_id=? AND managed_by=?",
+                        (
+                            role.value,
+                            now,
+                            tenant_id,
+                            kb_id,
+                            document_id,
+                            subject,
+                            managed_by,
+                        ),
+                    )
+                    changed = True
+                applied += 1
+            epoch = (
+                self._bump_epoch_locked(tenant_id, kb_id)
+                if changed
+                else self._epoch_locked(tenant_id, kb_id)
+            )
+        return {
+            "managed_by": managed_by,
+            "applied": applied,
+            "removed": removed,
+            "manual_preserved": manual_preserved,
+            "acl_epoch": epoch,
+        }
 
     def revoke_subject(
         self,

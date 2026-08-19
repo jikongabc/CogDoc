@@ -4,7 +4,7 @@
 
 [English](../README.md) · [简体中文](README_zh-CN.md)
 
-一个面向个人 / 企业的本地 RAG 知识库控制台，上层是 **LangGraph 多 Agent 编排**，底层是**确定性 Rust 核心（PyO3 + maturin）**。它能在你自己的 PDF 知识库上做问答、总结单篇文档、对比多篇文档，也能把反馈沉淀为可审核的派生知识——而且每条生成结论都会绑定回 `[source:Pn]` 引用，并且这个引用是**经过校验的，而非默认可信**。你可以用**命令行控制台**、基于 FastAPI 服务的 **Streamlit 网页端**，也可以用独立 **Debug 控制台**查看 trace。
+一个面向个人 / 企业的本地 RAG 知识库控制台，上层是 **LangGraph 多 Agent 编排**，底层是**确定性 Rust 核心（PyO3 + maturin）**。它能处理 PDF、Markdown、HTML、Office、表格和图片来源，做问答、总结与对比，也能把反馈沉淀为可审核的派生知识。每条生成结论都会绑定到固定版本的来源位置：PDF 继续使用 `[source:Pn]`，幻灯片、单元格、文本行、图片和章节使用各自定位；所有引用均**经过校验，而非默认可信**。你可以用**命令行控制台**、基于 FastAPI 服务的 **Streamlit 网页端**，也可以用独立 **Debug 控制台**查看 trace。
 
 > **可选本地 OCR。** OCR 默认关闭；开启后，原生文本不足的页面会由 PyMuPDF 渲染，并交给本机 Tesseract CLI 识别，带文字层的页面仍走现有快速路径。
 
@@ -25,6 +25,7 @@
 - **结构感知 Parent–Child 上下文** — 保守识别 Markdown、编号及中英文常见标题并形成章节父块。召回、重排和引用仍精确到 child chunk，命中后只从同章节补充有界连续 sibling 窗口；旧索引或无结构文档继续回退现有的前后各一块逻辑。
 
 - **内容寻址的增量缓存** — 逐文件 SHA-256 manifest 加带版本的 chunk 身份契约：未变化的文件直接复用已建索引，只有 PDF 内容或切块方案真正变化时才增量重建。
+- **可恢复的来源连接** — 本地目录、Git、URL、Zotero、Notion、Confluence、SharePoint 与 S3 共用持久 checkpoint、取消、预算和权限同步；密钥只通过环境变量引用。配置、权限和迁移说明见[通用来源与持续同步](CONNECTORS_zh-CN.md)。
 
 - **多知识库 · 多对话 · 分层记忆** — 完整展示历史持久化用于回放；通过引用校验的近期回合组成有界短期记忆，被淘汰回合转为会话级摘要和决策，只有带明确记忆信号的稳定事实才进入跨会话长期记忆，错误答案不会进入 Agent 记忆。
 
@@ -92,7 +93,7 @@ make run        # 构建/复用索引、预热模型、启动控制台
 
 依赖统一在 [pyproject.toml](../pyproject.toml)：运行时依赖在 `[project.dependencies]`，`dev`（构建/测试）与 `frontend`（Streamlit 客户端）为可选 extras；完整本地体验建议安装 `.[dev,frontend]`。包采用 `src/` 布局（`src/cogdoc/`）；`make` 目标会把 `src/` 加入 `PYTHONPATH`，因此跑测试无需先安装。
 
-把 `.env.example` 复制为 `.env`，至少设置云端 `LLM_API_KEY`（或用 `/local` 走 Ollama）。把 PDF 放进收件箱 `your_documents/`（或设置 `COGDOC_DOC_DIR`）。每次修改 `rust_core/src/` 下的代码后都必须重跑 `make native`——`.so` 不会自动重建，也不纳入版本控制。
+把 `.env.example` 复制为 `.env`，至少设置云端 `LLM_API_KEY`（或用 `/local` 走 Ollama）。把受支持的文档放进收件箱 `your_documents/`（或设置 `COGDOC_DOC_DIR`）。每次修改 `rust_core/src/` 下的代码后都必须重跑 `make native`——`.so` 不会自动重建，也不纳入版本控制。
 
 持久账号默认关闭，保证旧部署升级后行为不突变。个人或团队部署应设置 `COGDOC_ACCOUNT_AUTH_ENABLED=true`，启动 API 后注册首位 owner，并使用返回的 Bearer token。企业可随后邀请其他成员，再设置 `COGDOC_SELF_REGISTRATION_ENABLED=false` 关闭公开注册。
 
@@ -109,7 +110,7 @@ make run            # python -m cogdoc.cli
 之后在控制台里用斜杠命令完成全部操作：
 
 1. `/kb new <名称>` — 建知识库，`/kb` 列出/切换。
-2. `/add <文件.pdf>` — 把收件箱 `your_documents/` 里的 PDF 加入当前库（同步重建索引）。
+2. `/add <文件名>` — 把收件箱 `your_documents/` 里的受支持文档加入当前库（同步重建索引）。
 3. `/new` — 开新对话；`/chats`、`/open` 浏览持久化历史。
 4. 直接提问走 **QA**；"总结 `<文件>`" 走 **Summary**；"对比 `<a>` 和 `<b>`" 走 **Compare**。
 5. `/cloud` 用云端 LLM，`/local` 用 Ollama；`/help` 列出命令；`exit` 退出。
@@ -128,7 +129,7 @@ make frontend       # 终端 2：Streamlit 网页端（自动在浏览器打开�
 
 1. **账号** — 开启账号鉴权后先注册或登录，再选择个人/团队工作区。
 2. **侧栏 → 知识库** — 新建一个库，或选择已有的库。
-3. **侧栏 → 文档** — 上传 PDF 并入库；进度面板会轮询后台入库任务直到完成。
+3. **侧栏 → 文档** — 上传受支持的文档/图片，或配置持久来源连接；状态面板会跟踪同步与后台索引直到完成。
 4. **对话** — 新建对话或重开历史对话（会话和知识库持久化进 URL，刷新后续上同一对话）。
 5. **聊天** — 选模式（`auto` / `qa` / `summary` / `compare`），提问，查看实时进度，再读取已完成终态处理的答案及其引用来源、证据片段和 👍/👎 反馈。
 6. 在侧栏打开 **本地 Ollama 模式** 即可把生成切到本地模型。
@@ -153,7 +154,10 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 | `GET/PATCH /v1/knowledge-bases/{kb}/access` | 查看或切换知识库的 `workspace` / `private` 策略 |
 | `GET/PATCH /v1/knowledge-bases/{kb}/documents/{document_id}/access` | 查看或切换文档的 `inherit` / `workspace` / `private` 策略 |
 | `GET/POST/DELETE .../access/grants[/subject_id]` | 在知识库或文档级管理主体 grant |
-| `POST /v1/knowledge-bases/{kb}/documents` | 上传 + 入库 PDF（返回异步 `job_id`） |
+| `POST /v1/knowledge-bases/{kb}/documents` | 上传 + 入库受支持的文档/图片（返回异步 `job_id`） |
+| `GET/POST /v1/knowledge-bases/{kb}/connections` | 查看或创建持久来源连接 |
+| `POST /v1/knowledge-bases/{kb}/connections/{id}/sync` | 启动可恢复同步 |
+| `GET /v1/knowledge-bases/{kb}/sync-jobs` | 查看同步与索引状态 |
 | `GET /v1/knowledge-bases/{kb}/sources`、`GET /v1/knowledge-bases/{kb}/sources/{source}/chunks` | 浏览已索引来源文件与 chunk 预览 |
 | `GET /v1/index-jobs/{job_id}` | 轮询入库进度 |
 | `POST /v1/chat`、`POST /v1/chat/stream` | 提问（JSON 或 SSE 流式） |

@@ -465,6 +465,25 @@ async def test_upload_rejects_bad_inputs(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.anyio
+async def test_upload_accepts_supported_non_pdf_document(tmp_path, monkeypatch):
+    app, _ = _make_app(tmp_path, monkeypatch=monkeypatch)
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
+            response = await client.post(
+                "/v1/knowledge-bases/kb/documents",
+                files={
+                    "file": (
+                        "guide.md",
+                        b"# Guide\n\nSupported markdown content.",
+                        "text/markdown",
+                    )
+                },
+            )
+    assert response.status_code == 202
+
+
 # 验证 upload rejects oversize。
 @pytest.mark.anyio
 async def test_upload_rejects_oversize(tmp_path, monkeypatch):

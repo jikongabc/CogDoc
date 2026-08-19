@@ -213,9 +213,7 @@ def _call_retrieve_runner(runner, body: RetrieveRequest, retrieval_scope):
     except (TypeError, ValueError):
         accepts_scope = False
     docs = (
-        runner(body, retrieval_scope=retrieval_scope)
-        if accepts_scope
-        else runner(body)
+        runner(body, retrieval_scope=retrieval_scope) if accepts_scope else runner(body)
     )
     return [
         doc
@@ -264,6 +262,12 @@ def _retrieve_hit(rank: int, doc: Mapping[str, Any]) -> RetrieveHit:
         knowledge_id=str(meta.get("knowledge_id", "") or ""),
         chunk_index=meta.get("chunk_index"),
         source=str(meta.get("source", "") or ""),
+        source_id=str(meta.get("source_id", "") or ""),
+        source_version_id=str(meta.get("source_version_id", "") or ""),
+        media_type=str(meta.get("media_type", "") or ""),
+        location=dict(meta.get("source_location") or {})
+        if isinstance(meta.get("source_location"), Mapping)
+        else {},
         page=page,
         page_start=meta.get("page_start", page),
         page_end=meta.get("page_end", page),

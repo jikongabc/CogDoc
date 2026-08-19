@@ -176,6 +176,14 @@ SQLite 启动失败或迁移后检查失败时，按以下步骤回滚：
 
 ## 索引格式与迁移
 
+### 通用来源与连接器升级
+
+本版本把 PDF 专用来源扩展为带不可变版本和格式中立位置的通用来源，并新增连接配置、同步任务、来源目录与外部 ACL 状态表。SQLite 结构在启动时只做增量建表/加列；旧 manifest 在读取时兼容，但解析器/来源契约版本变化会要求索引 generation 重建。完整连接器配置与回滚步骤见 [通用来源与持续同步](CONNECTORS_zh-CN.md)。
+
+连接密钥不得进入请求的 `config`、registry、日志或数据库，只能以 `secret_env` 引用服务进程环境变量。生产环境应限制谁能修改服务环境，并只授予 owner/admin 连接管理权限。本地目录与 Git 连接可读取服务主机文件，必须把允许的根目录纳入部署审计；URL 与云连接使用 HTTPS、公网 DNS、主机 allowlist、禁止重定向和响应大小限制。
+
+Confluence/SharePoint 权限读取失败、身份映射服务异常或 ACL 分页不完整时会将文档设为私有并撤销连接器托管授权。不要通过关闭 `include_acl` 绕过受限来源的权限同步；只有确认整个来源本来面向当前工作区时，才设置 `workspace_visible=true`。
+
 以下变化必须视为索引契约变化：
 
 - `CHUNK_IDENTITY_BASE_VERSION` 或 chunk 参数变化。

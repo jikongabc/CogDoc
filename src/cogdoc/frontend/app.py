@@ -3640,6 +3640,168 @@ def _render_resource_access_controls(
 
 
 # 完成 侧边栏 处理。
+def _connection_workbench(client: CogDocClient, kb_id: str) -> None:
+    """Render a compact source-control surface for durable connectors."""
+
+    try:
+        connection_response = client.list_connections(kb_id)
+        connection_payload = response_payload(connection_response)
+        job_response = client.list_sync_jobs(kb_id)
+        job_payload = response_payload(job_response)
+    except Exception as exc:
+        st.caption(f"来源连接暂不可用：{exc}")
+        return
+    if connection_response.status_code != 200:
+        st.caption(
+            format_api_error(
+                connection_payload, connection_response.status_code, "读取来源连接失败"
+            )
+        )
+        return
+    connections = (
+        connection_payload.get("connections", [])
+        if isinstance(connection_payload, Mapping)
+        else []
+    )
+    jobs = (
+        job_payload.get("jobs", [])
+        if job_response.status_code == 200 and isinstance(job_payload, Mapping)
+        else []
+    )
+    latest_by_connection = {}
+    for job in jobs:
+        if (
+            isinstance(job, Mapping)
+            and job.get("connection_id") not in latest_by_connection
+        ):
+            latest_by_connection[job.get("connection_id")] = job
+
+    active_count = sum(
+        1
+        for connection in connections
+        if isinstance(connection, Mapping) and connection.get("enabled")
+    )
+    with st.expander(f"来源连接 · {active_count} 个运行中", expanded=False):
+        st.caption("同步脉冲 · 连接、抓取、入库三个阶段共享同一条可恢复任务记录")
+        if not connections:
+            st.info("还没有连接。添加一个来源后，可手动同步或设置周期。")
+        for connection in connections:
+            if not isinstance(connection, Mapping):
+                continue
+            connection_id = str(connection.get("connection_id") or "")
+            latest = latest_by_connection.get(connection_id, {})
+            status = str(latest.get("status") or "尚未同步")
+            state_icon = {
+                "succeeded": "●",
+                "failed": "×",
+                "cancelled": "○",
+                "尚未同步": "○",
+            }.get(status, "◐")
+            st.markdown(
+                f"**{connection.get('name') or connection_id}**  "
+                f"`{connection.get('connector_type')}`\n\n"
+                f"{state_icon} {status} · 已取 {latest.get('documents_fetched', 0)} 项 · "
+                f"{latest.get('bytes_fetched', 0)} bytes"
+            )
+            actions = st.columns([1, 1, 2])
+            if actions[0].button("立即同步", key=f"sync-{connection_id}"):
+                response = client.start_connection_sync(kb_id, connection_id)
+                payload = response_payload(response)
+                if response.status_code == 202:
+                    st.success("同步已启动")
+                    st.rerun()
+                else:
+                    st.error(format_api_error(payload, response.status_code))
+            enabled = bool(connection.get("enabled"))
+            if actions[1].button(
+                "暂停" if enabled else "启用", key=f"toggle-{connection_id}"
+            ):
+                response = client.set_connection_enabled(
+                    kb_id, connection_id, not enabled
+                )
+                if response.status_code == 200:
+                    st.rerun()
+                else:
+                    st.error(
+                        format_api_error(
+                            response_payload(response),
+                            response.status_code,
+                            "更新连接失败",
+                        )
+                    )
+            st.divider()
+
+        connector_type = st.selectbox(
+            "新增来源类型",
+            [
+                "local-directory",
+                "git",
+                "url",
+                "zotero",
+                "notion",
+                "confluence",
+                "sharepoint",
+                "s3",
+            ],
+            key="new-connector-type",
+        )
+        examples = {
+            "local-directory": '{"root":"/data/handbook","schedule_seconds":300}',
+            "git": '{"repository":"/repos/docs","ref":"main","subpath":"docs"}',
+            "url": '{"urls":["https://docs.example.com/guide"]}',
+            "zotero": '{"library_type":"users","library_id":"123"}',
+            "notion": '{"schedule_seconds":300}',
+            "confluence": '{"base_url":"https://team.atlassian.net"}',
+            "sharepoint": '{"site_id":"...","drive_id":"..."}',
+            "s3": '{"bucket":"docs","region":"us-east-1","prefix":"manuals/"}',
+        }
+        secret_examples = {
+            "zotero": '{"api_key":"COGDOC_ZOTERO_API_KEY"}',
+            "notion": '{"token":"COGDOC_NOTION_TOKEN"}',
+            "confluence": '{"token":"COGDOC_CONFLUENCE_TOKEN"}',
+            "sharepoint": '{"token":"COGDOC_SHAREPOINT_TOKEN"}',
+            "s3": '{"access_key":"AWS_ACCESS_KEY_ID","secret_key":"AWS_SECRET_ACCESS_KEY"}',
+        }
+        with st.form("create-connection", clear_on_submit=True):
+            connection_name = st.text_input("连接名称", placeholder="例如：产品手册")
+            config_text = st.text_area(
+                "位置与周期（JSON）", value=examples[connector_type], height=90
+            )
+            secret_text = st.text_area(
+                "密钥环境变量（JSON，不填密钥值）",
+                value=secret_examples.get(connector_type, "{}"),
+                height=70,
+            )
+            workspace_visible = st.checkbox("同步后对工作区成员可见", value=False)
+            create = st.form_submit_button("保存连接")
+        if create:
+            try:
+                config = json.loads(config_text)
+                secret_env = json.loads(secret_text)
+                if not isinstance(config, dict) or not isinstance(secret_env, dict):
+                    raise ValueError("JSON 顶层必须是对象")
+                response = client.create_connection(
+                    kb_id,
+                    {
+                        "connector_type": connector_type,
+                        "name": connection_name,
+                        "config": config,
+                        "secret_env": secret_env,
+                        "workspace_visible": workspace_visible,
+                    },
+                )
+                payload = response_payload(response)
+                if response.status_code == 201:
+                    st.success("连接已保存")
+                    st.rerun()
+                else:
+                    st.error(
+                        format_api_error(payload, response.status_code, "保存连接失败")
+                    )
+            except (json.JSONDecodeError, ValueError) as exc:
+                st.error(f"配置 JSON 无效：{exc}")
+
+
 def _sidebar() -> None:
     # 侧栏：后端地址、模式开关、知识库选择/新建/上传入库/文档列表。
     with st.sidebar:
@@ -3714,8 +3876,33 @@ def _sidebar() -> None:
 
         st.divider()
         st.subheader("文档")
-        uploaded = st.file_uploader("上传 PDF", type=["pdf"])
+        _connection_workbench(client, kb_id)
+        uploaded = st.file_uploader(
+            "上传文件",
+            type=[
+                "pdf",
+                "md",
+                "markdown",
+                "txt",
+                "html",
+                "htm",
+                "docx",
+                "pptx",
+                "xlsx",
+                "png",
+                "jpg",
+                "jpeg",
+                "tif",
+                "tiff",
+                "bmp",
+                "webp",
+            ],
+            help="支持文档、演示文稿、表格、网页和图片；图片会在 OCR 可用时提取文字。",
+        )
         if st.button("上传并入库", disabled=uploaded is None):
+            if uploaded is None:  # disabled controls are not a static type guard
+                st.error("请先选择要上传的文件")
+                return
             resp = client.upload_document(kb_id, uploaded.name, uploaded.getvalue())
             if resp.status_code != 202:
                 st.error(resp.json().get("message", resp.text))
@@ -4865,9 +5052,7 @@ def _render_retrieval_diagnostic_console(
         summary[2].metric("最终证据", len(result.get("final") or []))
         summary[3].metric("总耗时", f"{float(latency.get('total') or 0):.1f} ms")
         st.caption(
-            " · ".join(
-                f"{name} {count}" for name, count in channel_counts.items()
-            )
+            " · ".join(f"{name} {count}" for name, count in channel_counts.items())
         )
         missing = decision.get("missing_requirement_ids") or []
         if missing:
@@ -4900,7 +5085,13 @@ def _render_retrieval_diagnostic_console(
             retrieval = hit.get("retrieval") or {}
             contributions = retrieval.get("channel_contributions") or {}
             movement = int(hit.get("rank_delta") or 0)
-            movement_label = f"↑{movement}" if movement > 0 else f"↓{-movement}" if movement < 0 else "—"
+            movement_label = (
+                f"↑{movement}"
+                if movement > 0
+                else f"↓{-movement}"
+                if movement < 0
+                else "—"
+            )
             with st.expander(
                 f"#{int(hit.get('rank') or 0):02d} {movement_label} · "
                 f"{hit.get('source') or '未知来源'}",
@@ -5064,6 +5255,8 @@ def _render_index_migration_console(client: CogDocClient, kb_id: str | None) -> 
                     st.success("旧代已清理，本次迁移完成验收。")
                 else:
                     st.error(_eval_response_detail(response, "清理旧代失败"))
+
+
 def _render_eval_unit(
     draft: Mapping, unit: Mapping, candidates: Sequence[Mapping]
 ) -> dict:
@@ -5302,9 +5495,7 @@ def _review_desk_header() -> None:
 
 def _claim_review_queue_label(row: Mapping) -> str:
     status = "待审" if row.get("status") == "pending" else "已审"
-    verdict = CLAIM_VERDICT_LABELS.get(
-        str(row.get("actual_verdict") or ""), "未知判定"
-    )
+    verdict = CLAIM_VERDICT_LABELS.get(str(row.get("actual_verdict") or ""), "未知判定")
     claim = " ".join(str(row.get("claim") or "").split())
     if len(claim) > 54:
         claim = claim[:53] + "…"
@@ -5366,9 +5557,7 @@ def _claim_verification_review_desk(client: CogDocClient) -> None:
         "人机一致率",
         f"{float(agreement_rate):.1%}" if agreement_rate is not None else "尚无标注",
     )
-    metrics[3].metric(
-        "证据不完整", int(summary.get("evidence_incomplete_count") or 0)
-    )
+    metrics[3].metric("证据不完整", int(summary.get("evidence_incomplete_count") or 0))
     oldest_pending = str(summary.get("oldest_pending_at") or "")
     st.caption(
         f"SHADOW {int(summary.get('shadow_count') or 0):04d} · "
@@ -5503,9 +5692,9 @@ def _claim_verification_review_desk(client: CogDocClient) -> None:
             <section class="claim-sheet">
               <div class="claim-meta">{task_type} · {policy_id} · {review_id}</div>
               <h3>{claim}</h3>
-              <span class="verdict-stamp {verdict_class}">MODEL / {html.escape(CLAIM_VERDICT_LABELS.get(actual_verdict, '未知'))}</span>
-              <span class="verdict-chip">模式：{html.escape(str(detail.get('effective_mode') or ''))}</span>
-              <span class="verdict-chip">决策：{html.escape(str(detail.get('decision') or ''))}</span>
+              <span class="verdict-stamp {verdict_class}">MODEL / {html.escape(CLAIM_VERDICT_LABELS.get(actual_verdict, "未知"))}</span>
+              <span class="verdict-chip">模式：{html.escape(str(detail.get("effective_mode") or ""))}</span>
+              <span class="verdict-chip">决策：{html.escape(str(detail.get("decision") or ""))}</span>
             </section>
             """,
             unsafe_allow_html=True,
@@ -5522,9 +5711,7 @@ def _claim_verification_review_desk(client: CogDocClient) -> None:
         if not detail.get("evidence_complete"):
             st.warning("引用证据快照不完整；标注时应把缺失证据纳入判断。")
         evidence = [
-            item
-            for item in detail.get("evidence") or []
-            if isinstance(item, Mapping)
+            item for item in detail.get("evidence") or [] if isinstance(item, Mapping)
         ]
         st.markdown(f"#### 精确引用证据 · {len(evidence)} 段")
         if evidence:
@@ -5535,9 +5722,7 @@ def _claim_verification_review_desk(client: CogDocClient) -> None:
 
         current_expected = str(detail.get("expected_verdict") or "")
         options = list(CLAIM_VERDICT_LABELS)
-        with st.form(
-            f"claim-review-label-{selected_id}-{detail.get('revision')}"
-        ):
+        with st.form(f"claim-review-label-{selected_id}-{detail.get('revision')}"):
             expected = st.radio(
                 "人工结论",
                 options,
@@ -5577,14 +5762,15 @@ def _claim_verification_review_desk(client: CogDocClient) -> None:
                 st.success("人工结论已保存；汇总指标和发布门禁数据已更新。")
                 st.rerun()
             elif label_response.status_code == 409:
-                st.warning("这条任务已被其他审核者更新，请刷新后基于最新 revision 重审。")
+                st.warning(
+                    "这条任务已被其他审核者更新，请刷新后基于最新 revision 重审。"
+                )
             else:
                 st.error(_eval_response_detail(label_response, "保存人工结论失败"))
 
     st.divider()
     export_scope = (
-        f"{client.base_url}:{client.auth_cache_identity}:"
-        f"{client.workspace_id or '-'}"
+        f"{client.base_url}:{client.auth_cache_identity}:{client.workspace_id or '-'}"
     )
     if st.session_state.get("claim_review_export_scope") != export_scope:
         st.session_state.claim_review_export_jsonl = ""
@@ -5601,8 +5787,8 @@ def _claim_verification_review_desk(client: CogDocClient) -> None:
         except Exception as exc:
             st.error(f"导出声明核验门禁集失败：{exc}")
         else:
-            st.session_state.claim_review_export_jsonl = (
-                _claim_review_export_jsonl(export_items)
+            st.session_state.claim_review_export_jsonl = _claim_review_export_jsonl(
+                export_items
             )
             st.session_state.claim_review_export_scope = export_scope
             st.success(f"已准备 {len(export_items)} 条人工判卷样本。")
@@ -5632,9 +5818,7 @@ def _evidence_review_area(kb_id: str | None) -> None:
         _retrieval_eval_review_desk(kb_id, client)
 
 
-def _retrieval_eval_review_desk(
-    kb_id: str | None, client: CogDocClient
-) -> None:
+def _retrieval_eval_review_desk(kb_id: str | None, client: CogDocClient) -> None:
     _render_index_migration_console(client, kb_id)
     _render_retrieval_diagnostic_console(client, kb_id)
     controls = st.columns([2, 2, 3])

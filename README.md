@@ -4,7 +4,7 @@
 
 [English](README.md) · [简体中文](docs/README_zh-CN.md)
 
-A local RAG knowledge-base console for individuals and teams, built on **LangGraph multi-agent orchestration** with a **deterministic Rust core (PyO3 + maturin)** underneath. It answers questions, summarizes a single document, compares multiple documents, and turns feedback into reviewable derived knowledge over your own PDF knowledge base — and every generated claim is pinned back to a `[source:Pn]` citation that is *checked, not trusted*. Use it from a **CLI console**, a **Streamlit web app** backed by FastAPI, or a standalone **Debug console** for trace inspection.
+A local RAG knowledge-base console for individuals and teams, built on **LangGraph multi-agent orchestration** with a **deterministic Rust core (PyO3 + maturin)** underneath. It answers questions, summarizes and compares documents, and turns feedback into reviewable derived knowledge over PDF, Markdown, HTML, Office, spreadsheet, and image sources. Every generated claim is pinned to a versioned source location that is *checked, not trusted*—PDF citations remain `[source:Pn]`, while slides, cells, lines, images, and sections use format-aware locators. Use it from a **CLI console**, a **Streamlit web app** backed by FastAPI, or a standalone **Debug console** for trace inspection.
 
 > **Optional local OCR.** OCR is disabled by default. When enabled, pages without enough usable native text are rendered with PyMuPDF and recognized by a local Tesseract CLI; native-text pages keep the existing fast path.
 
@@ -25,6 +25,7 @@ A local RAG knowledge-base console for individuals and teams, built on **LangGra
 - **Structure-aware Parent–Child context** — conservative Markdown, numbered, and common Chinese/English headings form section parents. Retrieval and citations remain child-chunk precise, while reranked hits can hydrate a bounded contiguous sibling window from the same section; legacy or unstructured indexes fall back to the existing ±1 neighbor window.
 
 - **Content-addressed incremental cache** — a per-file SHA-256 manifest plus a versioned chunk-identity contract: unchanged files reuse the existing index, and only a changed PDF or chunking scheme triggers an incremental rebuild.
+- **Durable source connections** — local folders, Git, URLs, Zotero, Notion, Confluence, SharePoint, and S3 share one resumable sync runtime with checkpoints, cancellation, budgets, fail-closed ACL mapping, and secret-by-environment references. See [the connector guide](docs/CONNECTORS_zh-CN.md).
 
 - **Multiple knowledge bases · multiple conversations · layered memory** — full display history is persisted for replay; validated recent turns form bounded short-term memory, evicted turns become session-level summaries and decisions, and only explicit stable facts enter cross-session long-term memory. Wrong answers never enter Agent memory.
 
@@ -92,7 +93,7 @@ make run        # build/reuse the index, warm up models, start the console
 
 Dependencies live in [pyproject.toml](pyproject.toml): runtime in `[project.dependencies]`, with `dev` (build/test) and `frontend` (Streamlit client) as optional extras — install both for the full local experience via `.[dev,frontend]`. The package uses a `src/` layout (`src/cogdoc/`); the `make` targets put `src/` on `PYTHONPATH`, so no install is strictly required to run the suite.
 
-Copy `.env.example` to `.env` and set at least your cloud `LLM_API_KEY` (or run `/local` with Ollama). Put PDFs in the inbox `your_documents/` (or set `COGDOC_DOC_DIR`). `make native` must be re-run after any change under `rust_core/src/` — the `.so` is not auto-rebuilt and not committed.
+Copy `.env.example` to `.env` and set at least your cloud `LLM_API_KEY` (or run `/local` with Ollama). Put supported documents in the inbox `your_documents/` (or set `COGDOC_DOC_DIR`). `make native` must be re-run after any change under `rust_core/src/` — the `.so` is not auto-rebuilt and not committed.
 
 Persistent accounts default to off for a no-surprise upgrade. For an individual or team deployment, set `COGDOC_ACCOUNT_AUTH_ENABLED=true`, start the API, register the first owner, and use its returned Bearer token. An enterprise can then invite the remaining members and set `COGDOC_SELF_REGISTRATION_ENABLED=false`.
 
@@ -109,7 +110,7 @@ make run            # python -m cogdoc.cli
 Then drive everything with slash commands inside the console:
 
 1. `/kb new <name>` — create a knowledge base, `/kb` to list / switch.
-2. `/add <file.pdf>` — ingest an inbox PDF from `your_documents/` into the active KB (synchronous rebuild).
+2. `/add <filename>` — ingest a supported inbox document from `your_documents/` into the active KB (synchronous rebuild).
 3. `/new` — start a conversation; `/chats` and `/open` browse persisted history.
 4. Ask directly to run **QA**; "summarize `<file>`" runs **Summary**; "compare `<a>` and `<b>`" runs **Compare**.
 5. `/cloud` uses the cloud LLM, `/local` uses Ollama; `/help` lists commands; `exit` quits.
@@ -128,7 +129,7 @@ In the browser:
 
 1. **Account** — when account auth is enabled, register or sign in, then choose one of your personal/team workspaces.
 2. **Sidebar → Knowledge base** — create a KB, or select an existing one.
-3. **Sidebar → Documents** — upload a PDF and ingest it; a progress panel polls the background index job until it finishes.
+3. **Sidebar → Documents** — upload a supported document/image or configure a durable source connection; the status panel follows synchronization and indexing to completion.
 4. **Conversations** — start a new conversation or reopen a previous one (session and KB persist in the URL, so a refresh resumes the same chat).
 5. **Chat** — pick a mode (`auto` / `qa` / `summary` / `compare`), ask, watch live progress, and read the finalized answer with its citation sources, evidence snippets, and 👍/👎 feedback.
 6. Toggle **Local Ollama mode** in the sidebar to route generation to the local model.
@@ -153,7 +154,10 @@ The Streamlit app is a thin client over the FastAPI service — you can hit it d
 | `GET/PATCH /v1/knowledge-bases/{kb}/access` | Inspect or change a KB's `workspace` / `private` policy |
 | `GET/PATCH /v1/knowledge-bases/{kb}/documents/{document_id}/access` | Inspect or change a document's `inherit` / `workspace` / `private` policy |
 | `GET/POST/DELETE .../access/grants[/subject_id]` | Manage subject grants at either KB or document scope |
-| `POST /v1/knowledge-bases/{kb}/documents` | Upload + ingest a PDF (returns an async `job_id`) |
+| `POST /v1/knowledge-bases/{kb}/documents` | Upload + ingest a supported document/image (returns an async `job_id`) |
+| `GET/POST /v1/knowledge-bases/{kb}/connections` | List or create durable source connections |
+| `POST /v1/knowledge-bases/{kb}/connections/{id}/sync` | Start a resumable synchronization |
+| `GET /v1/knowledge-bases/{kb}/sync-jobs` | Observe synchronization and indexing status |
 | `GET /v1/knowledge-bases/{kb}/sources`, `GET /v1/knowledge-bases/{kb}/sources/{source}/chunks` | Browse indexed sources and chunk previews |
 | `GET /v1/index-jobs/{job_id}` | Poll ingestion progress |
 | `POST /v1/chat`, `POST /v1/chat/stream` | Ask (JSON or SSE streaming) |

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import mimetypes
 import os
 from collections.abc import Mapping
 from typing import Any, Callable, Iterable, Iterator
@@ -594,10 +595,64 @@ class CogDocClient:
     def upload_document(
         self, kb_id: str, filename: str, content: bytes
     ) -> httpx.Response:
-        files = {"file": (filename, content, "application/pdf")}
+        files = {
+            "file": (
+                filename,
+                content,
+                mimetypes.guess_type(filename)[0] or "application/octet-stream",
+            )
+        }
         return httpx.post(
             self._url(f"/v1/knowledge-bases/{kb_id}/documents"),
             files=files,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_connections(self, kb_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/knowledge-bases/{kb_id}/connections"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def create_connection(
+        self, kb_id: str, payload: Mapping[str, Any]
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url(f"/v1/knowledge-bases/{kb_id}/connections"),
+            json=dict(payload),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def set_connection_enabled(
+        self, kb_id: str, connection_id: str, enabled: bool
+    ) -> httpx.Response:
+        return httpx.patch(
+            self._url(f"/v1/knowledge-bases/{kb_id}/connections/{connection_id}"),
+            json={"enabled": enabled},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def start_connection_sync(self, kb_id: str, connection_id: str) -> httpx.Response:
+        return httpx.post(
+            self._url(f"/v1/knowledge-bases/{kb_id}/connections/{connection_id}/sync"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_sync_jobs(self, kb_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/knowledge-bases/{kb_id}/sync-jobs"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_sync_job(self, kb_id: str, job_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/knowledge-bases/{kb_id}/sync-jobs/{job_id}"),
             timeout=self.timeout,
             headers=self._headers,
         )

@@ -126,6 +126,12 @@ def _retrieve_draft_candidates(
                 "chunk_id": str(meta.get("chunk_id") or ""),
                 "parent_chunk_id": str(meta.get("parent_chunk_id") or ""),
                 "source": source,
+                "source_id": str(meta.get("source_id") or ""),
+                "source_version_id": str(meta.get("source_version_id") or ""),
+                "media_type": str(meta.get("media_type") or ""),
+                "location": dict(meta.get("source_location") or {})
+                if isinstance(meta.get("source_location"), Mapping)
+                else {},
                 "source_sha256": str(
                     meta.get("source_sha256") or source_versions.get(source) or ""
                 ),

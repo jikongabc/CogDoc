@@ -655,9 +655,38 @@ def chunk_paper(
                 "chunk_char_count": len(chunk_text),
                 "chunk_quality_score": _chunk_quality(chunk_text),
             }
+            first_page = parsed_pages[0]
+            for source_key in (
+                "source_id",
+                "source_version_id",
+                "media_type",
+                "origin_uri",
+                "connector_type",
+            ):
+                if first_page.get(source_key):
+                    meta[source_key] = first_page[source_key]
             covered_pages = [
                 page for page in parsed_pages if p_start <= int(page["page"]) <= p_end
             ]
+            source_locations = [
+                dict(page["location"])
+                for page in covered_pages
+                if isinstance(page.get("location"), dict)
+            ]
+            if source_locations:
+                meta["source_locations"] = source_locations
+                if len(source_locations) == 1:
+                    meta["source_location"] = source_locations[0]
+                    for location_key in (
+                        "line_start",
+                        "line_end",
+                        "slide",
+                        "sheet",
+                        "cell_range",
+                        "image",
+                    ):
+                        if location_key in source_locations[0]:
+                            meta[location_key] = source_locations[0][location_key]
             extraction_methods = {
                 str(page.get("extraction_method", "native")) for page in covered_pages
             }

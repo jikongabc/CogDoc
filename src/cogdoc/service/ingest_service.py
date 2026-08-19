@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -22,6 +23,7 @@ from cogdoc.service.kb_locks import kb_write_lock
 from cogdoc.service.kb_readers import has_readers
 from cogdoc.service.purge_queue import shared_purge_queue
 from cogdoc.service.kb_state import KBState
+from cogdoc.source_model import SourceDocument
 from cogdoc.tools.chunk_identity import (
     CHUNKING_STRATEGY_VERSION,
     CHUNK_IDENTITY_VERSION,
@@ -33,9 +35,16 @@ from cogdoc.tools.manifest import (
     manifest_path,
     save_index_manifest,
     stamp_chunk_identity_contract,
+    stamp_source_document_contract,
 )
 from cogdoc.tools.embedder import Embedder
 from cogdoc.tools.parser import PARSER_VERSION, smart_parse
+from cogdoc.tools.source_parser import (
+    SOURCE_PARSER_VERSION,
+    list_supported_files,
+    parse_source,
+    scan_source_manifest,
+)
 from cogdoc.tools.retriever.bm25_retriever import BM25Retriever
 from cogdoc.tools.retriever.hybrid import HybridRetriever
 from cogdoc.tools.retriever.vector_retriever import VectorRetriever
@@ -47,9 +56,11 @@ from cogdoc.tools.tokenizer import TOKENIZER_VERSION
 INDEX_BUILD_VERSION = (
     f"{CHUNK_IDENTITY_VERSION}"
     f"|parser={PARSER_VERSION}"
+    f"|source_parser={SOURCE_PARSER_VERSION}"
     f"|tokenizer={TOKENIZER_VERSION}"
     f"|embedder={Embedder.EMBEDDING_CONTRACT_VERSION}"
 )
+_SOURCE_CONTRACTS_SIDECAR = ".cogdoc-source-contracts.json"
 
 
 # 新建不含页面文本或错误详情的 OCR 汇总。
@@ -215,7 +226,8 @@ def _chunk_text_hash(text: object) -> str:
 def _chunks_by_source(chunks: list[dict]) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}
     for chunk in chunks:
-        meta = chunk.get("meta") if isinstance(chunk.get("meta"), dict) else {}
+        raw_meta = chunk.get("meta")
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
         source = str(meta.get("source") or "")
         if source:
             grouped.setdefault(source, []).append(chunk)
@@ -236,7 +248,8 @@ def _auto_rebind_updates(row: dict, chunks: list[dict]) -> dict | None:
         matched_by_anchor = bool(anchor and anchor in text)
         if not matched_by_hash and not matched_by_anchor:
             continue
-        meta = chunk.get("meta") if isinstance(chunk.get("meta"), dict) else {}
+        raw_meta = chunk.get("meta")
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
         priority = 0 if matched_by_hash else 1
         scored.append((priority, chunk_hash, meta))
     if not scored:
@@ -343,9 +356,67 @@ def _mark_stale_derived_knowledge_quiet(
 
 # 列出文档文件。
 def list_pdf_files(source_dir: str) -> list[str]:
+    """Compatibility name for the now format-neutral source directory scan."""
+
     if not os.path.isdir(source_dir):
         return []
-    return sorted(f for f in os.listdir(source_dir) if f.lower().endswith(".pdf"))
+    return list_supported_files(source_dir)
+
+
+def _source_contracts(source_dir: str) -> dict[str, SourceDocument]:
+    path = os.path.join(source_dir, _SOURCE_CONTRACTS_SIDECAR)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    documents = payload.get("documents") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or not isinstance(documents, dict)
+    ):
+        raise IndexInconsistencyError("source contract sidecar is invalid")
+    result: dict[str, SourceDocument] = {}
+    for name, row in documents.items():
+        if (
+            not isinstance(name, str)
+            or os.path.basename(name) != name
+            or not isinstance(row, dict)
+        ):
+            raise IndexInconsistencyError(
+                "source contract sidecar contains invalid rows"
+            )
+        document = SourceDocument.from_manifest_document(row)
+        if document.display_name != name:
+            raise IndexInconsistencyError(
+                "source contract display name is inconsistent"
+            )
+        result[name] = document
+    return result
+
+
+def _merge_source_contracts(manifest: dict, source_dir: str) -> dict:
+    contracts = _source_contracts(source_dir)
+    if not contracts:
+        return manifest
+    merged = dict(manifest)
+    rows = []
+    for scanned in manifest.get("documents", []):
+        name = str(scanned.get("name") or "")
+        document = contracts.get(name)
+        if document is None:
+            rows.append(scanned)
+            continue
+        if document.version.content_sha256 != str(scanned.get("sha256") or ""):
+            raise IndexInconsistencyError("source contract content hash is stale")
+        row = document.to_manifest_document()
+        row["name"] = name
+        row["size"] = scanned.get("size")
+        row["sha256"] = scanned.get("sha256")
+        rows.append(row)
+    merged["documents"] = rows
+    return merged
 
 
 # 使失效检索引擎缓存。
@@ -535,10 +606,17 @@ def _parse_and_chunk(
     ocr_summary: dict | None = None,
 ) -> tuple[list, list[IngestDocResult]]:
     all_chunks = []
+    source_contracts = _source_contracts(source_dir)
     next_chunk_index = start_index
     doc_results = []
     for pdf in names:
-        pages = smart_parse(os.path.join(source_dir, pdf))
+        source_path = os.path.join(source_dir, pdf)
+        source_document = source_contracts.get(pdf)
+        pages = (
+            smart_parse(source_path)
+            if pdf.lower().endswith(".pdf") and source_document is None
+            else parse_source(source_path, source_document=source_document)
+        )
         if ocr_summary is not None:
             _merge_ocr_summary(ocr_summary, _summarize_ocr_pages(pages))
         chunks = chunk_paper(pages, source_sha256=source_hash_by_name[pdf])
@@ -637,12 +715,15 @@ def _build_kb_index_locked(kb_id: str, source_dir: str) -> IngestResult:
         _invalidate_engine_cache(kb_id)
         return IngestResult(kb_id, 0, 0, [])
 
-    rust_core = ensure_rust_core("scan_pdf_manifest_native")
     abs_dir = os.path.abspath(source_dir)
+    if all(name.lower().endswith(".pdf") for name in pdf_files):
+        rust_core = ensure_rust_core("scan_pdf_manifest_native")
+        scanned_manifest = rust_core.scan_pdf_manifest_native(kb_id, abs_dir)
+    else:
+        scanned_manifest = scan_source_manifest(kb_id, abs_dir)
+    scanned_manifest = _merge_source_contracts(scanned_manifest, abs_dir)
     manifest = stamp_index_build_version(
-        stamp_chunk_identity_contract(
-            rust_core.scan_pdf_manifest_native(kb_id, abs_dir)
-        )
+        stamp_source_document_contract(stamp_chunk_identity_contract(scanned_manifest))
     )
     source_hash_by_name = _documents_by_name(manifest)
 
@@ -674,6 +755,9 @@ def _hardlink_snapshot(source_dir: str, gen_dir: str, filenames: list[str]) -> N
             os.link(src, dst)
         except OSError:
             shutil.copy2(src, dst)
+    sidecar = os.path.join(source_dir, _SOURCE_CONTRACTS_SIDECAR)
+    if os.path.isfile(sidecar):
+        shutil.copy2(sidecar, os.path.join(gen_dir, _SOURCE_CONTRACTS_SIDECAR))
 
 
 # 校验暂存区。
@@ -962,11 +1046,15 @@ def _build_transactional_locked(
             retain_previous_generation=retain_previous_generation,
         )
 
-    rust_core = ensure_rust_core("scan_pdf_manifest_native")
+    abs_dir = os.path.abspath(source_dir)
+    if all(name.lower().endswith(".pdf") for name in pdf_files):
+        rust_core = ensure_rust_core("scan_pdf_manifest_native")
+        scanned_manifest = rust_core.scan_pdf_manifest_native(kb_id, abs_dir)
+    else:
+        scanned_manifest = scan_source_manifest(kb_id, abs_dir)
+    scanned_manifest = _merge_source_contracts(scanned_manifest, abs_dir)
     manifest = stamp_index_build_version(
-        stamp_chunk_identity_contract(
-            rust_core.scan_pdf_manifest_native(kb_id, os.path.abspath(source_dir))
-        )
+        stamp_source_document_contract(stamp_chunk_identity_contract(scanned_manifest))
     )
     source_hash_by_name = _documents_by_name(manifest)
 

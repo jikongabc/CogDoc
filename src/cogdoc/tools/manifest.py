@@ -2,6 +2,7 @@ import json
 import os
 from cogdoc.config.settings import get_settings
 from cogdoc.tools.chunk_identity import CHUNK_IDENTITY_VERSION
+from cogdoc.source_model import stamp_source_contract
 
 # 测试和本地工具可覆盖该路径；默认从 COGDOC_DATA_DIR 派生。
 MANIFEST_DIR = None
@@ -59,3 +60,9 @@ def stamp_chunk_identity_contract(manifest: dict) -> dict:
     # 保存 manifest 前写入当前 chunk 身份契约版本。
     manifest["chunk_identity_version"] = CHUNK_IDENTITY_VERSION
     return manifest
+
+
+def stamp_source_document_contract(manifest: dict) -> dict:
+    """Project legacy scanner rows into the versioned generic source contract."""
+
+    return stamp_source_contract(manifest)

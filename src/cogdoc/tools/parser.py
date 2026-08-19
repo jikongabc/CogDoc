@@ -17,9 +17,7 @@ from cogdoc.tools.ocr import (
 
 
 # 解析逻辑变化时 bump：进入增量复用门控，避免未变文档复用旧解析结果。
-PARSER_VERSION = (
-    "pymupdf_smart_parse_v3_ocr_" + ocr_config_signature(get_settings())
-)
+PARSER_VERSION = "pymupdf_smart_parse_v3_ocr_" + ocr_config_signature(get_settings())
 
 
 def _ordered_native_text(page: Any, blocks: list) -> str:
@@ -42,6 +40,51 @@ def _ordered_native_text(page: Any, blocks: list) -> str:
         ordered = sorted(blocks, key=lambda x: (x[1], x[0]))
         page_text = "\n".join(b[4] for b in ordered)
     return re.sub(r"\n{3,}", "\n\n", page_text).strip()
+
+
+def _native_tables(page: Any, existing_text: str) -> str:
+    """Append tables as Markdown when PyMuPDF exposes structured cells."""
+
+    finder = getattr(page, "find_tables", None)
+    if not callable(finder):
+        return ""
+    try:
+        tables = getattr(finder(), "tables", ())
+    except Exception:
+        return ""
+    rendered: list[str] = []
+    # Only suppress a rendered table when its rows already exist as complete
+    # native-text lines. A flattened table appearing inside ordinary prose is
+    # not sufficient evidence and must not cause structured data loss.
+    normalized_existing_lines = {
+        normalized
+        for line in existing_text.splitlines()
+        if (normalized := " ".join(line.split()))
+    }
+    for table in tables:
+        try:
+            rows = table.extract()
+        except Exception:
+            continue
+        clean = [
+            ["" if cell is None else str(cell).strip() for cell in row] for row in rows
+        ]
+        if not clean or not any(any(row) for row in clean):
+            continue
+        normalized_rows = [
+            " ".join(cell for cell in row if cell).strip() for row in clean
+        ]
+        normalized_rows = [row for row in normalized_rows if row]
+        if normalized_rows and all(
+            row in normalized_existing_lines for row in normalized_rows
+        ):
+            continue
+        width = max(len(row) for row in clean)
+        clean = [row + [""] * (width - len(row)) for row in clean]
+        lines = ["| " + " | ".join(row) + " |" for row in clean]
+        lines.insert(1, "| " + " | ".join("---" for _ in range(width)) + " |")
+        rendered.append("\n".join(lines))
+    return "\n\n".join(rendered)
 
 
 def _ocr_failure_page(
@@ -83,11 +126,13 @@ def smart_parse(
             is_candidate = len(native_text) < threshold and len(blocks) <= 1
 
             if not is_candidate:
+                ordered_text = _ordered_native_text(page, blocks)
+                tables = _native_tables(page, ordered_text)
                 parsed_pages.append(
                     {
                         "page": page_num,
                         "source": source_name,
-                        "text": _ordered_native_text(page, blocks),
+                        "text": ordered_text + (f"\n\n{tables}" if tables else ""),
                         "is_ocr_fallback": False,
                         "extraction_method": "native",
                         "ocr_status": "not_needed",
@@ -129,6 +174,8 @@ def smart_parse(
 
             ocr_attempts += 1
             try:
+                if engine is None:  # config.enabled guarantees construction
+                    raise OcrUnavailableError("OCR engine is unavailable")
                 result = engine.extract(page)
                 if not result.text:
                     raise OcrExecutionError("OCR returned empty text")

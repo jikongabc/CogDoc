@@ -149,9 +149,7 @@ def public_research_evidence(
     for doc in docs:
         meta = doc.get("meta") if isinstance(doc.get("meta"), Mapping) else {}
         retrieval = (
-            doc.get("retrieval")
-            if isinstance(doc.get("retrieval"), Mapping)
-            else {}
+            doc.get("retrieval") if isinstance(doc.get("retrieval"), Mapping) else {}
         )
         chunk_id = str(meta.get("chunk_id") or "")
         knowledge_id = str(meta.get("knowledge_id") or "")
@@ -161,9 +159,7 @@ def public_research_evidence(
         leading_trim = len(raw_text) - len(raw_text.lstrip())
         raw_span_start = retrieval.get("evidence_text_start")
         span_start = (
-            raw_span_start
-            if type(raw_span_start) is int and raw_span_start >= 0
-            else 0
+            raw_span_start if type(raw_span_start) is int and raw_span_start >= 0 else 0
         ) + leading_trim
         span_end = span_start + len(visible_text)
         identity = (chunk_id, span_start, span_end, knowledge_id)
@@ -178,6 +174,12 @@ def public_research_evidence(
             "source_type": str(meta.get("source_type") or "document"),
             "knowledge_id": knowledge_id,
             "source": str(meta.get("source") or ""),
+            "source_id": str(meta.get("source_id") or ""),
+            "source_version_id": str(meta.get("source_version_id") or ""),
+            "media_type": str(meta.get("media_type") or ""),
+            "location": dict(meta.get("source_location") or {})
+            if isinstance(meta.get("source_location"), Mapping)
+            else {},
             "source_sha256": str(meta.get("source_sha256") or ""),
             "text_hash": hashlib.sha256(normalized_text.encode("utf-8")).hexdigest(),
             "page": page,
@@ -418,9 +420,7 @@ class ResearchExecutionManager:
             return
 
     def reconcile_orphans(self) -> int:
-        detailed_reconcile = getattr(
-            self._store, "reconcile_running_outcomes", None
-        )
+        detailed_reconcile = getattr(self._store, "reconcile_running_outcomes", None)
         if callable(detailed_reconcile):
             outcomes = dict(detailed_reconcile())
             count = sum(max(0, int(value)) for value in outcomes.values())
@@ -438,13 +438,9 @@ class ResearchExecutionManager:
         with self._lock:
             if self._closed:
                 raise RuntimeError("ResearchExecutionManager is closed")
-            occupied = (
-                self._executor.pending_count() + self._submission_reservations
-            )
+            occupied = self._executor.pending_count() + self._submission_reservations
             if occupied >= self._max_pending:
-                raise ResearchExecutionCapacityError(
-                    "research execution queue is full"
-                )
+                raise ResearchExecutionCapacityError("research execution queue is full")
             self._submission_reservations += 1
 
     def _release_submission(self) -> None:
@@ -795,7 +791,9 @@ class ResearchExecutionManager:
 
     def compile(self, job_id: str) -> dict[str, Any]:
         if self._report_builder is None:
-            raise ResearchJobStateConflictError("research report builder is unavailable")
+            raise ResearchJobStateConflictError(
+                "research report builder is unavailable"
+            )
         self._reserve_submission()
         transition_started = False
         try:
@@ -926,9 +924,7 @@ class ResearchExecutionManager:
             current = self._read_provenance(str(row.get("kb_id") or ""))
         except Exception as exc:
             return {
-                "status": (
-                    "stale" if row.get("evidence_provenance") else "untracked"
-                ),
+                "status": ("stale" if row.get("evidence_provenance") else "untracked"),
                 "stale_reasons": [f"provenance_reader_error:{type(exc).__name__}"],
                 "captured": dict(row.get("evidence_provenance") or {}),
                 "current": {},
@@ -1064,8 +1060,7 @@ class ResearchExecutionManager:
             handles = [
                 handle
                 for handle in self._active.values()
-                if handle.job_id == job_id
-                and (phase is None or handle.phase == phase)
+                if handle.job_id == job_id and (phase is None or handle.phase == phase)
             ]
         for handle in handles:
             handle.control.request_stop(reason)
@@ -1095,9 +1090,10 @@ class ResearchExecutionManager:
                 and current.get("terminal_reason") == "ResearchDeadlineExceeded"
             ):
                 return "deadline"
-            if row.get("status") == "paused" or current.get(
-                "control_state"
-            ) == "paused":
+            if (
+                row.get("status") == "paused"
+                or current.get("control_state") == "paused"
+            ):
                 return "paused"
             return "superseded"
 
@@ -1201,11 +1197,7 @@ class ResearchExecutionManager:
         report_execution_id = str(row.get("report_execution_id") or "")
         control_snapshot = research_run_control(row, "report")
         lease_id = str(control_snapshot.get("lease_id") or "")
-        if (
-            not report_execution_id
-            or not lease_id
-            or row.get("status") != "generating"
-        ):
+        if not report_execution_id or not lease_id or row.get("status") != "generating":
             return False
         active_key = f"report:{job_id}:{lease_id}"
         with self._lock:
@@ -1290,8 +1282,8 @@ class ResearchExecutionManager:
             row = {}
         status = str(row.get("status") or "")
         kb_id = str(row.get("kb_id") or "")
-        error_class = type(error).__name__ if error is not None else str(
-            row.get("error") or ""
+        error_class = (
+            type(error).__name__ if error is not None else str(row.get("error") or "")
         )
         control = research_run_control(row, handle.phase) if row else {}
         # The durable commit is authoritative.  A caller may observe the
@@ -1367,12 +1359,10 @@ class ResearchExecutionManager:
                     # Startup reconciliation remains the durable fallback when
                     # callback-side persistence itself is unavailable.
                     pass
-            outcome, status, kb_id, error_class, termination = (
-                self._background_result(
-                    handle,
-                    error,
-                    cancelled=was_cancelled,
-                )
+            outcome, status, kb_id, error_class, termination = self._background_result(
+                handle,
+                error,
+                cancelled=was_cancelled,
             )
             if termination:
                 self._observe(
@@ -1425,13 +1415,9 @@ class ResearchExecutionManager:
                 }
                 with kb_read_lease(str(job.get("kb_id") or "")):
                     self.assert_current(job)
-                    result = (
-                        self._report_builder(job) if self._report_builder else None
-                    )
+                    result = self._report_builder(job) if self._report_builder else None
                     if result is None:
-                        raise RuntimeError(
-                            "research report builder returned no result"
-                        )
+                        raise RuntimeError("research report builder returned no result")
                     if isinstance(result, Mapping):
                         payload = dict(result)
                     elif is_dataclass(result):
@@ -1595,9 +1581,7 @@ class ResearchExecutionManager:
                             execution_metrics=execution_metrics,
                             lease_id=lease_id,
                         )
-                        committed_control = research_run_control(
-                            committed, "evidence"
-                        )
+                        committed_control = research_run_control(committed, "evidence")
                         if (
                             committed_control.get("last_commit_lease_id") == lease_id
                             and committed_control.get("last_commit_section_id")
