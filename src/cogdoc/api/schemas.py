@@ -82,6 +82,14 @@ class ErrorCode(str, Enum):
     RESEARCH_CAPACITY_EXHAUSTED = "RESEARCH_CAPACITY_EXHAUSTED"
     CLAIM_REVIEW_REVISION_CONFLICT = "CLAIM_REVIEW_REVISION_CONFLICT"
     CLAIM_REVIEW_NOT_FOUND = "CLAIM_REVIEW_NOT_FOUND"
+    CREDENTIAL_NOT_FOUND = "CREDENTIAL_NOT_FOUND"
+    CREDENTIAL_UNAVAILABLE = "CREDENTIAL_UNAVAILABLE"
+    CREDENTIAL_REVISION_CONFLICT = "CREDENTIAL_REVISION_CONFLICT"
+    OAUTH_SESSION_INVALID = "OAUTH_SESSION_INVALID"
+    OAUTH_PROVIDER_UNAVAILABLE = "OAUTH_PROVIDER_UNAVAILABLE"
+    SOURCE_NOT_FOUND = "SOURCE_NOT_FOUND"
+    SOURCE_VERSION_NOT_FOUND = "SOURCE_VERSION_NOT_FOUND"
+    SYNC_REPLAY_CONFLICT = "SYNC_REPLAY_CONFLICT"
 
 
 # 带查询和知识库标识的请求基类。
@@ -144,6 +152,7 @@ class ConnectionCreate(ApiModel):
     name: str = Field(min_length=1, max_length=160)
     config: dict[str, Any] = Field(default_factory=dict)
     secret_env: dict[str, str] = Field(default_factory=dict)
+    credential_id: str | None = Field(default=None, min_length=1, max_length=160)
     workspace_visible: bool = False
 
 
@@ -158,6 +167,8 @@ class Connection(ApiModel):
     name: str
     config: dict[str, Any]
     secret_fields: list[str]
+    credential_id: str | None = None
+    credential_source: Literal["vault", "environment", "none"] = "none"
     workspace_visible: bool
     enabled: bool
     created_at: float
@@ -189,10 +200,210 @@ class ConnectorSyncJob(ApiModel):
     updated_at: float
     finished_at: float | None = None
     revision: int
+    replay_of: str | None = None
 
 
 class ConnectorSyncJobList(ApiModel):
     jobs: list[ConnectorSyncJob]
+
+
+class ConnectorCredentialCreate(ApiModel):
+    provider: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")
+    credential_kind: str = Field(
+        default="static", min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$"
+    )
+    label: str = Field(min_length=1, max_length=160)
+    secret_values: dict[str, str] = Field(min_length=1, max_length=32)
+    connection_id: str | None = Field(default=None, min_length=1, max_length=160)
+    subject: str | None = Field(default=None, min_length=1, max_length=512)
+    scopes: list[str] = Field(default_factory=list, max_length=128)
+    expires_at: float | None = Field(default=None, gt=0)
+
+
+class ConnectorCredentialRotate(ApiModel):
+    secret_values: dict[str, str] | None = Field(
+        default=None, min_length=1, max_length=32
+    )
+    expires_at: float | None = Field(default=None, gt=0)
+    expected_revision: int | None = Field(default=None, ge=1, strict=True)
+
+
+class ConnectorCredential(ApiModel):
+    credential_id: str
+    kb_id: str
+    connection_id: str | None = None
+    provider: str
+    credential_kind: str
+    label: str
+    subject: str | None = None
+    scopes: list[str]
+    secret_fields: list[str]
+    key_version: str
+    expires_at: float | None = None
+    last_used_at: float | None = None
+    created_by: str
+    updated_by: str
+    created_at: float
+    updated_at: float
+    revision: int
+
+
+class ConnectorCredentialList(ApiModel):
+    credentials: list[ConnectorCredential]
+
+
+class ConnectorCredentialEvent(ApiModel):
+    event_id: str
+    credential_id: str
+    kb_id: str
+    connection_id: str | None = None
+    action: str
+    actor_id: str
+    revision: int
+    key_version: str
+    occurred_at: float
+
+
+class ConnectorCredentialEventList(ApiModel):
+    events: list[ConnectorCredentialEvent]
+
+
+class ConnectorOAuthStart(ApiModel):
+    provider: Literal["notion", "atlassian", "microsoft"]
+    connection_id: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class ConnectorOAuthAuthorization(ApiModel):
+    session_id: str
+    provider: str
+    authorization_url: str
+    redirect_uri: str
+    expires_at: float
+
+
+class ConnectorOAuthCallback(ApiModel):
+    credential_id: str
+    provider: str
+    connection_id: str | None = None
+    kb_id: str
+    status: Literal["connected"] = "connected"
+
+
+class ConnectorSyncHealth(ApiModel):
+    kb_id: str
+    connection_id: str
+    schedule_seconds: int | None = None
+    next_run_at: float | None = None
+    health_status: str
+    last_job_id: str | None = None
+    last_job_status: str | None = None
+    last_started_at: float | None = None
+    last_success_at: float | None = None
+    last_failure_at: float | None = None
+    last_error_code: str | None = None
+    last_duration_seconds: float | None = None
+    consecutive_failures: int = 0
+    updated_at: float | None = None
+    backlog: int = 0
+
+
+class ConnectorSyncHealthList(ApiModel):
+    connections: list[ConnectorSyncHealth]
+
+
+class SourceCatalogEntry(ApiModel):
+    source_id: str
+    connection_id: str | None = None
+    connector_type: str
+    external_id: str
+    display_name: str
+    media_type: str
+    kind: str
+    origin_uri: str | None = None
+    version_id: str
+    metadata: dict[str, Any]
+    health_status: str
+    last_sync_at: float | None = None
+    last_sync_error: str | None = None
+    deleted_at: float | None = None
+    updated_at: float
+    content_sha256: str
+    byte_size: int | None = None
+    etag: str | None = None
+    modified_at: str | None = None
+    fetched_at: float
+    document_id: str | None = None
+    access_policy: str | None = None
+    access_configured: bool = False
+    acl_epoch: int | None = None
+
+
+class SourceCatalogList(ApiModel):
+    sources: list[SourceCatalogEntry]
+
+
+class SourceVersion(ApiModel):
+    source_id: str
+    version_id: str
+    content_sha256: str
+    byte_size: int | None = None
+    etag: str | None = None
+    modified_at: str | None = None
+    fetched_at: float
+    created_at: float
+    is_current: bool
+    artifact_available: bool = False
+
+
+class SourceVersionList(ApiModel):
+    versions: list[SourceVersion]
+
+
+class SourceArtifactVersionSummary(ApiModel):
+    source_id: str
+    version_id: str
+    content_sha256: str
+    byte_size: int
+    media_type: str
+    display_name: str | None = None
+    created_at: float
+
+
+class SourceVersionDiff(ApiModel):
+    source_id: str
+    from_version_id: str
+    to_version_id: str
+    kind: Literal["text", "binary"]
+    truncated: bool
+    added_lines: int
+    removed_lines: int
+    diff: str | None = None
+    from_version: SourceArtifactVersionSummary
+    to_version: SourceArtifactVersionSummary
+
+
+class SourceArtifactDelete(ApiModel):
+    source_id: str
+    version_id: str
+    recovery_token: str
+    deleted: bool
+
+
+class SourceArtifactRestore(ApiModel):
+    source_id: str
+    version_id: str
+    restored: bool = True
+
+
+class SourceArtifactUsage(ApiModel):
+    active_bytes: int
+    active_versions: int
+    trash_bytes: int
+    trash_versions: int
+
+
+class SourceArtifactPurge(ApiModel):
+    purged: int
 
 
 # 单次引用在最终答案中的位置；偏移是 Unicode code point 的 0-based half-open 区间。

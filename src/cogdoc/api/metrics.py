@@ -159,6 +159,35 @@ class Metrics:
             "生成前证据校验器异常计数",
             registry=self.registry,
         )
+        # Connector labels are deliberately restricted to the finite built-in
+        # connector type/outcome sets. Connection, KB, tenant and job IDs stay
+        # in logs/webhooks so Prometheus cardinality remains bounded.
+        self.connector_sync_events = Counter(
+            "cogdoc_connector_sync_events_total",
+            "来源同步生命周期事件数",
+            ["connector_type", "outcome"],
+            registry=self.registry,
+        )
+        self.connector_sync_duration = Histogram(
+            "cogdoc_connector_sync_duration_seconds",
+            "来源同步终态耗时",
+            ["connector_type", "outcome"],
+            buckets=(0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600),
+            registry=self.registry,
+        )
+        self.connector_sync_backlog = Histogram(
+            "cogdoc_connector_sync_backlog",
+            "来源同步事件发生时的连接级积压采样",
+            ["connector_type"],
+            buckets=(0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 100, 250, 500),
+            registry=self.registry,
+        )
+        self.connector_sync_documents = Counter(
+            "cogdoc_connector_sync_documents_total",
+            "终态来源同步抓取文档数",
+            ["connector_type", "outcome"],
+            registry=self.registry,
+        )
         # Research 指标只使用闭集标签。job/kb/execution/section 等关联标识仅进日志与
         # trace，绝不进入 Prometheus label，避免长任务持续制造高基数时间序列。
         self.research_lifecycle = Counter(

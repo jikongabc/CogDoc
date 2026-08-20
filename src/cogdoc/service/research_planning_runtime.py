@@ -23,6 +23,9 @@ class ResearchPlanningRuntime:
         max_pending: int,
         thread_name_prefix: str = "cogdoc-research-planning",
     ):
+        self._max_workers = max_workers
+        self._max_pending = max_pending
+        self._thread_name_prefix = thread_name_prefix
         self._executor = DaemonFutureExecutor(
             max_workers=max_workers,
             max_pending=max_pending,
@@ -61,6 +64,21 @@ class ResearchPlanningRuntime:
             control.set()
         self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
         return self.is_drained()
+
+    def reopen(self) -> None:
+        """Recreate the bounded executor after a fully drained shutdown."""
+
+        with self._lock:
+            if not self._closed:
+                return
+            if self._active_controls or not self._executor.is_drained():
+                raise RuntimeError("cannot reopen ResearchPlanningRuntime while active")
+            self._executor = DaemonFutureExecutor(
+                max_workers=self._max_workers,
+                max_pending=self._max_pending,
+                thread_name_prefix=self._thread_name_prefix,
+            )
+            self._closed = False
 
     def is_drained(self) -> bool:
         with self._lock:

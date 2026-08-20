@@ -7,6 +7,7 @@ from typing import Any, Mapping
 from fastapi import Request
 
 from cogdoc.api.tenancy import Permission, Principal, required_permission
+from cogdoc.service.kb_lifecycle import LIFECYCLE_ACTIVE, shared_lifecycle_store
 from cogdoc.tools.retriever.scope import RetrievalAccessMode, RetrievalScope
 
 
@@ -93,6 +94,14 @@ def _scope_from_record(record: Mapping[str, Any]) -> KnowledgeBaseScope:
         owner_id=str(record.get("owner_id") or "default"),
         created_at=str(record.get("created_at") or ""),
     )
+
+
+def _lifecycle_active(storage_id: str) -> bool:
+    try:
+        return shared_lifecycle_store().status(storage_id) == LIFECYCLE_ACTIVE
+    except Exception:
+        # Lifecycle state is an authorization boundary for incarnation reuse.
+        return False
 
 
 def _requested_permission(request: Request) -> Permission:
@@ -260,6 +269,7 @@ def resolve_kb_scope(
     kb_id: str,
     *,
     allow_legacy_default: bool = False,
+    allow_inactive: bool = False,
 ) -> KnowledgeBaseScope | None:
     """Resolve an external tenant-local slug to its internal physical ID."""
 
@@ -278,8 +288,15 @@ def resolve_kb_scope(
         record = None
     if isinstance(record, Mapping):
         scope = _scope_from_record(record)
-        if scope.tenant_id == principal.tenant_id and _decision_is_allowed(
-            _access_decision(request, scope)
+        active = _lifecycle_active(scope.storage_id)
+        decision_allowed = _decision_is_allowed(_access_decision(request, scope))
+        cleanup_authorized = bool(
+            allow_inactive and not active and principal.allows(Permission.DELETE)
+        )
+        if (
+            scope.tenant_id == principal.tenant_id
+            and (active or allow_inactive)
+            and (decision_allowed or cleanup_authorized)
         ):
             return scope
         return None
@@ -293,9 +310,7 @@ def resolve_kb_scope(
         # after a registry entry is deleted, so orphaned index data cannot be
         # reached by guessing the deterministic storage ID.
         physical_getter = getattr(registry, "get_by_storage_id", None)
-        physical_record = (
-            physical_getter(kb_id) if callable(physical_getter) else None
-        )
+        physical_record = physical_getter(kb_id) if callable(physical_getter) else None
         if isinstance(physical_record, Mapping) or kb_id.startswith("t-"):
             return None
         # Pre-registry test runners and legacy default-KB deployments used the
@@ -310,28 +325,31 @@ def resolve_kb_scope(
         )
         return (
             legacy_scope
-            if _decision_is_allowed(_access_decision(request, legacy_scope))
+            if (allow_inactive or _lifecycle_active(legacy_scope.storage_id))
+            and _decision_is_allowed(_access_decision(request, legacy_scope))
             else None
         )
     return None
 
 
-def scope_for_storage_id(request: Request, storage_id: str) -> KnowledgeBaseScope | None:
+def scope_for_storage_id(
+    request: Request, storage_id: str
+) -> KnowledgeBaseScope | None:
     """Authorize an opaque persisted KB ID against the request tenant."""
 
     principal = request_principal(request)
     registry = request.app.state.kb_registry
     getter = getattr(registry, "get_by_storage_id", None)
     try:
-        record = (
-            getter(storage_id) if callable(getter) else registry.get(storage_id)
-        )
+        record = getter(storage_id) if callable(getter) else registry.get(storage_id)
     except (TypeError, ValueError):
         return None
     if not isinstance(record, Mapping):
         return None
     scope = _scope_from_record(record)
     if scope.tenant_id != principal.tenant_id:
+        return None
+    if not _lifecycle_active(scope.storage_id):
         return None
     return scope if _decision_is_allowed(_access_decision(request, scope)) else None
 
@@ -351,7 +369,8 @@ def tenant_kb_scopes(request: Request) -> list[KnowledgeBaseScope]:
     return [
         scope
         for scope in scopes
-        if _decision_is_allowed(_access_decision(request, scope))
+        if _lifecycle_active(scope.storage_id)
+        and _decision_is_allowed(_access_decision(request, scope))
     ]
 
 

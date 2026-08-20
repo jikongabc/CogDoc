@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import Any
 
+from cogdoc.tools.source_parser import SUPPORTED_EXTENSIONS
+
 
 class TenantQuotaExceeded(RuntimeError):
     """Raised before a tenant mutation would exceed a configured hard limit."""
@@ -94,16 +96,15 @@ class TenantQuotaManager:
             ]
 
     @staticmethod
-    def _pdf_usage(source_dir: str) -> tuple[int, int]:
-        documents = 0
-        storage_bytes = 0
+    def _document_entries(source_dir: str) -> dict[str, int]:
+        result: dict[str, int] = {}
         try:
             entries = os.scandir(source_dir)
         except FileNotFoundError:
-            return 0, 0
+            return result
         with entries:
             for entry in entries:
-                if not entry.name.lower().endswith(".pdf"):
+                if os.path.splitext(entry.name)[1].casefold() not in SUPPORTED_EXTENSIONS:
                     continue
                 try:
                     if not entry.is_file(follow_symlinks=False):
@@ -118,9 +119,13 @@ class TenantQuotaManager:
                     # unreadable committed entry must reject admission rather
                     # than be treated as zero usage.
                     raise
-                documents += 1
-                storage_bytes += max(0, int(size))
-        return documents, storage_bytes
+                result[entry.name] = max(0, int(size))
+        return result
+
+    @classmethod
+    def _document_usage(cls, source_dir: str) -> tuple[int, int]:
+        entries = cls._document_entries(source_dir)
+        return len(entries), sum(entries.values())
 
     def _actual_usage(self, tenant_id: str) -> dict[str, int]:
         records = self._tenant_records(tenant_id)
@@ -131,7 +136,7 @@ class TenantQuotaManager:
             if not storage_id:
                 continue
             source_dir = self._registry.source_dir(storage_id)
-            count, byte_count = self._pdf_usage(source_dir)
+            count, byte_count = self._document_usage(source_dir)
             documents += count
             storage_bytes += byte_count
         return {
@@ -268,6 +273,96 @@ class TenantQuotaManager:
                 kind="upload",
                 storage_id=storage_id,
                 filename=safe_name,
+                document_delta=document_delta,
+                byte_delta=byte_delta,
+            )
+            return token
+
+    def reserve_connector_snapshot(
+        self,
+        tenant_id: str,
+        storage_id: str,
+        source_dir: str,
+        baseline_dir: str,
+        proposed_dir: str,
+        reservation_key: str,
+    ) -> str | None:
+        """Reserve the non-negative growth of one connector snapshot.
+
+        Connector staging is private until its directory swap.  Comparing the
+        previous and proposed connection directories lets admission account
+        only for this job's growth while ``_actual_usage`` continues to cover
+        uploads and every other connector in the tenant.  Shrinkage is never
+        lent speculatively: it becomes available after the committed source
+        directory is visible and this reservation is released.
+        """
+
+        if not (
+            self.policy.max_documents or self.policy.max_storage_bytes
+        ):
+            return None
+        key = str(reservation_key or "").strip()
+        if not key or len(key) > 256:
+            raise ValueError("connector reservation key is invalid")
+        with self._lock:
+            for item in self._reservations.values():
+                if (
+                    item.kind == "connector"
+                    and item.tenant_id == tenant_id
+                    and item.storage_id == storage_id
+                    and item.filename == key
+                ):
+                    raise TenantMutationInProgress(
+                        f"connector snapshot already pending: {key}"
+                    )
+
+            usage = self._actual_usage(tenant_id)
+            baseline = self._document_entries(baseline_dir)
+            proposed = self._document_entries(proposed_dir)
+            published = self._document_entries(source_dir)
+            affected_names = baseline.keys() | proposed.keys()
+            published_affected = {
+                name: published[name]
+                for name in affected_names
+                if name in published
+            }
+            # During recovery the top-level source directory may contain any
+            # prefix of the new snapshot. Project its final state rather than
+            # blindly adding the whole proposed-minus-baseline delta, which
+            # would double-charge files already published before a crash.
+            document_delta = max(0, len(proposed) - len(published_affected))
+            byte_delta = max(
+                0, sum(proposed.values()) - sum(published_affected.values())
+            )
+            pending_documents = sum(
+                item.document_delta
+                for item in self._reservations.values()
+                if item.tenant_id == tenant_id
+            )
+            pending_bytes = sum(
+                item.byte_delta
+                for item in self._reservations.values()
+                if item.tenant_id == tenant_id
+            )
+            self._enforce(
+                "documents",
+                self.policy.max_documents,
+                usage["documents"] + pending_documents,
+                document_delta,
+            )
+            self._enforce(
+                "storage_bytes",
+                self.policy.max_storage_bytes,
+                usage["storage_bytes"] + pending_bytes,
+                byte_delta,
+            )
+            token = secrets.token_hex(16)
+            self._reservations[token] = _Reservation(
+                token=token,
+                tenant_id=tenant_id,
+                kind="connector",
+                storage_id=storage_id,
+                filename=key,
                 document_delta=document_delta,
                 byte_delta=byte_delta,
             )

@@ -40,6 +40,9 @@ _PUBLIC_AUTH_PATHS = frozenset(
         "/v1/auth/register",
         "/v1/auth/login",
         "/v1/auth/invitations/accept",
+        "/v1/auth/connector-oauth/callback/notion",
+        "/v1/auth/connector-oauth/callback/atlassian",
+        "/v1/auth/connector-oauth/callback/microsoft",
     }
 )
 WORKSPACE_HEADER = "X-CogDoc-Workspace"

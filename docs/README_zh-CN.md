@@ -25,7 +25,7 @@
 - **结构感知 Parent–Child 上下文** — 保守识别 Markdown、编号及中英文常见标题并形成章节父块。召回、重排和引用仍精确到 child chunk，命中后只从同章节补充有界连续 sibling 窗口；旧索引或无结构文档继续回退现有的前后各一块逻辑。
 
 - **内容寻址的增量缓存** — 逐文件 SHA-256 manifest 加带版本的 chunk 身份契约：未变化的文件直接复用已建索引，只有 PDF 内容或切块方案真正变化时才增量重建。
-- **可恢复的来源连接** — 本地目录、Git、URL、Zotero、Notion、Confluence、SharePoint 与 S3 共用持久 checkpoint、取消、预算和权限同步；密钥只通过环境变量引用。配置、权限和迁移说明见[通用来源与持续同步](CONNECTORS_zh-CN.md)。
+- **知识源运维控制面** — 本地目录、Git、URL、Zotero、Notion、Confluence、SharePoint 与 S3 共用一套可恢复同步 runtime，支持 checkpoint、健康快照、死信/重放、预算与 fail-closed ACL 映射。连接密钥可使用 AES-256-GCM 凭据库、手工轮换或 Notion/Atlassian/Microsoft OAuth，旧环境变量引用继续兼容；管理员还可浏览来源目录、下载/比较不可变版本，并软删除/恢复历史原始 artifact。详见[连接器说明](CONNECTORS_zh-CN.md)。
 
 - **多知识库 · 多对话 · 分层记忆** — 完整展示历史持久化用于回放；通过引用校验的近期回合组成有界短期记忆，被淘汰回合转为会话级摘要和决策，只有带明确记忆信号的稳定事实才进入跨会话长期记忆，错误答案不会进入 Agent 记忆。
 
@@ -155,9 +155,18 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 | `GET/PATCH /v1/knowledge-bases/{kb}/documents/{document_id}/access` | 查看或切换文档的 `inherit` / `workspace` / `private` 策略 |
 | `GET/POST/DELETE .../access/grants[/subject_id]` | 在知识库或文档级管理主体 grant |
 | `POST /v1/knowledge-bases/{kb}/documents` | 上传 + 入库受支持的文档/图片（返回异步 `job_id`） |
-| `GET/POST /v1/knowledge-bases/{kb}/connections` | 查看或创建持久来源连接 |
+| `GET/POST /v1/knowledge-bases/{kb}/connections` | 查看或创建使用 vault 凭据/环境引用的持久来源连接 |
+| `GET/POST /v1/knowledge-bases/{kb}/connector-credentials` | 查看 metadata 或加密写入手工凭据（secret value 只写不回显） |
+| `PATCH/DELETE .../connector-credentials/{credential_id}`、`GET .../connector-credentials/audit/events` | 带 revision 保护地轮换/删除凭据，或查看不含密钥的凭据审计事件 |
+| `POST /v1/knowledge-bases/{kb}/connector-oauth/authorize`、`GET /v1/auth/connector-oauth/callback/{provider}` | 执行一次性的 Notion、Atlassian 或 Microsoft OAuth 流程 |
+| `POST .../connector-credentials/{credential_id}/refresh` | 刷新已保存的 OAuth 凭据 |
 | `POST /v1/knowledge-bases/{kb}/connections/{id}/sync` | 启动可恢复同步 |
-| `GET /v1/knowledge-bases/{kb}/sync-jobs` | 查看同步与索引状态 |
+| `GET /v1/knowledge-bases/{kb}/sync-jobs`、`GET /v1/knowledge-bases/{kb}/connection-health` | 查看任务、调度、失败、backlog 与连接健康状态 |
+| `POST /v1/knowledge-bases/{kb}/sync-jobs/{job_id}/replay` | 从最近成功 checkpoint 把死信重放为新任务 |
+| `GET /v1/knowledge-bases/{kb}/source-catalog[/{source_id}]` | 按连接/健康浏览运维来源目录及投影的文档 ACL 状态 |
+| `GET .../source-catalog/{source_id}/versions`、`/diff`、`.../{version_id}/content` | 查看、有界比较或完整性校验下载不可变原始版本 |
+| `DELETE .../{version_id}/artifact`、`POST .../source-artifacts/{recovery_token}/restore` | 软删除非当前原始版本，或用作用域恢复令牌还原 |
+| `GET .../source-artifacts/usage`、`DELETE .../source-artifacts/trash?older_than=...` | 查看活动区/trash 用量，或按 epoch 边界不可逆清理作用域 trash |
 | `GET /v1/knowledge-bases/{kb}/sources`、`GET /v1/knowledge-bases/{kb}/sources/{source}/chunks` | 浏览已索引来源文件与 chunk 预览 |
 | `GET /v1/index-jobs/{job_id}` | 轮询入库进度 |
 | `POST /v1/chat`、`POST /v1/chat/stream` | 提问（JSON 或 SSE 流式） |
@@ -198,6 +207,14 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 Compare 的中间模型文本可能包含内部 Evidence ID，且尚未通过终态处理，
 因此会被有意缓冲；客户端不会收到逐 token 正文，而是在常规 `final` 事件前，
 通过单个 `token` 事件收到最终答案。其他任务保留实时模型 token，除非全局声明校验门禁要求缓冲。
+
+### 知识源运维与连接凭据
+
+凭据、OAuth、source catalog、artifact 变更、同步取消和死信重放都要求知识库级 `manage_access`；普通读者只能通过只读接口查看连接、任务与健康摘要。OAuth callback 的公开仅用于供应商浏览器跳转：高熵 state 在服务端短时保存、只能消费一次，并绑定发起人的 tenant、KB、connection 与 user。Microsoft 使用 S256 PKCE，所有供应商 token 最终都进入加密凭据库。
+
+凭据库使用每 revision 随机数据密钥与 AES-256-GCM 信封加密。轮换主密钥时先把新旧 key 同时放入版本化 keyring、切换 active ID，再 PATCH 每条旧凭据（不改 secret 也可重包装），确认同步成功后才能移除旧 key。每条连接只能二选一使用 `credential_id` 或 `secret_env`。不配置 vault 时，vault/OAuth 接口会 fail closed，但已有环境引用连接不受影响。
+
+每次同步都会更新持久 health、低基数 Prometheus 指标，并可发送 `connector.sync.retry|succeeded|failed|dead_letter` webhook。可重试故障耗尽 attempt 后形成不可变死信；replay 会新建带 `replay_of` 的任务，从最后成功 checkpoint 继续。原始版本独立存放在 `COGDOC_DATA_DIR/source-artifacts`，下载/diff 会验证 SHA-256，默认保留 10 个活动版本，手工删除进入可恢复的 store-local trash；trash purge 必须显式执行且不可逆。备份必须在停止写入后同时保存 `data/` 和外部 vault keyring；`make backup` 默认不会包含 `.env`。配置字段、完整接口、指标、RBAC、轮换和恢复演练见[连接器说明](CONNECTORS_zh-CN.md)。
 
 ### 账号、工作区与 RAG 权限
 
@@ -689,9 +706,27 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `COGDOC_DATA_DIR` | `./data` | 知识库状态、SQLite、manifest 和索引产物根目录 |
 | `COGDOC_TRACE_ENABLED` | `true` | 是否导出请求 JSON trace |
 | `COGDOC_TRACE_DIR` | `logs/traces` | trace JSON 文件目录 |
-| `COGDOC_WEBHOOK_URL` | 未设置 | 待审核知识事件的可选回调地址 |
+| `COGDOC_WEBHOOK_URL` | 未设置 | 待审核知识与连接同步生命周期事件的可选回调地址 |
 | `COGDOC_WEBHOOK_SECRET` | 未设置 | 回调请求携带的可选共享密钥 |
 | `COGDOC_WEBHOOK_TIMEOUT_SECONDS` | `3` | 回调投递请求超时时间 |
+| `COGDOC_CREDENTIAL_MASTER_KEYS` | 未设置 | key ID 到 base64url 32 字节 AES key 的 JSON keyring；未设置时关闭 vault/OAuth，环境引用连接保持兼容 |
+| `COGDOC_CREDENTIAL_ACTIVE_KEY_VERSION` | `v1` | 新建/轮换凭据 envelope 使用的 key ID，必须存在于 keyring |
+| `COGDOC_CONNECTOR_OAUTH_PUBLIC_BASE_URL` | 未设置 | 用于构造供应商精确 callback 的 API 公网 origin；生产必须 HTTPS |
+| `COGDOC_CONNECTOR_OAUTH_SESSION_TTL_SECONDS` | `600` | 一次性 OAuth state/PKCE 会话有效期（30–1800 秒） |
+| `COGDOC_CONNECTOR_OAUTH_TIMEOUT_SECONDS` | `15` | 供应商 token 请求超时（1–60 秒） |
+| `COGDOC_CONNECTOR_INDEX_TIMEOUT_SECONDS` | `30` | 连接器发布/清理索引任务的有界等待（1–3600 秒）；重试复用持久任务 |
+| `COGDOC_CONNECTOR_MAX_CONNECTIONS_GLOBAL` | `10000` | 持久连接定义的进程级硬上限 |
+| `COGDOC_CONNECTOR_MAX_CONNECTIONS_PER_TENANT` | `1000` | 每租户连接定义硬上限 |
+| `COGDOC_CONNECTOR_MAX_CONNECTIONS_PER_KB` | `100` | 每知识库连接定义硬上限，同时约束未分页的连接与健康响应 |
+| `COGDOC_CONNECTOR_USE_AUDIT_RETENTION_DAYS` | `30` | 高频凭据 use 事件保留期；create/rotate/delete 安全审计持续保留 |
+| `COGDOC_CONNECTOR_JOB_RETENTION_DAYS` | `30` | 终态连接同步任务进入有界后台清理前的最短保留期 |
+| `COGDOC_NOTION_OAUTH_CLIENT_ID` / `COGDOC_NOTION_OAUTH_CLIENT_SECRET` | 未设置 | Notion public integration OAuth client |
+| `COGDOC_ATLASSIAN_OAUTH_CLIENT_ID` / `COGDOC_ATLASSIAN_OAUTH_CLIENT_SECRET` | 未设置 | Confluence 使用的 Atlassian 3LO client |
+| `COGDOC_MICROSOFT_OAUTH_CLIENT_ID` / `COGDOC_MICROSOFT_OAUTH_CLIENT_SECRET` | 未设置 | SharePoint 使用的 Microsoft identity client；public client 可不设 secret |
+| `COGDOC_MICROSOFT_OAUTH_TENANT` | `common` | Microsoft v2 授权 tenant 路径段 |
+| `COGDOC_SOURCE_ARTIFACT_MAX_FILE_MB` | `100` | 单个不可变原始来源版本上限 |
+| `COGDOC_SOURCE_ARTIFACT_MAX_VERSIONS` | `10` | 每来源活动原始版本保留数，旧版本随后进入可恢复 trash |
+| `COGDOC_SOURCE_ARTIFACT_MAX_TENANT_MB` | `512` | 每租户活动原始版本与 trash 的硬容量上限；同步在发布前预留 |
 | `COGDOC_FEEDBACK_STORE` | `jsonl` | 反馈存储后端；设为 `sqlite` 时使用数据库并导出逐行对象副本 |
 | `COGDOC_DERIVED_KNOWLEDGE_INDEX_AUTO_REFRESH` | `false` | 知识审核变更后在后台重建派生知识向量索引 |
 | `COGDOC_ACCOUNT_AUTH_ENABLED` | `false` | 启用持久真人账号、登录会话、工作区、邀请及资源 ACL；默认关闭以兼容旧部署 |

@@ -5,6 +5,12 @@ from cogdoc.api.app import _unhandled_error_response, create_app
 from cogdoc.api.auth_store import AuthStore
 from cogdoc.api.resource_access import ResourceAccessStore
 from cogdoc.api.session_store import SessionStore
+from cogdoc.connectors.connection_store import ConnectionStore
+from cogdoc.connectors.credential_store import CredentialVault
+from cogdoc.connectors.oauth import OAuthCoordinator, OAuthSessionStore
+from cogdoc.connectors.sync_store import ConnectorSyncStore
+from cogdoc.service.source_artifact_store import SourceArtifactStore
+from cogdoc.service.source_catalog import SourceCatalog
 
 
 # 声明异步测试使用的后端。
@@ -17,6 +23,43 @@ def anyio_backend():
 async def _client(app, raise_app_exceptions=True):
     transport = ASGITransport(app=app, raise_app_exceptions=raise_app_exceptions)
     return AsyncClient(transport=transport, base_url="http://testserver")
+
+
+def _connector_ready_app(tmp_path, *, with_oauth=True):
+    vault = CredentialVault(
+        str(tmp_path / "vault.db"),
+        master_keys={"v1": b"h" * 32},
+        active_key_version="v1",
+    )
+    options = {
+        "session_store": SessionStore(),
+        "connection_store": ConnectionStore(str(tmp_path / "connections.db")),
+        "connector_sync_store": ConnectorSyncStore(str(tmp_path / "sync.db")),
+        "source_catalog": SourceCatalog(str(tmp_path / "catalog.db")),
+        "source_artifact_store": SourceArtifactStore(tmp_path / "artifacts"),
+        "connector_credential_vault": vault,
+    }
+    if with_oauth:
+        oauth_sessions = OAuthSessionStore(str(tmp_path / "oauth.db"), vault)
+        options["connector_oauth"] = OAuthCoordinator(oauth_sessions, vault, {})
+    app = create_app(
+        **options,
+    )
+    return app
+
+
+def _close_connector_ready_stores(app) -> None:
+    for name in (
+        "connection_store",
+        "connector_sync_store",
+        "source_catalog",
+        "connector_credential_vault",
+        "connector_oauth_session_store",
+    ):
+        try:
+            getattr(app.state, name).close()
+        except Exception:
+            pass
 
 
 # 验证 healthz is ok 场景。
@@ -111,6 +154,122 @@ async def test_structured_readiness_reports_components(monkeypatch):
     assert payload["components"]["authentication"] == {
         "status": "degraded",
         "required": False,
+    }
+    for component in (
+        "connection_store",
+        "connector_sync_store",
+        "source_catalog",
+        "source_artifact_store",
+    ):
+        assert payload["components"][component] == {
+            "status": "ready",
+            "required": True,
+        }
+    assert payload["components"]["connector_credential_vault"] == {
+        "status": "disabled",
+        "required": False,
+    }
+    assert payload["components"]["connector_oauth_session_store"] == {
+        "status": "disabled",
+        "required": False,
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("component", "required_table"),
+    [
+        ("connection_store", "connector_connections"),
+        ("connector_sync_store", "connector_sync_jobs"),
+        ("source_catalog", "source_catalog_documents"),
+        ("connector_credential_vault", "connector_credentials"),
+        ("connector_oauth_session_store", "connector_oauth_sessions"),
+    ],
+)
+@pytest.mark.parametrize("failure_kind", ["closed", "damaged"])
+async def test_connector_readiness_fails_for_closed_or_damaged_sqlite_component(
+    tmp_path, monkeypatch, component, required_table, failure_kind
+):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    app = _connector_ready_app(tmp_path)
+    try:
+        async with app.router.lifespan_context(app):
+            target = getattr(app.state, component)
+            if failure_kind == "closed":
+                target.close()
+            else:
+                target._conn.execute(f"DROP TABLE {required_table}")
+            async with await _client(app) as client:
+                structured = await client.get("/health/ready")
+                legacy = await client.get("/readyz")
+    finally:
+        _close_connector_ready_stores(app)
+
+    assert structured.status_code == legacy.status_code == 503
+    assert structured.json()["components"][component] == {
+        "status": "not_ready",
+        "required": True,
+    }
+
+
+@pytest.mark.anyio
+async def test_vault_is_required_without_enabling_oauth_sessions(tmp_path, monkeypatch):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    app = _connector_ready_app(tmp_path, with_oauth=False)
+    try:
+        async with app.router.lifespan_context(app):
+            async with await _client(app) as client:
+                response = await client.get("/health/ready")
+    finally:
+        _close_connector_ready_stores(app)
+
+    assert response.status_code == 200
+    assert response.json()["components"]["connector_credential_vault"] == {
+        "status": "ready",
+        "required": True,
+    }
+    assert response.json()["components"]["connector_oauth_session_store"] == {
+        "status": "disabled",
+        "required": False,
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure_kind", ["unavailable", "not_writable"])
+async def test_connector_readiness_requires_accessible_writable_artifact_root(
+    tmp_path, monkeypatch, failure_kind
+):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    app = _connector_ready_app(tmp_path)
+    artifact_store = app.state.source_artifact_store
+    try:
+        async with app.router.lifespan_context(app):
+            if failure_kind == "unavailable":
+                artifact_store.root.rename(tmp_path / "artifacts-unavailable")
+            else:
+                monkeypatch.setattr(
+                    artifact_store,
+                    "check",
+                    lambda: (_ for _ in ()).throw(
+                        PermissionError("artifact root is read-only")
+                    ),
+                )
+            async with await _client(app) as client:
+                structured = await client.get("/health/ready")
+                legacy = await client.get("/readyz")
+    finally:
+        _close_connector_ready_stores(app)
+
+    assert structured.status_code == legacy.status_code == 503
+    assert structured.json()["components"]["source_artifact_store"] == {
+        "status": "not_ready",
+        "required": True,
     }
 
 

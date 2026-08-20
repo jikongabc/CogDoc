@@ -57,6 +57,107 @@ def test_quota_counts_only_the_requested_tenant(tmp_path):
     manager.release(token)
 
 
+def test_quota_counts_every_supported_document_format(tmp_path):
+    registry = _Registry(tmp_path)
+    registry.records.append(
+        {"tenant_id": "a", "storage_id": "a-kb", "kb_id": "kb"}
+    )
+    _write(registry, "a-kb", "notes.md", b"123")
+    _write(registry, "a-kb", "readme.txt", b"4567")
+    _write(registry, "a-kb", "internal.json", b"not-a-source")
+    manager = TenantQuotaManager(registry, TenantQuotaPolicy(max_documents=2))
+
+    assert manager.snapshot("a")["usage"] == {
+        "knowledge_bases": 1,
+        "documents": 2,
+        "storage_bytes": 7,
+    }
+    with pytest.raises(TenantQuotaExceeded):
+        manager.reserve_upload(
+            "a", "a-kb", registry.source_dir("a-kb"), "third.html", 1
+        )
+
+
+def test_connector_snapshot_reserves_growth_until_materialization(tmp_path):
+    registry = _Registry(tmp_path)
+    registry.records.append(
+        {"tenant_id": "a", "storage_id": "a-kb", "kb_id": "kb"}
+    )
+    _write(registry, "a-kb", "existing.md", b"old")
+    baseline = tmp_path / "baseline"
+    proposed = tmp_path / "proposed"
+    other = tmp_path / "other"
+    baseline.mkdir()
+    proposed.mkdir()
+    other.mkdir()
+    (baseline / "existing.md").write_bytes(b"old")
+    (proposed / "existing.md").write_bytes(b"old")
+    (proposed / "new.txt").write_bytes(b"more")
+    (other / "another.md").write_bytes(b"x")
+    manager = TenantQuotaManager(
+        registry,
+        TenantQuotaPolicy(max_documents=2, max_storage_bytes=7),
+    )
+
+    token = manager.reserve_connector_snapshot(
+        "a",
+        "a-kb",
+        registry.source_dir("a-kb"),
+        str(baseline),
+        str(proposed),
+        "sync-1",
+    )
+    assert token
+    assert manager.snapshot("a")["reserved"] == {
+        "knowledge_bases": 0,
+        "documents": 1,
+        "storage_bytes": 4,
+    }
+    with pytest.raises(TenantQuotaExceeded):
+        manager.reserve_connector_snapshot(
+            "a",
+            "a-kb",
+            registry.source_dir("a-kb"),
+            str(tmp_path / "missing"),
+            str(other),
+            "sync-2",
+        )
+    manager.release(token)
+
+
+def test_connector_recovery_does_not_double_charge_already_published_prefix(tmp_path):
+    registry = _Registry(tmp_path)
+    registry.records.append(
+        {"tenant_id": "a", "storage_id": "a-kb", "kb_id": "kb"}
+    )
+    _write(registry, "a-kb", "old.md", b"old")
+    _write(registry, "a-kb", "new.md", b"new")
+    baseline = tmp_path / "baseline-prefix"
+    proposed = tmp_path / "proposed-prefix"
+    baseline.mkdir()
+    proposed.mkdir()
+    (baseline / "old.md").write_bytes(b"old")
+    (proposed / "old.md").write_bytes(b"old")
+    (proposed / "new.md").write_bytes(b"new")
+    manager = TenantQuotaManager(
+        registry,
+        TenantQuotaPolicy(max_documents=2, max_storage_bytes=6),
+    )
+
+    token = manager.reserve_connector_snapshot(
+        "a",
+        "a-kb",
+        registry.source_dir("a-kb"),
+        str(baseline),
+        str(proposed),
+        "recover",
+    )
+    assert token
+    assert manager.snapshot("a")["reserved"]["documents"] == 0
+    assert manager.snapshot("a")["reserved"]["storage_bytes"] == 0
+    manager.release(token)
+
+
 def test_inflight_reservations_close_quota_race(tmp_path):
     registry = _Registry(tmp_path)
     registry.records.append(

@@ -1069,6 +1069,20 @@ class IndexJobManager:
         if callable(reconcile):
             reconcile()
 
+    def reopen(self) -> None:
+        """Re-enable admission after a fully drained lifespan shutdown."""
+
+        with self._ex_lock:
+            if not self._closed:
+                return
+            if (
+                self._executors
+                or self._retired_executors
+                or any(self._inflight.values())
+            ):
+                raise RuntimeError("cannot reopen IndexJobManager while work remains")
+            self._closed = False
+
     # 完成 shutdown 处理。
     def shutdown(self, wait: bool = True) -> None:
         with self._ex_lock:

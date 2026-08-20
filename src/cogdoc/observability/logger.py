@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import sys
 import traceback
 from collections.abc import Mapping
@@ -23,7 +24,40 @@ _BASE_RECORD_KEYS = set(
 )
 _RESERVED_EXTRA_KEYS = _BASE_RECORD_KEYS | {"message", "asctime"}
 _HANDLER_MARKER = "_cogdoc_handler"
+_ACCESS_FILTER_MARKER = "_cogdoc_sensitive_query_filter"
 _CONFIGURED_SIGNATURE = None
+_OAUTH_CALLBACK_TARGET = re.compile(
+    r"(/v1/auth/connector-oauth/callback/[A-Za-z0-9_-]+)\?[^\s\"]*"
+)
+
+
+class OAuthCallbackAccessLogFilter(logging.Filter):
+    """Strip OAuth callback query secrets from Uvicorn access records."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            target = str(args[2])
+            redacted = _OAUTH_CALLBACK_TARGET.sub(r"\1", target)
+            if redacted != target:
+                updated = list(args)
+                updated[2] = redacted
+                record.args = tuple(updated)
+        elif isinstance(record.msg, str):
+            record.msg = _OAUTH_CALLBACK_TARGET.sub(r"\1", record.msg)
+        return True
+
+
+def _install_sensitive_access_log_filter() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if any(
+        getattr(active_filter, _ACCESS_FILTER_MARKER, False)
+        for active_filter in access_logger.filters
+    ):
+        return
+    active_filter = OAuthCallbackAccessLogFilter()
+    setattr(active_filter, _ACCESS_FILTER_MARKER, True)
+    access_logger.addFilter(active_filter)
 
 
 # 定义 JsonLogFormatter 数据结构。
@@ -73,6 +107,9 @@ def get_logger(name: str) -> logging.Logger:
 # 配置logging。
 def configure_logging(settings: Settings | None = None) -> None:
     global _CONFIGURED_SIGNATURE
+    # Uvicorn formats the raw request target outside the ASGI application, so
+    # route middleware cannot reliably hide OAuth state/code query values.
+    _install_sensitive_access_log_filter()
     settings = settings or get_settings()
     logger = logging.getLogger("cogdoc")
     signature = (

@@ -4,6 +4,8 @@ import mimetypes
 import os
 from collections.abc import Mapping
 from typing import Any, Callable, Iterable, Iterator
+from urllib.parse import quote
+
 import httpx
 
 DEFAULT_TIMEOUT = 180.0
@@ -653,6 +655,271 @@ class CogDocClient:
     def get_sync_job(self, kb_id: str, job_id: str) -> httpx.Response:
         return httpx.get(
             self._url(f"/v1/knowledge-bases/{kb_id}/sync-jobs/{job_id}"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def replay_sync_job(self, kb_id: str, job_id: str) -> httpx.Response:
+        return httpx.post(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/sync-jobs/"
+                f"{quote(job_id, safe='')}/replay"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_connection_health(self, kb_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/knowledge-bases/{quote(kb_id, safe='')}/connection-health"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_connection_health(self, kb_id: str, connection_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/connections/"
+                f"{quote(connection_id, safe='')}/health"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_connector_credentials(self, kb_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/connector-credentials"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def create_connector_credential(
+        self, kb_id: str, payload: Mapping[str, Any]
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/connector-credentials"
+            ),
+            json=dict(payload),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def rotate_connector_credential(
+        self,
+        kb_id: str,
+        credential_id: str,
+        *,
+        secret_values: Mapping[str, str] | None = None,
+        expires_at: float | None = None,
+        expected_revision: int | None = None,
+        update_expiry: bool = False,
+    ) -> httpx.Response:
+        payload: dict[str, Any] = {}
+        if secret_values is not None:
+            payload["secret_values"] = dict(secret_values)
+        if update_expiry:
+            payload["expires_at"] = expires_at
+        if expected_revision is not None:
+            payload["expected_revision"] = expected_revision
+        return httpx.patch(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/"
+                f"connector-credentials/{quote(credential_id, safe='')}"
+            ),
+            json=payload,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def refresh_connector_credential(
+        self,
+        kb_id: str,
+        credential_id: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> httpx.Response:
+        params = (
+            {"expected_revision": expected_revision}
+            if expected_revision is not None
+            else None
+        )
+        return httpx.post(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/"
+                f"connector-credentials/{quote(credential_id, safe='')}/refresh"
+            ),
+            params=params,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def delete_connector_credential(
+        self,
+        kb_id: str,
+        credential_id: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> httpx.Response:
+        params = (
+            {"expected_revision": expected_revision}
+            if expected_revision is not None
+            else None
+        )
+        return httpx.delete(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/"
+                f"connector-credentials/{quote(credential_id, safe='')}"
+            ),
+            params=params,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_connector_credential_events(
+        self,
+        kb_id: str,
+        *,
+        credential_id: str | None = None,
+        limit: int = 200,
+    ) -> httpx.Response:
+        params: dict[str, Any] = {"limit": limit}
+        if credential_id is not None:
+            params["credential_id"] = credential_id
+        return httpx.get(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/"
+                "connector-credentials/audit/events"
+            ),
+            params=params,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def authorize_connector_oauth(
+        self,
+        kb_id: str,
+        provider: str,
+        *,
+        connection_id: str | None = None,
+    ) -> httpx.Response:
+        payload = {"provider": provider}
+        if connection_id is not None:
+            payload["connection_id"] = connection_id
+        return httpx.post(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/connector-oauth/authorize"
+            ),
+            json=payload,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_source_catalog(
+        self,
+        kb_id: str,
+        *,
+        connection_id: str | None = None,
+        health_status: str | None = None,
+        include_deleted: bool = False,
+    ) -> httpx.Response:
+        params: dict[str, Any] = {"include_deleted": include_deleted}
+        if connection_id is not None:
+            params["connection_id"] = connection_id
+        if health_status is not None:
+            params["health_status"] = health_status
+        return httpx.get(
+            self._url(f"/v1/knowledge-bases/{quote(kb_id, safe='')}/source-catalog"),
+            params=params,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_source_catalog_entry(self, kb_id: str, source_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/source-catalog/"
+                f"{quote(source_id, safe='')}"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_source_versions(self, kb_id: str, source_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/source-catalog/"
+                f"{quote(source_id, safe='')}/versions"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def diff_source_versions(
+        self,
+        kb_id: str,
+        source_id: str,
+        from_version_id: str,
+        to_version_id: str,
+    ) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/source-catalog/"
+                f"{quote(source_id, safe='')}/diff"
+            ),
+            params={
+                "from_version_id": from_version_id,
+                "to_version_id": to_version_id,
+            },
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def download_source_version(
+        self, kb_id: str, source_id: str, version_id: str
+    ) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/source-catalog/"
+                f"{quote(source_id, safe='')}/versions/"
+                f"{quote(version_id, safe='')}/content"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def delete_source_artifact(
+        self, kb_id: str, source_id: str, version_id: str
+    ) -> httpx.Response:
+        return httpx.delete(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/source-catalog/"
+                f"{quote(source_id, safe='')}/versions/"
+                f"{quote(version_id, safe='')}/artifact"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def restore_source_artifact(
+        self, kb_id: str, recovery_token: str
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/source-artifacts/"
+                f"{quote(recovery_token, safe='')}/restore"
+            ),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_source_artifact_usage(self, kb_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/source-artifacts/usage"
+            ),
             timeout=self.timeout,
             headers=self._headers,
         )

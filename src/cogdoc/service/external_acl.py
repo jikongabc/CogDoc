@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any, Mapping, Protocol
@@ -10,6 +11,7 @@ from typing import Any, Mapping, Protocol
 from cogdoc.api.persistence import connect_sqlite
 from cogdoc.api.resource_access import AccessPolicy, ResourceAccessStore
 from cogdoc.api.tenancy import Role
+from cogdoc.connectors.base import MAX_CONNECTOR_ACL_BYTES, MAX_CONNECTOR_ACL_GRANTS
 
 
 @dataclass(frozen=True)
@@ -19,11 +21,23 @@ class ExternalGrant:
     subject_type: str = "user"
 
     def __post_init__(self) -> None:
-        subject = str(self.external_subject or "").strip().casefold()
-        if not subject or len(subject) > 320:
+        if not isinstance(self.external_subject, str):
+            raise TypeError("external_subject must be a string")
+        subject = self.external_subject.strip().casefold()
+        if (
+            not subject
+            or len(subject.encode("utf-8")) > 320
+            or any(
+                ord(character) < 32 or ord(character) == 127 for character in subject
+            )
+        ):
             raise ValueError("external_subject is invalid")
+        if not isinstance(self.permission, str):
+            raise TypeError("external permission must be a string")
         if self.permission not in {"read", "review", "write"}:
             raise ValueError("external permission is unsupported")
+        if not isinstance(self.subject_type, str):
+            raise TypeError("external subject_type must be a string")
         if self.subject_type not in {"user", "group"}:
             raise ValueError("external subject_type is unsupported")
         object.__setattr__(self, "external_subject", subject)
@@ -39,7 +53,21 @@ class ExternalAclSnapshot:
     def __post_init__(self) -> None:
         if type(self.workspace_visible) is not bool or type(self.complete) is not bool:
             raise TypeError("ACL completeness and visibility must be booleans")
-        keys = [(grant.subject_type, grant.external_subject) for grant in self.grants]
+        grants = tuple(self.grants)
+        if any(not isinstance(grant, ExternalGrant) for grant in grants):
+            raise TypeError("external ACL grants must be ExternalGrant values")
+        object.__setattr__(self, "grants", grants)
+        if len(grants) > MAX_CONNECTOR_ACL_GRANTS:
+            raise ValueError("external ACL grant count exceeds the limit")
+        if self.provider_version is not None:
+            if not isinstance(self.provider_version, str):
+                raise TypeError("provider_version must be a string")
+            if len(self.provider_version.encode("utf-8")) > 1024 or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in self.provider_version
+            ):
+                raise ValueError("provider_version is invalid")
+        keys = [(grant.subject_type, grant.external_subject) for grant in grants]
         if len(keys) != len(set(keys)):
             raise ValueError("external ACL contains duplicate subjects")
 
@@ -47,26 +75,43 @@ class ExternalAclSnapshot:
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> ExternalAclSnapshot:
         if payload is None:
             return cls(complete=False)
-        raw_grants = payload.get("grants") or []
+        if not isinstance(payload, Mapping):
+            raise ValueError("external ACL must be a mapping")
+        try:
+            encoded = json.dumps(
+                dict(payload),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise ValueError("external ACL must be a finite JSON object") from exc
+        if len(encoded) > MAX_CONNECTOR_ACL_BYTES:
+            raise ValueError("external ACL exceeds the byte limit")
+        raw_grants = payload.get("grants", [])
         if not isinstance(raw_grants, list):
             raise ValueError("external ACL grants must be a list")
+        if len(raw_grants) > MAX_CONNECTOR_ACL_GRANTS:
+            raise ValueError("external ACL grant count exceeds the limit")
+        if any(not isinstance(row, Mapping) for row in raw_grants):
+            raise ValueError("external ACL grants must contain objects")
+        workspace_visible = payload.get("workspace_visible", False)
+        complete = payload.get("complete", False)
+        if type(workspace_visible) is not bool or type(complete) is not bool:
+            raise ValueError("external ACL flags must be booleans")
         return cls(
             grants=tuple(
                 ExternalGrant(
-                    str(row.get("external_subject") or row.get("email") or ""),
-                    str(row.get("permission") or "read"),
-                    str(row.get("subject_type") or "user"),
+                    row.get("external_subject") or row.get("email") or "",
+                    row.get("permission") or "read",
+                    row.get("subject_type") or "user",
                 )
                 for row in raw_grants
-                if isinstance(row, Mapping)
             ),
-            workspace_visible=payload.get("workspace_visible") is True,
-            complete=payload.get("complete") is True,
-            provider_version=(
-                str(payload.get("provider_version"))
-                if payload.get("provider_version") is not None
-                else None
-            ),
+            workspace_visible=workspace_visible,
+            complete=complete,
+            provider_version=payload.get("provider_version"),
         )
 
     def fingerprint(self) -> str:
@@ -191,9 +236,81 @@ class ExternalAclSyncStore:
             "updated_at": row[5],
         }
 
+    def delete_scope(self, tenant_id: str, kb_id: str) -> int:
+        """Remove provider ACL checkpoints for a deleted KB incarnation."""
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM external_acl_sync_state WHERE tenant_id=? AND kb_id=?",
+                (str(tenant_id), str(kb_id)),
+            )
+        return int(cursor.rowcount)
+
+    def managed_document_ids(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        managed_by: str,
+    ) -> tuple[str, ...]:
+        """Return every document ever checkpointed by one connector."""
+
+        tenant = str(tenant_id).strip()
+        knowledge_base = str(kb_id).strip()
+        manager = str(managed_by).strip()
+        if not tenant or not knowledge_base or not manager:
+            raise ValueError("ACL checkpoint scope must not be empty")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT document_id FROM external_acl_sync_state "
+                "WHERE tenant_id=? AND kb_id=? AND managed_by=? "
+                "ORDER BY document_id",
+                (tenant, knowledge_base, manager),
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def delete_managed(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        managed_by: str,
+        document_ids: Iterable[str] | None = None,
+    ) -> int:
+        """Delete one connector's ACL checkpoints, optionally for exact docs."""
+
+        tenant = str(tenant_id).strip()
+        knowledge_base = str(kb_id).strip()
+        manager = str(managed_by).strip()
+        if not tenant or not knowledge_base or not manager:
+            raise ValueError("ACL checkpoint scope must not be empty")
+        documents = (
+            None
+            if document_ids is None
+            else tuple(
+                dict.fromkeys(
+                    str(document_id).strip()
+                    for document_id in document_ids
+                    if str(document_id).strip()
+                )
+            )
+        )
+        if documents == ():
+            return 0
+        clauses = "tenant_id=? AND kb_id=? AND managed_by=?"
+        parameters: list[object] = [tenant, knowledge_base, manager]
+        if documents is not None:
+            clauses += " AND document_id IN (" + ",".join("?" for _ in documents) + ")"
+            parameters.extend(documents)
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM external_acl_sync_state WHERE " + clauses,
+                tuple(parameters),
+            )
+        return int(cursor.rowcount)
+
 
 class ExternalAclSynchronizer:
     _ROLES = {"read": Role.VIEWER, "review": Role.REVIEWER, "write": Role.EDITOR}
+    _ROLE_RANK = {Role.VIEWER: 0, Role.REVIEWER: 1, Role.EDITOR: 2}
 
     def __init__(
         self,
@@ -222,14 +339,31 @@ class ExternalAclSynchronizer:
         unresolved = 0
         if snapshot.complete:
             try:
+                resolved_by_subject: dict[str, tuple[Role, str | None]] = {}
                 for grant in snapshot.grants:
                     identity = self.identity_resolver.resolve(tenant_id, grant)
                     if identity is None:
                         unresolved += 1
                         continue
-                    resolved.append(
-                        (identity[0], self._ROLES[grant.permission], identity[1])
-                    )
+                    if not isinstance(identity, tuple) or len(identity) != 2:
+                        raise ValueError("resolved identity is invalid")
+                    subject_id, membership_id = identity
+                    self._validate_resolved_identity(subject_id, "subject_id")
+                    if membership_id is not None:
+                        self._validate_resolved_identity(membership_id, "membership_id")
+                    role = self._ROLES[grant.permission]
+                    existing = resolved_by_subject.get(subject_id)
+                    if existing is None:
+                        resolved_by_subject[subject_id] = (role, membership_id)
+                        continue
+                    if existing[1] != membership_id:
+                        raise ValueError("resolved identity membership is ambiguous")
+                    if self._ROLE_RANK[role] < self._ROLE_RANK[existing[0]]:
+                        resolved_by_subject[subject_id] = (role, membership_id)
+                resolved = [
+                    (subject_id, role, membership_id)
+                    for subject_id, (role, membership_id) in resolved_by_subject.items()
+                ]
             except Exception:
                 # Identity backend failures revoke the provider-managed view;
                 # they never preserve a potentially stale allowlist.
@@ -248,22 +382,21 @@ class ExternalAclSynchronizer:
             if snapshot.complete and snapshot.workspace_visible
             else AccessPolicy.PRIVATE
         )
-        self.access_store.set_document_policy(
+        grant_result = self.access_store.apply_managed_document_access(
             tenant_id,
             kb_id,
             document_id,
             source,
             owner_id,
             policy,
-            owner_membership_id=owner_membership_id,
-        )
-        grant_result = self.access_store.replace_managed_document_grants(
-            tenant_id,
-            kb_id,
-            document_id,
             managed_by,
             resolved if snapshot.complete else [],
+            owner_membership_id=owner_membership_id,
         )
+        revoked_ignored = int(grant_result.get("revoked_ignored", 0))
+        if revoked_ignored:
+            unresolved += revoked_ignored
+        resolved_count = max(0, len(resolved) - revoked_ignored)
         status = "current" if snapshot.complete else "quarantined"
         state = self.state_store.record(
             tenant_id=tenant_id,
@@ -272,7 +405,18 @@ class ExternalAclSynchronizer:
             managed_by=managed_by,
             status=status,
             snapshot=snapshot,
-            resolved_count=len(resolved),
+            resolved_count=resolved_count,
             unresolved_count=unresolved,
         )
         return {**state, **grant_result, "policy": policy.value}
+
+    @staticmethod
+    def _validate_resolved_identity(value: object, field: str) -> None:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 160
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError(f"resolved {field} is invalid")

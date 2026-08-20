@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from cogdoc.connectors.base import ConnectorError, ConnectorSourceRef
+from cogdoc.connectors.base import (
+    MAX_CONNECTOR_ACL_BYTES,
+    MAX_CONNECTOR_ACL_GRANTS,
+    ConnectorError,
+    ConnectorSourceRef,
+)
 from cogdoc.connectors.http_transport import HttpResponse, HttpTransport
 from cogdoc.connectors.implementations import (
     ConfluenceConnector,
@@ -191,6 +196,82 @@ def test_notion_fetches_nested_blocks_with_shared_budget():
     assert fetched.content.decode() == "More\n\nNested"
 
 
+@pytest.mark.parametrize(
+    ("provider", "payload"),
+    [
+        pytest.param("notion", {}, id="notion-missing-results"),
+        pytest.param(
+            "notion",
+            {"results": "not-a-list", "has_more": False},
+            id="notion-wrong-results",
+        ),
+        pytest.param("confluence", {}, id="confluence-missing-results"),
+        pytest.param(
+            "confluence",
+            {"results": "not-a-list", "_links": {}},
+            id="confluence-wrong-results",
+        ),
+        pytest.param("sharepoint", {}, id="sharepoint-missing-value"),
+        pytest.param(
+            "sharepoint",
+            {"value": {}, "@odata.deltaLink": "https://graph.example/delta"},
+            id="sharepoint-wrong-value",
+        ),
+    ],
+)
+def test_provider_list_schema_uncertainty_never_becomes_an_empty_snapshot(
+    provider, payload
+):
+    transport = FakeTransport([_response(payload)])
+    connector = {
+        "notion": lambda: NotionConnector("token", transport),
+        "confluence": lambda: ConfluenceConnector(
+            "https://wiki.example", "token", transport
+        ),
+        "sharepoint": lambda: SharePointConnector("site", "drive", "token", transport),
+    }[provider]()
+
+    with pytest.raises(ConnectorError, match="schema"):
+        connector.list_page(None, limit=10)
+
+
+def test_confluence_missing_storage_body_is_not_materialized_as_empty_content():
+    connector = ConfluenceConnector(
+        "https://wiki.example",
+        "token",
+        FakeTransport([_response({"body": {}})]),
+    )
+
+    with pytest.raises(ConnectorError, match="storage body"):
+        connector.fetch(ConnectorSourceRef("page", "page.html"))
+
+
+@pytest.mark.parametrize(
+    "xml",
+    [
+        b"<foo/>",
+        b"<ListBucketResult/>",
+        b"<ListBucketResult><IsTruncated>maybe</IsTruncated></ListBucketResult>",
+        (
+            b"<ListBucketResult><IsTruncated>false</IsTruncated>"
+            b"<Contents><Key>docs/a.md</Key></Contents></ListBucketResult>"
+        ),
+    ],
+)
+def test_s3_malformed_list_never_becomes_an_empty_snapshot(xml):
+    connector = S3Connector(
+        bucket="bucket",
+        region="us-east-1",
+        access_key="AKID",
+        secret_key="secret",
+        transport=FakeTransport([_response(xml, content_type="application/xml")]),
+        clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(ConnectorError):
+        connector.list_page(None, limit=10)
+
+
 def test_confluence_reads_storage_html_and_sharepoint_downloads_file():
     confluence_transport = FakeTransport(
         [
@@ -212,7 +293,14 @@ def test_confluence_reads_storage_html_and_sharepoint_downloads_file():
         "https://wiki.example", "token", confluence_transport
     )
     confluence_ref = confluence.list_page(None, limit=10).items[0]
-    assert confluence.fetch(confluence_ref).content == b"<p>Body</p>"
+    confluence_fetched = confluence.fetch(confluence_ref)
+    assert confluence_fetched.content == b"<p>Body</p>"
+    assert confluence_fetched.acl == {
+        "complete": True,
+        "workspace_visible": True,
+        "provider_version": None,
+        "grants": [],
+    }
 
     graph_transport = FakeTransport(
         [
@@ -251,6 +339,473 @@ def test_confluence_reads_storage_html_and_sharepoint_downloads_file():
     fetched = sharepoint.fetch(sharepoint_ref)
     assert fetched.content == b"docx"
     assert fetched.acl["grants"][0]["external_subject"] == "alice@example.com"
+
+
+def test_confluence_acl_stably_deduplicates_normalized_subjects():
+    transport = FakeTransport(
+        [
+            _response({"body": {"storage": {"value": "body"}}}),
+            _response(
+                {
+                    "restrictionsHash": "acl-v1",
+                    "read": {
+                        "restrictions": {
+                            "user": {
+                                "results": [
+                                    {"email": "Alice@Example.COM"},
+                                    {"email": " alice@example.com "},
+                                ],
+                                "size": 2,
+                            },
+                            "group": {
+                                "results": [{"name": "ALICE@EXAMPLE.COM"}],
+                                "size": 1,
+                            },
+                        }
+                    },
+                }
+            ),
+        ]
+    )
+    connector = ConfluenceConnector("https://wiki.example", "token", transport)
+
+    fetched = connector.fetch(ConnectorSourceRef("1", "page.html"))
+
+    assert fetched.acl == {
+        "complete": True,
+        "workspace_visible": False,
+        "provider_version": "acl-v1",
+        "grants": [
+            {
+                "external_subject": "alice@example.com",
+                "subject_type": "user",
+                "permission": "read",
+            },
+            {
+                "external_subject": "alice@example.com",
+                "subject_type": "group",
+                "permission": "read",
+            },
+        ],
+    }
+
+
+def test_confluence_acl_grant_overflow_quarantines_without_losing_content(
+    monkeypatch,
+):
+    # Isolate the grant-count boundary from the independent serialized-byte
+    # boundary; production enforces both and either one must quarantine.
+    monkeypatch.setattr(
+        "cogdoc.connectors.base.MAX_CONNECTOR_ACL_BYTES",
+        MAX_CONNECTOR_ACL_BYTES * 10,
+    )
+    rows = [
+        {"accountId": f"account-{index}"}
+        for index in range(MAX_CONNECTOR_ACL_GRANTS + 1)
+    ]
+    transport = FakeTransport(
+        [
+            _response({"body": {"storage": {"value": "body"}}}),
+            _response(
+                {
+                    "read": {
+                        "restrictions": {
+                            "user": {"results": rows, "size": len(rows)},
+                            "group": {"results": [], "size": 0},
+                        }
+                    }
+                }
+            ),
+        ]
+    )
+    connector = ConfluenceConnector("https://wiki.example", "token", transport)
+
+    fetched = connector.fetch(ConnectorSourceRef("1", "page.html"))
+
+    assert fetched.content == b"body"
+    assert fetched.acl == {
+        "complete": False,
+        "workspace_visible": False,
+        "provider_version": None,
+        "grants": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("first_role", "second_role"),
+    [("write", "read"), ("read", "write")],
+)
+def test_sharepoint_acl_merges_duplicate_roles_to_least_privilege_in_stable_order(
+    first_role, second_role
+):
+    transport = FakeTransport(
+        [
+            _response(b"file", content_type="application/octet-stream"),
+            _response(
+                {
+                    "value": [
+                        {
+                            "roles": ["owner"],
+                            "grantedToV2": {"user": {"email": "bob@example.com"}},
+                        },
+                        {
+                            "roles": [first_role],
+                            "grantedToV2": {"user": {"email": "Alice@Example.COM"}},
+                        },
+                        {
+                            "roles": [second_role],
+                            "grantedToV2": {"user": {"email": " alice@example.com "}},
+                        },
+                    ]
+                }
+            ),
+        ]
+    )
+    connector = SharePointConnector("site", "drive", "token", transport)
+
+    fetched = connector.fetch(ConnectorSourceRef("item", "report.docx"))
+
+    assert fetched.acl == {
+        "complete": True,
+        "workspace_visible": False,
+        "provider_version": None,
+        "grants": [
+            {
+                "external_subject": "bob@example.com",
+                "subject_type": "user",
+                "permission": "write",
+            },
+            {
+                "external_subject": "alice@example.com",
+                "subject_type": "user",
+                "permission": "read",
+            },
+        ],
+    }
+
+
+def test_sharepoint_acl_byte_overflow_quarantines_without_losing_content():
+    transport = FakeTransport(
+        [
+            _response(b"file", content_type="application/octet-stream"),
+            _response(
+                {
+                    "value": [
+                        {
+                            "roles": ["read"],
+                            "grantedToV2": {
+                                "user": {"email": "x" * MAX_CONNECTOR_ACL_BYTES}
+                            },
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    connector = SharePointConnector("site", "drive", "token", transport)
+
+    fetched = connector.fetch(
+        ConnectorSourceRef("item", "report.docx", etag="acl-etag")
+    )
+
+    assert fetched.content == b"file"
+    assert fetched.acl == {
+        "complete": False,
+        "workspace_visible": False,
+        "provider_version": "acl-etag",
+        "grants": [],
+    }
+
+
+def test_sharepoint_unknown_acl_role_quarantines_without_losing_content():
+    transport = FakeTransport(
+        [
+            _response(b"file", content_type="application/octet-stream"),
+            _response(
+                {
+                    "value": [
+                        {
+                            "roles": ["future-role"],
+                            "grantedToV2": {"user": {"email": "alice@example.com"}},
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    connector = SharePointConnector("site", "drive", "token", transport)
+
+    fetched = connector.fetch(ConnectorSourceRef("item", "report.docx"))
+
+    assert fetched.content == b"file"
+    assert fetched.acl == {
+        "complete": False,
+        "workspace_visible": False,
+        "provider_version": None,
+        "grants": [],
+    }
+
+
+def test_sharepoint_display_name_only_identity_quarantines_content():
+    transport = FakeTransport(
+        [
+            _response(b"file", content_type="application/octet-stream"),
+            _response(
+                {
+                    "value": [
+                        {
+                            "roles": ["read"],
+                            "grantedToV2": {
+                                "user": {"displayName": "alice@example.com"}
+                            },
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    connector = SharePointConnector("site", "drive", "token", transport)
+
+    fetched = connector.fetch(ConnectorSourceRef("item", "report.docx"))
+
+    assert fetched.content == b"file"
+    assert fetched.acl["complete"] is False
+    assert fetched.acl["workspace_visible"] is False
+    assert fetched.acl["grants"] == []
+
+
+@pytest.mark.parametrize(
+    ("connector_type", "subject"),
+    [
+        pytest.param("confluence", 123, id="confluence-number"),
+        pytest.param("sharepoint", {"unexpected": "object"}, id="sharepoint-object"),
+    ],
+)
+def test_provider_acl_non_string_subject_quarantines_content(connector_type, subject):
+    if connector_type == "confluence":
+        connector = ConfluenceConnector(
+            "https://wiki.example",
+            "token",
+            FakeTransport(
+                [
+                    _response({"body": {"storage": {"value": "body"}}}),
+                    _response(
+                        {
+                            "read": {
+                                "restrictions": {
+                                    "user": {
+                                        "results": [{"accountId": subject}],
+                                        "size": 1,
+                                    },
+                                    "group": {"results": [], "size": 0},
+                                }
+                            }
+                        }
+                    ),
+                ]
+            ),
+        )
+        ref = ConnectorSourceRef("1", "page.html")
+        expected_content = b"body"
+    else:
+        connector = SharePointConnector(
+            "site",
+            "drive",
+            "token",
+            FakeTransport(
+                [
+                    _response(b"file", content_type="application/octet-stream"),
+                    _response(
+                        {
+                            "value": [
+                                {
+                                    "roles": ["read"],
+                                    "grantedToV2": {"user": {"email": subject}},
+                                }
+                            ]
+                        }
+                    ),
+                ]
+            ),
+        )
+        ref = ConnectorSourceRef("item", "report.docx")
+        expected_content = b"file"
+
+    fetched = connector.fetch(ref)
+
+    assert fetched.content == expected_content
+    assert fetched.acl["complete"] is False
+    assert fetched.acl["workspace_visible"] is False
+    assert fetched.acl["grants"] == []
+
+
+@pytest.mark.parametrize("scope", ["organization", "anonymous"])
+def test_sharepoint_broad_links_are_parsed_as_provider_workspace_visibility(scope):
+    transport = FakeTransport(
+        [
+            _response(b"file", content_type="application/octet-stream"),
+            _response(
+                {
+                    "value": [
+                        {
+                            "roles": ["read"],
+                            "link": {"scope": scope},
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    connector = SharePointConnector("site", "drive", "token", transport)
+
+    fetched = connector.fetch(ConnectorSourceRef("item", "report.docx"))
+
+    assert fetched.acl == {
+        "complete": True,
+        "workspace_visible": True,
+        "provider_version": None,
+        "grants": [],
+    }
+
+
+def test_atlassian_oauth_confluence_uses_cloud_gateway_for_content_and_acl():
+    transport = FakeTransport(
+        [
+            _response({"results": [{"id": "1", "title": "Page"}], "_links": {}}),
+            _response({"body": {"storage": {"value": "<p>Body</p>"}}}),
+            _response(
+                {
+                    "read": {
+                        "restrictions": {
+                            "user": {"results": [], "size": 0},
+                            "group": {"results": [], "size": 0},
+                        }
+                    }
+                }
+            ),
+        ]
+    )
+    connector = ConfluenceConnector(
+        "https://docs.atlassian.net",
+        "oauth-token",
+        transport,
+        cloud_id="cloud-123",
+    )
+    ref = connector.list_page(None, limit=10).items[0]
+    fetched = connector.fetch(ref)
+
+    assert fetched.content == b"<p>Body</p>"
+    assert [call[1] for call in transport.calls] == [
+        "https://api.atlassian.com/ex/confluence/cloud-123/wiki/api/v2/pages?limit=10",
+        "https://api.atlassian.com/ex/confluence/cloud-123/wiki/api/v2/pages/1?body-format=storage",
+        "https://api.atlassian.com/ex/confluence/cloud-123/wiki/rest/api/content/1/restriction/byOperation",
+    ]
+
+
+@pytest.mark.parametrize(
+    "acl_response",
+    [
+        {},
+        {"read": {}},
+        {
+            "read": {
+                "restrictions": {
+                    "user": {"results": [{}], "size": 1},
+                    "group": {"results": [], "size": 0},
+                }
+            }
+        },
+        pytest.param(
+            {
+                "read": {
+                    "restrictions": {
+                        "user": {"results": [], "size": 0, "totalSize": 1},
+                        "group": {"results": [], "size": 0},
+                    }
+                }
+            },
+            id="total-size-shows-truncation",
+        ),
+        pytest.param(
+            {
+                "read": {
+                    "restrictions": {
+                        "user": {
+                            "results": [{"accountId": "alice"}],
+                            "size": 1,
+                            "_links": {"next": "/next-page"},
+                        },
+                        "group": {"results": [], "size": 0},
+                    }
+                }
+            },
+            id="next-link-shows-truncation",
+        ),
+        pytest.param(
+            {
+                "read": {
+                    "restrictions": {
+                        "user": {
+                            "results": [{"accountId": "alice"}],
+                            "size": 1,
+                            "start": 0,
+                            "limit": 1,
+                        },
+                        "group": {"results": [], "size": 0},
+                    }
+                }
+            },
+            id="full-page-without-total-size",
+        ),
+    ],
+)
+def test_confluence_acl_uncertainty_quarantines_content(acl_response):
+    transport = FakeTransport(
+        [
+            _response({"body": {"storage": {"value": "body"}}}),
+            _response(acl_response),
+        ]
+    )
+    connector = ConfluenceConnector("https://wiki.example", "token", transport)
+    fetched = connector.fetch(ConnectorSourceRef("1", "page.html"))
+    assert fetched.content == b"body"
+    assert fetched.acl == {
+        "complete": False,
+        "workspace_visible": False,
+        "provider_version": None,
+        "grants": [],
+    }
+
+
+@pytest.mark.parametrize("connector_type", ["confluence", "sharepoint"])
+def test_acl_transport_failure_quarantines_without_losing_content(connector_type):
+    def fail_acl(*_args):
+        raise ConnectorError("permission endpoint denied")
+
+    if connector_type == "confluence":
+        connector = ConfluenceConnector(
+            "https://wiki.example",
+            "token",
+            FakeTransport(
+                [_response({"body": {"storage": {"value": "body"}}}), fail_acl]
+            ),
+        )
+        ref = ConnectorSourceRef("1", "page.html")
+        expected = b"body"
+    else:
+        connector = SharePointConnector(
+            "site",
+            "drive",
+            "token",
+            FakeTransport([_response(b"file"), fail_acl]),
+        )
+        ref = ConnectorSourceRef("1", "file.docx", etag="etag")
+        expected = b"file"
+    fetched = connector.fetch(ref)
+    assert fetched.content == expected
+    assert fetched.acl["complete"] is False
+    assert fetched.acl["workspace_visible"] is False
+    assert fetched.acl["grants"] == []
 
 
 def test_sharepoint_delta_propagates_nested_deletions():

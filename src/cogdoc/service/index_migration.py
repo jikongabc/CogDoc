@@ -212,7 +212,9 @@ class IndexMigrationRunner:
                         item["status"] = "succeeded_with_refresh_failure"
                         item["refresh_error"] = _safe_error(exc)
             except Exception as exc:
-                item.update(status="failed", finished_at=_now_iso(), error=_safe_error(exc))
+                item.update(
+                    status="failed", finished_at=_now_iso(), error=_safe_error(exc)
+                )
             self.store.save(run)
             self._emit(progress, run, item, position, total)
 
@@ -239,8 +241,7 @@ class IndexMigrationRunner:
             item
             for item in run.get("items", [])
             if isinstance(item, dict)
-            and item.get("status")
-            in {"succeeded", "succeeded_with_refresh_failure"}
+            and item.get("status") in {"succeeded", "succeeded_with_refresh_failure"}
             and item.get("previous_generation_id")
             and (not selected or item.get("storage_id") in selected)
         ]
@@ -409,6 +410,20 @@ class IndexMigrationManager:
                 raise RuntimeError("another index migration operation is running")
             future = self._executor.submit(function, *args, **kwargs)
         return future.result()
+
+    def reopen(self) -> None:
+        """Recreate the terminal executor for a subsequent app lifespan."""
+
+        with self._lock:
+            if not self._closed:
+                return
+            if any(not future.done() for future in self._futures.values()):
+                raise RuntimeError("cannot reopen while an index migration is running")
+            self._futures.clear()
+            self._executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="cogdoc-index-migration"
+            )
+            self._closed = False
 
     def shutdown(self, *, wait: bool = True) -> None:
         with self._lock:

@@ -1,6 +1,6 @@
 import logging
 import threading
-from typing import Callable
+from collections.abc import Callable, Mapping
 from cogdoc.observability.logger import log_event
 from cogdoc.service import ingest_service
 from cogdoc.service.kb_locks import compact_locks
@@ -16,11 +16,13 @@ class BackgroundSweeper:
         index_jobs,
         interval_seconds: float = 300.0,
         executor_idle_seconds: float = 900.0,
+        maintenance_tasks: Mapping[str, Callable[[], object]] | None = None,
     ):
         self._kb_ids = kb_ids_provider
         self._index_jobs = index_jobs
         self._interval = interval_seconds
         self._idle = executor_idle_seconds
+        self._maintenance_tasks = dict(maintenance_tasks or {})
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -58,6 +60,7 @@ class BackgroundSweeper:
             ("model_rebuild", lambda: self._rebuild_stale_models(kb_ids)),
             ("executor_evict", lambda: self._index_jobs.evict_idle(self._idle)),
             ("lock_compact", lambda: compact_locks(set(kb_ids))),
+            *tuple(self._maintenance_tasks.items()),
         )
         for task_name, task in tasks:
             try:

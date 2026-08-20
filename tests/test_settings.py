@@ -93,6 +93,18 @@ def test_settings_defaults_match_current_runtime_contract():
     assert settings.cogdoc_trace_enabled is True
     assert settings.cogdoc_trace_dir == "logs/traces"
     assert settings.cogdoc_chat_stream_idle_timeout_seconds == 300.0
+    assert settings.cogdoc_connector_vault_keys == ""
+    assert settings.cogdoc_connector_vault_active_key_id == "v1"
+    assert settings.cogdoc_connector_oauth_session_ttl_seconds == 600
+    assert settings.cogdoc_connector_index_timeout_seconds == 30.0
+    assert settings.cogdoc_confluence_allowed_hosts == ""
+    assert settings.cogdoc_s3_endpoint_allowed_hosts == ""
+    assert settings.cogdoc_local_connector_allowed_roots == ""
+    assert settings.cogdoc_git_connector_allowed_roots == ""
+    assert settings.cogdoc_url_connector_allowed_hosts == ""
+    assert settings.cogdoc_source_artifact_max_file_mb == 100
+    assert settings.cogdoc_source_artifact_max_tenant_mb == 512
+    assert settings.cogdoc_source_artifact_max_versions == 10
     assert settings.eval_review_api_key_set == set()
     assert settings.cogdoc_ocr_enabled is False
     assert settings.cogdoc_ocr_provider == "tesseract"
@@ -138,6 +150,7 @@ def test_settings_reads_environment_overrides(monkeypatch):
     monkeypatch.setenv("QA_ADAPTIVE_RETRIEVAL_MAX_TOP_K", "24")
     monkeypatch.setenv("COGDOC_EVAL_REVIEW_API_KEYS", "review-a, review-b")
     monkeypatch.setenv("COGDOC_CHAT_STREAM_IDLE_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("COGDOC_CONNECTOR_INDEX_TIMEOUT_SECONDS", "75")
 
     settings = get_settings()
 
@@ -173,6 +186,7 @@ def test_settings_reads_environment_overrides(monkeypatch):
     assert settings.qa_adaptive_retrieval_max_top_k == 24
     assert settings.eval_review_api_key_set == {"review-a", "review-b"}
     assert settings.cogdoc_chat_stream_idle_timeout_seconds == 45.0
+    assert settings.cogdoc_connector_index_timeout_seconds == 75.0
 
 
 def test_claim_verification_mode_takes_precedence_over_legacy_boolean(monkeypatch):
@@ -188,13 +202,15 @@ def test_claim_verification_mode_takes_precedence_over_legacy_boolean(monkeypatc
 
 def test_claim_verification_rollout_settings_are_bounded():
     assert (
-        Settings(_env_file=None, claim_verification_rollout_percent=0.0)
-        .claim_verification_rollout_percent
+        Settings(
+            _env_file=None, claim_verification_rollout_percent=0.0
+        ).claim_verification_rollout_percent
         == 0.0
     )
     assert (
-        Settings(_env_file=None, claim_verification_rollout_percent=100.0)
-        .claim_verification_rollout_percent
+        Settings(
+            _env_file=None, claim_verification_rollout_percent=100.0
+        ).claim_verification_rollout_percent
         == 100.0
     )
     with pytest.raises(ValueError):
@@ -254,6 +270,13 @@ def test_chat_stream_idle_timeout_is_bounded():
         Settings(_env_file=None, cogdoc_chat_stream_idle_timeout_seconds=0.5)
     with pytest.raises(ValueError):
         Settings(_env_file=None, cogdoc_chat_stream_idle_timeout_seconds=3601)
+
+
+def test_connector_index_timeout_is_bounded():
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, cogdoc_connector_index_timeout_seconds=0.5)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, cogdoc_connector_index_timeout_seconds=3601)
 
 
 def test_api_principal_map_parses_json_without_exposing_legacy_keys(monkeypatch):

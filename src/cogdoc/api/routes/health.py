@@ -1,14 +1,18 @@
+import asyncio
 from datetime import datetime, timezone
+import time
 from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from cogdoc.api.metrics import CONTENT_TYPE_LATEST
+from cogdoc.api.offload import run_sync
 from cogdoc.config.settings import get_settings
 from cogdoc.tools.ocr import OcrConfig, probe_ocr_dependency
 from cogdoc.tools.rust_core_loader import REQUIRED_NATIVE_SYMBOLS, ensure_rust_core
 
 router = APIRouter(tags=["health"])
+_READINESS_CACHE_SECONDS = 5.0
 
 
 def _component(status: str, *, required: bool = True) -> dict[str, Any]:
@@ -28,8 +32,8 @@ def _ocr_readiness_component() -> dict[str, Any]:
     )
 
 
-def _security_store_component(store: Any, *, required: bool) -> dict[str, Any]:
-    """Probe one security store without ever treating uncertainty as healthy."""
+def _store_readiness_component(store: Any, *, required: bool) -> dict[str, Any]:
+    """Probe one required store without ever treating uncertainty as healthy."""
 
     check = getattr(store, "check", None) if store is not None else None
     healthy = False
@@ -41,6 +45,10 @@ def _security_store_component(store: Any, *, required: bool) -> dict[str, Any]:
     if healthy:
         return _component("ready", required=required)
     return _component("not_ready" if required else "degraded", required=required)
+
+
+def _security_store_component(store: Any, *, required: bool) -> dict[str, Any]:
+    return _store_readiness_component(store, required=required)
 
 
 def _readiness_snapshot(request: Request) -> tuple[bool, dict[str, Any]]:
@@ -76,6 +84,34 @@ def _readiness_snapshot(request: Request) -> tuple[bool, dict[str, Any]]:
         except Exception:
             state_ready = False
     components["state"] = _component("ready" if state_ready else "not_ready")
+
+    for state_name in (
+        "connection_store",
+        "connector_sync_store",
+        "source_catalog",
+        "source_artifact_store",
+    ):
+        components[state_name] = _store_readiness_component(
+            getattr(app_state, state_name, None), required=True
+        )
+
+    oauth_sessions = getattr(app_state, "connector_oauth_session_store", None)
+    oauth_configured = (
+        getattr(app_state, "connector_oauth", None) is not None
+        or oauth_sessions is not None
+    )
+    credential_vault = getattr(app_state, "connector_credential_vault", None)
+    vault_configured = credential_vault is not None or oauth_configured
+    components["connector_credential_vault"] = (
+        _store_readiness_component(credential_vault, required=True)
+        if vault_configured
+        else _component("disabled", required=False)
+    )
+    components["connector_oauth_session_store"] = (
+        _store_readiness_component(oauth_sessions, required=True)
+        if oauth_configured
+        else _component("disabled", required=False)
+    )
 
     try:
         ensure_rust_core(*REQUIRED_NATIVE_SYMBOLS)
@@ -124,6 +160,46 @@ def _readiness_snapshot(request: Request) -> tuple[bool, dict[str, Any]]:
     return ready, payload
 
 
+async def _cached_readiness_snapshot(request: Request) -> tuple[bool, dict[str, Any]]:
+    """Single-flight expensive filesystem/SQLite probes off the event loop."""
+
+    app_state = request.app.state
+    now = time.monotonic()
+    cached = getattr(app_state, "readiness_probe_cache", None)
+    if isinstance(cached, tuple) and len(cached) == 3 and float(cached[0]) > now:
+        return bool(cached[1]), cached[2]
+    lock = getattr(app_state, "readiness_probe_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        app_state.readiness_probe_lock = lock
+    async with lock:
+        now = time.monotonic()
+        cached = getattr(app_state, "readiness_probe_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 3 and float(cached[0]) > now:
+            return bool(cached[1]), cached[2]
+        try:
+            ready, payload = await run_sync(
+                app_state.offload_executor,
+                _readiness_snapshot,
+                request,
+            )
+        except Exception:
+            ready = False
+            payload = {
+                "status": "not_ready",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "components": {
+                    "readiness_probe": _component("not_ready", required=True)
+                },
+            }
+        app_state.readiness_probe_cache = (
+            now + _READINESS_CACHE_SECONDS,
+            ready,
+            payload,
+        )
+        return ready, payload
+
+
 # 返回结果。
 @router.get("/healthz")
 async def healthz():
@@ -143,8 +219,10 @@ async def health_live():
 @router.get("/readyz")
 async def readyz(request: Request):
     # 保留旧探针的响应字段，同时纳入生命周期和状态依赖检查。
-    ready, snapshot = _readiness_snapshot(request)
-    native_ready = snapshot["components"]["rust_core"]["status"] == "ready"
+    ready, snapshot = await _cached_readiness_snapshot(request)
+    native_ready = (
+        snapshot.get("components", {}).get("rust_core", {}).get("status") == "ready"
+    )
     payload = {
         "status": "ready" if ready else "not_ready",
         "rust_core": native_ready,
@@ -157,7 +235,7 @@ async def readyz(request: Request):
 
 @router.get("/health/ready")
 async def health_ready(request: Request):
-    ready, payload = _readiness_snapshot(request)
+    ready, payload = await _cached_readiness_snapshot(request)
     if not ready:
         return JSONResponse(status_code=503, content=payload)
     return payload

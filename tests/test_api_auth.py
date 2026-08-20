@@ -644,6 +644,52 @@ async def test_member_removal_revokes_all_grants_before_reinvite(auth_app):
     )
 
 
+def test_api_principal_queued_mutation_revalidates_live_resource_grant(
+    tmp_path, monkeypatch
+):
+    import cogdoc.api.routes.documents as docs_module
+
+    access_store = ResourceAccessStore(tmp_path / "api-principal-access.db")
+    principal = Principal.for_api_key(
+        "service-key",
+        tenant_id="team-a",
+        subject_id="automation",
+        role=Role.EDITOR,
+    )
+    access_store.set_kb_policy("team-a", "storage-a", "owner", "private")
+    access_store.grant_subject("team-a", "storage-a", principal.subject_id, Role.EDITOR)
+    monkeypatch.setattr(
+        docs_module,
+        "shared_lifecycle_store",
+        lambda: SimpleNamespace(status=lambda _kb_id: "active"),
+    )
+    app_state = SimpleNamespace(
+        auth_store=None,
+        resource_access_store=access_store,
+        kb_registry=SimpleNamespace(get_by_storage_id=lambda _kb_id: None),
+    )
+    guard = _live_session_authorization_guard(
+        SimpleNamespace(
+            state=SimpleNamespace(principal=principal),
+            app=SimpleNamespace(state=app_state),
+        ),
+        KnowledgeBaseScope(
+            tenant_id="team-a",
+            external_id="docs",
+            storage_id="storage-a",
+            owner_id="owner",
+        ),
+        permission=Permission.WRITE,
+    )
+
+    assert guard is not None
+    guard()
+    assert access_store.revoke_subject("team-a", "storage-a", principal.subject_id)
+    with pytest.raises(PermissionError, match="resource authorization was revoked"):
+        guard()
+    access_store.close()
+
+
 @pytest.mark.anyio
 async def test_acl_cleanup_failure_keeps_member_and_grants_retryable(
     auth_app, monkeypatch

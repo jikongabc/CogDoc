@@ -3,6 +3,8 @@ from cogdoc.api.routes.access import router as access_router
 from cogdoc.api.routes.auth import router as auth_router
 from cogdoc.api.routes.chat import router as chat_router
 from cogdoc.api.routes.claim_verification import router as claim_verification_router
+from cogdoc.api.routes.connector_credentials import router as connector_credentials_router
+from cogdoc.api.routes.connector_oauth import router as connector_oauth_router
 from cogdoc.api.routes.connections import router as connections_router
 from cogdoc.api.routes.documents import router as documents_router
 from cogdoc.api.routes.feedback import router as feedback_router
@@ -16,6 +18,7 @@ from cogdoc.api.routes.retrieval_diagnostics import (
     router as retrieval_diagnostics_router,
 )
 from cogdoc.api.routes.research import router as research_router
+from cogdoc.api.routes.source_operations import router as source_operations_router
 from cogdoc.api.routes.traces import router as traces_router
 
 __all__ = [
@@ -24,6 +27,8 @@ __all__ = [
     "auth_router",
     "chat_router",
     "claim_verification_router",
+    "connector_credentials_router",
+    "connector_oauth_router",
     "connections_router",
     "documents_router",
     "feedback_router",
@@ -33,5 +38,6 @@ __all__ = [
     "retrieval_eval_drafts_router",
     "retrieval_diagnostics_router",
     "research_router",
+    "source_operations_router",
     "traces_router",
 ]

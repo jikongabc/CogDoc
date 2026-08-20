@@ -269,8 +269,9 @@ class ResearchExecutionManager:
         )
         if self._max_pending < 1:
             raise ValueError("research max_pending must be positive")
+        self._worker_limit = max(1, max_workers)
         self._executor = DaemonFutureExecutor(
-            max_workers=max(1, max_workers),
+            max_workers=self._worker_limit,
             max_pending=self._max_pending,
             thread_name_prefix="cogdoc-research",
         )
@@ -1048,6 +1049,37 @@ class ResearchExecutionManager:
                 and not any(not handle.future.done() for handle in handles)
             )
         return local_drained and self._executor.is_drained()
+
+    def reopen(self) -> None:
+        """Re-enable cleanly drained execution pools for another lifespan."""
+
+        with self._lock:
+            if not self._closed:
+                return
+            handles = tuple(self._active.values())
+            if (
+                self._provider_calls_in_use
+                or self._provider_processes_in_use
+                or self._submission_reservations
+                or any(not handle.future.done() for handle in handles)
+                or not self._executor.is_drained()
+                or not self._provider_executor.is_drained()
+            ):
+                raise RuntimeError(
+                    "cannot reopen ResearchExecutionManager while active"
+                )
+            self._active.clear()
+            self._executor = DaemonFutureExecutor(
+                max_workers=self._worker_limit,
+                max_pending=self._max_pending,
+                thread_name_prefix="cogdoc-research",
+            )
+            self._provider_executor = DaemonFutureExecutor(
+                max_workers=self._provider_worker_limit,
+                max_pending=self._provider_max_pending,
+                thread_name_prefix="cogdoc-research-provider",
+            )
+            self._closed = False
 
     def _signal_job(
         self,

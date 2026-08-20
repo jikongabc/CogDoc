@@ -25,7 +25,7 @@ A local RAG knowledge-base console for individuals and teams, built on **LangGra
 - **Structure-aware Parent–Child context** — conservative Markdown, numbered, and common Chinese/English headings form section parents. Retrieval and citations remain child-chunk precise, while reranked hits can hydrate a bounded contiguous sibling window from the same section; legacy or unstructured indexes fall back to the existing ±1 neighbor window.
 
 - **Content-addressed incremental cache** — a per-file SHA-256 manifest plus a versioned chunk-identity contract: unchanged files reuse the existing index, and only a changed PDF or chunking scheme triggers an incremental rebuild.
-- **Durable source connections** — local folders, Git, URLs, Zotero, Notion, Confluence, SharePoint, and S3 share one resumable sync runtime with checkpoints, cancellation, budgets, fail-closed ACL mapping, and secret-by-environment references. See [the connector guide](docs/CONNECTORS_zh-CN.md).
+- **Source operations control plane** — local folders, Git, URLs, Zotero, Notion, Confluence, SharePoint, and S3 share one resumable sync runtime with checkpoints, health snapshots, dead letters/replay, budgets, and fail-closed ACL mapping. Connector secrets can use an AES-256-GCM vault, manual rotation, or Notion/Atlassian/Microsoft OAuth, while legacy environment references remain supported. Operators can browse the source catalog, download or diff immutable versions, and soft-delete/restore historical raw artifacts. See [the connector guide](docs/CONNECTORS_zh-CN.md).
 
 - **Multiple knowledge bases · multiple conversations · layered memory** — full display history is persisted for replay; validated recent turns form bounded short-term memory, evicted turns become session-level summaries and decisions, and only explicit stable facts enter cross-session long-term memory. Wrong answers never enter Agent memory.
 
@@ -155,9 +155,18 @@ The Streamlit app is a thin client over the FastAPI service — you can hit it d
 | `GET/PATCH /v1/knowledge-bases/{kb}/documents/{document_id}/access` | Inspect or change a document's `inherit` / `workspace` / `private` policy |
 | `GET/POST/DELETE .../access/grants[/subject_id]` | Manage subject grants at either KB or document scope |
 | `POST /v1/knowledge-bases/{kb}/documents` | Upload + ingest a supported document/image (returns an async `job_id`) |
-| `GET/POST /v1/knowledge-bases/{kb}/connections` | List or create durable source connections |
+| `GET/POST /v1/knowledge-bases/{kb}/connections` | List or create durable source connections using a vault credential or environment reference |
+| `GET/POST /v1/knowledge-bases/{kb}/connector-credentials` | List metadata or encrypt a manual connector credential (secret values are write-only) |
+| `PATCH/DELETE .../connector-credentials/{credential_id}`, `GET .../connector-credentials/audit/events` | Rotate/delete credentials with revision protection, or inspect metadata-only credential audit events |
+| `POST /v1/knowledge-bases/{kb}/connector-oauth/authorize`, `GET /v1/auth/connector-oauth/callback/{provider}` | Run the one-shot Notion, Atlassian, or Microsoft OAuth flow |
+| `POST .../connector-credentials/{credential_id}/refresh` | Refresh a stored OAuth credential |
 | `POST /v1/knowledge-bases/{kb}/connections/{id}/sync` | Start a resumable synchronization |
-| `GET /v1/knowledge-bases/{kb}/sync-jobs` | Observe synchronization and indexing status |
+| `GET /v1/knowledge-bases/{kb}/sync-jobs`, `GET /v1/knowledge-bases/{kb}/connection-health` | Observe jobs, schedules, failures, backlog, and per-connection health |
+| `POST /v1/knowledge-bases/{kb}/sync-jobs/{job_id}/replay` | Replay a dead letter as a new job from the last successful checkpoint |
+| `GET /v1/knowledge-bases/{kb}/source-catalog[/{source_id}]` | Browse the operations catalog by connection/health, including projected document ACL state |
+| `GET .../source-catalog/{source_id}/versions`, `/diff`, `.../{version_id}/content` | Inspect, bounded-diff, or integrity-checked download an immutable raw source version |
+| `DELETE .../{version_id}/artifact`, `POST .../source-artifacts/{recovery_token}/restore` | Soft-delete a non-current raw version or restore it with its scoped recovery token |
+| `GET .../source-artifacts/usage`, `DELETE .../source-artifacts/trash?older_than=...` | Inspect active/trash usage or irreversibly purge scoped trash older than an epoch boundary |
 | `GET /v1/knowledge-bases/{kb}/sources`, `GET /v1/knowledge-bases/{kb}/sources/{source}/chunks` | Browse indexed sources and chunk previews |
 | `GET /v1/index-jobs/{job_id}` | Poll ingestion progress |
 | `POST /v1/chat`, `POST /v1/chat/stream` | Ask (JSON or SSE streaming) |
@@ -200,6 +209,14 @@ output can contain internal Evidence IDs and has not yet passed finalization; th
 client receives the finalized answer as one `token` event immediately before the
 normal `final` event, not as token-by-token prose. Other tasks retain live model
 tokens unless the global claim-verification gate requires buffering.
+
+### Source operations and connector credentials
+
+Credential, OAuth, source-catalog, artifact mutation, sync cancellation, and dead-letter replay routes require the KB-scoped `manage_access` permission; readers can inspect connection/job/health summaries through the ordinary read routes. OAuth callbacks are public only so providers can redirect a browser: a high-entropy state is stored server-side as a short-lived, one-shot binding to the initiating tenant, KB, connection, and user. Microsoft uses S256 PKCE; token payloads from every provider are encrypted in the connector vault.
+
+The vault uses a random per-revision data key and AES-256-GCM envelope encryption. Configure a versioned keyring, keep old keys during rotation, set the new active ID, then PATCH every old credential (an unchanged payload is enough to rewrap it) before removing the old key. A connection uses either `credential_id` or `secret_env`, never both. Leaving the vault unconfigured makes vault/OAuth endpoints fail closed without breaking existing environment-reference connections.
+
+Every connector sync updates durable health, low-cardinality Prometheus metrics, and optional `connector.sync.retry|succeeded|failed|dead_letter` webhooks. Retryable failures become an immutable dead letter after the bounded attempt budget; replay creates a new `replay_of` job and resumes from the last successful checkpoint. Raw versions live separately under `COGDOC_DATA_DIR/source-artifacts`, are SHA-256 checked on download/diff, retain ten active versions by default, and use recoverable store-local trash for manual deletion. Trash purge is explicit and irreversible. Back up `data/` and the external vault keyring at one stopped-write recovery point—`make backup` deliberately excludes `.env`. Exact setup, provider fields, endpoints, metrics, RBAC, rotation, and recovery drills are in [the connector guide](docs/CONNECTORS_zh-CN.md).
 
 ### Accounts, workspaces, and RAG authorization
 
@@ -691,9 +708,27 @@ CogDoc/
 | `COGDOC_DATA_DIR` | `./data` | Root for persisted KB state, SQLite DBs, manifests, and index artifacts |
 | `COGDOC_TRACE_ENABLED` | `true` | Enable JSON trace export for request inspection |
 | `COGDOC_TRACE_DIR` | `logs/traces` | Directory for exported trace JSON files |
-| `COGDOC_WEBHOOK_URL` | unset | Optional endpoint for pending knowledge review events |
+| `COGDOC_WEBHOOK_URL` | unset | Optional endpoint for pending-knowledge and connector-sync lifecycle events |
 | `COGDOC_WEBHOOK_SECRET` | unset | Optional shared secret sent with webhook requests |
 | `COGDOC_WEBHOOK_TIMEOUT_SECONDS` | `3` | Timeout for webhook delivery attempts |
+| `COGDOC_CREDENTIAL_MASTER_KEYS` | unset | JSON keyring of key ID to base64url 32-byte AES key; unset disables vault/OAuth endpoints while environment-reference connections remain compatible |
+| `COGDOC_CREDENTIAL_ACTIVE_KEY_VERSION` | `v1` | Key ID used for new/rotated credential envelopes; the ID must exist in the keyring |
+| `COGDOC_CONNECTOR_OAUTH_PUBLIC_BASE_URL` | unset | Public API origin used to build exact provider callbacks; production requires HTTPS |
+| `COGDOC_CONNECTOR_OAUTH_SESSION_TTL_SECONDS` | `600` | One-shot OAuth state/PKCE session lifetime (30–1800 seconds) |
+| `COGDOC_CONNECTOR_OAUTH_TIMEOUT_SECONDS` | `15` | Provider token request timeout (1–60 seconds) |
+| `COGDOC_CONNECTOR_INDEX_TIMEOUT_SECONDS` | `30` | Bounded wait for connector publication/cleanup index jobs (1–3600 seconds); retries reuse the persisted job |
+| `COGDOC_CONNECTOR_MAX_CONNECTIONS_GLOBAL` | `10000` | Hard process-wide bound on persisted connector definitions |
+| `COGDOC_CONNECTOR_MAX_CONNECTIONS_PER_TENANT` | `1000` | Hard connector-definition bound per tenant |
+| `COGDOC_CONNECTOR_MAX_CONNECTIONS_PER_KB` | `100` | Hard connector-definition bound per knowledge base; also bounds unpaginated connection/health responses |
+| `COGDOC_CONNECTOR_USE_AUDIT_RETENTION_DAYS` | `30` | Retention for high-volume credential-use events; create/rotate/delete security events remain retained |
+| `COGDOC_CONNECTOR_JOB_RETENTION_DAYS` | `30` | Minimum retention for terminal connector jobs before bounded background pruning |
+| `COGDOC_NOTION_OAUTH_CLIENT_ID` / `COGDOC_NOTION_OAUTH_CLIENT_SECRET` | unset | Notion public-integration OAuth client |
+| `COGDOC_ATLASSIAN_OAUTH_CLIENT_ID` / `COGDOC_ATLASSIAN_OAUTH_CLIENT_SECRET` | unset | Atlassian 3LO client used by Confluence connections |
+| `COGDOC_MICROSOFT_OAUTH_CLIENT_ID` / `COGDOC_MICROSOFT_OAUTH_CLIENT_SECRET` | unset | Microsoft identity client used by SharePoint; the secret may be empty for a public client |
+| `COGDOC_MICROSOFT_OAUTH_TENANT` | `common` | Microsoft v2 authorization tenant segment |
+| `COGDOC_SOURCE_ARTIFACT_MAX_FILE_MB` | `100` | Maximum immutable raw source-version size |
+| `COGDOC_SOURCE_ARTIFACT_MAX_TENANT_MB` | `512` | Hard per-tenant raw-version/trash storage cap; reservations make concurrent commits fail before publication |
+| `COGDOC_SOURCE_ARTIFACT_MAX_VERSIONS` | `10` | Active raw versions retained per source before older versions move to recoverable trash |
 | `COGDOC_FEEDBACK_STORE` | `jsonl` | Feedback storage backend; set `sqlite` to use SQLite with JSONL export |
 | `COGDOC_DERIVED_KNOWLEDGE_INDEX_AUTO_REFRESH` | `false` | Rebuild approved derived-knowledge vectors in the background after review changes |
 | `COGDOC_ACCOUNT_AUTH_ENABLED` | `false` | Enable persistent human accounts, login sessions, workspaces, invitations, and resource ACL enforcement; opt-in for compatibility |

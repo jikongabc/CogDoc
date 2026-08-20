@@ -248,7 +248,9 @@ _SSE_PROGRESS_TYPES = {
     "claim_rejected",
 }
 _STREAM_DONE = object()
+_STREAM_WORKER_STARTED = object()
 _STREAM_QUEUE_WATCHDOG_SECONDS = 0.05
+_STREAM_WORKER_START_TIMEOUT_SECONDS = 1.0
 
 
 # 封装SSE 帧。
@@ -327,6 +329,11 @@ async def chat_stream(request_body: ChatRequest, request: Request):
     def produce() -> None:
         # 同步事件流跑在有界线程池里，逐事件回投到事件循环的队列。
         try:
+            # Queueing can wait briefly behind other bounded offload work.  The
+            # provider idle clock starts only once this worker actually owns a
+            # thread; otherwise a very small configured idle timeout can fire
+            # before an immediately-yielded ``request_started`` event.
+            loop.call_soon_threadsafe(queue.put_nowait, _STREAM_WORKER_STARTED)
             for event in run_with_optional_session(
                 stream_runner,
                 doc_id,
@@ -369,6 +376,7 @@ async def chat_stream(request_body: ChatRequest, request: Request):
         final_result: ChatResult | None = None
         recorded = False
         last_activity = loop.time()
+        worker_started = False
 
         # 记录最终结果。
         def record_final(result: ChatResult) -> None:
@@ -409,7 +417,15 @@ async def chat_stream(request_body: ChatRequest, request: Request):
 
         try:
             while True:
-                remaining = idle_timeout_seconds - (loop.time() - last_activity)
+                timeout_seconds = (
+                    idle_timeout_seconds
+                    if worker_started
+                    else max(
+                        idle_timeout_seconds,
+                        _STREAM_WORKER_START_TIMEOUT_SECONDS,
+                    )
+                )
+                remaining = timeout_seconds - (loop.time() - last_activity)
                 if remaining <= 0:
                     producer_future.cancel()
                     timeout_event = ChatEvent(
@@ -463,6 +479,9 @@ async def chat_stream(request_body: ChatRequest, request: Request):
                     else:
                         continue
                 last_activity = loop.time()
+                if event is _STREAM_WORKER_STARTED:
+                    worker_started = True
+                    continue
                 if event is _STREAM_DONE:
                     break
                 if event.type == "final":

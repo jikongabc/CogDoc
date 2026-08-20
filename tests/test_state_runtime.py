@@ -185,6 +185,18 @@ def test_create_app_runtime_shutdown_ownership(tmp_path, monkeypatch):
     assert app_owned.closed is True
     assert owned_app.state.single_instance_lock_handle is None
 
+    internally_owned = runtime_for("internal")
+    monkeypatch.setattr(
+        app_module.StateRuntime,
+        "from_settings",
+        lambda *args, **kwargs: internally_owned,
+    )
+    internal_app = create_app(session_store=SessionStore())
+    asyncio.run(cycle(internal_app))
+    assert internally_owned.closed is True
+    with pytest.raises(RuntimeError, match="StateRuntime is closed"):
+        asyncio.run(cycle(internal_app))
+
 
 @pytest.mark.parametrize("undrained_component", ["research", "planning"])
 def test_create_app_retains_process_lock_while_background_work_is_undrained(

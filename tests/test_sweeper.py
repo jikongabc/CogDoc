@@ -48,6 +48,23 @@ def test_sweep_calls_evict_and_compact(monkeypatch):
     assert compacted == [{"a", "b"}]
 
 
+def test_sweep_runs_bounded_connector_maintenance(monkeypatch):
+    jobs = MagicMock()
+    maintenance = MagicMock()
+    monkeypatch.setattr(
+        sweeper_mod, "KBState", lambda kb_id: MagicMock(stale_generation_ids=lambda: [])
+    )
+    sweeper = sweeper_mod.BackgroundSweeper(
+        kb_ids_provider=lambda: [],
+        index_jobs=jobs,
+        maintenance_tasks={"connector_retention": maintenance},
+    )
+
+    sweeper.sweep_once()
+
+    maintenance.assert_called_once_with()
+
+
 # 验证 evict idle removes idle executor。
 def test_evict_idle_removes_idle_executor():
     mgr = IndexJobManager(

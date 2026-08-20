@@ -903,9 +903,7 @@ def test_claim_verification_review_client_calls_stable_endpoints(monkeypatch):
 
     monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", fake_get)
     monkeypatch.setattr("cogdoc.frontend.api_client.httpx.post", fake_post)
-    client = CogDocClient(
-        "http://api", api_key="secret", workspace_id="workspace-a"
-    )
+    client = CogDocClient("http://api", api_key="secret", workspace_id="workspace-a")
 
     client.claim_verification_review_summary()
     client.list_claim_verification_reviews(
@@ -977,9 +975,7 @@ def test_claim_verification_export_client_collects_bounded_pages(monkeypatch):
     monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", fake_get)
     client = CogDocClient("http://api")
 
-    items = client.export_all_claim_verification_reviews(
-        page_size=2000, max_items=10
-    )
+    items = client.export_all_claim_verification_reviews(page_size=2000, max_items=10)
 
     assert items == [{"id": "first"}, {"id": "second"}]
     assert calls == [{"limit": 1000}, {"limit": 1000, "cursor": "next"}]
@@ -1009,3 +1005,163 @@ def test_knowledge_metrics_client_methods_call_expected_endpoints(monkeypatch):
     assert calls[2][0] == "http://api/v1/feedback-loop-metrics"
     assert calls[2][1]["headers"] == {"Authorization": "Bearer secret"}
     assert calls[2][1]["params"] == {"kb_id": "kb", "answer_count": 20}
+
+
+def test_connector_control_client_calls_credentials_health_and_replay(monkeypatch):
+    calls = []
+
+    def record(method):
+        def fake(url, **kwargs):
+            calls.append((method, url, kwargs))
+            return httpx.Response(200, json={"ok": True})
+
+        return fake
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", record("GET"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.post", record("POST"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.patch", record("PATCH"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.delete", record("DELETE"))
+    client = CogDocClient("http://api", api_key="secret")
+
+    client.list_connection_health("kb/ops")
+    client.get_connection_health("kb/ops", "connection/1")
+    client.replay_sync_job("kb/ops", "job/1")
+    client.list_connector_credentials("kb/ops")
+    client.create_connector_credential(
+        "kb/ops",
+        {
+            "provider": "notion",
+            "credential_kind": "static",
+            "label": "Docs",
+            "secret_values": {"token": "private"},
+        },
+    )
+    client.rotate_connector_credential(
+        "kb/ops",
+        "credential/1",
+        secret_values={"token": "rotated"},
+        expected_revision=3,
+    )
+    client.refresh_connector_credential("kb/ops", "credential/1", expected_revision=4)
+    client.delete_connector_credential("kb/ops", "credential/1", expected_revision=4)
+    client.list_connector_credential_events(
+        "kb/ops", credential_id="credential/1", limit=25
+    )
+    client.authorize_connector_oauth(
+        "kb/ops", "microsoft", connection_id="connection/1"
+    )
+
+    headers = {"Authorization": "Bearer secret"}
+    assert calls[0] == (
+        "GET",
+        "http://api/v1/knowledge-bases/kb%2Fops/connection-health",
+        {"timeout": 180.0, "headers": headers},
+    )
+    assert calls[1][1].endswith("/connections/connection%2F1/health")
+    assert calls[2][1].endswith("/sync-jobs/job%2F1/replay")
+    assert calls[3][1].endswith("/connector-credentials")
+    assert calls[4][2]["json"]["secret_values"] == {"token": "private"}
+    assert calls[5][2]["json"] == {
+        "secret_values": {"token": "rotated"},
+        "expected_revision": 3,
+    }
+    assert calls[6][1].endswith("/connector-credentials/credential%2F1/refresh")
+    assert calls[6][2]["params"] == {"expected_revision": 4}
+    assert calls[7][2]["params"] == {"expected_revision": 4}
+    assert calls[8][1].endswith("/connector-credentials/audit/events")
+    assert calls[8][2]["params"] == {
+        "limit": 25,
+        "credential_id": "credential/1",
+    }
+    assert calls[9][1].endswith("/connector-oauth/authorize")
+    assert calls[9][2]["json"] == {
+        "provider": "microsoft",
+        "connection_id": "connection/1",
+    }
+
+
+def test_source_operations_client_calls_catalog_version_and_artifact_endpoints(
+    monkeypatch,
+):
+    calls = []
+
+    def record(method):
+        def fake(url, **kwargs):
+            calls.append((method, url, kwargs))
+            return httpx.Response(200, json={"ok": True})
+
+        return fake
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", record("GET"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.post", record("POST"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.delete", record("DELETE"))
+    client = CogDocClient("http://api", api_key="secret", workspace_id="workspace-a")
+
+    client.list_source_catalog(
+        "kb", connection_id="connection-1", health_status="stale", include_deleted=True
+    )
+    client.get_source_catalog_entry("kb", "source/1")
+    client.list_source_versions("kb", "source/1")
+    client.diff_source_versions("kb", "source/1", "version/old", "version/new")
+    client.download_source_version("kb", "source/1", "version/new")
+    client.delete_source_artifact("kb", "source/1", "version/old")
+    client.restore_source_artifact("kb", "recovery/token")
+    client.get_source_artifact_usage("kb")
+
+    headers = {
+        "Authorization": "Bearer secret",
+        "X-CogDoc-Workspace": "workspace-a",
+    }
+    assert calls[0] == (
+        "GET",
+        "http://api/v1/knowledge-bases/kb/source-catalog",
+        {
+            "params": {
+                "include_deleted": True,
+                "connection_id": "connection-1",
+                "health_status": "stale",
+            },
+            "timeout": 180.0,
+            "headers": headers,
+        },
+    )
+    assert calls[1][1].endswith("/source-catalog/source%2F1")
+    assert calls[2][1].endswith("/source-catalog/source%2F1/versions")
+    assert calls[3][1].endswith("/source-catalog/source%2F1/diff")
+    assert calls[3][2]["params"] == {
+        "from_version_id": "version/old",
+        "to_version_id": "version/new",
+    }
+    assert calls[4][1].endswith(
+        "/source-catalog/source%2F1/versions/version%2Fnew/content"
+    )
+    assert calls[5][0] == "DELETE"
+    assert calls[5][1].endswith(
+        "/source-catalog/source%2F1/versions/version%2Fold/artifact"
+    )
+    assert calls[6][0] == "POST"
+    assert calls[6][1].endswith("/source-artifacts/recovery%2Ftoken/restore")
+    assert calls[7][1].endswith("/source-artifacts/usage")
+
+
+def test_rotate_connector_credential_can_explicitly_clear_expiry(monkeypatch):
+    calls = []
+
+    def fake_patch(url, **kwargs):
+        calls.append((url, kwargs))
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.patch", fake_patch)
+
+    CogDocClient("http://api").rotate_connector_credential(
+        "kb",
+        "credential-1",
+        expires_at=None,
+        expected_revision=2,
+        update_expiry=True,
+    )
+
+    assert calls[0][1]["json"] == {
+        "expires_at": None,
+        "expected_revision": 2,
+    }

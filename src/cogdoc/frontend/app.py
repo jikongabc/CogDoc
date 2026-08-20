@@ -30,7 +30,7 @@ from cogdoc.frontend.api_client import (
 )
 
 DEFAULT_API_URL = os.getenv("COGDOC_API_URL", "http://localhost:8000")
-MAIN_VIEWS = ["对话", "研究", "派生知识", "证据审核", "调试"]
+MAIN_VIEWS = ["对话", "研究", "来源", "派生知识", "证据审核", "调试"]
 STREAM_RERUN_INTERVAL_SECONDS = 0.8
 STREAM_PREVIEW_HEAD_CHARS = 1200
 STREAM_PREVIEW_TAIL_CHARS = 3600
@@ -60,6 +60,24 @@ CLAIM_VERDICT_LABELS = {
     "unsupported": "证据反驳",
     "insufficient": "证据不足",
     "not_factual": "非事实声明",
+}
+CONNECTOR_SECRET_FIELDS = {
+    "zotero": (("api_key", "API key", True),),
+    "notion": (("token", "Integration token", True),),
+    "atlassian": (("token", "Access token", True),),
+    "microsoft": (("token", "Access token", True),),
+    "s3": (
+        ("access_key", "Access key", True),
+        ("secret_key", "Secret key", True),
+        ("session_token", "Session token", False),
+    ),
+}
+CONNECTOR_PROVIDER_ALIASES = {
+    "zotero": "zotero",
+    "notion": "notion",
+    "confluence": "atlassian",
+    "sharepoint": "microsoft",
+    "s3": "s3",
 }
 
 
@@ -362,6 +380,7 @@ def _init_state() -> None:
     st.session_state.setdefault("claim_review_pages", {})
     st.session_state.setdefault("claim_review_export_jsonl", "")
     st.session_state.setdefault("claim_review_export_scope", "")
+    st.session_state.setdefault("source_artifact_recovery", {})
     # 兼容旧状态：升级前只有一份全局消息，迁移到当前上下文桶里。
     if "messages" in st.session_state:
         if st.session_state.kb_id and st.session_state.messages:
@@ -478,6 +497,7 @@ def _reset_user_context() -> None:
         ("research_open_job_by_kb", {}),
         ("eval_candidate_cache", {}),
         ("claim_review_pages", {}),
+        ("source_artifact_recovery", {}),
         ("known_sessions", {}),
     ):
         st.session_state[name] = empty
@@ -3641,165 +3661,1155 @@ def _render_resource_access_controls(
 
 # 完成 侧边栏 处理。
 def _connection_workbench(client: CogDocClient, kb_id: str) -> None:
-    """Render a compact source-control surface for durable connectors."""
+    """Keep the sidebar as a radar; detailed operations live in the main view."""
 
+    if st.session_state.main_views_by_context.get(_context_key(kb_id)) == "来源":
+        st.caption("来源航海台已在主区打开")
+        return
     try:
         connection_response = client.list_connections(kb_id)
-        connection_payload = response_payload(connection_response)
-        job_response = client.list_sync_jobs(kb_id)
-        job_payload = response_payload(job_response)
+        health_response = client.list_connection_health(kb_id)
     except Exception as exc:
-        st.caption(f"来源连接暂不可用：{exc}")
+        st.caption(f"来源雷达暂不可用：{exc}")
         return
-    if connection_response.status_code != 200:
-        st.caption(
-            format_api_error(
-                connection_payload, connection_response.status_code, "读取来源连接失败"
-            )
-        )
+    connections, connection_error = _source_console_rows(
+        connection_response, "connections", "读取来源连接失败"
+    )
+    health_rows, health_error = _source_console_rows(
+        health_response, "connections", "读取连接健康失败"
+    )
+    if connection_error:
+        st.caption(connection_error)
         return
-    connections = (
-        connection_payload.get("connections", [])
-        if isinstance(connection_payload, Mapping)
-        else []
+    health_by_id = {str(row.get("connection_id") or ""): row for row in health_rows}
+    active_count = sum(bool(row.get("enabled")) for row in connections)
+    alert_count = sum(
+        str(row.get("health_status") or "unknown") in {"failed", "dead_letter"}
+        for row in health_rows
     )
-    jobs = (
-        job_payload.get("jobs", [])
-        if job_response.status_code == 200 and isinstance(job_payload, Mapping)
-        else []
-    )
-    latest_by_connection = {}
-    for job in jobs:
-        if (
-            isinstance(job, Mapping)
-            and job.get("connection_id") not in latest_by_connection
-        ):
-            latest_by_connection[job.get("connection_id")] = job
-
-    active_count = sum(
-        1
-        for connection in connections
-        if isinstance(connection, Mapping) and connection.get("enabled")
-    )
-    with st.expander(f"来源连接 · {active_count} 个运行中", expanded=False):
-        st.caption("同步脉冲 · 连接、抓取、入库三个阶段共享同一条可恢复任务记录")
+    with st.expander(f"来源雷达 · {active_count} 条航线", expanded=False):
+        if health_error:
+            st.caption(health_error)
         if not connections:
-            st.info("还没有连接。添加一个来源后，可手动同步或设置周期。")
-        for connection in connections:
-            if not isinstance(connection, Mapping):
-                continue
+            st.caption("尚未接入来源。打开航海台建立第一条航线。")
+        for connection in connections[:4]:
             connection_id = str(connection.get("connection_id") or "")
-            latest = latest_by_connection.get(connection_id, {})
-            status = str(latest.get("status") or "尚未同步")
-            state_icon = {
-                "succeeded": "●",
-                "failed": "×",
-                "cancelled": "○",
-                "尚未同步": "○",
-            }.get(status, "◐")
-            st.markdown(
-                f"**{connection.get('name') or connection_id}**  "
-                f"`{connection.get('connector_type')}`\n\n"
-                f"{state_icon} {status} · 已取 {latest.get('documents_fetched', 0)} 项 · "
-                f"{latest.get('bytes_fetched', 0)} bytes"
+            health = health_by_id.get(connection_id, {})
+            status = str(health.get("health_status") or "unknown")
+            marker = "●" if status == "healthy" else "◆" if status == "syncing" else "○"
+            st.caption(
+                f"{marker} {connection.get('name') or connection_id} · "
+                f"{_source_status_label(status)}"
             )
-            actions = st.columns([1, 1, 2])
-            if actions[0].button("立即同步", key=f"sync-{connection_id}"):
-                response = client.start_connection_sync(kb_id, connection_id)
-                payload = response_payload(response)
-                if response.status_code == 202:
-                    st.success("同步已启动")
-                    st.rerun()
-                else:
-                    st.error(format_api_error(payload, response.status_code))
-            enabled = bool(connection.get("enabled"))
-            if actions[1].button(
-                "暂停" if enabled else "启用", key=f"toggle-{connection_id}"
-            ):
-                response = client.set_connection_enabled(
-                    kb_id, connection_id, not enabled
-                )
-                if response.status_code == 200:
-                    st.rerun()
-                else:
-                    st.error(
-                        format_api_error(
-                            response_payload(response),
-                            response.status_code,
-                            "更新连接失败",
-                        )
-                    )
-            st.divider()
+        if len(connections) > 4:
+            st.caption(f"另有 {len(connections) - 4} 条航线")
+        if alert_count:
+            st.warning(f"{alert_count} 条航线需要处理")
+        if st.button(
+            "打开来源航海台 →",
+            key=f"open-source-console-{kb_id}",
+            use_container_width=True,
+        ):
+            st.session_state.main_views_by_context[_context_key(kb_id)] = "来源"
+            st.session_state[f"main-view-{kb_id}-{st.session_state.session_id}"] = (
+                "来源"
+            )
+            st.rerun()
 
-        connector_type = st.selectbox(
-            "新增来源类型",
-            [
-                "local-directory",
-                "git",
-                "url",
-                "zotero",
-                "notion",
-                "confluence",
-                "sharepoint",
-                "s3",
-            ],
-            key="new-connector-type",
+
+def _source_console_rows(
+    response, key: str, fallback: str
+) -> tuple[list[Mapping], str | None]:
+    status, payload = _response_status_payload(response)
+    if status != 200:
+        return [], format_api_error(payload, status, fallback)
+    if not isinstance(payload, Mapping) or not isinstance(payload.get(key), list):
+        return [], f"{fallback}：响应格式不符合预期"
+    return [row for row in payload[key] if isinstance(row, Mapping)], None
+
+
+def _source_console_mapping(response, fallback: str) -> tuple[Mapping, str | None]:
+    status, payload = _response_status_payload(response)
+    if status != 200:
+        return {}, format_api_error(payload, status, fallback)
+    if not isinstance(payload, Mapping):
+        return {}, f"{fallback}：响应格式不符合预期"
+    return payload, None
+
+
+def _source_status_label(value: object) -> str:
+    return {
+        "unknown": "等待首航",
+        "queued": "已排队",
+        "syncing": "同步中",
+        "retrying": "等待重试",
+        "healthy": "健康",
+        "degraded": "降级",
+        "stale": "已过期",
+        "error": "来源错误",
+        "failed": "同步失败",
+        "dead_letter": "死信",
+        "cancelled": "已取消",
+        "pending": "已排队",
+        "running": "同步中",
+        "committing": "提交中",
+        "retry_wait": "等待重试",
+        "succeeded": "已完成",
+    }.get(str(value or "unknown"), str(value or "未知"))
+
+
+def _source_status_class(value: object) -> str:
+    status = str(value or "unknown")
+    if status in {"healthy", "succeeded"}:
+        return "is-healthy"
+    if status in {"syncing", "running", "committing", "queued", "pending"}:
+        return "is-moving"
+    if status in {"failed", "dead_letter", "error"}:
+        return "is-fault"
+    if status in {"retrying", "retry_wait", "degraded", "stale"}:
+        return "is-warning"
+    return "is-muted"
+
+
+def _source_format_bytes(value: object) -> str:
+    if not isinstance(value, (str, int, float)):
+        return "—"
+    try:
+        size = max(0.0, float(value or 0))
+    except (TypeError, ValueError):
+        return "—"
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return "—"
+
+
+def _source_format_time(value: object) -> str:
+    if value is None:
+        return "—"
+    if not isinstance(value, (str, int, float)):
+        return "—"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(value)))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "—"
+
+
+def _source_navigation_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+          --nav-abyss:#071b2d; --nav-sounding:#0d3554; --nav-signal:#28c5d9;
+          --nav-foam:#eaf6f8; --nav-amber:#d99a2b; --nav-fault:#d85959;
+        }
+        .source-hero {background:linear-gradient(112deg,var(--nav-abyss),#0a2942 72%,#0d4057);
+          color:white;padding:1.2rem 1.35rem 1rem;border-top:5px solid var(--nav-signal);
+          margin:.15rem 0 1rem;box-shadow:0 12px 30px rgba(7,27,45,.13)}
+        .source-eyebrow,.source-ledger,.source-route,.source-pulse,.source-meta {
+          font-family:"IBM Plex Mono","SFMono-Regular",Consolas,monospace}
+        .source-eyebrow {font-size:.68rem;letter-spacing:.12em;text-transform:uppercase;
+          color:#8de5ef;font-weight:760}
+        .source-hero h2 {font-family:"Noto Sans SC","PingFang SC",sans-serif;
+          font-size:1.85rem;letter-spacing:-.045em;margin:.12rem 0 .18rem}
+        .source-hero p {color:#c9e1e7;margin:0;max-width:55rem;line-height:1.65}
+        .source-pulse {display:grid;grid-template-columns:repeat(4,1fr);margin-top:1rem;
+          border-top:1px solid #35647b;position:relative}
+        .source-pulse-stage {font-size:.68rem;color:#9bbac7;padding:.72rem .35rem .1rem 1rem;
+          position:relative;letter-spacing:.035em}
+        .source-pulse-stage::before {content:"";position:absolute;left:0;top:-.32rem;width:.58rem;
+          height:.58rem;border-radius:50%;background:#55778a;border:2px solid var(--nav-abyss)}
+        .source-pulse-stage.is-healthy::before {background:var(--nav-signal)}
+        .source-pulse-stage.is-moving::before {background:#fff;box-shadow:0 0 0 0 rgba(40,197,217,.6);
+          animation:source-ping 1.6s ease-out infinite}
+        .source-pulse-stage.is-warning::before {background:var(--nav-amber)}
+        .source-pulse-stage.is-fault::before {background:var(--nav-fault)}
+        @keyframes source-ping {60%{box-shadow:0 0 0 .55rem rgba(40,197,217,0)}100%{box-shadow:none}}
+        .source-ledger {border-top:1px solid #b9ced7;border-bottom:1px solid #b9ced7;
+          padding:.48rem 0;color:#244559;font-size:.7rem;letter-spacing:.035em;margin:.2rem 0 .7rem}
+        .source-route {display:grid;grid-template-columns:minmax(0,1.5fr) auto;gap:.7rem;
+          align-items:start;padding:.72rem .1rem;border-bottom:1px solid #c7d8df}
+        .source-route-name {font-family:"Noto Sans SC","PingFang SC",sans-serif;
+          color:#0b2639;font-weight:720;overflow-wrap:anywhere}
+        .source-meta {font-size:.66rem;color:#587180;line-height:1.65;margin-top:.12rem}
+        .source-state {font-size:.66rem;border:1px solid #87a9b8;padding:.18rem .4rem;
+          color:#31566a;white-space:nowrap}
+        .source-state.is-healthy {border-color:#258a95;color:#116874;background:#e7f7f8}
+        .source-state.is-moving {border-color:#238da8;color:#0d667d;background:#e5f5f8}
+        .source-state.is-warning {border-color:#b57c18;color:#7e560f;background:#fff6e2}
+        .source-state.is-fault {border-color:#bd4b4b;color:#9b3030;background:#fff0f0}
+        .source-trace {background:var(--nav-foam);border-left:4px solid var(--nav-signal);
+          padding:.66rem .8rem;margin:.5rem 0 .9rem;color:#173b50;font-size:.7rem;
+          font-family:"IBM Plex Mono","SFMono-Regular",Consolas,monospace;overflow-wrap:anywhere}
+        .source-trace b {color:#08768a}.source-diff {border-left:4px solid var(--nav-sounding)}
+        div[data-testid="stAppViewContainer"] button:focus-visible,
+        div[data-testid="stAppViewContainer"] a:focus-visible {outline:3px solid var(--nav-signal)!important;
+          outline-offset:2px}
+        @media (prefers-reduced-motion:reduce){.source-pulse-stage.is-moving::before{animation:none}}
+        @media (max-width:720px){.source-hero{padding:1rem}.source-hero h2{font-size:1.5rem}
+          .source-pulse{grid-template-columns:1fr 1fr}.source-route{grid-template-columns:1fr}
+          .source-state{justify-self:start}}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _source_navigation_hero(
+    connections: Sequence[Mapping],
+    health_rows: Sequence[Mapping],
+    jobs: Sequence[Mapping],
+    usage: Mapping,
+) -> None:
+    health_values = [str(row.get("health_status") or "unknown") for row in health_rows]
+    latest_status = str(jobs[0].get("status") or "unknown") if jobs else "unknown"
+    connection_status = (
+        "failed"
+        if any(value in {"failed", "dead_letter"} for value in health_values)
+        else "syncing"
+        if any(value in {"syncing", "queued", "retrying"} for value in health_values)
+        else "healthy"
+        if health_values and all(value == "healthy" for value in health_values)
+        else "unknown"
+    )
+    active_versions = int(usage.get("active_versions") or 0)
+    stages = (
+        ("01 连接健康", connection_status),
+        ("02 同步任务", latest_status),
+        ("03 来源版本", "healthy" if active_versions else "unknown"),
+        ("04 ACL / 引用", "healthy" if active_versions else "unknown"),
+    )
+    stage_markup = "".join(
+        f'<div class="source-pulse-stage {_source_status_class(status)}" role="listitem">'
+        f"{html.escape(label)}</div>"
+        for label, status in stages
+    )
+    st.markdown(
+        f"""
+        <section class="source-hero">
+          <div class="source-eyebrow">Source operations / {len(connections):02d} routes</div>
+          <h2>来源航海台</h2>
+          <p>沿一条可审计的同步脉冲，从连接健康追到原始版本、文档权限与引用身份。</p>
+          <div class="source-pulse" role="list" aria-label="来源同步链路">{stage_markup}</div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _source_render_connection_routes(
+    client: CogDocClient,
+    kb_id: str,
+    connections: Sequence[Mapping],
+    health_rows: Sequence[Mapping],
+    jobs: Sequence[Mapping],
+) -> None:
+    health_by_id = {str(row.get("connection_id") or ""): row for row in health_rows}
+    latest_by_connection: dict[str, Mapping] = {}
+    for job in jobs:
+        connection_id = str(job.get("connection_id") or "")
+        latest_by_connection.setdefault(connection_id, job)
+    st.markdown("### 航线与同步")
+    st.markdown(
+        f"<div class='source-ledger'>ROUTES {len(connections):03d}　"
+        f"BACKLOG {sum(int(row.get('backlog') or 0) for row in health_rows):03d}</div>",
+        unsafe_allow_html=True,
+    )
+    if not connections:
+        st.info("还没有来源连接。展开“接入新航线”建立第一条可同步航线。")
+    for connection in connections:
+        connection_id = str(connection.get("connection_id") or "")
+        health = health_by_id.get(connection_id, {})
+        latest = latest_by_connection.get(connection_id, {})
+        status = str(health.get("health_status") or "unknown")
+        name = html.escape(str(connection.get("name") or connection_id))
+        connector_type = html.escape(str(connection.get("connector_type") or "—"))
+        credential_source = html.escape(
+            str(connection.get("credential_source") or "none")
         )
-        examples = {
-            "local-directory": '{"root":"/data/handbook","schedule_seconds":300}',
-            "git": '{"repository":"/repos/docs","ref":"main","subpath":"docs"}',
-            "url": '{"urls":["https://docs.example.com/guide"]}',
-            "zotero": '{"library_type":"users","library_id":"123"}',
-            "notion": '{"schedule_seconds":300}',
-            "confluence": '{"base_url":"https://team.atlassian.net"}',
-            "sharepoint": '{"site_id":"...","drive_id":"..."}',
-            "s3": '{"bucket":"docs","region":"us-east-1","prefix":"manuals/"}',
+        st.markdown(
+            f"""
+            <article class="source-route">
+              <div><div class="source-route-name">{name}</div>
+              <div class="source-meta">{connector_type} · AUTH {credential_source} ·
+              LAST {_source_format_time(health.get("last_success_at"))} ·
+              BACKLOG {int(health.get("backlog") or 0)}</div></div>
+              <span class="source-state {_source_status_class(status)}">
+              {html.escape(_source_status_label(status))}</span>
+            </article>
+            """,
+            unsafe_allow_html=True,
+        )
+        actions = st.columns([1, 1, 1])
+        if actions[0].button(
+            "立即同步",
+            key=f"source-sync-{kb_id}-{connection_id}",
+            use_container_width=True,
+        ):
+            response = client.start_connection_sync(kb_id, connection_id)
+            if response.status_code == 202:
+                st.success("同步任务已进入队列。")
+                st.rerun()
+            else:
+                st.error(_response_error(response, "启动同步失败"))
+        enabled = bool(connection.get("enabled"))
+        if actions[1].button(
+            "暂停" if enabled else "启用",
+            key=f"source-toggle-{kb_id}-{connection_id}",
+            use_container_width=True,
+        ):
+            response = client.set_connection_enabled(kb_id, connection_id, not enabled)
+            if response.status_code == 200:
+                st.success("连接已暂停。" if enabled else "连接已启用。")
+                st.rerun()
+            else:
+                st.error(_response_error(response, "更新连接失败"))
+        replayable = str(latest.get("status") or "") == "dead_letter"
+        if actions[2].button(
+            "重放死信",
+            key=f"source-replay-{kb_id}-{connection_id}",
+            disabled=not replayable or not enabled,
+            help="只会创建新任务，原死信记录保持不变。",
+            use_container_width=True,
+        ):
+            response = client.replay_sync_job(kb_id, str(latest.get("job_id") or ""))
+            if response.status_code == 202:
+                st.success("已从死信创建新的同步任务。")
+                st.rerun()
+            else:
+                st.error(_response_error(response, "重放同步任务失败"))
+        if latest.get("error_code"):
+            st.caption(
+                f"最近错误：{latest.get('error_code')} · "
+                f"{str(latest.get('error_message') or '')[:180]}"
+            )
+
+
+def _source_provider_connections(
+    connections: Sequence[Mapping], provider: str
+) -> list[Mapping]:
+    return [
+        row
+        for row in connections
+        if CONNECTOR_PROVIDER_ALIASES.get(str(row.get("connector_type") or ""))
+        == provider
+        and not row.get("credential_id")
+        and str(row.get("credential_source") or "none") == "none"
+    ]
+
+
+def _source_render_credentials(
+    client: CogDocClient, kb_id: str, connections: Sequence[Mapping]
+) -> list[Mapping]:
+    try:
+        credential_response = client.list_connector_credentials(kb_id)
+        credentials, credential_error = _source_console_rows(
+            credential_response, "credentials", "读取连接凭据失败"
+        )
+    except Exception as exc:
+        credentials, credential_error = [], f"读取连接凭据失败：{exc}"
+    with st.expander(f"加密凭据 · {len(credentials)}", expanded=False):
+        if credential_error:
+            st.warning(credential_error)
+            st.caption("凭据库未配置时，既有环境变量引用仍可继续使用。")
+            return credentials
+        credential_by_id = {
+            str(row.get("credential_id") or ""): row for row in credentials
         }
-        secret_examples = {
-            "zotero": '{"api_key":"COGDOC_ZOTERO_API_KEY"}',
-            "notion": '{"token":"COGDOC_NOTION_TOKEN"}',
-            "confluence": '{"token":"COGDOC_CONFLUENCE_TOKEN"}',
-            "sharepoint": '{"token":"COGDOC_SHAREPOINT_TOKEN"}',
-            "s3": '{"access_key":"AWS_ACCESS_KEY_ID","secret_key":"AWS_SECRET_ACCESS_KEY"}',
+        if credential_by_id:
+            selected_id = st.selectbox(
+                "凭据",
+                list(credential_by_id),
+                format_func=lambda value: (
+                    f"{credential_by_id[value].get('label') or value} · "
+                    f"{credential_by_id[value].get('provider') or 'unknown'}"
+                ),
+                key=f"source-credential-selected-{kb_id}",
+            )
+            selected = credential_by_id[selected_id]
+            referenced_by = [
+                str(connection.get("name") or connection.get("connection_id") or "")
+                for connection in connections
+                if str(connection.get("credential_id") or "") == selected_id
+            ]
+            is_bound = bool(selected.get("connection_id") or referenced_by)
+            st.caption(
+                f"{selected.get('credential_kind') or 'static'} · "
+                f"字段 {', '.join(str(item) for item in selected.get('secret_fields') or [])} · "
+                f"revision {selected.get('revision') or 1} · "
+                f"最近使用 {_source_format_time(selected.get('last_used_at'))}"
+            )
+            if referenced_by:
+                st.caption("使用连接：" + "、".join(referenced_by))
+            if str(selected.get("credential_kind") or "") == "oauth":
+                if st.button(
+                    "刷新 OAuth 令牌",
+                    key=f"source-credential-refresh-{kb_id}-{selected_id}",
+                    use_container_width=True,
+                ):
+                    response = client.refresh_connector_credential(
+                        kb_id,
+                        selected_id,
+                        expected_revision=int(selected.get("revision") or 1),
+                    )
+                    if response.status_code == 200:
+                        st.success("OAuth 令牌已刷新。")
+                        st.rerun()
+                    else:
+                        st.error(_response_error(response, "刷新 OAuth 令牌失败"))
+            elif selected.get("secret_fields"):
+                with st.form(
+                    f"source-credential-rotate-{kb_id}-{selected_id}",
+                    clear_on_submit=True,
+                ):
+                    rotated_values = {
+                        str(field): st.text_input(
+                            f"新的 {field}",
+                            type="password",
+                            autocomplete="off",
+                        )
+                        for field in selected.get("secret_fields") or []
+                    }
+                    rotate = st.form_submit_button("轮换密钥", use_container_width=True)
+                if rotate:
+                    if any(not str(value) for value in rotated_values.values()):
+                        st.warning("轮换时请填写全部现有密钥字段。")
+                    else:
+                        response = client.rotate_connector_credential(
+                            kb_id,
+                            selected_id,
+                            secret_values=rotated_values,
+                            expected_revision=int(selected.get("revision") or 1),
+                        )
+                        if response.status_code == 200:
+                            st.success("凭据已原子轮换；明文未写入页面状态。")
+                            st.rerun()
+                        else:
+                            st.error(_response_error(response, "轮换凭据失败"))
+            delete_columns = st.columns([2, 1])
+            delete_confirmed = delete_columns[0].checkbox(
+                "确认删除未绑定凭据",
+                key=f"source-credential-delete-confirm-{kb_id}-{selected_id}",
+                disabled=is_bound,
+            )
+            if delete_columns[1].button(
+                "删除",
+                key=f"source-credential-delete-{kb_id}-{selected_id}",
+                disabled=not delete_confirmed or is_bound,
+                use_container_width=True,
+            ):
+                response = client.delete_connector_credential(
+                    kb_id,
+                    selected_id,
+                    expected_revision=int(selected.get("revision") or 1),
+                )
+                if response.status_code == 204:
+                    st.success("凭据已删除。")
+                    st.rerun()
+                else:
+                    st.error(_response_error(response, "删除凭据失败"))
+        else:
+            st.caption("凭据库可用，但这个知识库还没有保存凭据。")
+
+        static_tab, oauth_tab, audit_tab = st.tabs(
+            ["新增静态凭据", "OAuth 接入", "审计"]
+        )
+        with static_tab:
+            provider = st.selectbox(
+                "提供方",
+                list(CONNECTOR_SECRET_FIELDS),
+                key=f"source-static-provider-{kb_id}",
+            )
+            targets = _source_provider_connections(connections, provider)
+            target_ids = [""] + [str(row.get("connection_id") or "") for row in targets]
+            target_labels = {
+                str(row.get("connection_id") or ""): str(row.get("name") or "")
+                for row in targets
+            }
+            with st.form(f"source-credential-create-{kb_id}", clear_on_submit=True):
+                label = st.text_input("凭据名称", placeholder="例如：产品空间只读令牌")
+                target_id = st.selectbox(
+                    "绑定连接（可稍后绑定）",
+                    target_ids,
+                    format_func=lambda value: target_labels.get(value, "暂不绑定"),
+                )
+                secret_values = {
+                    field: st.text_input(
+                        label_text + ("" if required else "（可选）"),
+                        type="password",
+                        autocomplete="off",
+                    )
+                    for field, label_text, required in CONNECTOR_SECRET_FIELDS[provider]
+                }
+                create_credential = st.form_submit_button(
+                    "加密保存", use_container_width=True
+                )
+            if create_credential:
+                required_fields = {
+                    field
+                    for field, _, required in CONNECTOR_SECRET_FIELDS[provider]
+                    if required
+                }
+                clean_values = {
+                    field: str(value)
+                    for field, value in secret_values.items()
+                    if str(value)
+                }
+                if not label.strip():
+                    st.warning("请填写凭据名称。")
+                elif not required_fields <= clean_values.keys():
+                    st.warning("请填写全部必需密钥字段。")
+                else:
+                    payload = {
+                        "provider": provider,
+                        "credential_kind": "static",
+                        "label": label.strip(),
+                        "secret_values": clean_values,
+                    }
+                    if target_id:
+                        payload["connection_id"] = target_id
+                    response = client.create_connector_credential(kb_id, payload)
+                    if response.status_code == 201:
+                        st.success("凭据已加密保存；接口只返回字段名。")
+                        st.rerun()
+                    else:
+                        st.error(_response_error(response, "保存凭据失败"))
+        with oauth_tab:
+            oauth_provider = st.selectbox(
+                "OAuth 提供方",
+                ["notion", "atlassian", "microsoft"],
+                key=f"source-oauth-provider-{kb_id}",
+            )
+            oauth_targets = _source_provider_connections(connections, oauth_provider)
+            oauth_ids = [""] + [
+                str(row.get("connection_id") or "") for row in oauth_targets
+            ]
+            oauth_labels = {
+                str(row.get("connection_id") or ""): str(row.get("name") or "")
+                for row in oauth_targets
+            }
+            oauth_target = st.selectbox(
+                "授权后绑定（可稍后绑定）",
+                oauth_ids,
+                format_func=lambda value: oauth_labels.get(value, "暂不绑定"),
+                key=f"source-oauth-target-{kb_id}-{oauth_provider}",
+            )
+            if st.button(
+                "生成一次性授权链接",
+                key=f"source-oauth-start-{kb_id}-{oauth_provider}",
+                use_container_width=True,
+            ):
+                response = client.authorize_connector_oauth(
+                    kb_id,
+                    oauth_provider,
+                    connection_id=oauth_target or None,
+                )
+                payload = response_payload(response)
+                if response.status_code in {200, 201} and isinstance(payload, Mapping):
+                    authorization_url = str(payload.get("authorization_url") or "")
+                    if authorization_url.startswith("https://"):
+                        st.success("一次性授权会话已建立，请在有效期内完成授权。")
+                        st.link_button(
+                            f"前往 {oauth_provider} 授权 →",
+                            authorization_url,
+                            type="primary",
+                            use_container_width=True,
+                        )
+                        if st.button(
+                            "我已完成授权，刷新凭据列表",
+                            key=f"source-oauth-finished-{kb_id}-{oauth_provider}",
+                            use_container_width=True,
+                        ):
+                            st.rerun()
+                    else:
+                        st.error("OAuth 服务返回了无效授权地址。")
+                else:
+                    st.error(_response_error(response, "建立 OAuth 授权会话失败"))
+        with audit_tab:
+            load_audit = st.toggle(
+                "加载最近 50 条凭据操作",
+                value=False,
+                key=f"source-credential-audit-load-{kb_id}",
+            )
+            if load_audit:
+                event_response = client.list_connector_credential_events(
+                    kb_id, limit=50
+                )
+                events, event_error = _source_console_rows(
+                    event_response, "events", "读取凭据审计失败"
+                )
+                if event_error:
+                    st.error(event_error)
+                elif not events:
+                    st.caption("还没有凭据操作记录。")
+                else:
+                    for event in events[:20]:
+                        st.caption(
+                            f"{_source_format_time(event.get('occurred_at'))} · "
+                            f"{event.get('action') or 'unknown'} · "
+                            f"{str(event.get('credential_id') or '')[:14]} · "
+                            f"actor {str(event.get('actor_id') or '')[:14]}"
+                        )
+            else:
+                st.caption("审计按需加载，不会在每次页面刷新时重复查询。")
+    return credentials
+
+
+def _source_render_connection_creator(
+    client: CogDocClient,
+    kb_id: str,
+    credentials: Sequence[Mapping],
+) -> None:
+    examples = {
+        "local-directory": '{"root":"/data/handbook","schedule_seconds":300}',
+        "git": '{"repository":"/repos/docs","ref":"main","subpath":"docs"}',
+        "url": '{"urls":["https://docs.example.com/guide"]}',
+        "zotero": '{"library_type":"users","library_id":"123"}',
+        "notion": '{"schedule_seconds":300}',
+        "confluence": '{"base_url":"https://team.atlassian.net"}',
+        "sharepoint": '{"site_id":"...","drive_id":"..."}',
+        "s3": '{"bucket":"docs","region":"us-east-1","prefix":"manuals/"}',
+    }
+    secret_examples = {
+        "zotero": '{"api_key":"COGDOC_ZOTERO_API_KEY"}',
+        "notion": '{"token":"COGDOC_NOTION_TOKEN"}',
+        "confluence": '{"token":"COGDOC_CONFLUENCE_TOKEN"}',
+        "sharepoint": '{"token":"COGDOC_SHAREPOINT_TOKEN"}',
+        "s3": '{"access_key":"AWS_ACCESS_KEY_ID","secret_key":"AWS_SECRET_ACCESS_KEY"}',
+    }
+    with st.expander("接入新航线", expanded=False):
+        connector_type = st.selectbox(
+            "来源类型",
+            list(examples),
+            key=f"source-new-connector-type-{kb_id}",
+        )
+        provider = CONNECTOR_PROVIDER_ALIASES.get(connector_type)
+        matching_credentials = [
+            row
+            for row in credentials
+            if str(row.get("provider") or "") == provider
+            and not row.get("connection_id")
+        ]
+        auth_options = ["无需凭据"]
+        if provider is not None:
+            auth_options = ["加密凭据", "环境变量"]
+        auth_mode = st.radio(
+            "认证方式",
+            auth_options,
+            horizontal=True,
+            key=f"source-new-auth-mode-{kb_id}-{connector_type}",
+        )
+        credential_by_id = {
+            str(row.get("credential_id") or ""): row for row in matching_credentials
         }
-        with st.form("create-connection", clear_on_submit=True):
-            connection_name = st.text_input("连接名称", placeholder="例如：产品手册")
+        selected_credential = None
+        if auth_mode == "加密凭据":
+            if credential_by_id:
+                selected_credential = st.selectbox(
+                    "未绑定凭据",
+                    list(credential_by_id),
+                    format_func=lambda value: str(
+                        credential_by_id[value].get("label") or value
+                    ),
+                    key=f"source-new-credential-{kb_id}-{connector_type}",
+                )
+            else:
+                st.caption("没有匹配的未绑定凭据；请先在“加密凭据”中创建或完成 OAuth。")
+        with st.form(
+            f"source-create-connection-{kb_id}-{connector_type}-{auth_mode}",
+            clear_on_submit=True,
+        ):
+            name = st.text_input("连接名称", placeholder="例如：产品手册")
             config_text = st.text_area(
-                "位置与周期（JSON）", value=examples[connector_type], height=90
+                "位置与周期（JSON）", value=examples[connector_type], height=100
             )
-            secret_text = st.text_area(
-                "密钥环境变量（JSON，不填密钥值）",
-                value=secret_examples.get(connector_type, "{}"),
-                height=70,
-            )
+            secret_text = "{}"
+            if auth_mode == "环境变量":
+                secret_text = st.text_area(
+                    "密钥环境变量（JSON，只填变量名）",
+                    value=secret_examples.get(connector_type, "{}"),
+                    height=80,
+                )
             workspace_visible = st.checkbox("同步后对工作区成员可见", value=False)
-            create = st.form_submit_button("保存连接")
+            create = st.form_submit_button("保存航线", use_container_width=True)
         if create:
             try:
                 config = json.loads(config_text)
                 secret_env = json.loads(secret_text)
                 if not isinstance(config, dict) or not isinstance(secret_env, dict):
                     raise ValueError("JSON 顶层必须是对象")
-                response = client.create_connection(
-                    kb_id,
-                    {
-                        "connector_type": connector_type,
-                        "name": connection_name,
-                        "config": config,
-                        "secret_env": secret_env,
-                        "workspace_visible": workspace_visible,
-                    },
-                )
-                payload = response_payload(response)
+                if not name.strip():
+                    raise ValueError("连接名称不能为空")
+                if auth_mode == "加密凭据" and not selected_credential:
+                    raise ValueError("请先选择匹配的加密凭据")
+                payload = {
+                    "connector_type": connector_type,
+                    "name": name.strip(),
+                    "config": config,
+                    "secret_env": secret_env if auth_mode == "环境变量" else {},
+                    "workspace_visible": workspace_visible,
+                }
+                if selected_credential:
+                    payload["credential_id"] = selected_credential
+                response = client.create_connection(kb_id, payload)
                 if response.status_code == 201:
-                    st.success("连接已保存")
+                    st.success("航线已保存。")
                     st.rerun()
                 else:
-                    st.error(
-                        format_api_error(payload, response.status_code, "保存连接失败")
-                    )
+                    st.error(_response_error(response, "保存连接失败"))
             except (json.JSONDecodeError, ValueError) as exc:
-                st.error(f"配置 JSON 无效：{exc}")
+                st.error(f"连接配置无效：{exc}")
+
+
+def _source_render_job_ledger(
+    client: CogDocClient, kb_id: str, jobs: Sequence[Mapping]
+) -> None:
+    with st.expander(f"同步任务账本 · {len(jobs)}", expanded=False):
+        if not jobs:
+            st.caption("还没有同步任务。")
+            return
+        job_by_id = {str(row.get("job_id") or ""): row for row in jobs}
+        selected_id = st.selectbox(
+            "任务",
+            list(job_by_id),
+            format_func=lambda value: (
+                f"{_source_status_label(job_by_id[value].get('status'))} · "
+                f"{value[:12]} · {job_by_id[value].get('connector_type') or 'unknown'}"
+            ),
+            key=f"source-job-ledger-{kb_id}",
+        )
+        job = job_by_id[selected_id]
+        st.code(
+            json.dumps(
+                {
+                    key: job.get(key)
+                    for key in (
+                        "job_id",
+                        "connection_id",
+                        "status",
+                        "attempt",
+                        "pages_processed",
+                        "documents_seen",
+                        "documents_fetched",
+                        "deleted_seen",
+                        "bytes_fetched",
+                        "error_code",
+                        "error_message",
+                        "retry_at",
+                        "replay_of",
+                    )
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            language="json",
+        )
+        if str(job.get("status") or "") == "dead_letter" and st.button(
+            "从这条死信创建新任务",
+            key=f"source-ledger-replay-{kb_id}-{selected_id}",
+            use_container_width=True,
+        ):
+            response = client.replay_sync_job(kb_id, selected_id)
+            if response.status_code == 202:
+                st.success("新任务已创建，原任务保留用于审计。")
+                st.rerun()
+            else:
+                st.error(_response_error(response, "重放同步任务失败"))
+
+
+def _source_label(row: Mapping) -> str:
+    name = str(row.get("display_name") or row.get("external_id") or "未命名来源")
+    if len(name) > 54:
+        name = name[:53] + "…"
+    return f"{_source_status_label(row.get('health_status'))} · {name}"
+
+
+def _source_render_acl(client: CogDocClient, kb_id: str, source: Mapping) -> None:
+    document_id = str(source.get("document_id") or "")
+    if not document_id:
+        st.caption("该来源尚未物化为可引用文档，暂时没有文档 ACL 身份。")
+        return
+    configured = bool(source.get("access_configured"))
+    current_policy = str(source.get("access_policy") or "inherit")
+    policy_options: tuple[str, ...] = ("inherit", "workspace", "private")
+    policy_labels = {
+        "inherit": "继承知识库",
+        "workspace": "工作区成员",
+        "private": "仅授权成员",
+    }
+    policy = st.selectbox(
+        "文档可见性",
+        policy_options,
+        index=policy_options.index(current_policy)
+        if current_policy in policy_options
+        else 0,
+        format_func=lambda value: policy_labels.get(value, value),
+        key=f"source-acl-{kb_id}-{document_id}",
+    )
+    if st.button(
+        "保存来源权限",
+        key=f"source-acl-save-{kb_id}-{document_id}",
+        use_container_width=True,
+    ):
+        metadata = source.get("metadata")
+        materialized_name = (
+            str(metadata.get("materialized_name") or "")
+            if isinstance(metadata, Mapping)
+            else ""
+        )
+        response = client.update_document_access_policy(
+            kb_id,
+            document_id,
+            str(policy or current_policy),
+            source=None
+            if configured
+            else materialized_name or str(source.get("display_name") or ""),
+        )
+        if response.status_code == 200:
+            st.success("来源权限已更新；后续查询按新的 ACL 判定。")
+            st.rerun()
+        else:
+            st.error(_response_error(response, "更新来源权限失败"))
+
+
+def _source_render_versions(client: CogDocClient, kb_id: str, source: Mapping) -> None:
+    source_id = str(source.get("source_id") or "")
+    version_response = client.list_source_versions(kb_id, source_id)
+    versions, version_error = _source_console_rows(
+        version_response, "versions", "读取来源版本失败"
+    )
+    if version_error:
+        st.error(version_error)
+        return
+    if not versions:
+        st.info("这个来源还没有可审计版本。")
+        return
+    version_by_id = {str(row.get("version_id") or ""): row for row in versions}
+    version_ids = list(version_by_id)
+    current_id = next(
+        (value for value in version_ids if version_by_id[value].get("is_current")),
+        version_ids[0],
+    )
+    st.markdown(
+        f"<div class='source-ledger'>VERSIONS {len(versions):03d}　"
+        f"CURRENT {html.escape(current_id[:16])}　"
+        f"BYTES {_source_format_bytes(source.get('byte_size'))}</div>",
+        unsafe_allow_html=True,
+    )
+    selected_id = st.selectbox(
+        "版本内容",
+        version_ids,
+        format_func=lambda value: (
+            ("当前 · " if version_by_id[value].get("is_current") else "历史 · ")
+            + _source_format_time(version_by_id[value].get("fetched_at"))
+            + (
+                " · 原件可用"
+                if version_by_id[value].get("artifact_available")
+                else " · 仅元数据"
+            )
+        ),
+        key=f"source-version-selected-{kb_id}-{source_id}",
+    )
+    selected = version_by_id[selected_id]
+    content_columns = st.columns([1, 1])
+    if content_columns[0].button(
+        "准备下载原件",
+        key=f"source-version-download-prepare-{kb_id}-{source_id}-{selected_id}",
+        disabled=not bool(selected.get("artifact_available")),
+        use_container_width=True,
+    ):
+        response = client.download_source_version(kb_id, source_id, selected_id)
+        if response.status_code == 200:
+            content_columns[1].download_button(
+                "下载这个版本",
+                data=response.content,
+                file_name=str(
+                    source.get("display_name") or f"{source_id}-{selected_id}"
+                ),
+                mime=response.headers.get("content-type", "application/octet-stream"),
+                key=f"source-version-download-{kb_id}-{source_id}-{selected_id}",
+                use_container_width=True,
+            )
+        else:
+            st.error(_response_error(response, "读取版本原件失败"))
+
+    if len(version_ids) >= 2:
+        diff_columns = st.columns(2)
+        default_from = next(
+            (value for value in reversed(version_ids) if value != current_id),
+            version_ids[-1],
+        )
+        from_id = diff_columns[0].selectbox(
+            "对比基线",
+            version_ids,
+            index=version_ids.index(default_from),
+            key=f"source-version-from-{kb_id}-{source_id}",
+        )
+        to_id = diff_columns[1].selectbox(
+            "目标版本",
+            version_ids,
+            index=version_ids.index(current_id),
+            key=f"source-version-to-{kb_id}-{source_id}",
+        )
+        if st.button(
+            "生成有界差异",
+            key=f"source-version-diff-{kb_id}-{source_id}",
+            disabled=from_id == to_id,
+            use_container_width=True,
+        ):
+            response = client.diff_source_versions(kb_id, source_id, from_id, to_id)
+            payload = response_payload(response)
+            if response.status_code != 200 or not isinstance(payload, Mapping):
+                st.error(_response_error(response, "生成版本差异失败"))
+            else:
+                st.markdown(
+                    f"<div class='source-trace source-diff'>DIFF / "
+                    f"+{int(payload.get('added_lines') or 0)}　"
+                    f"-{int(payload.get('removed_lines') or 0)}　"
+                    f"{html.escape(str(payload.get('kind') or 'unknown'))}"
+                    f"{'　TRUNCATED' if payload.get('truncated') else ''}</div>",
+                    unsafe_allow_html=True,
+                )
+                if payload.get("diff"):
+                    st.code(str(payload["diff"]), language="diff")
+                else:
+                    st.info("这是二进制版本；已核对摘要，但没有可展示的逐行差异。")
+
+    historical = [
+        value
+        for value in version_ids
+        if not version_by_id[value].get("is_current")
+        and version_by_id[value].get("artifact_available")
+    ]
+    recovery_key = f"{kb_id}:{source_id}"
+    recovery = st.session_state.source_artifact_recovery.get(recovery_key)
+    with st.expander("原件保留与恢复", expanded=False):
+        if historical:
+            delete_id = st.selectbox(
+                "可删除历史原件",
+                historical,
+                key=f"source-artifact-delete-version-{kb_id}-{source_id}",
+            )
+            confirm = st.checkbox(
+                "我确认只删除历史原件；版本元数据与当前在线版本不受影响",
+                key=f"source-artifact-delete-confirm-{kb_id}-{source_id}-{delete_id}",
+            )
+            if st.button(
+                "移入可恢复区",
+                key=f"source-artifact-delete-{kb_id}-{source_id}-{delete_id}",
+                disabled=not confirm,
+                use_container_width=True,
+            ):
+                response = client.delete_source_artifact(kb_id, source_id, delete_id)
+                payload = response_payload(response)
+                if response.status_code == 200 and isinstance(payload, Mapping):
+                    st.session_state.source_artifact_recovery[recovery_key] = {
+                        "token": str(payload.get("recovery_token") or ""),
+                        "version_id": delete_id,
+                    }
+                    st.success("历史原件已移入可恢复区。")
+                    st.rerun()
+                else:
+                    st.error(_response_error(response, "删除历史原件失败"))
+        else:
+            st.caption("没有可删除的历史原件；当前在线版本始终受保护。")
+        if isinstance(recovery, Mapping) and recovery.get("token"):
+            st.caption(f"待恢复版本：{recovery.get('version_id')}")
+            if st.button(
+                "恢复最近移除的原件",
+                key=f"source-artifact-restore-{kb_id}-{source_id}",
+                use_container_width=True,
+            ):
+                response = client.restore_source_artifact(
+                    kb_id, str(recovery.get("token") or "")
+                )
+                if response.status_code == 200:
+                    st.session_state.source_artifact_recovery.pop(recovery_key, None)
+                    st.success("原件已恢复到活动版本库。")
+                    st.rerun()
+                else:
+                    st.error(_response_error(response, "恢复来源原件失败"))
+
+
+def _source_render_browser(
+    client: CogDocClient,
+    kb_id: str,
+    connections: Sequence[Mapping],
+    health_rows: Sequence[Mapping],
+) -> None:
+    st.markdown("### 来源、版本与权限")
+    connection_labels = {
+        str(row.get("connection_id") or ""): str(row.get("name") or "")
+        for row in connections
+    }
+    filters = st.columns([2, 2, 1])
+    connection_filter = filters[0].selectbox(
+        "航线筛选",
+        [""] + list(connection_labels),
+        format_func=lambda value: connection_labels.get(value, "全部航线"),
+        key=f"source-catalog-connection-{kb_id}",
+    )
+    health_filter = filters[1].selectbox(
+        "来源状态",
+        ["", "healthy", "syncing", "degraded", "stale", "error", "unknown"],
+        format_func=lambda value: _source_status_label(value) if value else "全部状态",
+        key=f"source-catalog-health-{kb_id}",
+    )
+    include_deleted = filters[2].toggle(
+        "含已删除", value=False, key=f"source-catalog-deleted-{kb_id}"
+    )
+    try:
+        response = client.list_source_catalog(
+            kb_id,
+            connection_id=connection_filter or None,
+            health_status=health_filter or None,
+            include_deleted=include_deleted,
+        )
+        sources, source_error = _source_console_rows(
+            response, "sources", "读取来源目录失败"
+        )
+    except Exception as exc:
+        sources, source_error = [], f"读取来源目录失败：{exc}"
+    if source_error:
+        st.error(source_error)
+        st.caption("来源目录需要知识库管理权限；普通读者仍可从“文档”列表访问获准内容。")
+        return
+    st.markdown(
+        f"<div class='source-ledger'>VISIBLE {len(sources):03d}　"
+        f"HEALTHY {sum(str(row.get('health_status')) == 'healthy' for row in sources):03d}　"
+        f"STALE {sum(str(row.get('health_status')) == 'stale' for row in sources):03d}</div>",
+        unsafe_allow_html=True,
+    )
+    if not sources:
+        st.info("当前筛选下没有来源。先同步一条连接，或调整航线与健康状态筛选。")
+        return
+    source_by_id = {str(row.get("source_id") or ""): row for row in sources}
+    selected_id = st.selectbox(
+        "来源目录",
+        list(source_by_id),
+        format_func=lambda value: _source_label(source_by_id[value]),
+        key=f"source-catalog-selected-{kb_id}",
+    )
+    detail_response = client.get_source_catalog_entry(kb_id, selected_id)
+    source, detail_error = _source_console_mapping(detail_response, "读取来源详情失败")
+    if detail_error:
+        st.error(detail_error)
+        return
+    connection_id = str(source.get("connection_id") or "")
+    health_by_id = {str(row.get("connection_id") or ""): row for row in health_rows}
+    connection_health = str(
+        health_by_id.get(connection_id, {}).get("health_status") or "unknown"
+    )
+    acl_label = (
+        str(source.get("access_policy") or "inherit")
+        if source.get("access_configured")
+        else "未配置"
+    )
+    st.markdown(
+        f"""
+        <div class="source-trace"><b>CONNECTION</b>
+        {html.escape(connection_labels.get(connection_id, connection_id or "manual"))}
+        [{html.escape(_source_status_label(connection_health))}]　→　
+        <b>VERSION</b> {html.escape(str(source.get("version_id") or "")[:18])}　→　
+        <b>ACL</b> {html.escape(acl_label)}　→　
+        <b>CITATION</b> {html.escape(str(source.get("document_id") or "待物化"))}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    heading = html.escape(str(source.get("display_name") or selected_id))
+    st.markdown(f"#### {heading}")
+    st.caption(
+        f"{source.get('connector_type') or 'unknown'} · {source.get('media_type') or 'unknown'} · "
+        f"来源同步 {_source_format_time(source.get('last_sync_at'))} · "
+        f"原件 {_source_format_bytes(source.get('byte_size'))}"
+    )
+    if source.get("last_sync_error"):
+        st.error(f"来源错误：{source.get('last_sync_error')}")
+    details, versions = st.tabs(["身份与权限", "版本航迹"])
+    with details:
+        detail_columns = st.columns([3, 2])
+        with detail_columns[0]:
+            origin_uri = str(source.get("origin_uri") or "")
+            if origin_uri:
+                st.caption(f"原始位置：{origin_uri}")
+            st.code(
+                json.dumps(
+                    {
+                        "source_id": source.get("source_id"),
+                        "external_id": source.get("external_id"),
+                        "content_sha256": source.get("content_sha256"),
+                        "etag": source.get("etag"),
+                        "modified_at": source.get("modified_at"),
+                        "document_id": source.get("document_id"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                language="json",
+            )
+            with st.expander("提供方元数据", expanded=False):
+                st.json(source.get("metadata") or {})
+        with detail_columns[1]:
+            _source_render_acl(client, kb_id, source)
+    with versions:
+        _source_render_versions(client, kb_id, source)
+
+
+def _source_navigation_console(client: CogDocClient, kb_id: str | None) -> None:
+    _source_navigation_styles()
+    if not kb_id:
+        st.info("先选择一个知识库，再进入来源航海台。")
+        return
+    if st.session_state.get(
+        "auth_mode"
+    ) == "account" and "manage_access" not in st.session_state.get(
+        "auth_permissions", []
+    ):
+        st.warning("来源航海台只向知识库管理员开放；当前账号可继续使用已授权文档。")
+        return
+    try:
+        connection_response = client.list_connections(kb_id)
+        health_response = client.list_connection_health(kb_id)
+        job_response = client.list_sync_jobs(kb_id)
+        usage_response = client.get_source_artifact_usage(kb_id)
+    except Exception as exc:
+        st.error(f"来源航海台无法连接后端：{exc}")
+        return
+    connections, connection_error = _source_console_rows(
+        connection_response, "connections", "读取来源连接失败"
+    )
+    health_rows, health_error = _source_console_rows(
+        health_response, "connections", "读取连接健康失败"
+    )
+    jobs, job_error = _source_console_rows(job_response, "jobs", "读取同步任务失败")
+    usage, usage_error = _source_console_mapping(usage_response, "读取来源原件用量失败")
+    fatal_errors = [
+        error for error in (connection_error, health_error, job_error) if error
+    ]
+    if fatal_errors:
+        for error in fatal_errors:
+            st.error(error)
+        return
+    if usage_error:
+        st.caption(usage_error)
+    _source_navigation_hero(connections, health_rows, jobs, usage)
+    summary = st.columns(4)
+    summary[0].metric("活动航线", sum(bool(row.get("enabled")) for row in connections))
+    summary[1].metric(
+        "同步积压", sum(int(row.get("backlog") or 0) for row in health_rows)
+    )
+    summary[2].metric("保留版本", int(usage.get("active_versions") or 0))
+    summary[3].metric("原件占用", _source_format_bytes(usage.get("active_bytes")))
+    left, right = st.columns([0.38, 0.62], gap="large")
+    with left:
+        _source_render_connection_routes(client, kb_id, connections, health_rows, jobs)
+        credentials = _source_render_credentials(client, kb_id, connections)
+        _source_render_connection_creator(client, kb_id, credentials)
+        _source_render_job_ledger(client, kb_id, jobs)
+    with right:
+        _source_render_browser(client, kb_id, connections, health_rows)
 
 
 def _sidebar() -> None:
@@ -6107,6 +7117,8 @@ def _chat_area() -> None:
             st.rerun()
     elif view == "研究":
         _research_area(kb_id)
+    elif view == "来源":
+        _source_navigation_console(_client(), kb_id)
     elif view == "派生知识":
         _knowledge_area(kb_id)
     elif view == "证据审核":

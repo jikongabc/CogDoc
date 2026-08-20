@@ -6,21 +6,24 @@
 
 需要备份的状态：
 
-- `data/kb/`：知识库 registry、源 PDF、generation state、入库 journal。
+- `data/kb/`：知识库 registry、物化来源文件、generation state、入库 journal。
 - `data/chroma_db/`：向量集合。
 - `data/bm25_db/`：BM25 registry 与 native index bytes。
 - `data/manifests/`：manifest 与索引契约快照。
-- `data/state.db`：sessions、index jobs，以及开启账号鉴权后的用户、带盐密码哈希、工作区、成员关系、登录会话/邀请摘要和资源 ACL。
+- `data/source-artifacts/`：连接器来源的不可变原始版本，以及可恢复的 `.trash`。
+- `data/state.db`：sessions、index jobs、连接/同步 checkpoint 与 health、AES-GCM 凭据 envelope、OAuth 会话、来源目录，以及开启账号鉴权后的用户、带盐密码哈希、工作区、成员关系、登录会话/邀请摘要和资源 ACL。
 - `data/feedback/`：feedback 与 bad cases。
 - `logs/traces/`：请求 trace，可按保留策略裁剪。
+- 数据目录外的密钥材料：完整 vault keyring、OAuth client secret、API key 与被 `secret_env` 引用的上游密钥。它们应由密钥管理系统单独备份和恢复。
 
 恢复顺序：
 
 1. 停止 API/前端进程。
-2. 恢复 `data/` 目录和需要保留的 `logs/traces/`。
-3. 运行 `make check` 确认 native extension 符号匹配。
-4. 运行 `make smoke-api` 验证 API 骨架可用。
-5. 启动服务后检查 `/readyz` 与 `/v1/auth/config`；若已开启鉴权，先登录，再检查 `/v1/knowledge-bases` 和目标 KB 的 sources/chunks。
+2. 恢复 `data/` 目录和需要保留的 `logs/traces/`，但不要立即接入流量。
+3. 从外部密钥系统注入该恢复点需要的完整 vault keyring、OAuth client secret、API key 和连接器环境密钥。keyring 必须包含 `state.db` 中所有 credential `key_version` 对应的旧 key。
+4. 运行 `make check` 确认 native extension 符号匹配。
+5. 运行 `make smoke-api` 验证 API 骨架可用。
+6. 启动服务后检查 `/readyz` 与 `/v1/auth/config`；若已开启鉴权，先登录，再检查 `/v1/knowledge-bases`、目标 KB 的 sources/chunks、connection health、凭据 metadata、一个原始版本的下载 SHA-256，以及代表性的 ACL 允许/拒绝查询。切流前对每类生产连接至少完成一次同步。
 
 没有做过恢复演练的备份不能视为有效备份。每次索引格式或 chunk identity 变化后，都应执行一次小规模 restore drill。
 
@@ -40,7 +43,7 @@ make backup
 python scripts/backup_state.py --include-env
 ```
 
-`.env` 可能包含 API key，只应保存到受控位置，不要提交或共享；优先从密钥管理系统独立恢复密钥。
+`.env` 可能包含 API key、vault 主密钥、OAuth client secret 和上游 token，只应保存到受控、加密且访问可审计的位置，不要提交或共享；优先从密钥管理系统独立恢复密钥。只有数据归档而没有对应 vault keyring 的备份无法解密连接凭据。
 
 仅校验归档、不修改运行状态：
 
@@ -178,11 +181,44 @@ SQLite 启动失败或迁移后检查失败时，按以下步骤回滚：
 
 ### 通用来源与连接器升级
 
-本版本把 PDF 专用来源扩展为带不可变版本和格式中立位置的通用来源，并新增连接配置、同步任务、来源目录与外部 ACL 状态表。SQLite 结构在启动时只做增量建表/加列；旧 manifest 在读取时兼容，但解析器/来源契约版本变化会要求索引 generation 重建。完整连接器配置与回滚步骤见 [通用来源与持续同步](CONNECTORS_zh-CN.md)。
+本版本把 PDF 专用来源扩展为带不可变版本和格式中立位置的通用来源，并新增连接配置、加密凭据/OAuth、同步任务与 health、来源目录/原始版本和外部 ACL 状态。SQLite 结构在启动时只做增量建表/加列；旧 manifest 和 `secret_env` 连接保持兼容，但解析器/来源契约变化仍可能要求索引 generation 重建。完整配置与接口见[通用来源与知识源运维控制面](CONNECTORS_zh-CN.md)。
 
-连接密钥不得进入请求的 `config`、registry、日志或数据库，只能以 `secret_env` 引用服务进程环境变量。生产环境应限制谁能修改服务环境，并只授予 owner/admin 连接管理权限。本地目录与 Git 连接可读取服务主机文件，必须把允许的根目录纳入部署审计；URL 与云连接使用 HTTPS、公网 DNS、主机 allowlist、禁止重定向和响应大小限制。
+#### 凭据库与 OAuth 上线
+
+连接密钥不得进入请求的 `config`、registry、日志或任务错误。两种受支持路径为：连接只保存环境变量名的 `secret_env`；或只保存 `credential_id`，由 vault 在 tenant/KB/connection 作用域校验后解密。两者不能在同一连接中混用。不配置 `COGDOC_CREDENTIAL_MASTER_KEYS` 时凭据/OAuth 接口返回 503，但环境引用连接继续工作，因此可逐连接迁移。
+
+生产 vault keyring 是 key ID 到 base64url 32 字节 key 的 JSON，active ID 必须存在于其中。凭据采用每 revision 随机 DEK 的 AES-256-GCM 信封加密，认证数据绑定 credential、tenant、KB、可选 connection、provider 和 kind。数据库泄漏仍需要按敏感事件处理；加密不能抵消运行中主密钥和数据库同时失窃，也不能替代主机权限、日志脱敏和加密备份。
+
+推荐上线顺序：
+
+1. 停止写入并同时备份 `data/` 与部署密钥配置；生成 `v1` key，经密钥管理系统注入 `COGDOC_CREDENTIAL_MASTER_KEYS` 与 `COGDOC_CREDENTIAL_ACTIVE_KEY_VERSION=v1`。
+2. 在 TLS 反向代理后设置 `COGDOC_CONNECTOR_OAUTH_PUBLIC_BASE_URL`；供应商控制台的 callback 必须精确为 `/v1/auth/connector-oauth/callback/{provider}`，其中 provider 分别为 `notion`、`atlassian`、`microsoft`。仅配置需要的 client；Notion/Atlassian 必须有 client secret，Microsoft public client 可留空 secret。
+3. 用 owner/admin 身份创建手工凭据或发起 OAuth，把新凭据绑定连接，确认凭据 API 从不回显 `secret_values`，再执行一次同步和 ACL 拒绝测试。
+4. 逐连接撤掉旧运行环境密钥。回滚窗口内仍应在受控位置保留旧部署配置，不得因新连接成功一次就立即销毁旧恢复路径。
+
+轮换主密钥时先把新旧 key 同时放入 keyring，切换 active ID 后，逐条 PATCH 凭据使其在不改 secret 的情况下重新包装；用 metadata 的 `key_version` 和一次真实同步验收。只有所有持久凭据、短时 OAuth 会话和仍保留的备份都不再引用旧版本后，才能删除旧 key。active ID 切换不会自动批量重加密；遗失旧 key 会让对应密文永久不可用。OAuth access token 已过期或将在 60 秒内过期时，同步路径会先用 refresh token 执行 revision-safe 刷新；应对 provider 刷新失败和 refresh token 撤销单独告警。
+
+凭据、OAuth 发起/刷新、source catalog、artifact 删除/恢复、同步取消和死信重放统一要求 KB 级 `manage_access`。连接/任务/health 摘要可由具备 `read` 的主体查看；包含上游 ID、本地 origin、失败诊断与投影 ACL 的运维 source catalog 不应开放给普通读者。OAuth callback 虽是公开路径，但只依赖短时、一次性、高熵 state 恢复服务端 tenant/KB/connection/user 绑定；网关必须完整透传 query，不能缓存 callback 响应。CogDoc 会从 Uvicorn access log 移除该 callback 的整段 query；反向代理、WAF、APM 与负载均衡器也必须只记录 callback path，禁止记录其中的 `state`、`code` 或 `error` query。
+
+#### 来源版本与恢复
+
+连接同步会把原始版本归档到 `COGDOC_DATA_DIR/source-artifacts/`，独立于当前物化目录与索引 generation。默认单版本上限 100 MiB、每来源保留 10 个活动版本、每租户（含 trash）硬上限 512 MiB；可用 `COGDOC_SOURCE_ARTIFACT_MAX_TENANT_MB` 调整租户隔离边界。批量同步在 authority transition 前原子预留 raw 版本容量，超限不会先发布物化快照。下载与文本 diff 会验证完整 SHA-256，diff 仅在内存保留 256 KiB/5000 行的有界前缀；二进制 diff 只返回两端 metadata。超过保留数的旧版本进入 store-local trash，trash 仍占用租户上限和 2 GiB 进程级紧急物理上限；监控 `GET .../source-artifacts/usage` 的 active/trash bytes 和 versions。
+
+手工删除只允许非当前在线版本，返回绑定 tenant/KB 的 `recovery_token`；恢复会检查 hash、目标冲突和版本配额。catalog 的版本 metadata 不随 raw artifact 软删除，`artifact_available=false` 表示该版本不能下载/diff。永久清理接口 `DELETE .../source-artifacts/trash?older_than=<epoch>&limit=<n>` 只删除当前 tenant/KB 中早于边界的 trash，且不可恢复；调用前必须完成停止写入的一致备份、归档恢复演练和保留期审批，再以小批次清理并复查 usage。上游完整快照删除的来源会标为 `deleted_at`/`stale`，可用 `include_deleted=true` 排障；它与 raw artifact 的软删除是两套状态，不能互相代替。
+
+#### 同步可观测与死信处理
+
+可重试错误默认最多尝试 5 次并指数退避，耗尽后进入 `dead_letter`、停止该连接周期调度；非重试错误进入 `failed`。修复根因后，`POST .../sync-jobs/{job_id}/replay` 从最近成功 checkpoint 创建新任务，并以 `replay_of` 保留原死信关联；原任务不可变，且有活动任务或连接被禁用时拒绝重放。
+
+告警应组合 `/connection-health` 的 `health_status`、`consecutive_failures`、`last_error_code`、`backlog` 与以下 Prometheus 指标：`cogdoc_connector_sync_events_total`、`cogdoc_connector_sync_duration_seconds`、`cogdoc_connector_sync_backlog`、`cogdoc_connector_sync_documents_total`。label 仅含闭集 connector type/outcome，不包含 tenant、KB、connection、job 等高基数 ID。配置 `COGDOC_WEBHOOK_URL` 后，retry/succeeded/failed/dead_letter 会异步发送 `connector.sync.<outcome>`；`COGDOC_WEBHOOK_SECRET` 是 `X-CogDoc-Webhook-Secret` 共享值而非签名，接收端必须使用 HTTPS、恒定时间比较、event ID 幂等和自己的重试/告警。投递失败只记日志，不回滚同步终态。
+
+本地目录与 Git 连接可读取服务主机文件，必须把允许的根目录纳入部署审计。根目录 allowlist 是全实例共享能力，任一租户的 KB 管理员都能选择其中任一根或子目录；禁止把各租户私有目录的共同父目录列入，隔离要求更高时应拆分实例。URL 与云连接使用 HTTPS、服务端主机 allowlist、单次解析并固定公网 IP；重定向逐跳重验且跨 origin 剥离凭据，并受响应大小限制。网络层仍应拒绝到 loopback、RFC1918、link-local 和云 metadata 网段的出站流量，作为 DNS 与代理配置错误的纵深防御。
 
 Confluence/SharePoint 权限读取失败、身份映射服务异常或 ACL 分页不完整时会将文档设为私有并撤销连接器托管授权。不要通过关闭 `include_acl` 绕过受限来源的权限同步；只有确认整个来源本来面向当前工作区时，才设置 `workspace_visible=true`。
+
+#### 控制面回滚
+
+升级前恢复点必须同时覆盖 `state.db`、`source-artifacts/`、KB 物化目录、Chroma/BM25/manifests、vault keyring、OAuth client 配置和环境引用密钥。回滚时停止所有写入，先在新目录/卷完整校验归档，再注入能够解密该时点所有 `key_version` 的 keyring 并启动旧版本。逐项验证 health、凭据 metadata、原始版本 hash、连接同步和 ACL 后再切流；不能只换旧镜像、只恢复数据库或手工删除新增表列。
 
 以下变化必须视为索引契约变化：
 

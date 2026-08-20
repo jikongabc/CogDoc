@@ -48,6 +48,66 @@ def _media(name: str, fallback: str = "application/octet-stream") -> str:
     return mimetypes.guess_type(name)[0] or fallback
 
 
+def _quarantined_acl(provider_version: object | None = None) -> dict[str, Any]:
+    return {
+        "complete": False,
+        "workspace_visible": False,
+        "provider_version": (
+            str(provider_version) if provider_version is not None else None
+        ),
+        "grants": [],
+    }
+
+
+_ACL_PERMISSION_RANK = {"read": 0, "review": 1, "write": 2}
+_SHAREPOINT_ROLE_PERMISSION = {
+    "read": "read",
+    "write": "write",
+    # Provider ownership is deliberately capped at the connector's highest
+    # externally managed role; it never becomes a local owner/admin grant.
+    "owner": "write",
+}
+
+
+def _merge_acl_grant(
+    grants: dict[tuple[str, str], dict[str, str]],
+    *,
+    external_subject: str,
+    subject_type: str,
+    permission: str,
+) -> None:
+    """Merge one provider row by normalized identity, preserving stable order.
+
+    Providers can legally repeat an identity across permission rows. When those
+    rows disagree, retain the least-privileged permission so an ambiguous
+    provider response can only narrow local access.
+    """
+
+    if not isinstance(external_subject, str):
+        raise TypeError("external ACL subject must be a string")
+    subject = external_subject.strip().casefold()
+    if (
+        not subject
+        or len(subject.encode("utf-8")) > 320
+        or any(ord(character) < 32 or ord(character) == 127 for character in subject)
+    ):
+        raise ValueError("external ACL subject is invalid")
+    rank = _ACL_PERMISSION_RANK.get(permission)
+    if rank is None:
+        raise ValueError("external ACL permission is unsupported")
+    key = (subject_type, subject)
+    existing = grants.get(key)
+    if existing is None:
+        grants[key] = {
+            "external_subject": subject,
+            "subject_type": subject_type,
+            "permission": permission,
+        }
+        return
+    if rank < _ACL_PERMISSION_RANK[existing["permission"]]:
+        existing["permission"] = permission
+
+
 class LocalDirectoryConnector:
     connector_type = "local-directory"
 
@@ -370,10 +430,17 @@ class NotionConnector(_JsonApiConnector):
         if cursor:
             payload["start_cursor"] = cursor
         data = self._json("POST", "search", payload=payload)
+        rows = data.get("results")
+        has_more = data.get("has_more")
+        if not isinstance(rows, list) or type(has_more) is not bool:
+            raise ConnectorError("Notion search response schema is invalid")
+        next_cursor = data.get("next_cursor")
+        if has_more and (not isinstance(next_cursor, str) or not next_cursor):
+            raise ConnectorError("Notion pagination cursor is missing")
         refs = []
-        for row in data.get("results", []):
+        for row in rows:
             if not isinstance(row, dict) or not row.get("id"):
-                continue
+                raise ConnectorError("Notion search result schema is invalid")
             properties = row.get("properties", {})
             title = ""
             if isinstance(properties, dict):
@@ -394,10 +461,10 @@ class NotionConnector(_JsonApiConnector):
                     modified_at=str(row.get("last_edited_time") or "") or None,
                 )
             )
-        complete = not bool(data.get("has_more"))
+        complete = not has_more
         return ConnectorPage(
             tuple(refs),
-            next_cursor=None if complete else str(data.get("next_cursor") or ""),
+            next_cursor=None if complete else next_cursor,
             complete=complete,
             snapshot=True,
         )
@@ -420,9 +487,13 @@ class NotionConnector(_JsonApiConnector):
             data = self._json(
                 "GET", f"blocks/{quote(block_id, safe='')}/children{suffix}"
             )
-            for row in data.get("results", []):
+            rows = data.get("results")
+            has_more = data.get("has_more")
+            if not isinstance(rows, list) or type(has_more) is not bool:
+                raise ConnectorError("Notion block response schema is invalid")
+            for row in rows:
                 if not isinstance(row, dict):
-                    continue
+                    raise ConnectorError("Notion block schema is invalid")
                 budget[0] += 1
                 if budget[0] > 10_000:
                     raise ConnectorError("Notion block count exceeds the safety limit")
@@ -435,11 +506,12 @@ class NotionConnector(_JsonApiConnector):
                             str(row["id"]), depth=depth + 1, budget=budget
                         )
                     )
-            if not data.get("has_more"):
+            if not has_more:
                 break
-            cursor = str(data.get("next_cursor") or "")
-            if not cursor:
+            raw_cursor = data.get("next_cursor")
+            if not isinstance(raw_cursor, str) or not raw_cursor:
                 raise ConnectorError("Notion pagination cursor is missing")
+            cursor = raw_cursor
         else:
             raise ConnectorError("Notion block pagination exceeds the safety limit")
         return lines
@@ -458,12 +530,30 @@ class ConfluenceConnector(_JsonApiConnector):
         token: str,
         transport: HttpTransport,
         *,
+        cloud_id: str | None = None,
         include_acl: bool = True,
     ) -> None:
         self.site_url = base_url.rstrip("/")
         self.include_acl = include_acl
+        self.cloud_id = str(cloud_id or "").strip() or None
+        if self.cloud_id is not None and (
+            len(self.cloud_id) > 160
+            or any(
+                char
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+                for char in self.cloud_id
+            )
+        ):
+            raise ValueError("Atlassian cloud_id is invalid")
+        self.api_root = (
+            "https://api.atlassian.com/ex/confluence/"
+            + quote(self.cloud_id, safe="")
+            + "/"
+            if self.cloud_id is not None
+            else self.site_url + "/"
+        )
         super().__init__(
-            self.site_url + "/wiki/api/v2/",
+            self.api_root + "wiki/api/v2/",
             transport,
             {"Authorization": f"Bearer {token}"},
         )
@@ -473,27 +563,31 @@ class ConfluenceConnector(_JsonApiConnector):
             f"&cursor={quote(cursor)}" if cursor else ""
         )
         data = self._json("GET", path)
+        rows = data.get("results")
+        links_payload = data.get("_links")
+        if not isinstance(rows, list) or not isinstance(links_payload, dict):
+            raise ConnectorError("Confluence page response schema is invalid")
         refs = []
-        for row in data.get("results", []):
+        for row in rows:
             if not isinstance(row, dict) or not row.get("id"):
-                continue
+                raise ConnectorError("Confluence page result schema is invalid")
             links = row.get("_links", {}) if isinstance(row.get("_links"), dict) else {}
             refs.append(
                 ConnectorSourceRef(
                     str(row["id"]),
                     str(row.get("title") or row["id"]) + ".html",
                     media_type="text/html",
-                    origin_uri=urljoin(self.base_url, str(links.get("webui") or "")),
+                    origin_uri=urljoin(
+                        self.site_url + "/", str(links.get("webui") or "")
+                    ),
                     modified_at=str(row.get("version", {}).get("createdAt") or "")
                     if isinstance(row.get("version"), dict)
                     else None,
                 )
             )
-        next_link = (
-            data.get("_links", {}).get("next")
-            if isinstance(data.get("_links"), dict)
-            else None
-        )
+        next_link = links_payload.get("next")
+        if next_link is not None and not isinstance(next_link, str):
+            raise ConnectorError("Confluence next page link is invalid")
         next_cursor = None
         if next_link:
             next_cursor = dict(parse_qsl(urlsplit(str(next_link)).query)).get("cursor")
@@ -508,61 +602,122 @@ class ConfluenceConnector(_JsonApiConnector):
         data = self._json(
             "GET", f"pages/{quote(ref.external_id, safe='')}?body-format=storage"
         )
-        body = (
-            data.get("body", {}).get("storage", {}).get("value", "")
-            if isinstance(data.get("body"), dict)
-            else ""
+        body_payload = data.get("body")
+        storage_payload = (
+            body_payload.get("storage") if isinstance(body_payload, dict) else None
         )
+        body = (
+            storage_payload.get("value") if isinstance(storage_payload, dict) else None
+        )
+        if not isinstance(body, str):
+            raise ConnectorError("Confluence storage body is missing")
         acl = None
         if self.include_acl:
-            restrictions = self._json(
-                "GET",
-                self.site_url
-                + "/wiki/rest/api/content/"
-                + quote(ref.external_id, safe="")
-                + "/restriction/byOperation",
-            )
-            read = restrictions.get("read", {})
-            if not isinstance(read, dict):
-                read = restrictions.get("restrictions", {}).get("read", {})
-            buckets = read.get("restrictions", {}) if isinstance(read, dict) else {}
-            grants = []
-            complete = True
-            for subject_type in ("user", "group"):
-                bucket = (
-                    buckets.get(subject_type, {}) if isinstance(buckets, dict) else {}
+            try:
+                restrictions = self._json(
+                    "GET",
+                    self.api_root
+                    + "wiki/rest/api/content/"
+                    + quote(ref.external_id, safe="")
+                    + "/restriction/byOperation",
                 )
-                rows = bucket.get("results", []) if isinstance(bucket, dict) else []
-                if not isinstance(rows, list):
-                    complete = False
-                    continue
-                size = bucket.get("size", len(rows))
-                if isinstance(size, int) and size > len(rows):
-                    complete = False
-                for row in rows:
-                    if not isinstance(row, dict):
+                read = restrictions.get("read")
+                if read is None and isinstance(restrictions.get("restrictions"), dict):
+                    read = restrictions["restrictions"].get("read")
+                if not isinstance(read, dict):
+                    raise ValueError("Confluence read restrictions are missing")
+                buckets = read.get("restrictions")
+                if (
+                    not isinstance(buckets, dict)
+                    or not {
+                        "user",
+                        "group",
+                    }
+                    <= buckets.keys()
+                ):
+                    raise ValueError("Confluence restriction buckets are incomplete")
+                grants_by_subject: dict[tuple[str, str], dict[str, str]] = {}
+                complete = True
+                for subject_type in ("user", "group"):
+                    bucket = buckets[subject_type]
+                    if not isinstance(bucket, dict):
+                        complete = False
                         continue
-                    external_subject = (
-                        row.get("email")
-                        or row.get("accountId")
-                        or row.get("id")
-                        or row.get("name")
-                    )
-                    if external_subject:
-                        grants.append(
-                            {
-                                "external_subject": str(external_subject),
-                                "subject_type": subject_type,
-                                "permission": "read",
-                            }
+                    rows = bucket.get("results")
+                    size = bucket.get("size")
+                    if (
+                        not isinstance(rows, list)
+                        or isinstance(size, bool)
+                        or not isinstance(size, int)
+                        or size != len(rows)
+                    ):
+                        complete = False
+                        continue
+                    start = bucket.get("start", 0)
+                    limit = bucket.get("limit")
+                    has_total_size = "totalSize" in bucket
+                    total_size = bucket.get("totalSize", len(rows))
+                    links = bucket.get("_links", {})
+                    if (
+                        isinstance(start, bool)
+                        or not isinstance(start, int)
+                        or start != 0
+                        or (
+                            limit is not None
+                            and (
+                                isinstance(limit, bool)
+                                or not isinstance(limit, int)
+                                or limit <= 0
+                                or len(rows) > limit
+                            )
                         )
-            acl = {
-                "complete": complete,
-                "workspace_visible": complete and not grants,
-                "provider_version": restrictions.get("restrictionsHash"),
-                "grants": grants,
-            }
-        return FetchedSource(ref, str(body).encode(), acl=acl)
+                        or isinstance(total_size, bool)
+                        or not isinstance(total_size, int)
+                        or total_size != len(rows)
+                        or not isinstance(links, dict)
+                        or links.get("next") is not None
+                        or (
+                            not has_total_size
+                            and isinstance(limit, int)
+                            and not isinstance(limit, bool)
+                            and size >= limit
+                        )
+                    ):
+                        complete = False
+                        continue
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            complete = False
+                            continue
+                        external_subject = (
+                            row.get("email")
+                            or row.get("accountId")
+                            or row.get("id")
+                            or row.get("name")
+                        )
+                        if not external_subject:
+                            complete = False
+                            continue
+                        _merge_acl_grant(
+                            grants_by_subject,
+                            external_subject=external_subject,
+                            subject_type=subject_type,
+                            permission="read",
+                        )
+                grants = list(grants_by_subject.values())
+                acl = {
+                    "complete": complete,
+                    "workspace_visible": complete and not grants,
+                    "provider_version": restrictions.get("restrictionsHash"),
+                    "grants": grants if complete else [],
+                }
+                return FetchedSource(ref, body.encode(), acl=acl)
+            except Exception:
+                # Content remains synchronizable, but any ACL transport/schema
+                # or FetchedSource boundary uncertainty must revoke stale
+                # provider-managed grants and quarantine the document as private.
+                acl = _quarantined_acl()
+        return FetchedSource(ref, body.encode(), acl=acl)
 
 
 class SharePointConnector(_JsonApiConnector):
@@ -599,11 +754,14 @@ class SharePointConnector(_JsonApiConnector):
         else:
             raise ConnectorError("SharePoint delta cursor is invalid")
         data = self._json("GET", path)
+        rows = data.get("value")
+        if not isinstance(rows, list):
+            raise ConnectorError("SharePoint delta response schema is invalid")
         refs = []
         deleted = []
-        for row in data.get("value", []):
+        for row in rows:
             if not isinstance(row, dict) or not row.get("id"):
-                continue
+                raise ConnectorError("SharePoint delta item schema is invalid")
             if "deleted" in row:
                 deleted.append(str(row["id"]))
                 continue
@@ -626,6 +784,10 @@ class SharePointConnector(_JsonApiConnector):
             )
         next_link = data.get("@odata.nextLink")
         delta_link = data.get("@odata.deltaLink")
+        if next_link is not None and not isinstance(next_link, str):
+            raise ConnectorError("SharePoint next link is invalid")
+        if delta_link is not None and not isinstance(delta_link, str):
+            raise ConnectorError("SharePoint delta link is invalid")
         if next_link:
             next_cursor = f"{mode}:{next_link}"
             complete = False
@@ -650,62 +812,86 @@ class SharePointConnector(_JsonApiConnector):
         response = self.transport.request("GET", url, headers=self.headers)
         acl = None
         if self.include_acl:
-            permissions = self._json(
-                "GET",
-                f"drives/{self.drive_id}/items/"
-                f"{quote(ref.external_id, safe='')}/permissions",
-            )
-            rows = permissions.get("value", [])
-            complete = isinstance(rows, list) and not permissions.get("@odata.nextLink")
-            grants = []
-            workspace_visible = False
-            for permission in rows if isinstance(rows, list) else []:
-                if not isinstance(permission, dict):
-                    continue
-                roles = permission.get("roles", [])
-                permission_name = "write" if "write" in roles else "read"
-                link = permission.get("link", {})
-                if isinstance(link, dict) and link.get("scope") in {
-                    "organization",
-                    "anonymous",
-                }:
-                    workspace_visible = True
-                identities = []
-                for key in ("grantedToV2", "grantedTo"):
-                    value = permission.get(key)
-                    if isinstance(value, dict):
-                        identities.append(value)
-                for key in ("grantedToIdentitiesV2", "grantedToIdentities"):
-                    value = permission.get(key)
-                    if isinstance(value, list):
-                        identities.extend(
-                            item for item in value if isinstance(item, dict)
-                        )
-                for identity in identities:
-                    for subject_type in ("user", "group"):
-                        subject = identity.get(subject_type)
-                        if not isinstance(subject, dict):
-                            continue
-                        external_subject = (
-                            subject.get("email")
-                            or subject.get("loginName")
-                            or subject.get("id")
-                            or subject.get("displayName")
-                        )
-                        if external_subject:
-                            grants.append(
-                                {
-                                    "external_subject": str(external_subject),
-                                    "subject_type": subject_type,
-                                    "permission": permission_name,
-                                }
+            try:
+                permissions = self._json(
+                    "GET",
+                    f"drives/{self.drive_id}/items/"
+                    f"{quote(ref.external_id, safe='')}/permissions",
+                )
+                rows = permissions.get("value")
+                if not isinstance(rows, list) or permissions.get("@odata.nextLink"):
+                    raise ValueError("SharePoint permissions are incomplete")
+                grants_by_subject: dict[tuple[str, str], dict[str, str]] = {}
+                workspace_visible = False
+                complete = True
+                for permission in rows:
+                    if not isinstance(permission, dict):
+                        complete = False
+                        continue
+                    roles = permission.get("roles")
+                    if not isinstance(roles, list) or not roles:
+                        complete = False
+                        continue
+                    if any(
+                        not isinstance(role, str)
+                        or role not in _SHAREPOINT_ROLE_PERMISSION
+                        for role in roles
+                    ):
+                        raise ValueError("SharePoint permission role is unsupported")
+                    permission_name = min(
+                        (_SHAREPOINT_ROLE_PERMISSION[role] for role in roles),
+                        key=_ACL_PERMISSION_RANK.__getitem__,
+                    )
+                    link = permission.get("link", {})
+                    broad_link = isinstance(link, dict) and link.get("scope") in {
+                        "organization",
+                        "anonymous",
+                    }
+                    if broad_link:
+                        workspace_visible = True
+                    identities = []
+                    for key in ("grantedToV2", "grantedTo"):
+                        value = permission.get(key)
+                        if isinstance(value, dict):
+                            identities.append(value)
+                    for key in ("grantedToIdentitiesV2", "grantedToIdentities"):
+                        value = permission.get(key)
+                        if isinstance(value, list):
+                            identities.extend(
+                                item for item in value if isinstance(item, dict)
                             )
-            acl = {
-                "complete": complete,
-                "workspace_visible": complete and workspace_visible,
-                "provider_version": ref.etag,
-                "grants": grants,
-            }
+                    recognized = broad_link
+                    for identity in identities:
+                        for subject_type in ("user", "group"):
+                            subject = identity.get(subject_type)
+                            if not isinstance(subject, dict):
+                                continue
+                            external_subject = (
+                                subject.get("email")
+                                or subject.get("loginName")
+                                or subject.get("id")
+                            )
+                            if not external_subject:
+                                continue
+                            recognized = True
+                            _merge_acl_grant(
+                                grants_by_subject,
+                                external_subject=external_subject,
+                                subject_type=subject_type,
+                                permission=permission_name,
+                            )
+                    if not recognized:
+                        complete = False
+                grants = list(grants_by_subject.values())
+                acl = {
+                    "complete": complete,
+                    "workspace_visible": complete and workspace_visible,
+                    "provider_version": ref.etag,
+                    "grants": grants if complete else [],
+                }
+                return FetchedSource(ref, response.body, acl=acl)
+            except Exception:
+                acl = _quarantined_acl(ref.etag)
         return FetchedSource(ref, response.body, acl=acl)
 
 
@@ -809,10 +995,22 @@ class S3Connector:
         def local(node):
             return node.tag.rsplit("}", 1)[-1]
 
+        if local(root) != "ListBucketResult":
+            raise ConnectorError("S3 list response root is invalid")
+
         refs = []
         for content in (node for node in root if local(node) == "Contents"):
             values = {local(node): node.text or "" for node in content}
-            key = values.get("Key", "")
+            key = values.get("Key")
+            size = values.get("Size")
+            if not key or size is None:
+                raise ConnectorError("S3 object listing is incomplete")
+            try:
+                byte_size = int(size)
+            except (TypeError, ValueError) as exc:
+                raise ConnectorError("S3 object size is invalid") from exc
+            if byte_size < 0:
+                raise ConnectorError("S3 object size is invalid")
             if not key or Path(key).suffix.casefold() not in SUPPORTED_EXTENSIONS:
                 continue
             refs.append(
@@ -823,13 +1021,17 @@ class S3Connector:
                     origin_uri=self.endpoint + "/" + quote(key, safe="/"),
                     etag=values.get("ETag", "").strip('"') or None,
                     modified_at=values.get("LastModified") or None,
-                    byte_size=int(values.get("Size") or 0),
+                    byte_size=byte_size,
                 )
             )
-        truncated = next(
-            (node.text == "true" for node in root if local(node) == "IsTruncated"),
-            False,
-        )
+        truncated_values = [
+            str(node.text or "").strip().casefold()
+            for node in root
+            if local(node) == "IsTruncated"
+        ]
+        if len(truncated_values) != 1 or truncated_values[0] not in {"true", "false"}:
+            raise ConnectorError("S3 truncation marker is invalid")
+        truncated = truncated_values[0] == "true"
         next_cursor = next(
             (node.text for node in root if local(node) == "NextContinuationToken"), None
         )

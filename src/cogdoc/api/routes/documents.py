@@ -42,10 +42,19 @@ from cogdoc.service.source_chunks import (
     source_chunks as read_source_chunks,
 )
 from cogdoc.service.kb_locks import kb_write_lock
+from cogdoc.service.kb_epoch import shared_epoch_store
+from cogdoc.service.kb_lifecycle import (
+    LIFECYCLE_ACTIVE,
+    LIFECYCLE_DELETING,
+    shared_lifecycle_store,
+)
 from cogdoc.service.kb_state import KBState
 from cogdoc.tools.manifest import load_index_manifest
 from cogdoc.tools.chunk_identity import build_document_id
-from cogdoc.tools.source_parser import SUPPORTED_EXTENSIONS
+from cogdoc.tools.source_parser import (
+    CONNECTOR_MATERIALIZED_PREFIX,
+    SUPPORTED_EXTENSIONS,
+)
 
 router = APIRouter(prefix="/v1", tags=["documents"])
 
@@ -91,6 +100,85 @@ def _clear_kb_review_state(kb_id, stores) -> None:
             clear_kb(kb_id)
 
 
+def _begin_connector_kb_delete(
+    kb_id: str,
+    registry,
+    authorization_guard: Callable[..., None] | None,
+) -> str:
+    """Persist the incarnation fence before draining connector workers."""
+
+    with kb_write_lock(kb_id):
+        if authorization_guard is not None:
+            authorization_guard()
+        if registry.get_by_storage_id(kb_id) is None:
+            raise KeyError(kb_id)
+        lifecycle = shared_lifecycle_store()
+        previous = lifecycle.status(kb_id)
+        lifecycle.set(kb_id, LIFECYCLE_DELETING)
+        return previous
+
+
+def _authorize_connector_kb_cleanup(
+    kb_id: str,
+    registry,
+    authorization_guard: Callable[..., None] | None,
+) -> None:
+    """Revalidate live authority immediately before irreversible cleanup."""
+
+    with kb_write_lock(kb_id):
+        if authorization_guard is not None:
+            authorization_guard(require_resource_acl=True)
+        if registry.get_by_storage_id(kb_id) is None:
+            raise KeyError(kb_id)
+        if shared_lifecycle_store().status(kb_id) != LIFECYCLE_DELETING:
+            raise PermissionError("knowledge-base deletion fence changed")
+        # Lifecycle=deleting already blocks control-plane writes while workers
+        # drain. Invalidate OAuth/callback incarnations only after this second
+        # authorization check, so a revoked delete can roll back cleanly.
+        shared_epoch_store().bump(kb_id)
+
+
+def _restore_connector_kb_delete(kb_id: str, registry, previous: str) -> None:
+    """Undo only a conflict fence that performed no connector cancellation."""
+
+    if previous != LIFECYCLE_ACTIVE:
+        return
+    with kb_write_lock(kb_id):
+        if registry.get_by_storage_id(kb_id) is not None:
+            shared_lifecycle_store().set(kb_id, LIFECYCLE_ACTIVE)
+
+
+def _cleanup_connector_kb_state(
+    tenant_id: str,
+    kb_id: str,
+    *,
+    sync_manager,
+    oauth_session_store=None,
+    credential_vault=None,
+    source_catalog=None,
+    source_artifact_store=None,
+    external_acl_sync_store=None,
+) -> None:
+    """Idempotently erase every connector capability for a fenced KB."""
+
+    try:
+        if oauth_session_store is not None:
+            oauth_session_store.delete_scope(tenant_id, kb_id)
+        sync_manager.purge_knowledge_base(tenant_id, kb_id)
+        if source_artifact_store is not None:
+            source_artifact_store.delete_scope(tenant_id, kb_id)
+        if source_catalog is not None:
+            source_catalog.delete_scope(tenant_id, kb_id)
+        if external_acl_sync_store is not None:
+            external_acl_sync_store.delete_scope(tenant_id, kb_id)
+        if credential_vault is not None:
+            credential_vault.delete_scope(tenant_id, kb_id)
+    except Exception as exc:
+        raise KBCleanupError(
+            f"KB connector control-plane cleanup failed: {kb_id}"
+        ) from exc
+
+
 # 删除 kb。
 def _delete_kb(
     kb_id,
@@ -105,7 +193,7 @@ def _delete_kb(
     research_job_store=None,
     resource_access_store=None,
     tenant_id="default",
-    authorization_guard: Callable[[], None] | None = None,
+    authorization_guard: Callable[..., None] | None = None,
 ):
     # registry 删除与落 tombstone 必须与 create 在同一把锁内原子完成。
     authorized = False
@@ -141,12 +229,15 @@ def _delete_kb(
             except Exception as exc:
                 # registry 保留到所有幂等状态清理完成后再删，失败时 DELETE 可重试。
                 raise KBCleanupError(f"KB 会话状态删除失败: {kb_id}") from exc
-            registry.delete(kb_id)
             if resource_access_store is not None:
                 try:
                     resource_access_store.clear_kb(tenant_id, kb_id)
                 except Exception as exc:
                     raise KBCleanupError(f"KB ACL 状态删除失败: {kb_id}") from exc
+            # Registry deletion is the final commit point. Every state keyed
+            # by the deterministic storage ID is gone first, so a same-slug
+            # create can never inherit old documents, grants, or capabilities.
+            registry.delete(kb_id)
     finally:
         try:
             if authorized:
@@ -235,39 +326,85 @@ def _live_session_authorization_guard(
     *,
     permission: Permission,
     source: str | None = None,
-) -> Callable[[], None] | None:
-    """Capture a human membership incarnation for an asynchronous mutation."""
+) -> Callable[..., None] | None:
+    """Capture live authority for an asynchronous mutation.
+
+    Human sessions additionally freeze the membership incarnation.  Static API
+    principals cannot change without replacing the running application, but
+    their resource grants are mutable and therefore still need a commit-time
+    ACL check.
+    """
 
     principal = request_principal(request)
-    if not is_user_session_principal(principal):
-        return None
+    user_session = is_user_session_principal(principal)
     auth_store = getattr(request.app.state, "auth_store", None)
     access_store = getattr(request.app.state, "resource_access_store", None)
+    if not user_session and (
+        access_store is None or principal.key_fingerprint == "auth-disabled"
+    ):
+        # Legacy/local mode has no live authorization state to revalidate.
+        return None
     captured_membership_id = principal.membership_id
     tenant_id = scope.tenant_id
     storage_id = scope.storage_id
     subject_id = principal.subject_id
     key_fingerprint = principal.key_fingerprint
 
-    def authorize_commit() -> None:
+    def authorize_commit(*, require_resource_acl: bool = False) -> None:
         try:
-            if not captured_membership_id or auth_store is None or access_store is None:
+            if access_store is None:
                 raise PermissionError("authorization state is unavailable")
-            membership = auth_store.membership(tenant_id, subject_id)
-            if not isinstance(membership, Mapping):
-                raise PermissionError("workspace membership was removed")
-            live_membership_id = str(
-                membership.get("member_id") or membership.get("membership_id") or ""
-            )
-            if live_membership_id != captured_membership_id:
-                raise PermissionError("workspace membership incarnation changed")
-            live_principal = Principal(
-                tenant_id=tenant_id,
-                subject_id=subject_id,
-                role=Role(str(membership.get("role") or "")),
-                key_fingerprint=key_fingerprint,
-                membership_id=live_membership_id,
-            )
+            if user_session:
+                if not captured_membership_id or auth_store is None:
+                    raise PermissionError("authorization state is unavailable")
+                membership = auth_store.membership(tenant_id, subject_id)
+                if not isinstance(membership, Mapping):
+                    raise PermissionError("workspace membership was removed")
+                live_membership_id = str(
+                    membership.get("member_id") or membership.get("membership_id") or ""
+                )
+                if live_membership_id != captured_membership_id:
+                    raise PermissionError("workspace membership incarnation changed")
+                live_principal = Principal(
+                    tenant_id=tenant_id,
+                    subject_id=subject_id,
+                    role=Role(str(membership.get("role") or "")),
+                    key_fingerprint=key_fingerprint,
+                    membership_id=live_membership_id,
+                )
+            else:
+                live_principal = principal
+            if not live_principal.allows(permission):
+                raise PermissionError("principal permission was revoked")
+            try:
+                lifecycle_active = (
+                    shared_lifecycle_store().status(storage_id) == LIFECYCLE_ACTIVE
+                )
+            except Exception:
+                lifecycle_active = False
+            if not lifecycle_active:
+                # Cleanup retries can legitimately run after the KB ACL row
+                # was already erased. Revalidate the live tenant membership,
+                # role and physical registry record instead of reopening an
+                # ACL-less resource to ordinary reads or writes.
+                record = request.app.state.kb_registry.get_by_storage_id(storage_id)
+                policy_reader = getattr(access_store, "get_kb_policy", None)
+                policy = (
+                    policy_reader(tenant_id, storage_id)
+                    if require_resource_acl and callable(policy_reader)
+                    else None
+                )
+                valid_record = (
+                    isinstance(record, Mapping)
+                    and str(record.get("tenant_id") or "default") == tenant_id
+                )
+                cleanup_authority = live_principal.allows(permission) or (
+                    valid_record and str(record.get("owner_id") or "") == subject_id
+                )
+                if not valid_record or (policy is None and not cleanup_authority):
+                    raise PermissionError("knowledge-base cleanup authority changed")
+                if not require_resource_acl or policy is None:
+                    return
             decision = access_store.allowed_sources(
                 live_principal,
                 storage_id,
@@ -386,7 +523,7 @@ async def get_knowledge_base(kb_id: str, request: Request):
 @router.delete("/knowledge-bases/{kb_id}", status_code=204, responses=_ERROR_RESPONSES)
 async def delete_knowledge_base(kb_id: str, request: Request):
     registry = request.app.state.kb_registry
-    scope = resolve_kb_scope(request, kb_id)
+    scope = resolve_kb_scope(request, kb_id, allow_inactive=True)
     if scope is None:
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
     storage_id = scope.storage_id
@@ -396,6 +533,112 @@ async def delete_knowledge_base(kb_id: str, request: Request):
         permission=Permission.DELETE,
     )
     index_jobs = request.app.state.index_jobs
+    activity = await run_sync(
+        request.app.state.offload_executor,
+        request.app.state.connector_sync_store.scope_activity,
+        scope.tenant_id,
+        storage_id,
+    )
+    if activity["committing"]:
+        return _error(
+            ErrorCode.KB_CLEANUP_FAILED,
+            "知识库有来源正在提交，请稍后重试删除",
+            409,
+        )
+    try:
+        previous_lifecycle = await run_sync(
+            request.app.state.offload_executor,
+            _begin_connector_kb_delete,
+            storage_id,
+            registry,
+            authorization_guard,
+        )
+    except (KeyError, PermissionError):
+        return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
+    try:
+        delete_fence = await run_sync(
+            request.app.state.offload_executor,
+            request.app.state.sync_manager.prepare_knowledge_base_delete,
+            scope.tenant_id,
+            storage_id,
+        )
+    except ValueError:
+        await run_sync(
+            request.app.state.offload_executor,
+            _restore_connector_kb_delete,
+            storage_id,
+            registry,
+            previous_lifecycle,
+        )
+        return _error(
+            ErrorCode.KB_CLEANUP_FAILED,
+            "知识库有来源正在提交，请稍后重试删除",
+            409,
+        )
+    except TimeoutError:
+        return _error(
+            ErrorCode.KB_CLEANUP_FAILED,
+            "来源同步尚未安全停止，请重试删除",
+            500,
+        )
+    try:
+        await run_sync(
+            request.app.state.offload_executor,
+            _authorize_connector_kb_cleanup,
+            storage_id,
+            registry,
+            authorization_guard,
+        )
+    except (KeyError, PermissionError):
+        await run_sync(
+            request.app.state.offload_executor,
+            _restore_connector_kb_delete,
+            storage_id,
+            registry,
+            previous_lifecycle,
+        )
+        await run_sync(
+            request.app.state.offload_executor,
+            request.app.state.sync_manager.restore_knowledge_base_delete,
+            scope.tenant_id,
+            storage_id,
+            tuple(delete_fence.get("previously_enabled_connection_ids", ())),
+        )
+        return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
+    try:
+        # Lifecycle=deleting and the bumped KB epoch reject every new control-
+        # plane mutation. Briefly acquiring the cross-store lock drains any
+        # mutation admitted before that fence; the potentially large work-tree
+        # and artifact purge then runs outside the global lock so one tenant's
+        # deletion cannot freeze credentials/OAuth for every other tenant.
+        async with request.app.state.connector_credential_reference_lock:
+            pass
+        await run_sync(
+            request.app.state.connector_cleanup_executor,
+            _cleanup_connector_kb_state,
+            scope.tenant_id,
+            storage_id,
+            sync_manager=request.app.state.sync_manager,
+            oauth_session_store=getattr(
+                request.app.state, "connector_oauth_session_store", None
+            ),
+            credential_vault=getattr(
+                request.app.state, "connector_credential_vault", None
+            ),
+            source_catalog=getattr(request.app.state, "source_catalog", None),
+            source_artifact_store=getattr(
+                request.app.state, "source_artifact_store", None
+            ),
+            external_acl_sync_store=getattr(
+                request.app.state, "external_acl_sync_store", None
+            ),
+        )
+    except KBCleanupError:
+        return _error(
+            ErrorCode.KB_CLEANUP_FAILED,
+            f"知识库连接状态清理未完成，请重试: {kb_id}",
+            500,
+        )
     # 排进该 KB 的序列化 executor，等待前序入库任务完成再执行。
     try:
         await run_sync(
@@ -415,12 +658,13 @@ async def delete_knowledge_base(kb_id: str, request: Request):
             request.app.state.research_job_store,
             getattr(request.app.state, "resource_access_store", None),
             scope.tenant_id,
-            authorization_guard,
+            # Live authority was linearized immediately before connector
+            # purge and KB epoch invalidation. From that irreversible commit
+            # point onward, a later membership change cannot safely roll back
+            # already erased credentials/artifacts; lifecycle fencing prevents
+            # any unrelated mutation from entering this queue in between.
+            None,
         )
-    except PermissionError:
-        # A queued delete whose authority disappeared is indistinguishable from
-        # an inaccessible KB, including across membership reincarnations.
-        return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
     except KBCleanupError:
         # 清理不完整：registry 与 manifest 均保留，返回可重试错误而非误报删除成功。
         return _error(
@@ -512,6 +756,12 @@ async def upload_document(kb_id: str, request: Request, file: UploadFile = File(
 
     filename = os.path.basename(file.filename or "")
     suffix = os.path.splitext(filename)[1].casefold()
+    if filename.startswith(CONNECTOR_MATERIALIZED_PREFIX):
+        return _error(
+            ErrorCode.INVALID_PDF,
+            "文件名使用了连接器保留命名空间",
+            400,
+        )
     if suffix not in SUPPORTED_EXTENSIONS:
         return _error(
             ErrorCode.INVALID_PDF,
@@ -630,6 +880,8 @@ async def delete_document(kb_id: str, name: str, request: Request):
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
 
     safe_name = os.path.basename(name)
+    if safe_name.startswith(CONNECTOR_MATERIALIZED_PREFIX):
+        return _error(ErrorCode.DOCUMENT_NOT_FOUND, "文档不存在", 404)
     if not source_is_authorized(
         request, scope, safe_name, permission=Permission.DELETE
     ):

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from threading import RLock
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from cogdoc.api.tenancy import Permission, Principal, ROLE_PERMISSIONS, Role
 
@@ -273,6 +273,16 @@ class ResourceAccessStore:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS resource_access_retiring_documents (
+                tenant_id TEXT NOT NULL,
+                kb_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                managed_by TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, kb_id, document_id)
+            )
+            """,
+            """
             CREATE INDEX IF NOT EXISTS idx_resource_access_documents_tenant_kb
             ON resource_access_document_policies (tenant_id, kb_id, document_id)
             """,
@@ -363,15 +373,37 @@ class ResourceAccessStore:
         subject_id: str,
         membership_id: object,
     ) -> None:
+        if self._membership_revoked_locked(tenant_id, subject_id, membership_id):
+            raise ResourceAccessConflictError("membership incarnation was revoked")
+
+    def _membership_revoked_locked(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        membership_id: object,
+    ) -> bool:
         if membership_id is None:
-            return
-        revoked = self._conn.execute(
+            return False
+        row = self._conn.execute(
             "SELECT 1 FROM resource_access_membership_tombstones "
             "WHERE tenant_id=? AND subject_id=? AND membership_id=?",
             (tenant_id, subject_id, str(membership_id)),
         ).fetchone()
-        if revoked is not None:
-            raise ResourceAccessConflictError("membership incarnation was revoked")
+        return row is not None
+
+    def _reject_retiring_document_locked(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        document_id: str,
+    ) -> None:
+        row = self._conn.execute(
+            "SELECT 1 FROM resource_access_retiring_documents "
+            "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+            (tenant_id, kb_id, document_id),
+        ).fetchone()
+        if row is not None:
+            raise ResourceAccessConflictError("document access is retiring")
 
     def acl_epoch(self, tenant_id: str, kb_id: str) -> int:
         tenant_id = _identity(tenant_id, field="tenant_id")
@@ -530,6 +562,7 @@ class ResourceAccessStore:
         now = _now_iso()
         try:
             with self._write_transaction():
+                self._reject_retiring_document_locked(tenant_id, kb_id, document_id)
                 kb_row = self._conn.execute(
                     "SELECT owner_id, owner_membership_id "
                     "FROM resource_access_kb_policies "
@@ -619,6 +652,209 @@ class ResourceAccessStore:
     put_document_policy = set_document_policy
     register_document = set_document_policy
 
+    def apply_managed_document_access(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        document_id: str,
+        source: str,
+        owner_id: str,
+        policy: AccessPolicy | str,
+        managed_by: str,
+        grants: Sequence[tuple[str, Role | str, str | None]],
+        *,
+        owner_membership_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically publish a document policy and one provider's grants.
+
+        Provider ACL refreshes must never expose a mixed generation such as a
+        newly-private document with stale provider-managed grants.  Keeping the
+        policy change and managed-grant replacement in one SQLite transaction
+        makes the authorization edge advance as a single unit.  Explicit local
+        grants are deliberately preserved.
+        """
+
+        tenant_id = _identity(tenant_id, field="tenant_id")
+        kb_id = _identity(kb_id, field="kb_id")
+        document_id = _identity(document_id, field="document_id")
+        source = _source(source)
+        owner_id = _identity(owner_id, field="owner_id")
+        normalized_policy = _policy(policy, document=True)
+        if normalized_policy is AccessPolicy.INHERIT:
+            raise ValueError("externally managed document policy cannot inherit")
+        managed_by = _identity(managed_by, field="managed_by")
+        if owner_membership_id is not None:
+            owner_membership_id = _identity(
+                owner_membership_id, field="owner_membership_id"
+            )
+
+        desired: dict[str, tuple[Role, str | None]] = {}
+        for subject_id, role, membership_id in grants:
+            subject = _identity(subject_id, field="subject_id")
+            normalized_role = _role(role)
+            if normalized_role not in {Role.VIEWER, Role.REVIEWER, Role.EDITOR}:
+                raise ValueError("externally managed grants are capped at editor")
+            membership = (
+                _identity(membership_id, field="membership_id")
+                if membership_id is not None
+                else None
+            )
+            previous = desired.get(subject)
+            if previous is not None and previous != (normalized_role, membership):
+                raise ValueError("duplicate managed subject has conflicting grants")
+            desired[subject] = (normalized_role, membership)
+
+        now = _now_iso()
+        applied = 0
+        removed = 0
+        manual_preserved = 0
+        revoked_ignored = 0
+        changed = False
+        try:
+            with self._write_transaction():
+                self._reject_retiring_document_locked(tenant_id, kb_id, document_id)
+                kb_row = self._conn.execute(
+                    "SELECT 1 FROM resource_access_kb_policies "
+                    "WHERE tenant_id=? AND kb_id=?",
+                    (tenant_id, kb_id),
+                ).fetchone()
+                if kb_row is None and not self._legacy_workspace_default:
+                    raise ResourceAccessNotFoundError(
+                        f"knowledge-base policy does not exist: {tenant_id}/{kb_id}"
+                    )
+                self._reject_revoked_membership_locked(
+                    tenant_id, owner_id, owner_membership_id
+                )
+                # Identity resolution can race with membership revocation.
+                # Omit those stale provider subjects inside this same ACL
+                # transaction so other upstream removals still commit instead
+                # of rolling back to a broader previous allowlist.
+                for subject, (_role_value, membership_id) in tuple(desired.items()):
+                    if self._membership_revoked_locked(
+                        tenant_id, subject, membership_id
+                    ):
+                        desired.pop(subject)
+                        revoked_ignored += 1
+                document = self._conn.execute(
+                    "SELECT source,owner_id,owner_membership_id,policy,created_at "
+                    "FROM resource_access_document_policies "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant_id, kb_id, document_id),
+                ).fetchone()
+                document_changed = (
+                    document is None
+                    or str(document["source"]) != source
+                    or str(document["owner_id"]) != owner_id
+                    or document["owner_membership_id"] != owner_membership_id
+                    or str(document["policy"]) != normalized_policy.value
+                )
+                if document_changed:
+                    created_at = (
+                        str(document["created_at"]) if document is not None else now
+                    )
+                    self._conn.execute(
+                        "INSERT INTO resource_access_document_policies "
+                        "(tenant_id,kb_id,document_id,source,owner_id,"
+                        "owner_membership_id,policy,created_at,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(tenant_id,kb_id,document_id) DO UPDATE SET "
+                        "source=excluded.source,owner_id=excluded.owner_id,"
+                        "owner_membership_id=excluded.owner_membership_id,"
+                        "policy=excluded.policy,updated_at=excluded.updated_at",
+                        (
+                            tenant_id,
+                            kb_id,
+                            document_id,
+                            source,
+                            owner_id,
+                            owner_membership_id,
+                            normalized_policy.value,
+                            created_at,
+                            now,
+                        ),
+                    )
+                    changed = True
+
+                existing_rows = self._conn.execute(
+                    "SELECT subject_id,role,managed_by,created_at FROM "
+                    "resource_access_subject_grants WHERE tenant_id=? AND kb_id=? "
+                    "AND document_key=?",
+                    (tenant_id, kb_id, document_id),
+                ).fetchall()
+                existing = {str(row["subject_id"]): row for row in existing_rows}
+                for subject, row in existing.items():
+                    if (
+                        str(row["managed_by"] or "") == managed_by
+                        and subject not in desired
+                    ):
+                        self._conn.execute(
+                            "DELETE FROM resource_access_subject_grants "
+                            "WHERE tenant_id=? AND kb_id=? AND document_key=? "
+                            "AND subject_id=? AND managed_by=?",
+                            (tenant_id, kb_id, document_id, subject, managed_by),
+                        )
+                        removed += 1
+                        changed = True
+                for subject, (role, membership_id) in desired.items():
+                    row = existing.get(subject)
+                    if row is not None and str(row["managed_by"] or "") != managed_by:
+                        manual_preserved += 1
+                        continue
+                    if row is None:
+                        self._conn.execute(
+                            "INSERT INTO resource_access_subject_grants "
+                            "(tenant_id,kb_id,document_key,subject_id,role,managed_by,"
+                            "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                            (
+                                tenant_id,
+                                kb_id,
+                                document_id,
+                                subject,
+                                role.value,
+                                managed_by,
+                                now,
+                                now,
+                            ),
+                        )
+                        changed = True
+                    elif str(row["role"]) != role.value:
+                        self._conn.execute(
+                            "UPDATE resource_access_subject_grants SET role=?,updated_at=? "
+                            "WHERE tenant_id=? AND kb_id=? AND document_key=? "
+                            "AND subject_id=? AND managed_by=?",
+                            (
+                                role.value,
+                                now,
+                                tenant_id,
+                                kb_id,
+                                document_id,
+                                subject,
+                                managed_by,
+                            ),
+                        )
+                        changed = True
+                    applied += 1
+                epoch = (
+                    self._bump_epoch_locked(tenant_id, kb_id)
+                    if changed
+                    else self._epoch_locked(tenant_id, kb_id)
+                )
+        except sqlite3.IntegrityError as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                raise ResourceAccessConflictError(
+                    f"source is already bound to another document: {source}"
+                ) from exc
+            raise
+        return {
+            "managed_by": managed_by,
+            "applied": applied,
+            "removed": removed,
+            "manual_preserved": manual_preserved,
+            "revoked_ignored": revoked_ignored,
+            "acl_epoch": epoch,
+            "policy": normalized_policy.value,
+        }
+
     def get_document_policy(
         self, tenant_id: str, kb_id: str, document_id: str
     ) -> dict[str, Any] | None:
@@ -678,6 +914,7 @@ class ResourceAccessStore:
         kb_id = _identity(kb_id, field="kb_id")
         document_id = _identity(document_id, field="document_id")
         with self._write_transaction():
+            self._reject_retiring_document_locked(tenant_id, kb_id, document_id)
             deleted = self._conn.execute(
                 "DELETE FROM resource_access_document_policies "
                 "WHERE tenant_id=? AND kb_id=? AND document_id=?",
@@ -692,6 +929,241 @@ class ResourceAccessStore:
             )
             self._bump_epoch_locked(tenant_id, kb_id)
             return True
+
+    def quarantine_document_access(
+        self, tenant_id: str, kb_id: str, document_id: str
+    ) -> bool:
+        """Atomically make a retiring document private and revoke all grants.
+
+        Connection teardown removes source files before a potentially slow
+        index rebuild. Keeping the policy row as a private deny boundary until
+        that rebuild succeeds prevents an old active index from falling back
+        to workspace visibility after a partial cleanup.
+        """
+
+        return bool(
+            self.quarantine_documents_access(
+                tenant_id,
+                kb_id,
+                (document_id,),
+            )
+        )
+
+    def quarantine_documents_access(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        document_ids: Iterable[str],
+    ) -> int:
+        """Quarantine a connector's retiring documents in one transaction."""
+
+        tenant = _identity(tenant_id, field="tenant_id")
+        knowledge_base = _identity(kb_id, field="kb_id")
+        if isinstance(document_ids, (str, bytes)):
+            raise TypeError("document_ids must be an iterable of identifiers")
+        documents = tuple(
+            dict.fromkeys(
+                _identity(document_id, field="document_id")
+                for document_id in document_ids
+            )
+        )
+        if not documents:
+            return 0
+        found = 0
+        changed = False
+        now = _now_iso()
+        with self._write_transaction():
+            for document in documents:
+                row = self._conn.execute(
+                    "SELECT policy FROM resource_access_document_policies "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant, knowledge_base, document),
+                ).fetchone()
+                if row is None:
+                    continue
+                found += 1
+                removed = self._conn.execute(
+                    "DELETE FROM resource_access_subject_grants "
+                    "WHERE tenant_id=? AND kb_id=? AND document_key=?",
+                    (tenant, knowledge_base, document),
+                ).rowcount
+                policy_changed = str(row["policy"]) != AccessPolicy.PRIVATE.value
+                if policy_changed:
+                    self._conn.execute(
+                        "UPDATE resource_access_document_policies "
+                        "SET policy=?,updated_at=? "
+                        "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                        (
+                            AccessPolicy.PRIVATE.value,
+                            now,
+                            tenant,
+                            knowledge_base,
+                            document,
+                        ),
+                    )
+                changed = changed or policy_changed or bool(removed)
+            if changed:
+                self._bump_epoch_locked(tenant, knowledge_base)
+        return found
+
+    def begin_document_retirement(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        managed_by: str,
+        document_ids: Iterable[str],
+    ) -> int:
+        """Fence and quarantine retiring documents in one durable commit."""
+
+        tenant = _identity(tenant_id, field="tenant_id")
+        knowledge_base = _identity(kb_id, field="kb_id")
+        manager = _identity(managed_by, field="managed_by")
+        if isinstance(document_ids, (str, bytes)):
+            raise TypeError("document_ids must be an iterable of identifiers")
+        documents = tuple(
+            dict.fromkeys(
+                _identity(document_id, field="document_id")
+                for document_id in document_ids
+            )
+        )
+        if not documents:
+            return 0
+        changed = False
+        now = _now_iso()
+        with self._write_transaction():
+            for document in documents:
+                existing_fence = self._conn.execute(
+                    "SELECT managed_by FROM resource_access_retiring_documents "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant, knowledge_base, document),
+                ).fetchone()
+                if (
+                    existing_fence is not None
+                    and str(existing_fence["managed_by"]) != manager
+                ):
+                    raise ResourceAccessConflictError(
+                        "document is retiring under another manager"
+                    )
+                if existing_fence is None:
+                    self._conn.execute(
+                        "INSERT INTO resource_access_retiring_documents "
+                        "(tenant_id,kb_id,document_id,managed_by,started_at) "
+                        "VALUES (?,?,?,?,?)",
+                        (tenant, knowledge_base, document, manager, now),
+                    )
+                    changed = True
+                row = self._conn.execute(
+                    "SELECT policy FROM resource_access_document_policies "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant, knowledge_base, document),
+                ).fetchone()
+                if row is None:
+                    continue
+                removed = self._conn.execute(
+                    "DELETE FROM resource_access_subject_grants "
+                    "WHERE tenant_id=? AND kb_id=? AND document_key=?",
+                    (tenant, knowledge_base, document),
+                ).rowcount
+                if str(row["policy"]) != AccessPolicy.PRIVATE.value:
+                    self._conn.execute(
+                        "UPDATE resource_access_document_policies SET policy=?,"
+                        "updated_at=? WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                        (
+                            AccessPolicy.PRIVATE.value,
+                            now,
+                            tenant,
+                            knowledge_base,
+                            document,
+                        ),
+                    )
+                    changed = True
+                changed = changed or bool(removed)
+            if changed:
+                self._bump_epoch_locked(tenant, knowledge_base)
+        return len(documents)
+
+    def finish_document_retirement(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        managed_by: str,
+        document_ids: Iterable[str],
+    ) -> int:
+        """Remove fenced ACL state only after the index no longer contains it."""
+
+        tenant = _identity(tenant_id, field="tenant_id")
+        knowledge_base = _identity(kb_id, field="kb_id")
+        manager = _identity(managed_by, field="managed_by")
+        if isinstance(document_ids, (str, bytes)):
+            raise TypeError("document_ids must be an iterable of identifiers")
+        documents = tuple(
+            dict.fromkeys(
+                _identity(document_id, field="document_id")
+                for document_id in document_ids
+            )
+        )
+        removed_fences = 0
+        changed = False
+        with self._write_transaction():
+            for document in documents:
+                fence = self._conn.execute(
+                    "SELECT managed_by FROM resource_access_retiring_documents "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant, knowledge_base, document),
+                ).fetchone()
+                if fence is None:
+                    continue
+                if str(fence["managed_by"]) != manager:
+                    raise ResourceAccessConflictError(
+                        "document is retiring under another manager"
+                    )
+                changed = (
+                    bool(
+                        self._conn.execute(
+                            "DELETE FROM resource_access_subject_grants "
+                            "WHERE tenant_id=? AND kb_id=? AND document_key=?",
+                            (tenant, knowledge_base, document),
+                        ).rowcount
+                    )
+                    or changed
+                )
+                changed = (
+                    bool(
+                        self._conn.execute(
+                            "DELETE FROM resource_access_document_policies "
+                            "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                            (tenant, knowledge_base, document),
+                        ).rowcount
+                    )
+                    or changed
+                )
+                self._conn.execute(
+                    "DELETE FROM resource_access_retiring_documents "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=? AND managed_by=?",
+                    (tenant, knowledge_base, document, manager),
+                )
+                removed_fences += 1
+                changed = True
+            if changed:
+                self._bump_epoch_locked(tenant, knowledge_base)
+        return removed_fences
+
+    def retiring_document_ids(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        managed_by: str,
+    ) -> tuple[str, ...]:
+        tenant = _identity(tenant_id, field="tenant_id")
+        knowledge_base = _identity(kb_id, field="kb_id")
+        manager = _identity(managed_by, field="managed_by")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT document_id FROM resource_access_retiring_documents "
+                "WHERE tenant_id=? AND kb_id=? AND managed_by=? ORDER BY document_id",
+                (tenant, knowledge_base, manager),
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
 
     # -- Subject grant CRUD -------------------------------------------------
 
@@ -748,6 +1220,7 @@ class ResourceAccessStore:
                     f"knowledge-base policy does not exist: {tenant_id}/{kb_id}"
                 )
             if document_key:
+                self._reject_retiring_document_locked(tenant_id, kb_id, document_key)
                 document_exists = self._conn.execute(
                     "SELECT 1 FROM resource_access_document_policies "
                     "WHERE tenant_id=? AND kb_id=? AND document_id=?",
@@ -844,6 +1317,7 @@ class ResourceAccessStore:
         manual_preserved = 0
         changed = False
         with self._write_transaction():
+            self._reject_retiring_document_locked(tenant_id, kb_id, document_id)
             document = self._conn.execute(
                 "SELECT 1 FROM resource_access_document_policies "
                 "WHERE tenant_id=? AND kb_id=? AND document_id=?",
@@ -1113,7 +1587,7 @@ class ResourceAccessStore:
             )
 
         try:
-            kb_row, documents, grants, epoch, membership_revoked = (
+            kb_row, documents, grants, retirements, epoch, membership_revoked = (
                 self._authorization_snapshot(
                     requested_tenant,
                     kb_id,
@@ -1144,10 +1618,32 @@ class ResourceAccessStore:
                 kb_owner = _identity(kb_row["owner_id"], field="owner_id")
                 kb_policy = _policy(kb_row["policy"], document=False)
 
+            # A retirement fence removes content from every read/query/review
+            # projection while the old index generation may still contain it.
+            # It must not revoke the control-plane authority needed to finish
+            # that same cleanup: otherwise an admin deleting the only document
+            # would deny its own phase-two MANAGE_ACCESS revalidation forever.
+            content_permissions = {
+                Permission.READ,
+                Permission.QUERY,
+                Permission.WRITE,
+                Permission.REVIEW,
+                Permission.PUBLISH,
+            }
+            visible_retirements = (
+                retirements
+                if requested_permission in content_permissions
+                else frozenset()
+            )
+
             # Tenant owner/admin roles bypass resource visibility, never their own
             # role permissions (checked above), and never a missing policy unless
             # the constructor explicitly enabled legacy workspace behavior.
-            if principal.role in {Role.OWNER, Role.ADMIN}:
+            privileged_bypass = principal.role in {Role.OWNER, Role.ADMIN}
+            kb_owner_bypass = self._owner_matches(
+                principal, kb_owner, kb_row["owner_membership_id"] if kb_row else None
+            )
+            if privileged_bypass and not visible_retirements:
                 return self._all(
                     requested_tenant,
                     kb_id,
@@ -1155,9 +1651,7 @@ class ResourceAccessStore:
                     epoch=epoch,
                     reason=f"{principal.role.value}_bypass",
                 )
-            if self._owner_matches(
-                principal, kb_owner, kb_row["owner_membership_id"] if kb_row else None
-            ):
+            if kb_owner_bypass and not visible_retirements:
                 return self._all(
                     requested_tenant,
                     kb_id,
@@ -1174,10 +1668,15 @@ class ResourceAccessStore:
                 principal,
                 requested_permission,
             )
-            kb_allows = kb_policy is AccessPolicy.WORKSPACE or kb_grant_allows
+            kb_allows = (
+                privileged_bypass
+                or kb_owner_bypass
+                or kb_policy is AccessPolicy.WORKSPACE
+                or kb_grant_allows
+            )
 
             if not documents:
-                if kb_allows:
+                if kb_allows and not visible_retirements:
                     return self._all(
                         requested_tenant,
                         kb_id,
@@ -1196,6 +1695,8 @@ class ResourceAccessStore:
             allowed: list[tuple[str, str]] = []
             for row in documents:
                 document_id = _identity(row["document_id"], field="document_id")
+                if document_id in visible_retirements:
+                    continue
                 source = _source(row["source"])
                 document_owner = _identity(row["owner_id"], field="owner_id")
                 document_policy = _policy(row["policy"], document=True)
@@ -1204,7 +1705,9 @@ class ResourceAccessStore:
                     principal,
                     requested_permission,
                 )
-                if self._owner_matches(
+                if privileged_bypass or kb_owner_bypass:
+                    document_allows = True
+                elif self._owner_matches(
                     principal, document_owner, row["owner_membership_id"]
                 ):
                     document_allows = True
@@ -1217,7 +1720,7 @@ class ResourceAccessStore:
                 if document_allows:
                     allowed.append((document_id, source))
 
-            if kb_allows and len(allowed) == len(documents):
+            if kb_allows and not visible_retirements and len(allowed) == len(documents):
                 return self._all(
                     requested_tenant,
                     kb_id,
@@ -1285,6 +1788,7 @@ class ResourceAccessStore:
             for table in (
                 "resource_access_subject_grants",
                 "resource_access_document_policies",
+                "resource_access_retiring_documents",
                 "resource_access_kb_policies",
             ):
                 deleted = self._conn.execute(
@@ -1306,8 +1810,9 @@ class ResourceAccessStore:
                 "UNION SELECT kb_id FROM resource_access_document_policies "
                 "WHERE tenant_id=? "
                 "UNION SELECT kb_id FROM resource_access_subject_grants "
-                "WHERE tenant_id=? ORDER BY kb_id",
-                (tenant_id, tenant_id, tenant_id),
+                "WHERE tenant_id=? UNION SELECT kb_id FROM "
+                "resource_access_retiring_documents WHERE tenant_id=? ORDER BY kb_id",
+                (tenant_id, tenant_id, tenant_id, tenant_id),
             ).fetchall()
             kb_ids = [str(row["kb_id"]) for row in rows]
             self._conn.execute(
@@ -1319,6 +1824,7 @@ class ResourceAccessStore:
             for table in (
                 "resource_access_subject_grants",
                 "resource_access_document_policies",
+                "resource_access_retiring_documents",
                 "resource_access_kb_policies",
             ):
                 self._conn.execute(
@@ -1345,6 +1851,7 @@ class ResourceAccessStore:
                     "resource_access_subject_grants",
                     "resource_access_acl_epochs",
                     "resource_access_membership_tombstones",
+                    "resource_access_retiring_documents",
                 ):
                     self._conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
             except sqlite3.Error as exc:
@@ -1383,6 +1890,7 @@ class ResourceAccessStore:
         sqlite3.Row | None,
         Sequence[sqlite3.Row],
         Sequence[sqlite3.Row],
+        frozenset[str],
         int,
         bool,
     ]:
@@ -1408,6 +1916,14 @@ class ResourceAccessStore:
                     "WHERE tenant_id=? AND kb_id=? AND subject_id=?",
                     (tenant_id, kb_id, subject_id),
                 ).fetchall()
+                retirements = frozenset(
+                    str(row["document_id"])
+                    for row in self._conn.execute(
+                        "SELECT document_id FROM resource_access_retiring_documents "
+                        "WHERE tenant_id=? AND kb_id=?",
+                        (tenant_id, kb_id),
+                    ).fetchall()
+                )
                 epoch = self._epoch_locked(tenant_id, kb_id)
                 membership_revoked = False
                 if membership_id is not None:
@@ -1423,7 +1939,7 @@ class ResourceAccessStore:
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
-        return kb_row, documents, grants, epoch, membership_revoked
+        return kb_row, documents, grants, retirements, epoch, membership_revoked
 
     @staticmethod
     def _owner_matches(

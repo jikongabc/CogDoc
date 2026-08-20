@@ -304,11 +304,15 @@ async def test_delete_kb_cleanup_failure_keeps_kb(tmp_path, monkeypatch):
             await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
             resp = await client.delete("/v1/knowledge-bases/kb")
             after = await client.get("/v1/knowledge-bases")
+            retry = await client.delete("/v1/knowledge-bases/kb")
 
-    # 清理失败：返回可重试错误，KB 仍存在于 registry。
+    # 清理失败：registry 保留作为重试入口，但 deleting KB 不再可读。
     assert resp.status_code == 500
     assert resp.json()["error_code"] == "KB_CLEANUP_FAILED"
-    assert [kb["kb_id"] for kb in after.json()] == ["kb"]
+    assert after.json() == []
+    assert app.state.kb_registry.get("kb") is not None
+    assert retry.status_code == 500
+    assert retry.json()["error_code"] == "KB_CLEANUP_FAILED"
 
 
 # 验证会话清理失败不撤销 registry，保留 DELETE 重试入口。
@@ -386,6 +390,83 @@ def test_queued_kb_delete_revalidates_before_any_destructive_cleanup(monkeypatch
     assert released == ["kb"]
 
 
+@pytest.mark.anyio
+async def test_kb_delete_revoked_during_connector_drain_restores_fence_and_schedule(
+    monkeypatch,
+):
+    import cogdoc.api.routes.documents as docs_module
+
+    lifecycle = SimpleNamespace(current="active")
+    lifecycle.status = lambda _kb_id: lifecycle.current
+    lifecycle.set = lambda _kb_id, status: setattr(lifecycle, "current", status)
+    registry = SimpleNamespace(
+        get_by_storage_id=lambda _kb_id: {
+            "tenant_id": "tenant",
+            "storage_id": "storage-kb",
+            "kb_id": "docs",
+        }
+    )
+    scope = SimpleNamespace(
+        tenant_id="tenant",
+        storage_id="storage-kb",
+        external_id="docs",
+    )
+    guard_calls = []
+
+    def guard(**kwargs):
+        guard_calls.append(kwargs)
+        if kwargs.get("require_resource_acl"):
+            raise PermissionError("grant revoked while workers drained")
+
+    restored = []
+    manager = SimpleNamespace(
+        prepare_knowledge_base_delete=lambda *_args: {
+            "previously_enabled_connection_ids": ["conn-scheduled"]
+        },
+        restore_knowledge_base_delete=lambda tenant, kb, ids: restored.append(
+            (tenant, kb, ids)
+        ),
+    )
+
+    async def immediate(_executor, function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(docs_module, "run_sync", immediate)
+    monkeypatch.setattr(docs_module, "resolve_kb_scope", lambda *_a, **_k: scope)
+    monkeypatch.setattr(
+        docs_module, "_live_session_authorization_guard", lambda *_a, **_k: guard
+    )
+    monkeypatch.setattr(docs_module, "shared_lifecycle_store", lambda: lifecycle)
+    monkeypatch.setattr(docs_module, "kb_write_lock", lambda _kb_id: nullcontext())
+    monkeypatch.setattr(
+        docs_module,
+        "_cleanup_connector_kb_state",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("irreversible cleanup must not run")
+        ),
+    )
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                kb_registry=registry,
+                index_jobs=SimpleNamespace(),
+                connector_sync_store=SimpleNamespace(
+                    scope_activity=lambda *_args: {"committing": 0}
+                ),
+                sync_manager=manager,
+                offload_executor=None,
+            )
+        )
+    )
+
+    response = await docs_module.delete_knowledge_base("docs", request)
+
+    assert response.status_code == 404
+    assert guard_calls == [{}, {"require_resource_acl": True}]
+    assert lifecycle.current == "active"
+    assert restored == [("tenant", "storage-kb", ("conn-scheduled",))]
+
+
 # 验证 create kb rejects overlong id。
 @pytest.mark.anyio
 async def test_create_kb_rejects_overlong_id(tmp_path, monkeypatch):
@@ -454,6 +535,19 @@ async def test_upload_rejects_bad_inputs(tmp_path, monkeypatch):
                 "/v1/knowledge-bases/kb/documents",
                 files={"file": ("a.pdf", b"not a pdf", "application/pdf")},
             )
+            reserved = await client.post(
+                "/v1/knowledge-bases/kb/documents",
+                files={
+                    "file": (
+                        ".cogdoc-connector-deadbeef.md",
+                        b"must not enter connector namespace",
+                        "text/markdown",
+                    )
+                },
+            )
+            reserved_delete = await client.delete(
+                "/v1/knowledge-bases/kb/documents/.cogdoc-connector-deadbeef.md"
+            )
 
     assert to_missing.status_code == 404
     assert (
@@ -463,6 +557,8 @@ async def test_upload_rejects_bad_inputs(tmp_path, monkeypatch):
     assert (
         bad_magic.status_code == 400 and bad_magic.json()["error_code"] == "INVALID_PDF"
     )
+    assert reserved.status_code == 400
+    assert reserved_delete.status_code == 404
 
 
 @pytest.mark.anyio

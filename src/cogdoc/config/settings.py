@@ -51,6 +51,137 @@ class Settings(BaseSettings):
     cogdoc_webhook_timeout_seconds: float = Field(
         default=3.0, validation_alias="COGDOC_WEBHOOK_TIMEOUT_SECONDS"
     )
+    # Connector vault keys are a JSON object of key-id -> URL-safe base64
+    # encoded 32-byte AES keys. Empty keeps vault/OAuth endpoints fail-closed
+    # while preserving legacy environment-reference connections.
+    cogdoc_connector_vault_keys: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "COGDOC_CREDENTIAL_MASTER_KEYS", "COGDOC_CONNECTOR_VAULT_KEYS"
+        ),
+    )
+    cogdoc_connector_vault_active_key_id: str = Field(
+        default="v1",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._-]+$",
+        validation_alias=AliasChoices(
+            "COGDOC_CREDENTIAL_ACTIVE_KEY_VERSION",
+            "COGDOC_CONNECTOR_VAULT_ACTIVE_KEY_ID",
+        ),
+    )
+    cogdoc_connector_oauth_public_base_url: str = Field(
+        default="", validation_alias="COGDOC_CONNECTOR_OAUTH_PUBLIC_BASE_URL"
+    )
+    cogdoc_connector_oauth_session_ttl_seconds: int = Field(
+        default=600,
+        ge=30,
+        le=1800,
+        validation_alias="COGDOC_CONNECTOR_OAUTH_SESSION_TTL_SECONDS",
+    )
+    cogdoc_connector_oauth_timeout_seconds: float = Field(
+        default=15.0,
+        ge=1.0,
+        le=60.0,
+        validation_alias="COGDOC_CONNECTOR_OAUTH_TIMEOUT_SECONDS",
+    )
+    cogdoc_connector_index_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=3600.0,
+        validation_alias="COGDOC_CONNECTOR_INDEX_TIMEOUT_SECONDS",
+    )
+    # Custom credential-bearing endpoints are trusted only from this
+    # server-owned host allowlist. Values are comma-separated exact hostnames.
+    cogdoc_confluence_allowed_hosts: str = Field(
+        default="", validation_alias="COGDOC_CONFLUENCE_ALLOWED_HOSTS"
+    )
+    cogdoc_s3_endpoint_allowed_hosts: str = Field(
+        default="", validation_alias="COGDOC_S3_ENDPOINT_ALLOWED_HOSTS"
+    )
+    # Authenticated deployments fail closed for host filesystem connectors.
+    # Values are comma-separated, server-owned absolute directory roots.
+    cogdoc_local_connector_allowed_roots: str = Field(
+        default="", validation_alias="COGDOC_LOCAL_CONNECTOR_ALLOWED_ROOTS"
+    )
+    cogdoc_git_connector_allowed_roots: str = Field(
+        default="", validation_alias="COGDOC_GIT_CONNECTOR_ALLOWED_ROOTS"
+    )
+    cogdoc_url_connector_allowed_hosts: str = Field(
+        default="", validation_alias="COGDOC_URL_CONNECTOR_ALLOWED_HOSTS"
+    )
+    cogdoc_connector_max_connections_global: int = Field(
+        default=10_000,
+        ge=1,
+        le=100_000,
+        validation_alias="COGDOC_CONNECTOR_MAX_CONNECTIONS_GLOBAL",
+    )
+    cogdoc_connector_max_connections_per_tenant: int = Field(
+        default=1_000,
+        ge=1,
+        le=10_000,
+        validation_alias="COGDOC_CONNECTOR_MAX_CONNECTIONS_PER_TENANT",
+    )
+    cogdoc_connector_max_connections_per_kb: int = Field(
+        default=100,
+        ge=1,
+        le=1_000,
+        validation_alias="COGDOC_CONNECTOR_MAX_CONNECTIONS_PER_KB",
+    )
+    cogdoc_connector_use_audit_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=3_650,
+        validation_alias="COGDOC_CONNECTOR_USE_AUDIT_RETENTION_DAYS",
+    )
+    cogdoc_connector_job_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=3_650,
+        validation_alias="COGDOC_CONNECTOR_JOB_RETENTION_DAYS",
+    )
+    cogdoc_notion_oauth_client_id: str = Field(
+        default="", validation_alias="COGDOC_NOTION_OAUTH_CLIENT_ID"
+    )
+    cogdoc_notion_oauth_client_secret: str = Field(
+        default="", validation_alias="COGDOC_NOTION_OAUTH_CLIENT_SECRET"
+    )
+    cogdoc_atlassian_oauth_client_id: str = Field(
+        default="", validation_alias="COGDOC_ATLASSIAN_OAUTH_CLIENT_ID"
+    )
+    cogdoc_atlassian_oauth_client_secret: str = Field(
+        default="", validation_alias="COGDOC_ATLASSIAN_OAUTH_CLIENT_SECRET"
+    )
+    cogdoc_microsoft_oauth_client_id: str = Field(
+        default="", validation_alias="COGDOC_MICROSOFT_OAUTH_CLIENT_ID"
+    )
+    cogdoc_microsoft_oauth_client_secret: str = Field(
+        default="", validation_alias="COGDOC_MICROSOFT_OAUTH_CLIENT_SECRET"
+    )
+    cogdoc_microsoft_oauth_tenant: str = Field(
+        default="common",
+        min_length=1,
+        max_length=128,
+        validation_alias="COGDOC_MICROSOFT_OAUTH_TENANT",
+    )
+    cogdoc_source_artifact_max_file_mb: int = Field(
+        default=100,
+        ge=1,
+        le=2048,
+        validation_alias="COGDOC_SOURCE_ARTIFACT_MAX_FILE_MB",
+    )
+    cogdoc_source_artifact_max_tenant_mb: int = Field(
+        default=512,
+        ge=1,
+        le=2048,
+        validation_alias="COGDOC_SOURCE_ARTIFACT_MAX_TENANT_MB",
+    )
+    cogdoc_source_artifact_max_versions: int = Field(
+        default=10,
+        ge=2,
+        le=100,
+        validation_alias="COGDOC_SOURCE_ARTIFACT_MAX_VERSIONS",
+    )
     cogdoc_feedback_store: str = Field(
         default="jsonl", validation_alias="COGDOC_FEEDBACK_STORE"
     )
@@ -791,6 +922,7 @@ class Settings(BaseSettings):
     @property
     def effective_claim_verification_mode(self) -> str:
         return resolve_claim_verification_mode(self)
+
     hybrid_rrf_k: int = Field(default=60, validation_alias="HYBRID_RRF_K")
     cloud_section_max_workers: int = Field(
         default=6, validation_alias="CLOUD_SECTION_MAX_WORKERS"
@@ -1024,6 +1156,10 @@ class Settings(BaseSettings):
     def state_db_path(self) -> str:
         # 会话与入库任务落盘，进程重启不丢状态。
         return str(self.data_dir / "state.db")
+
+    @property
+    def source_artifact_dir(self) -> str:
+        return str(self.data_dir / "source-artifacts")
 
     @property
     def audit_log_path(self) -> str:
