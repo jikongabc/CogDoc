@@ -60,6 +60,7 @@ class ErrorCode(str, Enum):
     SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
     WORKSPACE_NOT_FOUND = "WORKSPACE_NOT_FOUND"
     MEMBER_NOT_FOUND = "MEMBER_NOT_FOUND"
+    SERVICE_ACCOUNT_NOT_FOUND = "SERVICE_ACCOUNT_NOT_FOUND"
     INVITE_INVALID = "INVITE_INVALID"
     INVITE_NOT_FOUND = "INVITE_NOT_FOUND"
     TENANT_QUOTA_EXCEEDED = "TENANT_QUOTA_EXCEEDED"
@@ -87,6 +88,8 @@ class ErrorCode(str, Enum):
     CREDENTIAL_REVISION_CONFLICT = "CREDENTIAL_REVISION_CONFLICT"
     OAUTH_SESSION_INVALID = "OAUTH_SESSION_INVALID"
     OAUTH_PROVIDER_UNAVAILABLE = "OAUTH_PROVIDER_UNAVAILABLE"
+    OIDC_FLOW_INVALID = "OIDC_FLOW_INVALID"
+    OIDC_PROVIDER_UNAVAILABLE = "OIDC_PROVIDER_UNAVAILABLE"
     SOURCE_NOT_FOUND = "SOURCE_NOT_FOUND"
     SOURCE_VERSION_NOT_FOUND = "SOURCE_VERSION_NOT_FOUND"
     SYNC_REPLAY_CONFLICT = "SYNC_REPLAY_CONFLICT"
@@ -2152,6 +2155,360 @@ class AuthMeResponse(ApiModel):
 class AuthSessionListResponse(ApiModel):
     schema_version: Literal["v1"] = API_SCHEMA_VERSION
     sessions: list[AuthSessionInfo] = Field(default_factory=list)
+
+
+class WorkspaceSessionPolicyUpdateRequest(ApiModel):
+    idle_timeout_minutes: int | None = Field(default=None, strict=True, ge=5, le=43_200)
+    absolute_timeout_hours: int | None = Field(
+        default=None, strict=True, ge=1, le=8_760
+    )
+    max_active_sessions: int | None = Field(default=None, strict=True, ge=1, le=50)
+    expected_revision: int = Field(strict=True, ge=0)
+
+
+class WorkspaceSessionPolicy(ApiModel):
+    workspace_id: str
+    idle_timeout_minutes: int | None = None
+    absolute_timeout_hours: int | None = None
+    max_active_sessions: int | None = None
+    revision: int = Field(ge=0)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class WorkspaceSessionPolicyResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    policy: WorkspaceSessionPolicy
+
+
+class WorkspaceSecuritySession(ApiModel):
+    session_id: str
+    user_id: str
+    email: str
+    display_name: str
+    role: WorkspaceRole | None = None
+    created_at: str
+    last_seen_at: str
+    expires_at: str
+    revoked_at: str | None = None
+    status: Literal["active", "expired", "revoked"]
+
+
+class WorkspaceSecuritySessionListResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    workspace_id: str
+    total: int = Field(ge=0)
+    sessions: list[WorkspaceSecuritySession] = Field(default_factory=list)
+    next_before_session_id: str | None = None
+
+
+class OIDCStartRequest(ApiModel):
+    return_url: str = Field(strict=True, min_length=8, max_length=2048)
+    workspace_id: str | None = Field(
+        default=None, strict=True, min_length=1, max_length=160
+    )
+
+
+class OIDCStartResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    flow_id: str
+    authorization_url: str
+    expires_at: float = Field(ge=0)
+
+
+class OIDCHandoffRequest(ApiModel):
+    code: str = Field(strict=True, min_length=32, max_length=512)
+
+    @field_validator("code")
+    @classmethod
+    def _code(cls, value: str) -> str:
+        if value != value.strip() or any(ord(character) < 33 for character in value):
+            raise ValueError("invalid OIDC handoff code")
+        return value
+
+
+class OIDCIdentity(ApiModel):
+    identity_id: str
+    issuer: str
+    subject: str
+    email_at_link: str
+    created_at: str = ""
+    last_login_at: str = ""
+
+
+class OIDCIdentityListResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    identities: list[OIDCIdentity] = Field(default_factory=list)
+
+
+class OIDCExchangeResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    kind: Literal["login", "link"]
+    session: AuthSessionResponse | None = None
+    identity: OIDCIdentity | None = None
+
+    @model_validator(mode="after")
+    def _one_result(self):
+        if (self.kind == "login") != (self.session is not None):
+            raise ValueError("login handoff requires exactly one session")
+        if (self.kind == "link") != (self.identity is not None):
+            raise ValueError("link handoff requires exactly one identity")
+        return self
+
+
+class WorkspaceOIDCPolicyUpdateRequest(ApiModel):
+    allowed_domains: list[str] = Field(min_length=1, max_length=100)
+    default_role: AssignableWorkspaceRole = "viewer"
+    enabled: bool = True
+    group_claim: str = Field(default="groups", min_length=1, max_length=128)
+    group_role_map: dict[str, AssignableWorkspaceRole] = Field(
+        default_factory=dict, max_length=100
+    )
+    require_mapped_group: bool = False
+    expected_revision: int | None = Field(default=None, strict=True, ge=0)
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def _domains(cls, values: list[str]) -> list[str]:
+        result: list[str] = []
+        for raw in values:
+            if not isinstance(raw, str):
+                raise ValueError("OIDC domains must be strings")
+            value = raw.strip().casefold().rstrip(".")
+            if (
+                not value
+                or len(value) > 253
+                or "@" in value
+                or "/" in value
+                or ":" in value
+                or value.startswith(".")
+                or any(character.isspace() for character in value)
+            ):
+                raise ValueError("invalid OIDC email domain")
+            if value not in result:
+                result.append(value)
+        return sorted(result)
+
+    @field_validator("group_claim")
+    @classmethod
+    def _group_claim(cls, value: str) -> str:
+        if value != value.strip() or any(
+            ord(character) < 33 or ord(character) == 127 for character in value
+        ):
+            raise ValueError("invalid OIDC group claim")
+        if value in {
+            "iss",
+            "sub",
+            "aud",
+            "azp",
+            "exp",
+            "iat",
+            "nbf",
+            "nonce",
+            "email",
+            "email_verified",
+            "name",
+            "preferred_username",
+        }:
+            raise ValueError("OIDC group claim is reserved")
+        return value
+
+    @field_validator("group_role_map", mode="before")
+    @classmethod
+    def _group_role_map(cls, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or len(value) > 100:
+            raise ValueError(
+                "OIDC group role map must be an object with at most 100 entries"
+            )
+        result: dict[str, Any] = {}
+        for raw_group, role in value.items():
+            if not isinstance(raw_group, str):
+                raise ValueError("OIDC group names must be strings")
+            group = unicodedata.normalize(
+                "NFKC", " ".join(raw_group.split())
+            ).casefold()
+            if (
+                not group
+                or len(group) > 256
+                or any(
+                    ord(character) < 32 or ord(character) == 127 for character in group
+                )
+            ):
+                raise ValueError("invalid OIDC group name")
+            if group in result and result[group] != role:
+                raise ValueError("OIDC group role map contains conflicting groups")
+            result[group] = role
+        return dict(sorted(result.items()))
+
+    @model_validator(mode="after")
+    def _mapped_group_requirement(self):
+        if self.require_mapped_group and not self.group_role_map:
+            raise ValueError("require_mapped_group requires a group role mapping")
+        return self
+
+
+class WorkspaceOIDCPolicy(ApiModel):
+    workspace_id: str
+    issuer: str
+    allowed_domains: list[str]
+    default_role: AssignableWorkspaceRole
+    enabled: bool
+    group_claim: str = "groups"
+    group_role_map: dict[str, AssignableWorkspaceRole] = Field(default_factory=dict)
+    require_mapped_group: bool = False
+    revision: int = Field(ge=0)
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class WorkspaceOIDCPolicyResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    policy: WorkspaceOIDCPolicy | None = None
+
+
+class SCIMDirectoryStatus(ApiModel):
+    enabled: bool
+    token_labels: list[str] = Field(default_factory=list)
+    default_role: AssignableWorkspaceRole = "viewer"
+    group_role_map: dict[str, AssignableWorkspaceRole] = Field(default_factory=dict)
+    active_users: int = Field(ge=0)
+    inactive_users: int = Field(ge=0)
+    deleted_users: int = Field(ge=0)
+    groups: int = Field(ge=0)
+    group_memberships: int = Field(ge=0)
+    last_updated_at: str | None = None
+
+
+class SCIMDirectoryStatusResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    status: SCIMDirectoryStatus
+
+
+class ServiceAccountCreateRequest(ApiModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=500)
+    role: AssignableWorkspaceRole = "viewer"
+
+    @field_validator("name", "description")
+    @classmethod
+    def _text(cls, value: str, info) -> str:
+        if not value and info.field_name == "description":
+            return ""
+        return _normalized_auth_text(
+            value,
+            field=str(info.field_name),
+            maximum=120 if info.field_name == "name" else 500,
+        )
+
+
+class ServiceAccountUpdateRequest(ServiceAccountCreateRequest):
+    active: bool = True
+    expected_revision: int = Field(strict=True, ge=1)
+
+
+class ServiceAccount(ApiModel):
+    service_account_id: str
+    workspace_id: str
+    name: str
+    description: str = ""
+    role: AssignableWorkspaceRole
+    active: bool
+    revision: int = Field(ge=1)
+    created_by: str
+    created_at: str
+    updated_at: str
+
+
+class ServiceAccountResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    service_account: ServiceAccount
+
+
+class ServiceAccountListResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    workspace_id: str
+    service_accounts: list[ServiceAccount] = Field(default_factory=list)
+
+
+class ServiceTokenCreateRequest(ApiModel):
+    label: str = Field(min_length=1, max_length=120)
+    expires_in_days: int | None = Field(default=90, strict=True, ge=1, le=365)
+    permissions: (
+        list[
+            Literal[
+                "read",
+                "query",
+                "write",
+                "delete",
+                "review",
+                "publish",
+                "manage_access",
+            ]
+        ]
+        | None
+    ) = None
+
+    @field_validator("label")
+    @classmethod
+    def _label(cls, value: str) -> str:
+        return _normalized_auth_text(value, field="label", maximum=120)
+
+
+class ServiceToken(ApiModel):
+    token_id: str
+    service_account_id: str
+    label: str
+    secret_hint: str
+    status: Literal["active", "expired", "revoked"]
+    revision: int = Field(ge=1)
+    created_at: str
+    expires_at: str | None = None
+    last_used_at: str | None = None
+    revoked_at: str | None = None
+    permissions: list[str] | None = None
+
+
+class ServiceTokenCreateResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    service_token: ServiceToken
+    token: str
+
+
+class ServiceTokenListResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    service_account_id: str
+    tokens: list[ServiceToken] = Field(default_factory=list)
+
+
+ServicePermission = Literal[
+    "read", "query", "write", "delete", "review", "publish", "manage_access"
+]
+
+
+class ServiceAccountPolicyUpdate(ApiModel):
+    max_accounts: int = Field(strict=True, ge=1, le=500)
+    max_tokens_per_account: int = Field(strict=True, ge=1, le=50)
+    max_token_ttl_days: int = Field(strict=True, ge=1, le=365)
+    allow_non_expiring: bool
+    allowed_permissions: list[ServicePermission] = Field(min_length=1)
+    expected_revision: int = Field(strict=True, ge=0)
+
+
+class ServiceAccountPolicy(ApiModel):
+    workspace_id: str
+    max_accounts: int
+    max_tokens_per_account: int
+    max_token_ttl_days: int
+    allow_non_expiring: bool
+    allowed_permissions: list[ServicePermission]
+    revision: int = Field(ge=0)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class ServiceAccountPolicyResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    policy: ServiceAccountPolicy
 
 
 class WorkspaceResponse(ApiModel):

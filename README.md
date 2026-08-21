@@ -40,7 +40,7 @@ A local RAG knowledge-base console for individuals and teams, built on **LangGra
 
 - **Trace observability, review queue, and webhooks** — every request can export a safe JSON trace with config, node timings, rewrites, evidence previews, and errors; the web UI scopes traces to the current conversation, aggregates pending/stale knowledge and feedback into a review queue, and can emit webhook events for new pending knowledge.
 
-- **Real accounts, team workspaces, and retrieval ACLs** — optional persistent email/password accounts provide revocable sessions, workspace membership, invitations, RBAC, and tenant-isolated state. Knowledge-base/document policies and subject grants are enforced inside vector and BM25 recall before top-k, then checked again before evidence reaches prompts, traces, or background Research.
+- **Real accounts, enterprise OIDC/SCIM, durable service tokens, team workspaces, and retrieval ACLs** — optional persistent accounts provide password or RS256/PKCE enterprise login, revocable sessions with per-workspace idle/absolute/concurrency policy, explicit identity linking, domain-gated JIT membership, SCIM 2.0 provisioning, and workspace-scoped service accounts with one-time, expiring, revision-safe API tokens. Knowledge-base/document policies and subject grants are enforced inside vector and BM25 recall before top-k, then checked again before evidence reaches prompts, traces, or background Research. Tamper-evident tenant audit chains can be exported as integrity-checked NDJSON for compliance workflows. See the [OIDC](docs/OIDC_zh-CN.md), [SCIM](docs/SCIM_zh-CN.md), [session security](docs/SESSION_SECURITY_zh-CN.md), [service-account](docs/SERVICE_ACCOUNTS_zh-CN.md), and [audit export](docs/AUDIT_EXPORTS_zh-CN.md) guides.
 
 ## Feature Walkthrough
 
@@ -95,7 +95,7 @@ Dependencies live in [pyproject.toml](pyproject.toml): runtime in `[project.depe
 
 Copy `.env.example` to `.env` and set at least your cloud `LLM_API_KEY` (or run `/local` with Ollama). Put supported documents in the inbox `your_documents/` (or set `COGDOC_DOC_DIR`). `make native` must be re-run after any change under `rust_core/src/` — the `.so` is not auto-rebuilt and not committed.
 
-Persistent accounts default to off for a no-surprise upgrade. For an individual or team deployment, set `COGDOC_ACCOUNT_AUTH_ENABLED=true`, start the API, register the first owner, and use its returned Bearer token. An enterprise can then invite the remaining members and set `COGDOC_SELF_REGISTRATION_ENABLED=false`.
+Persistent accounts default to off for a no-surprise upgrade. For an individual or team deployment, set `COGDOC_ACCOUNT_AUTH_ENABLED=true`, start the API, register the first owner, and use its returned Bearer token. An enterprise can then configure [OIDC SSO](docs/OIDC_zh-CN.md), optionally provision users and groups through [SCIM 2.0](docs/SCIM_zh-CN.md), and set `COGDOC_SELF_REGISTRATION_ENABLED=false`.
 
 ## How to Use
 
@@ -143,6 +143,9 @@ The Streamlit app is a thin client over the FastAPI service — you can hit it d
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /v1/auth/config`, `POST /v1/auth/register`, `POST /v1/auth/login` | Discover account mode, create an account/personal workspace, or issue an opaque Bearer session |
+| `POST /v1/auth/oidc/authorize`, `GET /v1/auth/oidc/callback`, `POST /v1/auth/oidc/exchange` | Run a PKCE/nonce-protected enterprise login and exchange a one-time browser handoff for a normal CogDoc session |
+| `POST /v1/auth/oidc/link/authorize`, `GET/DELETE /v1/auth/oidc/identities[/{id}]` | Explicitly link, inspect, or unlink a federated identity |
+| `GET/PUT /v1/workspaces/{id}/oidc-policy` | Manage revision-safe issuer/domain JIT admission for a workspace (owner/admin) |
 | `GET /v1/auth/me`, `POST /v1/auth/logout`, `POST /v1/auth/logout-all` | Inspect the current identity or revoke one/all login sessions |
 | `GET /v1/auth/sessions`, `DELETE /v1/auth/sessions/{id}`, `POST /v1/auth/change-password` | Manage devices/sessions and rotate the password |
 | `GET/POST /v1/workspaces`, `POST /v1/workspaces/{id}/switch` | List/create workspaces and switch the current session's active workspace |

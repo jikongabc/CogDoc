@@ -39,6 +39,9 @@ _PUBLIC_AUTH_PATHS = frozenset(
         "/v1/auth/config",
         "/v1/auth/register",
         "/v1/auth/login",
+        "/v1/auth/oidc/authorize",
+        "/v1/auth/oidc/callback",
+        "/v1/auth/oidc/exchange",
         "/v1/auth/invitations/accept",
         "/v1/auth/connector-oauth/callback/notion",
         "/v1/auth/connector-oauth/callback/atlassian",
@@ -50,6 +53,7 @@ WORKSPACE_HEADER = "X-CogDoc-Workspace"
 _RATE_LIMIT_EXEMPT_GET_PATHS = frozenset(
     ("/v1/knowledge-bases", "/v1/sessions", "/v1/traces")
 )
+_SCIM_PREFIX = "/scim/v2"
 _RATE_LIMIT_EXEMPT_GET_PREFIXES = (
     "/v1/index-jobs/",
     "/v1/knowledge-bases/",
@@ -435,7 +439,16 @@ class AccessControlMiddleware:
         if self._auth_store is None:
             return None, None, False
 
-        authenticate = self._auth_store.authenticate_session
+        is_service_token = api_key.startswith("cog_svc_")
+        authenticate = getattr(
+            self._auth_store,
+            "authenticate_service_token"
+            if is_service_token
+            else "authenticate_session",
+            None,
+        )
+        if not callable(authenticate):
+            return None, None, False
         executor = getattr(app_state, "offload_executor", None)
 
         async def authenticate_for(target: str | None) -> object:
@@ -478,9 +491,8 @@ class AccessControlMiddleware:
         candidate = getattr(context, "principal", None)
         if not isinstance(candidate, Principal):
             raise _AuthenticationBackendUnavailable
-        target_authorized = (
-            not target_rejected
-            and (workspace_id is None or candidate.tenant_id == workspace_id)
+        target_authorized = not target_rejected and (
+            workspace_id is None or candidate.tenant_id == workspace_id
         )
         return candidate, context, target_authorized
 
@@ -498,6 +510,86 @@ class AccessControlMiddleware:
             # attribute present avoids downstream instrumentation guessing.
             request.state.principal = None
             await self.app(scope, receive, send)
+            return
+
+        if path == _SCIM_PREFIX or path.startswith(f"{_SCIM_PREFIX}/"):
+            app_state = getattr(scope.get("app"), "state", None)
+            registry = getattr(app_state, "scim_access_registry", {})
+            client = request.client.host if request.client is not None else "unknown"
+            key = _extract_api_key(request)
+            access = None
+            fingerprint = None
+            if key is not None:
+                fingerprint = fingerprint_api_key(key)
+                if isinstance(registry, Mapping):
+                    access = registry.get(fingerprint)
+            if access is None:
+                if not self._limiter.allow(f"scim-public\x1f{client}"):
+                    response = JSONResponse(
+                        status_code=429,
+                        content={
+                            "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+                            "status": "429",
+                            "detail": "SCIM request rate exceeded",
+                        },
+                        media_type="application/scim+json",
+                    )
+                    await response(scope, receive, send)
+                    return
+                response = JSONResponse(
+                    status_code=401,
+                    content={
+                        "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+                        "status": "401",
+                        "detail": "invalid SCIM bearer token",
+                    },
+                    headers={"WWW-Authenticate": "Bearer"},
+                    media_type="application/scim+json",
+                )
+                await response(scope, receive, send)
+                return
+            workspace_id = str(getattr(access, "workspace_id", ""))
+            label = str(getattr(access, "label", "directory"))
+            if not workspace_id or fingerprint is None:
+                response = JSONResponse(
+                    status_code=503,
+                    content={
+                        "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+                        "status": "503",
+                        "detail": "SCIM configuration unavailable",
+                    },
+                    media_type="application/scim+json",
+                )
+                await response(scope, receive, send)
+                return
+            identity = f"scim\x1f{fingerprint}"
+            if not self._limiter.allow(identity):
+                response = JSONResponse(
+                    status_code=429,
+                    content={
+                        "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+                        "status": "429",
+                        "detail": "SCIM request rate exceeded",
+                    },
+                    media_type="application/scim+json",
+                )
+                await response(scope, receive, send)
+                return
+            scim_principal = Principal(
+                tenant_id=workspace_id,
+                subject_id=f"scim:{label}",
+                role=Role.ADMIN,
+                key_fingerprint=fingerprint,
+            )
+            request.state.scim_access = access
+            request.state.principal = scim_principal
+            await _send_and_audit(
+                self.app,
+                scope,
+                receive,
+                send,
+                principal=scim_principal,
+            )
             return
 
         if path in _PUBLIC_AUTH_PATHS:
@@ -536,9 +628,7 @@ class AccessControlMiddleware:
         # invalid credentials a 401 and avoids mutating a valid shared session's
         # active workspace for a request that will be rejected anyway.
         requested_workspace_id = (
-            None
-            if workspace_conflict
-            else header_workspace_id or path_workspace_id
+            None if workspace_conflict else header_workspace_id or path_workspace_id
         )
         try:
             principal, auth_context, target_authorized = await self._authenticate(
@@ -572,6 +662,28 @@ class AccessControlMiddleware:
                 ErrorCode.WORKSPACE_NOT_FOUND,
                 "工作区不存在",
                 status_code=404,
+            )
+            await _send_and_audit(
+                response,
+                scope,
+                receive,
+                send,
+                principal=principal,
+                record_attempt=False,
+            )
+            return
+        if getattr(auth_context, "service_account", None) is not None and (
+            path == "/v1/auth"
+            or path.startswith("/v1/auth/")
+            or path == "/v1/workspaces"
+            or path.startswith("/v1/workspaces/")
+            or path == "/v1/principals"
+            or path.startswith("/v1/principals/")
+        ):
+            response = _reject(
+                ErrorCode.FORBIDDEN,
+                "服务账号不能管理真人身份或服务凭据",
+                status_code=403,
             )
             await _send_and_audit(
                 response,

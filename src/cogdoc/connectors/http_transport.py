@@ -183,9 +183,7 @@ def _connect_verified(
                     )
                 )
             sock = socket.socket(address.family, socket.SOCK_STREAM)
-            if candidate_timeout is None or isinstance(
-                candidate_timeout, (int, float)
-            ):
+            if candidate_timeout is None or isinstance(candidate_timeout, (int, float)):
                 sock.settimeout(candidate_timeout)
             if source_address:
                 sock.bind(source_address)
@@ -330,6 +328,7 @@ class HttpTransport:
         allowed_hosts: set[str],
         timeout_seconds: float = 30.0,
         max_response_bytes: int = MAX_HTTP_RESPONSE_BYTES,
+        max_redirects: int = MAX_HTTP_REDIRECTS,
         allow_private_hosts: bool = False,
         opener=None,
         resolver: Callable = socket.getaddrinfo,
@@ -344,11 +343,14 @@ class HttpTransport:
             not math.isfinite(timeout_seconds)
             or timeout_seconds <= 0
             or max_response_bytes <= 0
+            or type(max_redirects) is not int
+            or not 0 <= max_redirects <= MAX_HTTP_REDIRECTS
         ):
-            raise ValueError("HTTP bounds must be positive")
+            raise ValueError("invalid HTTP bounds")
         self.allowed_hosts = hosts
         self.timeout_seconds = timeout_seconds
         self.max_response_bytes = max_response_bytes
+        self.max_redirects = max_redirects
         self.allow_private_hosts = allow_private_hosts
         self._resolver = resolver
         self._monotonic = monotonic
@@ -557,7 +559,7 @@ class HttpTransport:
         current_body = body
         deadline = self._monotonic() + self.timeout_seconds
 
-        for redirect_count in range(MAX_HTTP_REDIRECTS + 1):
+        for redirect_count in range(self.max_redirects + 1):
             try:
                 _remaining_seconds(deadline, self._monotonic)
             except TimeoutError as exc:
@@ -592,7 +594,7 @@ class HttpTransport:
             )
             if isinstance(result, HttpResponse):
                 return result
-            if redirect_count == MAX_HTTP_REDIRECTS:
+            if redirect_count == self.max_redirects:
                 raise ConnectorError("provider exceeded the redirect limit")
 
             current_method, current_body, current_headers = self._redirect_request(

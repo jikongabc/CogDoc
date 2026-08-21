@@ -226,6 +226,303 @@ class CogDocClient:
         )
         return self._remember_response_workspace(response)
 
+    def begin_oidc_login(
+        self, return_url: str, workspace_id: str | None = None
+    ) -> httpx.Response:
+        payload = {"return_url": return_url, "workspace_id": workspace_id}
+        return httpx.post(
+            self._url("/v1/auth/oidc/authorize"),
+            json={key: value for key, value in payload.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def exchange_oidc_handoff(self, code: str) -> httpx.Response:
+        response = httpx.post(
+            self._url("/v1/auth/oidc/exchange"),
+            json={"code": code},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+        if not 200 <= response.status_code < 300:
+            return response
+        payload = response_payload(response)
+        if isinstance(payload, Mapping) and isinstance(payload.get("session"), Mapping):
+            workspace = payload["session"].get("workspace")
+            if isinstance(workspace, Mapping) and isinstance(
+                workspace.get("workspace_id"), str
+            ):
+                self.set_workspace(str(workspace["workspace_id"]))
+        return response
+
+    def begin_oidc_link(self, return_url: str) -> httpx.Response:
+        return httpx.post(
+            self._url("/v1/auth/oidc/link/authorize"),
+            json={"return_url": return_url},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_oidc_identities(self) -> httpx.Response:
+        return httpx.get(
+            self._url("/v1/auth/oidc/identities"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def unlink_oidc_identity(self, identity_id: str) -> httpx.Response:
+        return httpx.delete(
+            self._url(f"/v1/auth/oidc/identities/{quote(identity_id, safe='')}"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_workspace_oidc_policy(self, workspace_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/workspaces/{quote(workspace_id, safe='')}/oidc-policy"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def update_workspace_oidc_policy(
+        self,
+        workspace_id: str,
+        *,
+        allowed_domains: list[str],
+        default_role: str,
+        enabled: bool,
+        group_claim: str = "groups",
+        group_role_map: dict[str, str] | None = None,
+        require_mapped_group: bool = False,
+        expected_revision: int | None = None,
+    ) -> httpx.Response:
+        payload = {
+            "allowed_domains": allowed_domains,
+            "default_role": default_role,
+            "enabled": enabled,
+            "group_claim": group_claim,
+            "group_role_map": group_role_map or {},
+            "require_mapped_group": require_mapped_group,
+            "expected_revision": expected_revision,
+        }
+        return httpx.put(
+            self._url(f"/v1/workspaces/{quote(workspace_id, safe='')}/oidc-policy"),
+            json={key: value for key, value in payload.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def get_workspace_scim_status(self, workspace_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/workspaces/{quote(workspace_id, safe='')}/scim-status"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def list_audit_exports(self, limit: int = 100) -> httpx.Response:
+        return httpx.get(
+            self._url("/v1/audit-events/exports"),
+            params={"limit": limit},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def create_audit_export(
+        self,
+        *,
+        from_sequence: int | None = None,
+        to_sequence: int | None = None,
+        actions: list[str] | None = None,
+        statuses: list[int] | None = None,
+        retention_seconds: int = 86_400,
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url("/v1/audit-events/exports"),
+            json={
+                "from_sequence": from_sequence,
+                "to_sequence": to_sequence,
+                "actions": actions or [],
+                "statuses": statuses or [],
+                "retention_seconds": retention_seconds,
+            },
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def get_audit_export(self, job_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/audit-events/exports/{quote(job_id, safe='')}"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def download_audit_export(self, job_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/audit-events/exports/{quote(job_id, safe='')}/content"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def delete_audit_export(
+        self, job_id: str, expected_revision: int
+    ) -> httpx.Response:
+        return httpx.delete(
+            self._url(f"/v1/audit-events/exports/{quote(job_id, safe='')}"),
+            params={"expected_revision": expected_revision},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_service_accounts(self, workspace_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/service-accounts"
+            ),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def get_service_account_policy(self, workspace_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/service-account-policy"
+            ),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def update_service_account_policy(
+        self,
+        workspace_id: str,
+        *,
+        max_accounts: int,
+        max_tokens_per_account: int,
+        max_token_ttl_days: int,
+        allow_non_expiring: bool,
+        allowed_permissions: list[str],
+        expected_revision: int,
+    ) -> httpx.Response:
+        return httpx.put(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/service-account-policy"
+            ),
+            json={
+                "max_accounts": max_accounts,
+                "max_tokens_per_account": max_tokens_per_account,
+                "max_token_ttl_days": max_token_ttl_days,
+                "allow_non_expiring": allow_non_expiring,
+                "allowed_permissions": allowed_permissions,
+                "expected_revision": expected_revision,
+            },
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def create_service_account(
+        self, workspace_id: str, *, name: str, description: str, role: str
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/service-accounts"
+            ),
+            json={"name": name, "description": description, "role": role},
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def update_service_account(
+        self,
+        workspace_id: str,
+        service_account_id: str,
+        *,
+        name: str,
+        description: str,
+        role: str,
+        active: bool,
+        expected_revision: int,
+    ) -> httpx.Response:
+        return httpx.patch(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/service-accounts/"
+                f"{quote(service_account_id, safe='')}"
+            ),
+            json={
+                "name": name,
+                "description": description,
+                "role": role,
+                "active": active,
+                "expected_revision": expected_revision,
+            },
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def delete_service_account(
+        self, workspace_id: str, service_account_id: str, expected_revision: int
+    ) -> httpx.Response:
+        return httpx.delete(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/service-accounts/"
+                f"{quote(service_account_id, safe='')}"
+            ),
+            params={"expected_revision": expected_revision},
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def list_service_tokens(
+        self, workspace_id: str, service_account_id: str
+    ) -> httpx.Response:
+        return httpx.get(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/service-accounts/"
+                f"{quote(service_account_id, safe='')}/tokens"
+            ),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def create_service_token(
+        self,
+        workspace_id: str,
+        service_account_id: str,
+        *,
+        label: str,
+        expires_in_days: int | None = 90,
+        permissions: list[str] | None = None,
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/service-accounts/"
+                f"{quote(service_account_id, safe='')}/tokens"
+            ),
+            json={
+                "label": label,
+                "expires_in_days": expires_in_days,
+                "permissions": permissions,
+            },
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def revoke_service_token(
+        self,
+        workspace_id: str,
+        service_account_id: str,
+        token_id: str,
+        expected_revision: int,
+    ) -> httpx.Response:
+        return httpx.delete(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/service-accounts/"
+                f"{quote(service_account_id, safe='')}/tokens/"
+                f"{quote(token_id, safe='')}"
+            ),
+            params={"expected_revision": expected_revision},
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
     def logout(self) -> httpx.Response:
         return httpx.post(
             self._url("/v1/auth/logout"),
@@ -269,6 +566,66 @@ class CogDocClient:
             self._url("/v1/auth/sessions"),
             timeout=self.timeout,
             headers=self._headers,
+        )
+
+    def get_workspace_session_policy(self, workspace_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/workspaces/{quote(workspace_id, safe='')}/session-policy"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def update_workspace_session_policy(
+        self,
+        workspace_id: str,
+        *,
+        idle_timeout_minutes: int | None,
+        absolute_timeout_hours: int | None,
+        max_active_sessions: int | None,
+        expected_revision: int,
+    ) -> httpx.Response:
+        return httpx.put(
+            self._url(f"/v1/workspaces/{quote(workspace_id, safe='')}/session-policy"),
+            json={
+                "idle_timeout_minutes": idle_timeout_minutes,
+                "absolute_timeout_hours": absolute_timeout_hours,
+                "max_active_sessions": max_active_sessions,
+                "expected_revision": expected_revision,
+            },
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def list_workspace_security_sessions(
+        self,
+        workspace_id: str,
+        *,
+        limit: int = 50,
+        before_session_id: str | None = None,
+        include_inactive: bool = False,
+    ) -> httpx.Response:
+        params = {"limit": limit, "include_inactive": str(include_inactive).lower()}
+        if before_session_id is not None:
+            params["before_session_id"] = before_session_id
+        return httpx.get(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/security-sessions"
+            ),
+            params=params,
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def revoke_workspace_security_session(
+        self, workspace_id: str, session_id: str
+    ) -> httpx.Response:
+        return httpx.delete(
+            self._url(
+                f"/v1/workspaces/{quote(workspace_id, safe='')}/security-sessions/"
+                f"{quote(session_id, safe='')}"
+            ),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
         )
 
     def delete_auth_session(self, session_id: str) -> httpx.Response:

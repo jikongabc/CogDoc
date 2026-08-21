@@ -27,7 +27,8 @@ _HANDLER_MARKER = "_cogdoc_handler"
 _ACCESS_FILTER_MARKER = "_cogdoc_sensitive_query_filter"
 _CONFIGURED_SIGNATURE = None
 _OAUTH_CALLBACK_TARGET = re.compile(
-    r"(/v1/auth/connector-oauth/callback/[A-Za-z0-9_-]+)\?[^\s\"]*"
+    r"(/v1/auth/(?:connector-oauth/callback/[A-Za-z0-9_-]+|oidc/callback))"
+    r"\?[^\s\"]*"
 )
 
 

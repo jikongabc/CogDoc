@@ -438,6 +438,183 @@ def test_account_client_methods_keep_bearer_on_authenticated_calls(monkeypatch):
     )
 
 
+def test_oidc_client_methods_keep_handoff_public_and_policy_workspace_scoped(
+    monkeypatch,
+):
+    calls = []
+
+    def response(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if url.endswith("/auth/oidc/exchange"):
+            return httpx.Response(
+                200,
+                json={
+                    "kind": "login",
+                    "session": {"workspace": {"workspace_id": "ws-oidc"}},
+                },
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.get",
+        lambda url, **kwargs: response("GET", url, **kwargs),
+    )
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.post",
+        lambda url, **kwargs: response("POST", url, **kwargs),
+    )
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.put",
+        lambda url, **kwargs: response("PUT", url, **kwargs),
+    )
+    monkeypatch.setattr(
+        "cogdoc.frontend.api_client.httpx.delete",
+        lambda url, **kwargs: response("DELETE", url, **kwargs),
+    )
+    public = CogDocClient("http://api", api_key="")
+    public.begin_oidc_login("https://app.example/login", "ws-target")
+    public.exchange_oidc_handoff("one-shot-code")
+
+    authenticated = CogDocClient("http://api", api_key="session-token")
+    authenticated.begin_oidc_link("https://app.example/login")
+    authenticated.list_oidc_identities()
+    authenticated.unlink_oidc_identity("odi/unsafe")
+    authenticated.get_workspace_oidc_policy("ws-policy")
+    authenticated.update_workspace_oidc_policy(
+        "ws-policy",
+        allowed_domains=["example.com"],
+        default_role="viewer",
+        enabled=True,
+        group_claim="team_groups",
+        group_role_map={"editors": "editor"},
+        require_mapped_group=True,
+        expected_revision=2,
+    )
+    authenticated.get_workspace_scim_status("ws-policy")
+
+    assert calls[0][1] == "http://api/v1/auth/oidc/authorize"
+    assert calls[0][2]["json"] == {
+        "return_url": "https://app.example/login",
+        "workspace_id": "ws-target",
+    }
+    assert "Authorization" not in calls[0][2]["headers"]
+    assert calls[1][1] == "http://api/v1/auth/oidc/exchange"
+    assert public.workspace_id == "ws-oidc"
+    assert calls[4][1].endswith("/auth/oidc/identities/odi%2Funsafe")
+    assert calls[5][2]["headers"]["X-CogDoc-Workspace"] == "ws-policy"
+    assert calls[6][2]["json"]["expected_revision"] == 2
+    assert calls[6][2]["json"]["group_claim"] == "team_groups"
+    assert calls[6][2]["json"]["group_role_map"] == {"editors": "editor"}
+    assert calls[6][2]["json"]["require_mapped_group"] is True
+    assert calls[7][1].endswith("/v1/workspaces/ws-policy/scim-status")
+    assert calls[7][2]["headers"]["X-CogDoc-Workspace"] == "ws-policy"
+
+
+def test_workspace_session_policy_client_is_scoped_and_revision_safe(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(("GET", url, kwargs))
+        return httpx.Response(200, json={"policy": {"revision": 0}})
+
+    def fake_put(url, **kwargs):
+        calls.append(("PUT", url, kwargs))
+        return httpx.Response(200, json={"policy": {"revision": 1}})
+
+    def fake_delete(url, **kwargs):
+        calls.append(("DELETE", url, kwargs))
+        return httpx.Response(204)
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", fake_get)
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.put", fake_put)
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.delete", fake_delete)
+    client = CogDocClient("http://api", api_key="session-token")
+    client.get_workspace_session_policy("ws/session")
+    client.update_workspace_session_policy(
+        "ws/session",
+        idle_timeout_minutes=30,
+        absolute_timeout_hours=24,
+        max_active_sessions=4,
+        expected_revision=2,
+    )
+    client.list_workspace_security_sessions(
+        "ws/session", limit=25, before_session_id="ses/cursor", include_inactive=True
+    )
+    client.revoke_workspace_security_session("ws/session", "ses/revoke")
+
+    assert calls[0][1].endswith("/v1/workspaces/ws%2Fsession/session-policy")
+    assert calls[0][2]["headers"]["X-CogDoc-Workspace"] == "ws/session"
+    assert calls[1][2]["json"] == {
+        "idle_timeout_minutes": 30,
+        "absolute_timeout_hours": 24,
+        "max_active_sessions": 4,
+        "expected_revision": 2,
+    }
+    assert calls[2][1].endswith("/v1/workspaces/ws%2Fsession/security-sessions")
+    assert calls[2][2]["params"] == {
+        "limit": 25,
+        "include_inactive": "true",
+        "before_session_id": "ses/cursor",
+    }
+    assert calls[3][1].endswith(
+        "/v1/workspaces/ws%2Fsession/security-sessions/ses%2Frevoke"
+    )
+
+
+def test_service_account_client_methods_are_workspace_scoped_and_revision_safe(
+    monkeypatch,
+):
+    calls = []
+
+    def response(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return httpx.Response(200, json={"ok": True})
+
+    for method in ("get", "post", "patch", "delete"):
+        monkeypatch.setattr(
+            f"cogdoc.frontend.api_client.httpx.{method}",
+            lambda url, _method=method.upper(), **kwargs: response(
+                _method, url, **kwargs
+            ),
+        )
+    client = CogDocClient("http://api", api_key="session", workspace_id="workspace")
+    client.list_service_accounts("ws/one")
+    client.create_service_account(
+        "ws/one", name="CI", description="build", role="viewer"
+    )
+    client.update_service_account(
+        "ws/one",
+        "svc/one",
+        name="CI",
+        description="build",
+        role="editor",
+        active=True,
+        expected_revision=2,
+    )
+    client.delete_service_account("ws/one", "svc/one", 3)
+    client.list_service_tokens("ws/one", "svc/one")
+    client.create_service_token("ws/one", "svc/one", label="rotate", expires_in_days=30)
+    client.revoke_service_token("ws/one", "svc/one", "svt/one", 4)
+
+    assert calls[0][1].endswith("/v1/workspaces/ws%2Fone/service-accounts")
+    assert calls[1][2]["json"] == {
+        "name": "CI",
+        "description": "build",
+        "role": "viewer",
+    }
+    assert calls[2][1].endswith("/service-accounts/svc%2Fone")
+    assert calls[2][2]["json"]["expected_revision"] == 2
+    assert calls[3][2]["params"] == {"expected_revision": 3}
+    assert calls[5][2]["json"] == {
+        "label": "rotate",
+        "expires_in_days": 30,
+        "permissions": None,
+    }
+    assert calls[6][1].endswith("/tokens/svt%2Fone")
+    assert calls[6][2]["params"] == {"expected_revision": 4}
+    assert all(call[2]["headers"]["X-CogDoc-Workspace"] == "ws/one" for call in calls)
+
+
 def test_resource_access_client_methods_use_stable_acl_endpoints(monkeypatch):
     calls = []
 
@@ -1165,3 +1342,79 @@ def test_rotate_connector_credential_can_explicitly_clear_expiry(monkeypatch):
         "expires_at": None,
         "expected_revision": 2,
     }
+
+
+def test_audit_export_client_uses_encoded_job_ids_and_revision(monkeypatch):
+    calls = []
+
+    def record(method):
+        def fake(url, **kwargs):
+            calls.append((method, url, kwargs))
+            return httpx.Response(200, json={"ok": True})
+
+        return fake
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", record("GET"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.post", record("POST"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.delete", record("DELETE"))
+    client = CogDocClient("http://api", api_key="secret")
+
+    client.create_audit_export(
+        from_sequence=10,
+        to_sequence=20,
+        actions=["document.read"],
+        statuses=[200],
+        retention_seconds=3600,
+    )
+    client.list_audit_exports(25)
+    client.get_audit_export("job/1")
+    client.download_audit_export("job/1")
+    client.delete_audit_export("job/1", 3)
+
+    assert calls[0][2]["json"] == {
+        "from_sequence": 10,
+        "to_sequence": 20,
+        "actions": ["document.read"],
+        "statuses": [200],
+        "retention_seconds": 3600,
+    }
+    assert calls[1][2]["params"] == {"limit": 25}
+    assert calls[2][1].endswith("/audit-events/exports/job%2F1")
+    assert calls[3][1].endswith("/audit-events/exports/job%2F1/content")
+    assert calls[4][2]["params"] == {"expected_revision": 3}
+
+
+def test_service_account_policy_client_is_workspace_scoped(monkeypatch):
+    calls = []
+
+    def record(method):
+        def fake(url, **kwargs):
+            calls.append((method, url, kwargs))
+            return httpx.Response(200, json={"ok": True})
+
+        return fake
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", record("GET"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.put", record("PUT"))
+    client = CogDocClient("http://api", api_key="secret")
+    client.get_service_account_policy("ws/one")
+    client.update_service_account_policy(
+        "ws/one",
+        max_accounts=20,
+        max_tokens_per_account=3,
+        max_token_ttl_days=30,
+        allow_non_expiring=False,
+        allowed_permissions=["read", "query"],
+        expected_revision=2,
+    )
+
+    assert calls[0][1].endswith("/workspaces/ws%2Fone/service-account-policy")
+    assert calls[1][2]["json"] == {
+        "max_accounts": 20,
+        "max_tokens_per_account": 3,
+        "max_token_ttl_days": 30,
+        "allow_non_expiring": False,
+        "allowed_permissions": ["read", "query"],
+        "expected_revision": 2,
+    }
+    assert calls[1][2]["headers"]["X-CogDoc-Workspace"] == "ws/one"

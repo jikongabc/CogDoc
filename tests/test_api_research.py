@@ -783,13 +783,18 @@ async def test_research_auto_plan_rechecks_live_session_membership_before_commit
         subject_id="user-a",
         role=Role.EDITOR,
         session_id="session-a",
+        membership_id="membership-a",
     )
-    membership = {"role": "editor"}
+    membership = {"role": "editor", "member_id": "membership-a"}
 
     class MembershipStore:
         def membership(self, workspace_id, user_id):
             assert (workspace_id, user_id) == ("workspace-a", "user-a")
             return membership or None
+
+        @staticmethod
+        def session_is_active(**_kwargs):
+            return True
 
     app.state.auth_store = MembershipStore()
     monkeypatch.setattr(
@@ -828,6 +833,8 @@ async def test_research_auto_plan_rechecks_live_session_membership_before_commit
             "created_by": "user-a",
             "creator_role": "editor",
             "auth_kind": "user_session",
+            "session_id": "session-a",
+            "membership_id": "membership-a",
             "mode": "all",
             "acl_epoch": 1,
             "allowed_sources": [],
@@ -853,9 +860,7 @@ def test_research_authorization_rejects_stale_admin_role_for_private_kb(
     tmp_path, monkeypatch
 ):
     access_store = ResourceAccessStore(tmp_path / "resource-access.db")
-    access_store.set_kb_policy(
-        "workspace-a", "kb", "resource-owner", "private"
-    )
+    access_store.set_kb_policy("workspace-a", "kb", "resource-owner", "private")
     membership = {"role": "admin"}
     principal = Principal.for_user_session(
         tenant_id="workspace-a",
@@ -869,6 +874,10 @@ def test_research_authorization_rejects_stale_admin_role_for_private_kb(
         def membership(workspace_id, user_id):
             assert (workspace_id, user_id) == ("workspace-a", "user-a")
             return membership
+
+        @staticmethod
+        def session_is_active(**_kwargs):
+            return True
 
     request = SimpleNamespace(
         app=SimpleNamespace(
@@ -917,10 +926,7 @@ def test_research_authorization_rejects_stale_admin_role_for_private_kb(
             role=Role.EDITOR,
             session_id="session-a",
         )
-        assert (
-            access_store.allowed_sources(fresh_editor, "kb").mode
-            is AccessMode.DENY
-        )
+        assert access_store.allowed_sources(fresh_editor, "kb").mode is AccessMode.DENY
         assert research_routes._job_is_authorized(request, row)
 
         membership["role"] = "editor"
@@ -945,6 +951,10 @@ def test_research_legacy_job_rejects_stale_session_role_after_demotion(
         @staticmethod
         def membership(_workspace_id, _user_id):
             return membership
+
+        @staticmethod
+        def session_is_active(**_kwargs):
+            return True
 
     request = SimpleNamespace(
         app=SimpleNamespace(

@@ -11,16 +11,17 @@
 - `data/bm25_db/`：BM25 registry 与 native index bytes。
 - `data/manifests/`：manifest 与索引契约快照。
 - `data/source-artifacts/`：连接器来源的不可变原始版本，以及可恢复的 `.trash`。
-- `data/state.db`：sessions、index jobs、连接/同步 checkpoint 与 health、AES-GCM 凭据 envelope、OAuth 会话、来源目录，以及开启账号鉴权后的用户、带盐密码哈希、工作区、成员关系、登录会话/邀请摘要和资源 ACL。
+- `data/state.db`：sessions、index jobs、连接/同步 checkpoint 与 health、AES-GCM 凭据 envelope、OAuth 会话、来源目录、审计导出作业账本，以及开启账号鉴权后的用户、带盐密码哈希、工作区、成员关系、登录会话/邀请摘要和资源 ACL。
+- `data/audit/events.jsonl` 与 `data/audit/exports/`：租户哈希链原始日志和仍在保留期内的合规导出制品；两者必须与 `state.db` 取同一静默恢复点。格式、校验与外部 WORM 归档建议见[审计导出指南](AUDIT_EXPORTS_zh-CN.md)。
 - `data/feedback/`：feedback 与 bad cases。
 - `logs/traces/`：请求 trace，可按保留策略裁剪。
-- 数据目录外的密钥材料：完整 vault keyring、OAuth client secret、API key 与被 `secret_env` 引用的上游密钥。它们应由密钥管理系统单独备份和恢复。
+- 数据目录外的密钥材料：完整 vault keyring、连接器/OIDC client secret、OIDC flow key、SCIM Bearer、API key 与被 `secret_env` 引用的上游密钥。它们应由密钥管理系统单独备份和恢复。
 
 恢复顺序：
 
 1. 停止 API/前端进程。
 2. 恢复 `data/` 目录和需要保留的 `logs/traces/`，但不要立即接入流量。
-3. 从外部密钥系统注入该恢复点需要的完整 vault keyring、OAuth client secret、API key 和连接器环境密钥。keyring 必须包含 `state.db` 中所有 credential `key_version` 对应的旧 key。
+3. 从外部密钥系统注入该恢复点需要的完整 vault keyring、连接器/OIDC client secret、OIDC flow key、SCIM Bearer、API key 和连接器环境密钥。keyring 必须包含 `state.db` 中所有 credential `key_version` 对应的旧 key；OIDC flow key 必须能解密该恢复点仍保留的短时登录 flow。
 4. 运行 `make check` 确认 native extension 符号匹配。
 5. 运行 `make smoke-api` 验证 API 骨架可用。
 6. 启动服务后检查 `/readyz` 与 `/v1/auth/config`；若已开启鉴权，先登录，再检查 `/v1/knowledge-bases`、目标 KB 的 sources/chunks、connection health、凭据 metadata、一个原始版本的下载 SHA-256，以及代表性的 ACL 允许/拒绝查询。切流前对每类生产连接至少完成一次同步。
@@ -117,7 +118,9 @@ docker run --rm --user 0 \
 
 本版本新增 `document_id = source-name-v1` 元数据，并把 chunk 身份契约提升为 `source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index_cs600_ov60_min30_ctx160`。这属于强制重建变化：ACL 上线完成前，必须通过正常入库流程重建所有受影响 PDF 的向量/BM25 generation。`SUBSET` 权限会在向量和 BM25 的 top-k 选择前下推，并在融合后再次过滤；后台 Research 会持久化创建者和冻结 allowlist，在召回前后复验当前成员/ACL，权限被撤销或后端无法执行子集过滤时 fail-closed。
 
-本地身份实现面向共享同一受保护数据目录的单个可写 CogDoc 服务实例。不能把各自持有独立 `state.db` 的实例直接放到负载均衡器后，并期待会话、邀请、成员或 ACL epoch 自动收敛。严格限制文件权限并加密备份，因为 `state.db` 含密码哈希和活动 token 摘要；获得仍有效的原始 Bearer 或邀请 token 依然足以执行对应操作。本版本不提供邮件投递、邮箱验证、邮件密码重置、MFA 或外部 IdP/SSO 桥接。需要这些控制的企业应把服务置于身份感知网关/私网之后，并做专门集成，不能绕过本地会话校验。
+本地身份实现面向共享同一受保护数据目录的单个可写 CogDoc 服务实例。不能把各自持有独立 `state.db` 的实例直接放到负载均衡器后，并期待会话、邀请、成员或 ACL epoch 自动收敛。严格限制文件权限并加密备份，因为 `state.db` 含密码哈希、OIDC 身份映射/加密在途 flow、SCIM 用户/组/revision 和活动 token 摘要；获得仍有效的原始 Bearer 或邀请 token 依然足以执行对应操作。本版本提供单 provider 企业 OIDC 登录、显式账号绑定与工作区级 SCIM 目录预配，完整上线、密钥轮换和故障排查见 [OIDC](OIDC_zh-CN.md) 与 [SCIM](SCIM_zh-CN.md) 部署指南。邮件投递、邮箱密码重置与 CogDoc 自身强制 MFA 仍不提供；MFA/条件访问应由 IdP 强制，不能绕过本地会话和 ACL 校验。
+
+长期自动化优先使用[持久服务账号](SERVICE_ACCOUNTS_zh-CN.md)，为每个用途签发独立、有限期、最小角色 token；静态 `COGDOC_API_PRINCIPALS` 只保留迁移和受控 break-glass。服务 token 原文不在备份中，恢复后必须从外部密钥系统重新注入客户端，无法确认的 token应撤销重发。
 
 共享 Streamlit 部署禁止设置单数的 `COGDOC_API_KEY`。它是前端向外发请求的客户端凭据；一旦存在，每个尚无真人会话的浏览器都会按设计跳过登录页，并以该服务主体操作。多用户前端必须留空它，API 端服务身份只用 `COGDOC_API_KEYS` 或 `COGDOC_API_PRINCIPALS` 配置。单数变量仅适合受信的单用户控制台或专用自动化前端。
 

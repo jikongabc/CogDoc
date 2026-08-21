@@ -135,9 +135,7 @@ class _SessionAuthStore:
 
 
 class _TargetRejectingSessionAuthStore(_SessionAuthStore):
-    def authenticate_session(
-        self, _token: str, workspace_id: str | None = None
-    ):
+    def authenticate_session(self, _token: str, workspace_id: str | None = None):
         if workspace_id is not None:
             raise AuthAuthorizationError("target rejected")
         return self.context
@@ -272,9 +270,7 @@ async def test_workspace_header_pins_shared_session_and_path_conflicts_fail_clos
     tmp_path,
 ):
     store = AuthStore(str(tmp_path / "auth.db"), scrypt_n=1 << 10)
-    owner = store.register(
-        "two-tabs@example.com", "correct horse battery", "Two Tabs"
-    )
+    owner = store.register("two-tabs@example.com", "correct horse battery", "Two Tabs")
     workspace_a = owner["workspace"]["workspace_id"]
     workspace_b = store.create_workspace(owner["user"]["user_id"], "Workspace B")[
         "workspace_id"
@@ -531,6 +527,16 @@ def test_role_permission_matrix_is_explicit_and_least_privilege():
             Permission.REVIEW,
         ),
         ("POST", "/v1/principals", Permission.MANAGE_ACCESS),
+        (
+            "GET",
+            "/v1/workspaces/wsp-1/session-policy",
+            Permission.MANAGE_ACCESS,
+        ),
+        (
+            "DELETE",
+            "/v1/workspaces/wsp-1/security-sessions/ses-1",
+            Permission.MANAGE_ACCESS,
+        ),
         ("GET", "/v1/tenants/t-1", Permission.MANAGE_TENANT),
         ("CONNECT", "/v1/unknown", Permission.MANAGE_TENANT),
     ],

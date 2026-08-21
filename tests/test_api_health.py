@@ -1,9 +1,13 @@
 import json
+from types import SimpleNamespace
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from cogdoc.api.app import _unhandled_error_response, create_app
 from cogdoc.api.auth_store import AuthStore
+from cogdoc.api.oidc import OIDCFlowStore, OIDCManager
 from cogdoc.api.resource_access import ResourceAccessStore
+from cogdoc.api.scim import parse_scim_access_registry
 from cogdoc.api.session_store import SessionStore
 from cogdoc.connectors.connection_store import ConnectionStore
 from cogdoc.connectors.credential_store import CredentialVault
@@ -173,6 +177,57 @@ async def test_structured_readiness_reports_components(monkeypatch):
         "status": "disabled",
         "required": False,
     }
+    assert payload["components"]["scim_directory"] == {
+        "status": "disabled",
+        "required": False,
+    }
+
+
+@pytest.mark.anyio
+async def test_scim_readiness_requires_healthy_auth_store(tmp_path, monkeypatch):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    auth = AuthStore(str(tmp_path / "auth.db"), scrypt_n=1 << 10)
+    access = ResourceAccessStore(tmp_path / "access.db")
+    owner = auth.register("owner@example.com", "correct horse battery", "Owner")
+    registry = parse_scim_access_registry(
+        json.dumps(
+            [
+                {
+                    "token": "s" * 32,
+                    "workspace_id": owner["workspace"]["workspace_id"],
+                }
+            ]
+        ),
+        issuer="https://id.example.com",
+    )
+    app = create_app(
+        session_store=SessionStore(),
+        auth_store=auth,
+        resource_access_store=access,
+        scim_access_registry=registry,
+    )
+    try:
+        async with app.router.lifespan_context(app):
+            async with await _client(app) as client:
+                ready = await client.get("/health/ready")
+                auth.close()
+                app.state.readiness_probe_cache = None
+                unavailable = await client.get("/health/ready")
+        assert ready.status_code == 200
+        assert ready.json()["components"]["scim_directory"] == {
+            "status": "ready",
+            "required": True,
+        }
+        assert unavailable.status_code == 503
+        assert unavailable.json()["components"]["scim_directory"] == {
+            "status": "not_ready",
+            "required": True,
+        }
+    finally:
+        auth.close()
+        access.close()
 
 
 @pytest.mark.anyio
@@ -235,6 +290,42 @@ async def test_vault_is_required_without_enabling_oauth_sessions(tmp_path, monke
     assert response.json()["components"]["connector_oauth_session_store"] == {
         "status": "disabled",
         "required": False,
+    }
+
+
+@pytest.mark.anyio
+async def test_oidc_flow_store_is_required_and_fails_closed(tmp_path, monkeypatch):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    auth_store = AuthStore(str(tmp_path / "auth.db"), scrypt_n=1 << 10)
+    access_store = ResourceAccessStore(tmp_path / "access.db")
+    flow_store = OIDCFlowStore(str(tmp_path / "flows.db"), b"o" * 32)
+    oidc_manager = OIDCManager(
+        SimpleNamespace(config=SimpleNamespace(display_name="Enterprise SSO")),
+        flow_store,
+        auth_store,
+    )
+    app = create_app(
+        session_store=SessionStore(),
+        auth_store=auth_store,
+        resource_access_store=access_store,
+        oidc_manager=oidc_manager,
+    )
+    try:
+        async with app.router.lifespan_context(app):
+            flow_store.close()
+            async with await _client(app) as client:
+                response = await client.get("/health/ready")
+    finally:
+        flow_store.close()
+        auth_store.close()
+        access_store.close()
+
+    assert response.status_code == 503
+    assert response.json()["components"]["oidc_flow_store"] == {
+        "status": "not_ready",
+        "required": True,
     }
 
 

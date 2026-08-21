@@ -40,7 +40,7 @@
 
 - **Trace 可观测、审核队列与 webhook** — 每次请求可导出安全 JSON trace，包含请求配置、节点耗时、改写、证据预览与错误摘要；网页端只展示当前对话的 trace，并把待审核/过期知识、反馈分析、检索调权聚合成审核队列，也可在新待审核知识产生时投递 webhook。
 
-- **真实账号、团队工作区与检索 ACL** — 可选的持久邮箱/密码账号提供可撤销登录会话、成员关系、邀请、RBAC 与租户状态隔离。知识库/文档策略和主体 grant 会在向量与 BM25 的 top-k 之前生效，并在证据进入 Prompt、Trace 或后台 Research 前再次复验。
+- **真实账号、企业 OIDC/SCIM、持久服务令牌、团队工作区与检索 ACL** — 可选持久账号支持密码或 RS256/PKCE 企业登录、可撤销会话、工作区级[会话安全策略](SESSION_SECURITY_zh-CN.md)、SCIM 2.0 预配，以及工作区级服务账号和一次性、有期限、可在线撤销的 API Token。知识库/文档策略和主体 grant 会在向量与 BM25 的 top-k 之前生效，并在证据进入 Prompt、Trace 或后台 Research 前再次复验。详见 [OIDC](OIDC_zh-CN.md)、[SCIM](SCIM_zh-CN.md) 与[服务账号](SERVICE_ACCOUNTS_zh-CN.md)指南。
 
 ## 功能演示
 
@@ -95,7 +95,7 @@ make run        # 构建/复用索引、预热模型、启动控制台
 
 把 `.env.example` 复制为 `.env`，至少设置云端 `LLM_API_KEY`（或用 `/local` 走 Ollama）。把受支持的文档放进收件箱 `your_documents/`（或设置 `COGDOC_DOC_DIR`）。每次修改 `rust_core/src/` 下的代码后都必须重跑 `make native`——`.so` 不会自动重建，也不纳入版本控制。
 
-持久账号默认关闭，保证旧部署升级后行为不突变。个人或团队部署应设置 `COGDOC_ACCOUNT_AUTH_ENABLED=true`，启动 API 后注册首位 owner，并使用返回的 Bearer token。企业可随后邀请其他成员，再设置 `COGDOC_SELF_REGISTRATION_ENABLED=false` 关闭公开注册。
+持久账号默认关闭，保证旧部署升级后行为不突变。个人或团队部署应设置 `COGDOC_ACCOUNT_AUTH_ENABLED=true`，启动 API 后注册首位 owner，并使用返回的 Bearer token。企业可随后配置 [OIDC 单点登录](OIDC_zh-CN.md)，按需接入 [SCIM 2.0](SCIM_zh-CN.md) 预配用户/组，再设置 `COGDOC_SELF_REGISTRATION_ENABLED=false` 关闭公开注册。
 
 ## 使用流程
 
@@ -143,6 +143,17 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 | 端点 | 用途 |
 | --- | --- |
 | `GET /v1/auth/config`、`POST /v1/auth/register`、`POST /v1/auth/login` | 查询账号模式、创建账号/个人工作区，或签发不透明 Bearer 会话 |
+| `POST /v1/auth/oidc/authorize`、`GET /v1/auth/oidc/callback`、`POST /v1/auth/oidc/exchange` | 执行带 PKCE/nonce 的企业登录，并用一次性浏览器 handoff 换取普通 CogDoc 会话 |
+| `POST /v1/auth/oidc/link/authorize`、`GET/DELETE /v1/auth/oidc/identities[/{id}]` | 显式绑定、查看或解绑联邦身份 |
+| `GET/PUT /v1/workspaces/{id}/oidc-policy` | owner/admin revision-safe 管理工作区 issuer/邮箱域 JIT 准入 |
+| `GET /v1/workspaces/{id}/scim-status` | owner/admin 查看不含 token/fingerprint 的目录同步状态 |
+| `GET/POST /scim/v2/Users`、`GET/PUT/PATCH/DELETE /scim/v2/Users/{id}` | 使用工作区专用 Bearer 执行 SCIM 用户预配、更新、停用与软删除 |
+| `GET/POST /scim/v2/Groups`、`GET/PUT/PATCH/DELETE /scim/v2/Groups/{id}` | 同步 SCIM 组成员，并按服务端精确组名映射角色 |
+| `GET/POST /v1/workspaces/{id}/service-accounts`、`PATCH/DELETE .../{service_account_id}` | owner/admin 管理持久非人类主体、实时角色与停用状态 |
+| `GET/POST .../service-accounts/{id}/tokens`、`DELETE .../tokens/{token_id}` | 一次性签发、查看 metadata 或 revision-safe 撤销服务 token |
+| `GET/PUT /v1/workspaces/{id}/service-account-policy` | 管理服务账号/token 数量、TTL、永久凭据和权限上限 |
+| `GET/PUT /v1/workspaces/{id}/session-policy` | 管理用户会话空闲/绝对时长与每用户并发上限 |
+| `GET/DELETE /v1/workspaces/{id}/security-sessions[/session_id]` | 分页盘点安全会话元数据并按工作区撤销 |
 | `GET /v1/auth/me`、`POST /v1/auth/logout`、`POST /v1/auth/logout-all` | 查看当前身份，或撤销单个/全部登录会话 |
 | `GET /v1/auth/sessions`、`DELETE /v1/auth/sessions/{id}`、`POST /v1/auth/change-password` | 管理设备会话与修改密码 |
 | `GET/POST /v1/workspaces`、`POST /v1/workspaces/{id}/switch` | 列出/创建工作区，并切换当前登录会话的活动工作区 |
@@ -150,6 +161,7 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 | `POST/GET /v1/workspaces/{id}/invites`、`DELETE .../invites/{invite_id}`、`POST /v1/auth/invitations/accept` | 签发、查看、撤销或接受一次性工作区邀请 |
 | `GET /v1/tenant` | 查看当前工作区、主体、角色、权限与配额使用量 |
 | `GET /v1/audit-events` | 分页读取当前工作区的哈希链审计元数据（owner/admin） |
+| `POST/GET /v1/audit-events/exports`、`GET .../{job_id}/content` | 创建、轮询与下载带完整性摘要的租户审计 NDJSON 导出 |
 | `POST /v1/knowledge-bases`、`GET /v1/knowledge-bases` | 创建 / 列出知识库 |
 | `GET/PATCH /v1/knowledge-bases/{kb}/access` | 查看或切换知识库的 `workspace` / `private` 策略 |
 | `GET/PATCH /v1/knowledge-bases/{kb}/documents/{document_id}/access` | 查看或切换文档的 `inherit` / `workspace` / `private` 策略 |

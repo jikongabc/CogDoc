@@ -506,3 +506,37 @@ def test_cuda_thresholds_reject_unknown_keys():
 
     with pytest.raises(ValueError, match="未知 CUDA 显存阈值配置"):
         settings.cuda_min_free_bytes("UNKNOWN_MIN_CUDA_FREE_MB")
+
+
+def test_enterprise_oidc_settings_are_opt_in_and_bounded(monkeypatch):
+    monkeypatch.setenv("COGDOC_OIDC_ENABLED", "true")
+    monkeypatch.setenv("COGDOC_OIDC_ISSUER", "https://id.example.com")
+    monkeypatch.setenv("COGDOC_OIDC_CLIENT_ID", "client")
+    monkeypatch.setenv("COGDOC_OIDC_FLOW_TTL_SECONDS", "300")
+    monkeypatch.setenv("COGDOC_OIDC_HANDOFF_TTL_SECONDS", "45")
+
+    settings = get_settings()
+
+    assert settings.cogdoc_oidc_enabled is True
+    assert settings.cogdoc_oidc_issuer == "https://id.example.com"
+    assert settings.cogdoc_oidc_client_id == "client"
+    assert settings.cogdoc_oidc_flow_ttl_seconds == 300
+    assert settings.cogdoc_oidc_handoff_ttl_seconds == 45
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, cogdoc_oidc_flow_ttl_seconds=29)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, cogdoc_oidc_handoff_ttl_seconds=301)
+
+
+def test_scim_settings_are_explicit_and_role_bounded():
+    settings = Settings(
+        _env_file=None,
+        cogdoc_scim_enabled=True,
+        cogdoc_scim_bearer_tokens='[{"token":"secret","workspace_id":"wsp"}]',
+        cogdoc_scim_default_role="reviewer",
+        cogdoc_scim_group_role_map='{"Admins":"admin"}',
+    )
+    assert settings.cogdoc_scim_enabled is True
+    assert settings.cogdoc_scim_default_role == "reviewer"
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, cogdoc_scim_default_role="owner")

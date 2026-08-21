@@ -150,7 +150,13 @@ def test_sink_startup_failure_dead_letters_and_manager_replays_new_job(tmp_path)
     assert replay["replay_of"] == original["job_id"]
     assert replayed_terminal["status"] == "dead_letter"
     assert replayed_terminal["attempt"] == 2
-    assert sync_store.get(original["job_id"]) == dead_letter
+    persisted_original = sync_store.get(original["job_id"])
+    assert persisted_original is not None
+    # Health duration is an eventually projected terminal metric and may be
+    # filled between these reads; replay must not mutate the job identity or
+    # state-machine fields.
+    for field in ("job_id", "status", "attempt", "replay_of", "connection_revision"):
+        assert persisted_original[field] == dead_letter[field]
     assert manager.health(connection["connection_id"])["next_run_at"] is None
     manager.shutdown()
     sync_store.close()

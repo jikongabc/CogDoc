@@ -113,12 +113,27 @@ def _job_is_authorized(request: Request, row) -> bool:
     if is_user_session_principal(principal):
         auth_store = getattr(request.app.state, "auth_store", None)
         membership_reader = getattr(auth_store, "membership", None)
-        if not callable(membership_reader):
+        session_is_active = getattr(auth_store, "session_is_active", None)
+        if not callable(membership_reader) or not callable(session_is_active):
             return False
         try:
+            if not session_is_active(
+                session_id=principal.key_fingerprint.removeprefix("session:"),
+                user_id=principal.subject_id,
+                workspace_id=principal.tenant_id,
+            ):
+                return False
             membership = membership_reader(principal.tenant_id, principal.subject_id)
             live_role = Role(str(membership.get("role") or ""))
+            live_membership_id = str(
+                membership.get("member_id") or membership.get("membership_id") or ""
+            )
         except Exception:
+            return False
+        if (
+            principal.membership_id is not None
+            and live_membership_id != principal.membership_id
+        ):
             return False
         # The middleware principal is a request-start snapshot. If membership
         # changed while a long-running research operation was in flight, do not

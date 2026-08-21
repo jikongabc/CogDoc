@@ -30,6 +30,7 @@ from cogdoc.frontend.api_client import (
 )
 
 DEFAULT_API_URL = os.getenv("COGDOC_API_URL", "http://localhost:8000")
+DEFAULT_FRONTEND_PUBLIC_URL = os.getenv("COGDOC_FRONTEND_PUBLIC_URL", "").strip()
 MAIN_VIEWS = ["对话", "研究", "来源", "派生知识", "证据审核", "调试"]
 STREAM_RERUN_INTERVAL_SECONDS = 0.8
 STREAM_PREVIEW_HEAD_CHARS = 1200
@@ -349,6 +350,10 @@ def _init_state() -> None:
     st.session_state.setdefault("auth_me_loaded_for", "")
     st.session_state.setdefault("auth_me_loaded_at", 0.0)
     st.session_state.setdefault("last_invite_token", "")
+    st.session_state.setdefault("oidc_authorization_url", "")
+    st.session_state.setdefault("oidc_authorization_expires_at", 0.0)
+    st.session_state.setdefault("oidc_link_authorization_url", "")
+    st.session_state.setdefault("oidc_link_authorization_expires_at", 0.0)
     # 会话标识持久化进地址栏，刷新后复用同一会话。
     if "session_id" not in st.session_state:
         st.session_state.session_id = st.query_params.get("sid") or uuid.uuid4().hex
@@ -512,6 +517,10 @@ def _reset_user_context() -> None:
     # identity/workspace/role boundary where it could be shown under the wrong
     # tenant and delivered to the wrong recipient.
     st.session_state.last_invite_token = ""
+    st.session_state.oidc_authorization_url = ""
+    st.session_state.oidc_authorization_expires_at = 0.0
+    st.session_state.oidc_link_authorization_url = ""
+    st.session_state.oidc_link_authorization_expires_at = 0.0
     _invalidate_auth_profile()
     for key in list(st.session_state):
         if str(key).startswith(("member-role-", "member-save-", "member-remove-")):
@@ -733,6 +742,56 @@ def _submit_auth_response(response, fallback: str) -> bool:
     return True
 
 
+def _pop_oidc_query(name: str) -> None:
+    try:
+        del st.query_params[name]
+    except (KeyError, TypeError):
+        pass
+
+
+def _consume_oidc_return() -> bool:
+    """Exchange the one-shot browser code without ever persisting it in state."""
+
+    raw_error = st.query_params.get("oidc_error")
+    if raw_error:
+        _pop_oidc_query("oidc_error")
+        st.error("企业身份提供方未完成授权，请重试。")
+        return False
+    raw_code = st.query_params.get("oidc_code")
+    if not raw_code:
+        return False
+    code = str(raw_code)
+    try:
+        response = CogDocClient(
+            st.session_state.api_url, api_key=""
+        ).exchange_oidc_handoff(code)
+    except Exception as exc:
+        st.error(f"完成企业登录失败: {exc}")
+        return False
+    _pop_oidc_query("oidc_code")
+    if response.status_code != 200:
+        st.error(_response_error(response, "完成企业登录失败"))
+        return False
+    payload = response_payload(response)
+    if not isinstance(payload, Mapping):
+        st.error("身份服务返回了无效企业登录结果。")
+        return False
+    if payload.get("kind") == "login" and isinstance(payload.get("session"), Mapping):
+        if not _apply_auth_session(payload["session"]):
+            st.error("身份服务返回了无效企业登录会话。")
+            return False
+        st.session_state.oidc_authorization_url = ""
+        st.session_state.oidc_authorization_expires_at = 0.0
+        st.rerun()
+    if payload.get("kind") == "link" and isinstance(payload.get("identity"), Mapping):
+        st.session_state.oidc_link_authorization_url = ""
+        st.session_state.oidc_link_authorization_expires_at = 0.0
+        st.success("企业身份已安全绑定。")
+        return True
+    st.error("身份服务返回了无法识别的企业登录结果。")
+    return False
+
+
 def _render_auth_screen(config: Mapping) -> None:
     st.subheader("登录 CogDoc")
     st.caption("账号会话仅保存在当前浏览器的 Streamlit 会话中。")
@@ -749,6 +808,53 @@ def _render_auth_screen(config: Mapping) -> None:
                 _submit_auth_response(response, "登录失败")
             except Exception as exc:
                 st.error(f"登录失败: {exc}")
+        if bool(config.get("oidc_enabled", False)):
+            st.divider()
+            oidc_name = str(config.get("oidc_display_name") or "Enterprise SSO")
+            if not DEFAULT_FRONTEND_PUBLIC_URL:
+                st.info("企业登录已启用，但前端尚未配置 COGDOC_FRONTEND_PUBLIC_URL。")
+            else:
+                if st.button(
+                    f"准备使用 {oidc_name} 登录",
+                    key="prepare-oidc-login",
+                    use_container_width=True,
+                ):
+                    try:
+                        response = public_client.begin_oidc_login(
+                            DEFAULT_FRONTEND_PUBLIC_URL
+                        )
+                    except Exception as exc:
+                        st.error(f"建立企业登录会话失败: {exc}")
+                    else:
+                        payload = response_payload(response)
+                        if response.status_code == 200 and isinstance(payload, Mapping):
+                            authorization_url = payload.get("authorization_url")
+                            if isinstance(authorization_url, str):
+                                st.session_state.oidc_authorization_url = (
+                                    authorization_url
+                                )
+                                st.session_state.oidc_authorization_expires_at = float(
+                                    payload.get("expires_at") or 0.0
+                                )
+                            else:
+                                st.error("身份服务返回了无效授权地址。")
+                        else:
+                            st.error(_response_error(response, "建立企业登录会话失败"))
+                authorization_url = str(
+                    st.session_state.get("oidc_authorization_url") or ""
+                )
+                expires_at = float(
+                    st.session_state.get("oidc_authorization_expires_at") or 0.0
+                )
+                if authorization_url and expires_at > time.time():
+                    st.link_button(
+                        f"继续前往 {oidc_name}",
+                        authorization_url,
+                        use_container_width=True,
+                    )
+                elif authorization_url:
+                    st.session_state.oidc_authorization_url = ""
+                    st.session_state.oidc_authorization_expires_at = 0.0
     with register_tab:
         if not bool(config.get("self_registration_enabled", False)):
             st.info("当前部署未开放自主注册，请使用邀请链接加入工作区。")
@@ -809,6 +915,7 @@ def _auth_gate() -> bool:
     if not bool(config.get("account_auth_enabled", False)):
         st.session_state.auth_mode = "legacy"
         return True
+    _consume_oidc_return()
     if st.session_state.auth_token:
         st.session_state.auth_mode = "account"
         return _refresh_auth_profile()
@@ -3347,6 +3454,695 @@ def _render_workspace_invites(client: CogDocClient, workspace_id: str) -> None:
                 st.error(_response_error(response, "撤销邀请失败"))
 
 
+def _render_oidc_account(client: CogDocClient, config: Mapping) -> None:
+    if not bool(config.get("oidc_enabled", False)):
+        st.caption("当前部署未启用企业身份联邦。")
+        return
+    oidc_name = str(config.get("oidc_display_name") or "Enterprise SSO")
+    try:
+        response = client.list_oidc_identities()
+    except Exception as exc:
+        st.error(f"读取企业身份失败: {exc}")
+        return
+    payload = response_payload(response)
+    identities = payload.get("identities", []) if isinstance(payload, Mapping) else []
+    if response.status_code != 200 or not isinstance(identities, list):
+        st.error(_response_error(response, "读取企业身份失败"))
+        return
+    if identities:
+        for item in identities:
+            if not isinstance(item, Mapping):
+                continue
+            identity_id = str(item.get("identity_id") or "")
+            row = st.columns([5, 1])
+            row[0].caption(
+                f"{item.get('email_at_link') or '-'} · {item.get('issuer') or '-'}"
+            )
+            if identity_id and row[1].button("解绑", key=f"unlink-oidc-{identity_id}"):
+                try:
+                    removed = client.unlink_oidc_identity(identity_id)
+                except Exception as exc:
+                    st.error(f"解绑企业身份失败: {exc}")
+                    continue
+                if removed.status_code == 204:
+                    st.rerun()
+                st.error(_response_error(removed, "解绑企业身份失败"))
+    else:
+        st.caption("尚未绑定企业身份。")
+    if not DEFAULT_FRONTEND_PUBLIC_URL:
+        st.info("配置 COGDOC_FRONTEND_PUBLIC_URL 后可绑定企业身份。")
+        return
+    if st.button(
+        f"准备绑定 {oidc_name}", key="prepare-oidc-link", use_container_width=True
+    ):
+        try:
+            started = client.begin_oidc_link(DEFAULT_FRONTEND_PUBLIC_URL)
+        except Exception as exc:
+            st.error(f"建立企业身份绑定会话失败: {exc}")
+        else:
+            started_payload = response_payload(started)
+            if started.status_code == 200 and isinstance(started_payload, Mapping):
+                url = started_payload.get("authorization_url")
+                if isinstance(url, str):
+                    st.session_state.oidc_link_authorization_url = url
+                    st.session_state.oidc_link_authorization_expires_at = float(
+                        started_payload.get("expires_at") or 0.0
+                    )
+                else:
+                    st.error("身份服务返回了无效授权地址。")
+            else:
+                st.error(_response_error(started, "建立企业身份绑定会话失败"))
+    link_url = str(st.session_state.get("oidc_link_authorization_url") or "")
+    link_expires = float(
+        st.session_state.get("oidc_link_authorization_expires_at") or 0.0
+    )
+    if link_url and link_expires > time.time():
+        st.link_button(f"继续前往 {oidc_name}", link_url, use_container_width=True)
+    elif link_url:
+        st.session_state.oidc_link_authorization_url = ""
+        st.session_state.oidc_link_authorization_expires_at = 0.0
+
+
+def _render_oidc_policy(client: CogDocClient, workspace_id: str) -> None:
+    try:
+        response = client.get_workspace_oidc_policy(workspace_id)
+    except Exception as exc:
+        st.error(f"读取企业准入策略失败: {exc}")
+        return
+    payload = response_payload(response)
+    policy = payload.get("policy") if isinstance(payload, Mapping) else None
+    if response.status_code != 200 or (
+        policy is not None and not isinstance(policy, Mapping)
+    ):
+        st.error(_response_error(response, "读取企业准入策略失败"))
+        return
+    current = dict(policy) if isinstance(policy, Mapping) else {}
+    roles = ["viewer", "reviewer", "editor", "admin"]
+    current_role = str(current.get("default_role") or "viewer")
+    current_group_map = current.get("group_role_map")
+    if not isinstance(current_group_map, Mapping):
+        current_group_map = {}
+    with st.form(f"oidc-policy-{workspace_id}"):
+        domains = st.text_area(
+            "允许自动加入的邮箱域（每行一个）",
+            value="\n".join(str(item) for item in current.get("allowed_domains", [])),
+        )
+        default_role = st.selectbox(
+            "自动加入角色",
+            roles,
+            index=roles.index(current_role) if current_role in roles else 0,
+        )
+        group_claim = st.text_input(
+            "组声明名称",
+            value=str(current.get("group_claim") or "groups"),
+            help="ID token 中包含组名字符串列表的 claim；只做规范化后的精确匹配。",
+        )
+        group_mappings = st.text_area(
+            "组到角色映射（每行 group=role）",
+            value="\n".join(
+                f"{group}={role}" for group, role in sorted(current_group_map.items())
+            ),
+            help="可用角色：viewer、reviewer、editor、admin；不能映射 owner。",
+        )
+        require_mapped_group = st.checkbox(
+            "仅允许命中组映射的 JIT 成员",
+            value=bool(current.get("require_mapped_group", False)),
+        )
+        enabled = st.checkbox("启用自动准入", value=bool(current.get("enabled", True)))
+        submitted = st.form_submit_button("保存企业准入策略", use_container_width=True)
+    if submitted:
+        allowed_domains = [
+            line.strip() for line in domains.splitlines() if line.strip()
+        ]
+        group_role_map: dict[str, str] = {}
+        invalid_mapping = False
+        for line in group_mappings.splitlines():
+            if not line.strip():
+                continue
+            group, separator, role = line.partition("=")
+            if not separator or not group.strip() or role.strip() not in roles:
+                invalid_mapping = True
+                break
+            group_role_map[group.strip()] = role.strip()
+        if invalid_mapping:
+            st.error("组映射格式无效，请使用 group=viewer|reviewer|editor|admin。")
+            return
+        try:
+            updated = client.update_workspace_oidc_policy(
+                workspace_id,
+                allowed_domains=allowed_domains,
+                default_role=default_role,
+                enabled=enabled,
+                group_claim=group_claim,
+                group_role_map=group_role_map,
+                require_mapped_group=require_mapped_group,
+                expected_revision=(
+                    int(current["revision"]) if "revision" in current else None
+                ),
+            )
+        except Exception as exc:
+            st.error(f"更新企业准入策略失败: {exc}")
+            return
+        if updated.status_code == 200:
+            st.success("企业准入策略已更新。")
+            st.rerun()
+        st.error(_response_error(updated, "更新企业准入策略失败"))
+
+
+def _render_scim_status(client: CogDocClient, workspace_id: str) -> None:
+    try:
+        response = client.get_workspace_scim_status(workspace_id)
+    except Exception as exc:
+        st.error(f"读取目录同步状态失败: {exc}")
+        return
+    payload = response_payload(response)
+    status = payload.get("status") if isinstance(payload, Mapping) else None
+    if response.status_code != 200 or not isinstance(status, Mapping):
+        st.error(_response_error(response, "读取目录同步状态失败"))
+        return
+    if not bool(status.get("enabled", False)):
+        st.caption("当前工作区未配置 SCIM 目录连接。")
+        return
+    columns = st.columns(4)
+    columns[0].metric("活动用户", int(status.get("active_users") or 0))
+    columns[1].metric("停用用户", int(status.get("inactive_users") or 0))
+    columns[2].metric("目录组", int(status.get("groups") or 0))
+    columns[3].metric("组成员关系", int(status.get("group_memberships") or 0))
+    labels = ", ".join(str(item) for item in status.get("token_labels", []))
+    st.caption(
+        f"目录连接: {labels or '-'} · 默认角色: "
+        f"{status.get('default_role') or 'viewer'} · 最近更新: "
+        f"{status.get('last_updated_at') or '-'}"
+    )
+    role_map = status.get("group_role_map")
+    if isinstance(role_map, Mapping) and role_map:
+        st.json(dict(role_map), expanded=False)
+
+
+def _render_workspace_session_policy(client: CogDocClient, workspace_id: str) -> None:
+    try:
+        response = client.get_workspace_session_policy(workspace_id)
+    except Exception as exc:
+        st.error(f"读取会话安全策略失败: {exc}")
+        return
+    payload = response_payload(response)
+    policy = payload.get("policy") if isinstance(payload, Mapping) else None
+    if response.status_code != 200 or not isinstance(policy, Mapping):
+        st.error(_response_error(response, "读取会话安全策略失败"))
+        return
+    with st.form(f"workspace-session-policy-{workspace_id}"):
+        idle_enabled = st.checkbox(
+            "启用空闲超时",
+            value=policy.get("idle_timeout_minutes") is not None,
+        )
+        idle_minutes = st.number_input(
+            "空闲超时（分钟）",
+            min_value=5,
+            max_value=43_200,
+            value=int(policy.get("idle_timeout_minutes") or 480),
+            disabled=not idle_enabled,
+        )
+        absolute_enabled = st.checkbox(
+            "启用绝对会话时长",
+            value=policy.get("absolute_timeout_hours") is not None,
+        )
+        absolute_hours = st.number_input(
+            "绝对会话时长（小时）",
+            min_value=1,
+            max_value=8_760,
+            value=int(policy.get("absolute_timeout_hours") or 168),
+            disabled=not absolute_enabled,
+        )
+        concurrency_enabled = st.checkbox(
+            "限制每用户并发会话",
+            value=policy.get("max_active_sessions") is not None,
+        )
+        max_sessions = st.number_input(
+            "每用户最多活动会话",
+            min_value=1,
+            max_value=50,
+            value=int(policy.get("max_active_sessions") or 5),
+            disabled=not concurrency_enabled,
+        )
+        submitted = st.form_submit_button("保存会话安全策略")
+    if submitted:
+        try:
+            updated = client.update_workspace_session_policy(
+                workspace_id,
+                idle_timeout_minutes=int(idle_minutes) if idle_enabled else None,
+                absolute_timeout_hours=(
+                    int(absolute_hours) if absolute_enabled else None
+                ),
+                max_active_sessions=(
+                    int(max_sessions) if concurrency_enabled else None
+                ),
+                expected_revision=int(policy.get("revision") or 0),
+            )
+        except Exception as exc:
+            st.error(f"更新会话安全策略失败: {exc}")
+            return
+        if updated.status_code == 200:
+            st.success("会话安全策略已更新；不合规的活动会话已撤销。")
+            st.rerun()
+        st.error(_response_error(updated, "更新会话安全策略失败"))
+    try:
+        sessions_response = client.list_workspace_security_sessions(
+            workspace_id, limit=50
+        )
+    except Exception as exc:
+        st.warning(f"读取工作区活动会话失败: {exc}")
+        return
+    sessions_payload = response_payload(sessions_response)
+    sessions = (
+        sessions_payload.get("sessions", [])
+        if isinstance(sessions_payload, Mapping)
+        else []
+    )
+    if sessions_response.status_code != 200 or not isinstance(sessions, list):
+        st.warning(_response_error(sessions_response, "读取工作区活动会话失败"))
+        return
+    st.markdown("**活动会话盘点**")
+    st.caption(
+        f"当前共 {int(sessions_payload.get('total') or 0)} 个活动会话；"
+        "仅展示安全元数据，不返回 Bearer 或摘要。"
+    )
+    for item in sessions:
+        if not isinstance(item, Mapping):
+            continue
+        session_id = str(item.get("session_id") or "")
+        if not session_id:
+            continue
+        details, action = st.columns([5, 1])
+        details.write(
+            f"{item.get('email') or item.get('user_id') or '-'} · "
+            f"{item.get('role') or '已移除成员'} · 最近活动 "
+            f"{item.get('last_seen_at') or '-'}"
+        )
+        if action.button(
+            "撤销",
+            key=f"revoke-workspace-session-{workspace_id}-{session_id}",
+            use_container_width=True,
+        ):
+            revoked = client.revoke_workspace_security_session(workspace_id, session_id)
+            if revoked.status_code == 204:
+                st.success("会话已撤销。")
+                st.rerun()
+            st.error(_response_error(revoked, "撤销会话失败"))
+    if sessions_payload.get("next_before_session_id"):
+        st.caption("当前仅展示最近 50 个会话；可通过 API 游标继续分页。")
+
+
+def _render_service_accounts(client: CogDocClient, workspace_id: str) -> None:
+    policy: Mapping[str, object] = {}
+    try:
+        policy_response = client.get_service_account_policy(workspace_id)
+        policy_payload = response_payload(policy_response)
+        candidate = (
+            policy_payload.get("policy")
+            if isinstance(policy_payload, Mapping)
+            else None
+        )
+        if policy_response.status_code == 200 and isinstance(candidate, Mapping):
+            policy = candidate
+        else:
+            st.warning(_response_error(policy_response, "读取服务账号策略失败"))
+    except Exception as exc:
+        st.warning(f"读取服务账号策略失败: {exc}")
+    if policy:
+        with st.expander("工作区 Token 安全策略"):
+            all_permissions = [
+                "read",
+                "query",
+                "write",
+                "delete",
+                "review",
+                "publish",
+                "manage_access",
+            ]
+            with st.form(f"service-account-policy-{workspace_id}"):
+                max_accounts = st.number_input(
+                    "最多服务账号",
+                    min_value=1,
+                    max_value=500,
+                    value=int(policy.get("max_accounts") or 100),
+                )
+                max_tokens = st.number_input(
+                    "每账号最多活动 Token",
+                    min_value=1,
+                    max_value=50,
+                    value=int(policy.get("max_tokens_per_account") or 10),
+                )
+                max_ttl = st.number_input(
+                    "Token 最长有效天数",
+                    min_value=1,
+                    max_value=365,
+                    value=int(policy.get("max_token_ttl_days") or 365),
+                )
+                allow_non_expiring = st.checkbox(
+                    "允许永久 Token",
+                    value=bool(policy.get("allow_non_expiring", True)),
+                )
+                allowed_permissions = st.multiselect(
+                    "工作区允许的 Token 权限",
+                    all_permissions,
+                    default=list(policy.get("allowed_permissions") or all_permissions),
+                )
+                save_policy = st.form_submit_button("保存安全策略")
+            if save_policy:
+                changed = client.update_service_account_policy(
+                    workspace_id,
+                    max_accounts=int(max_accounts),
+                    max_tokens_per_account=int(max_tokens),
+                    max_token_ttl_days=int(max_ttl),
+                    allow_non_expiring=allow_non_expiring,
+                    allowed_permissions=allowed_permissions,
+                    expected_revision=int(policy.get("revision") or 0),
+                )
+                if changed.status_code == 200:
+                    st.success("服务账号策略已更新。")
+                    st.rerun()
+                else:
+                    st.error(_response_error(changed, "更新服务账号策略失败"))
+    try:
+        response = client.list_service_accounts(workspace_id)
+    except Exception as exc:
+        st.error(f"读取服务账号失败: {exc}")
+        return
+    payload = response_payload(response)
+    accounts = (
+        payload.get("service_accounts", []) if isinstance(payload, Mapping) else []
+    )
+    if response.status_code != 200 or not isinstance(accounts, list):
+        st.error(_response_error(response, "读取服务账号失败"))
+        return
+    st.caption("令牌只在创建响应中显示一次；停用账号会永久撤销其现有令牌。")
+    with st.form(f"service-account-create-{workspace_id}", clear_on_submit=True):
+        name = st.text_input("服务账号名称")
+        description = st.text_input("用途说明")
+        role = st.selectbox("最小权限角色", ["viewer", "reviewer", "editor", "admin"])
+        submitted = st.form_submit_button("创建服务账号", use_container_width=True)
+    if submitted:
+        try:
+            created = client.create_service_account(
+                workspace_id,
+                name=name.strip(),
+                description=description.strip(),
+                role=role,
+            )
+        except Exception as exc:
+            st.error(f"创建服务账号失败: {exc}")
+        else:
+            if created.status_code == 201:
+                st.success("服务账号已创建。")
+                st.rerun()
+            else:
+                st.error(_response_error(created, "创建服务账号失败"))
+    if not accounts:
+        st.caption("尚无服务账号。")
+        return
+    account_by_id = {
+        str(item["service_account_id"]): item
+        for item in accounts
+        if isinstance(item, Mapping) and item.get("service_account_id")
+    }
+    account_id = st.selectbox(
+        "选择要管理的服务账号",
+        list(account_by_id),
+        format_func=lambda value: str(account_by_id[value].get("name") or value),
+        key=f"service-account-picker-{workspace_id}",
+    )
+    item = account_by_id[account_id]
+    st.caption(
+        f"{item.get('description') or '无说明'} · "
+        f"{'启用' if item.get('active') else '停用'} · "
+        f"{item.get('role') or 'viewer'} · revision {item.get('revision') or 0}"
+    )
+    roles = ["viewer", "reviewer", "editor", "admin"]
+    current_role = str(item.get("role") or "viewer")
+    desired_role = st.selectbox(
+        "角色",
+        roles,
+        index=roles.index(current_role) if current_role in roles else 0,
+        key=f"service-account-role-{account_id}",
+    )
+    actions = st.columns(3)
+    if actions[0].button(
+        "保存角色",
+        key=f"service-account-role-save-{account_id}",
+        use_container_width=True,
+        disabled=desired_role == current_role,
+    ):
+        changed = client.update_service_account(
+            workspace_id,
+            account_id,
+            name=str(item.get("name") or account_id),
+            description=str(item.get("description") or ""),
+            role=desired_role,
+            active=bool(item.get("active")),
+            expected_revision=int(item.get("revision") or 0),
+        )
+        if changed.status_code == 200:
+            st.rerun()
+        else:
+            st.error(_response_error(changed, "更新服务账号角色失败"))
+    if actions[1].button(
+        "停用并撤销令牌" if item.get("active") else "重新启用",
+        key=f"service-account-toggle-{account_id}",
+        use_container_width=True,
+    ):
+        changed = client.update_service_account(
+            workspace_id,
+            account_id,
+            name=str(item.get("name") or account_id),
+            description=str(item.get("description") or ""),
+            role=str(item.get("role") or "viewer"),
+            active=not bool(item.get("active")),
+            expected_revision=int(item.get("revision") or 0),
+        )
+        if changed.status_code == 200:
+            st.rerun()
+        else:
+            st.error(_response_error(changed, "更新服务账号失败"))
+    if actions[2].button(
+        "删除",
+        key=f"service-account-delete-{account_id}",
+        use_container_width=True,
+    ):
+        deleted = client.delete_service_account(
+            workspace_id,
+            account_id,
+            int(item.get("revision") or 0),
+        )
+        if deleted.status_code == 204:
+            st.rerun()
+        else:
+            st.error(_response_error(deleted, "删除服务账号失败"))
+    token_response = client.list_service_tokens(workspace_id, account_id)
+    token_payload = response_payload(token_response)
+    tokens = (
+        token_payload.get("tokens", []) if isinstance(token_payload, Mapping) else []
+    )
+    if token_response.status_code != 200 or not isinstance(tokens, list):
+        st.error(_response_error(token_response, "读取服务令牌失败"))
+        return
+    for token in tokens:
+        if not isinstance(token, Mapping):
+            continue
+        token_id = str(token.get("token_id") or "")
+        row = st.columns([5, 1])
+        row[0].caption(
+            f"{token.get('label') or '-'} · {token.get('secret_hint') or '-'} · "
+            f"{token.get('status') or '-'} · 到期 {token.get('expires_at') or '永不'} · "
+            f"权限 {', '.join(token.get('permissions') or ['legacy-role'])}"
+        )
+        if (
+            token_id
+            and token.get("status") == "active"
+            and row[1].button("撤销", key=f"service-token-revoke-{token_id}")
+        ):
+            revoked = client.revoke_service_token(
+                workspace_id,
+                account_id,
+                token_id,
+                int(token.get("revision") or 0),
+            )
+            if revoked.status_code == 204:
+                st.rerun()
+            else:
+                st.error(_response_error(revoked, "撤销服务令牌失败"))
+    if bool(item.get("active")):
+        with st.form(f"service-token-create-{account_id}", clear_on_submit=True):
+            token_label = st.text_input("新令牌标签")
+            policy_ttl = int(policy.get("max_token_ttl_days") or 365)
+            expires_days = st.number_input(
+                "有效天数",
+                min_value=1,
+                max_value=policy_ttl,
+                value=min(90, policy_ttl),
+            )
+            role_permissions = {
+                "viewer": ["read", "query"],
+                "reviewer": ["read", "query", "review", "publish"],
+                "editor": ["read", "query", "write"],
+                "admin": [
+                    "read",
+                    "query",
+                    "write",
+                    "delete",
+                    "review",
+                    "publish",
+                    "manage_access",
+                ],
+            }.get(str(item.get("role") or "viewer"), ["read", "query"])
+            policy_permissions = set(
+                policy.get("allowed_permissions") or role_permissions
+            )
+            role_permissions = [
+                permission
+                for permission in role_permissions
+                if permission in policy_permissions
+            ]
+            token_permissions = st.multiselect(
+                "令牌权限（不得超过账号角色）",
+                role_permissions,
+                default=role_permissions,
+            )
+            mint = st.form_submit_button("生成一次性令牌")
+        if mint:
+            minted = client.create_service_token(
+                workspace_id,
+                account_id,
+                label=token_label.strip(),
+                expires_in_days=int(expires_days),
+                permissions=token_permissions,
+            )
+            minted_payload = response_payload(minted)
+            raw_token = (
+                minted_payload.get("token")
+                if isinstance(minted_payload, Mapping)
+                else None
+            )
+            if minted.status_code == 201 and isinstance(raw_token, str):
+                st.warning("请立即复制；关闭或刷新后无法再次查看。")
+                st.code(raw_token, language=None)
+            else:
+                st.error(_response_error(minted, "生成服务令牌失败"))
+
+
+def _render_audit_exports(client: CogDocClient) -> None:
+    """Render durable compliance exports without retaining artifact bytes."""
+
+    with st.form("create-audit-export", clear_on_submit=True):
+        sequence_columns = st.columns(2)
+        from_sequence = sequence_columns[0].number_input(
+            "起始序号（0 表示不限）", min_value=0, value=0
+        )
+        to_sequence = sequence_columns[1].number_input(
+            "结束序号（0 表示不限）", min_value=0, value=0
+        )
+        actions_text = st.text_input("动作过滤（逗号分隔，可留空）")
+        statuses_text = st.text_input("HTTP 状态过滤（逗号分隔，可留空）")
+        retention_days = st.slider("导出保留天数", 1, 7, 1)
+        submitted = st.form_submit_button("创建审计导出", use_container_width=True)
+    if submitted:
+        try:
+            statuses = [
+                int(item.strip()) for item in statuses_text.split(",") if item.strip()
+            ]
+            response = client.create_audit_export(
+                from_sequence=int(from_sequence) or None,
+                to_sequence=int(to_sequence) or None,
+                actions=[
+                    item.strip() for item in actions_text.split(",") if item.strip()
+                ],
+                statuses=statuses,
+                retention_seconds=int(retention_days) * 86_400,
+            )
+        except (ValueError, TypeError) as exc:
+            st.error(f"状态码格式无效: {exc}")
+        except Exception as exc:
+            st.error(f"创建审计导出失败: {exc}")
+        else:
+            if response.status_code == 202:
+                st.success("导出任务已创建。")
+                st.rerun()
+            else:
+                st.error(_response_error(response, "创建审计导出失败"))
+
+    try:
+        response = client.list_audit_exports()
+    except Exception as exc:
+        st.error(f"读取审计导出失败: {exc}")
+        return
+    payload = response_payload(response)
+    exports = payload.get("exports", []) if isinstance(payload, Mapping) else []
+    if response.status_code != 200:
+        st.error(_response_error(response, "读取审计导出失败"))
+        return
+    if not isinstance(exports, list) or not exports:
+        st.caption("尚无审计导出。")
+        return
+    labels = {
+        str(item.get("job_id")): (
+            f"{item.get('status', '-')} · {item.get('event_count') or 0} 条 · "
+            f"{item.get('created_at', '-')}"
+        )
+        for item in exports
+        if isinstance(item, Mapping) and item.get("job_id")
+    }
+    selected_id = st.selectbox(
+        "审计导出任务",
+        list(labels),
+        format_func=lambda value: labels.get(value, value),
+        key="audit-export-picker",
+    )
+    selected = next(
+        (
+            item
+            for item in exports
+            if isinstance(item, Mapping) and item.get("job_id") == selected_id
+        ),
+        {},
+    )
+    st.json(
+        {
+            "status": selected.get("status"),
+            "event_count": selected.get("event_count"),
+            "sequence": [
+                selected.get("first_sequence"),
+                selected.get("last_sequence"),
+            ],
+            "sha256": selected.get("artifact_sha256"),
+            "expires_at": selected.get("expires_at"),
+        }
+    )
+    if selected.get("status") == "succeeded" and st.button(
+        "准备下载", key=f"audit-export-download-{selected_id}"
+    ):
+        downloaded = client.download_audit_export(selected_id)
+        if downloaded.status_code == 200:
+            st.download_button(
+                "下载 NDJSON",
+                data=downloaded.content,
+                file_name=f"{selected_id}.ndjson",
+                mime="application/x-ndjson",
+                key=f"audit-export-file-{selected_id}",
+            )
+        else:
+            st.error(_response_error(downloaded, "下载审计导出失败"))
+    if selected.get("status") in {"succeeded", "failed", "expired"} and st.button(
+        "删除导出", key=f"audit-export-delete-{selected_id}"
+    ):
+        deleted = client.delete_audit_export(
+            selected_id, int(selected.get("revision") or 0)
+        )
+        if deleted.status_code == 204:
+            st.success("导出已删除。")
+            st.rerun()
+        else:
+            st.error(_response_error(deleted, "删除审计导出失败"))
+
+
 def _render_account_sidebar(client: CogDocClient) -> None:
     mode = st.session_state.auth_mode
     if mode == "api_key":
@@ -3419,12 +4215,27 @@ def _render_account_sidebar(client: CogDocClient) -> None:
                 st.error(_response_error(response, "创建工作区失败"))
 
     role = str(workspace.get("role") or "")
+    config = _auth_config() or {}
+    with st.expander("企业身份"):
+        _render_oidc_account(client, config)
     if current_id and role in {"owner", "admin"}:
         with st.expander("成员与邀请"):
             st.markdown("**成员**")
             _render_workspace_members(client, current_id)
             st.markdown("**邀请**")
             _render_workspace_invites(client, current_id)
+        with st.expander("服务账号与 API Token"):
+            _render_service_accounts(client, current_id)
+        with st.expander("工作区会话安全"):
+            _render_workspace_session_policy(client, current_id)
+        with st.expander("审计与合规导出"):
+            _render_audit_exports(client)
+        if bool(config.get("oidc_enabled", False)):
+            with st.expander("企业 SSO 准入"):
+                _render_oidc_policy(client, current_id)
+                if bool(config.get("scim_enabled", False)):
+                    st.markdown("**SCIM 目录状态**")
+                    _render_scim_status(client, current_id)
 
     with st.expander("接受工作区邀请"):
         with st.form("authenticated-invite", clear_on_submit=True):

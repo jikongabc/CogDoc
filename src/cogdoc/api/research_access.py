@@ -31,20 +31,21 @@ def build_research_authorization(
     if mode not in {"all", "subset"} or (mode == "subset" and not sources):
         mode = "deny"
         sources = []
-    return {
+    user_session = principal.key_fingerprint.startswith("session:")
+    result: dict[str, Any] = {
         "version": "research-auth-v1",
         "tenant_id": principal.tenant_id,
         "created_by": principal.subject_id,
         "creator_role": principal.role.value,
-        "auth_kind": (
-            "user_session"
-            if principal.key_fingerprint.startswith("session:")
-            else "service"
-        ),
+        "auth_kind": "user_session" if user_session else "service",
         "mode": mode,
         "acl_epoch": max(0, int(getattr(decision, "acl_epoch", 0))),
         "allowed_sources": sources,
     }
+    if user_session:
+        result["session_id"] = principal.key_fingerprint.removeprefix("session:")
+        result["membership_id"] = principal.membership_id
+    return result
 
 
 def research_authorization(job: Mapping[str, Any]) -> Mapping[str, Any] | None:

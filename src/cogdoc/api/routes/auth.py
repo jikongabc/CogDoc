@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from functools import wraps
 from typing import Any, Callable
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from cogdoc.api.access_control import TokenBucketRateLimiter
@@ -45,6 +45,11 @@ from cogdoc.api.schemas import (
     WorkspaceMemberResponse,
     WorkspaceMemberUpdateRequest,
     WorkspaceResponse,
+    WorkspaceSessionPolicy,
+    WorkspaceSessionPolicyResponse,
+    WorkspaceSessionPolicyUpdateRequest,
+    WorkspaceSecuritySession,
+    WorkspaceSecuritySessionListResponse,
     WorkspaceUpdateRequest,
     build_error_response,
 )
@@ -607,9 +612,7 @@ async def _authorize_workspace(
 ) -> _AuthContext:
     current = await _authenticate(request)
     try:
-        value = await _authenticate_session_call(
-            request, current.token, workspace_id
-        )
+        value = await _authenticate_session_call(request, current.token, workspace_id)
         if value is None:
             raise LookupError(workspace_id)
         target = await _complete_context(
@@ -975,6 +978,157 @@ async def delete_session(session_id: str, request: Request):
         )
     if deleted is False:
         raise _RouteError(404, ErrorCode.SESSION_NOT_FOUND, "会话不存在")
+    return Response(status_code=204)
+
+
+@router.get(
+    "/workspaces/{workspace_id}/session-policy",
+    response_model=WorkspaceSessionPolicyResponse,
+    responses=_ERROR_RESPONSES,
+)
+@_guarded
+async def get_workspace_session_policy(workspace_id: str, request: Request):
+    context = await _authorize_workspace(
+        request, workspace_id, Permission.MANAGE_ACCESS
+    )
+    try:
+        row = await _store_call(
+            request,
+            "get_workspace_session_policy",
+            {"workspace_id": workspace_id, "actor_user_id": context.user_id},
+        )
+    except _RouteError:
+        raise
+    except Exception as exc:
+        _raise_mutation_failure(
+            exc,
+            missing_code=ErrorCode.WORKSPACE_NOT_FOUND,
+            missing_message="工作区不存在",
+        )
+    return WorkspaceSessionPolicyResponse(
+        policy=WorkspaceSessionPolicy.model_validate(_mapping(row))
+    )
+
+
+@router.put(
+    "/workspaces/{workspace_id}/session-policy",
+    response_model=WorkspaceSessionPolicyResponse,
+    responses=_ERROR_RESPONSES,
+)
+@_guarded
+async def update_workspace_session_policy(
+    workspace_id: str,
+    payload: WorkspaceSessionPolicyUpdateRequest,
+    request: Request,
+):
+    context = await _authorize_workspace(
+        request, workspace_id, Permission.MANAGE_ACCESS
+    )
+    try:
+        row = await _store_call(
+            request,
+            "set_workspace_session_policy",
+            {
+                "workspace_id": workspace_id,
+                "actor_user_id": context.user_id,
+                **payload.model_dump(),
+            },
+        )
+    except _RouteError:
+        raise
+    except Exception as exc:
+        _raise_mutation_failure(
+            exc,
+            missing_code=ErrorCode.WORKSPACE_NOT_FOUND,
+            missing_message="工作区不存在",
+        )
+    return WorkspaceSessionPolicyResponse(
+        policy=WorkspaceSessionPolicy.model_validate(_mapping(row))
+    )
+
+
+@router.get(
+    "/workspaces/{workspace_id}/security-sessions",
+    response_model=WorkspaceSecuritySessionListResponse,
+    responses=_ERROR_RESPONSES,
+)
+@_guarded
+async def list_workspace_security_sessions(
+    workspace_id: str,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=100),
+    before_session_id: str | None = Query(default=None, min_length=1, max_length=160),
+    include_inactive: bool = Query(default=False),
+):
+    context = await _authorize_workspace(
+        request, workspace_id, Permission.MANAGE_ACCESS
+    )
+    try:
+        result = await _store_call(
+            request,
+            "list_workspace_sessions",
+            {
+                "workspace_id": workspace_id,
+                "actor_user_id": context.user_id,
+                "limit": limit,
+                "before_session_id": before_session_id,
+                "include_inactive": include_inactive,
+            },
+        )
+    except _RouteError:
+        raise
+    except Exception as exc:
+        _raise_mutation_failure(
+            exc,
+            missing_code=ErrorCode.SESSION_NOT_FOUND,
+            missing_message="会话游标不存在",
+        )
+    value = _mapping(result)
+    return WorkspaceSecuritySessionListResponse(
+        workspace_id=workspace_id,
+        total=int(value.get("total", 0)),
+        sessions=[
+            WorkspaceSecuritySession.model_validate(_mapping(item))
+            for item in _rows(value.get("sessions", []), "sessions", "items")
+        ],
+        next_before_session_id=(
+            str(value["next_before_session_id"])
+            if value.get("next_before_session_id") is not None
+            else None
+        ),
+    )
+
+
+@router.delete(
+    "/workspaces/{workspace_id}/security-sessions/{session_id}",
+    status_code=204,
+    responses=_ERROR_RESPONSES,
+)
+@_guarded
+async def revoke_workspace_security_session(
+    workspace_id: str, session_id: str, request: Request
+):
+    context = await _authorize_workspace(
+        request, workspace_id, Permission.MANAGE_ACCESS
+    )
+    try:
+        await _store_call(
+            request,
+            "revoke_workspace_session",
+            {
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "actor_user_id": context.user_id,
+            },
+        )
+    except _RouteError:
+        raise
+    except Exception as exc:
+        _raise_mutation_failure(
+            exc,
+            missing_code=ErrorCode.SESSION_NOT_FOUND,
+            missing_message="会话不存在",
+        )
     return Response(status_code=204)
 
 

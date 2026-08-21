@@ -121,9 +121,7 @@ def _copy_safe_metadata(value: object, *, field: str) -> object:
                     )
                 validate(child, f"{location}.{key}")
             return
-        if isinstance(item, Sequence) and not isinstance(
-            item, (str, bytes, bytearray)
-        ):
+        if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
             for index, child in enumerate(item):
                 validate(child, f"{location}[{index}]")
             return
@@ -156,9 +154,7 @@ def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, An
 
 def _decode_line(raw_line: bytes, line_number: int) -> dict[str, Any]:
     if not raw_line.endswith(b"\n"):
-        raise AuditCorruptionError(
-            f"audit record on line {line_number} is truncated"
-        )
+        raise AuditCorruptionError(f"audit record on line {line_number} is truncated")
     encoded = raw_line[:-1]
     if not encoded:
         raise AuditCorruptionError(f"audit record on line {line_number} is empty")
@@ -294,11 +290,57 @@ class AuditStore:
                 event
                 for event in reversed(self._events)
                 if event["tenant"] == clean_tenant
-                and (
-                    before_sequence is None
-                    or event["sequence"] < before_sequence
-                )
+                and (before_sequence is None or event["sequence"] < before_sequence)
             ][:limit]
+            return [_copy_event(event) for event in selected]
+
+    def snapshot(
+        self,
+        tenant: str,
+        *,
+        from_sequence: int | None = None,
+        to_sequence: int | None = None,
+        actions: Sequence[str] = (),
+        statuses: Sequence[int] = (),
+    ) -> builtins.list[dict[str, Any]]:
+        """Return a verified, ascending, point-in-time tenant snapshot.
+
+        This is the export seam: callers never read the JSONL file directly,
+        so an export has exactly the same integrity and tenant-isolation
+        guarantees as the online audit API.
+        """
+
+        clean_tenant = _nonempty_text(tenant, "tenant")
+        if from_sequence is not None and (
+            type(from_sequence) is not int or from_sequence < 1
+        ):
+            raise ValueError("from_sequence must be a positive integer")
+        if to_sequence is not None and (
+            type(to_sequence) is not int or to_sequence < 1
+        ):
+            raise ValueError("to_sequence must be a positive integer")
+        if (
+            from_sequence is not None
+            and to_sequence is not None
+            and from_sequence > to_sequence
+        ):
+            raise ValueError("from_sequence must not exceed to_sequence")
+        clean_actions = frozenset(_nonempty_text(item, "action") for item in actions)
+        clean_statuses = frozenset(statuses)
+        if any(type(item) is not int or not 100 <= item <= 599 for item in statuses):
+            raise ValueError("statuses must contain HTTP status integers")
+        with self._lock:
+            self._raise_if_poisoned()
+            self._refresh_if_changed_locked()
+            selected = [
+                event
+                for event in self._events
+                if event["tenant"] == clean_tenant
+                and (from_sequence is None or event["sequence"] >= from_sequence)
+                and (to_sequence is None or event["sequence"] <= to_sequence)
+                and (not clean_actions or event["action"] in clean_actions)
+                and (not clean_statuses or event["status"] in clean_statuses)
+            ]
             return [_copy_event(event) for event in selected]
 
     def verify(self) -> bool:
@@ -337,9 +379,7 @@ class AuditStore:
         self._tenant_heads = heads
         self._file_signature = self._stat_signature()
 
-    def _assert_append_only_prefix(
-        self, events: builtins.list[dict[str, Any]]
-    ) -> None:
+    def _assert_append_only_prefix(self, events: builtins.list[dict[str, Any]]) -> None:
         # A validly re-hashed rewrite is still not an append.  While this store
         # is alive, retain its last verified prefix as an in-process anchor so
         # deletion, truncation, or history replacement fails closed too.

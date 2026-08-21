@@ -199,6 +199,122 @@ async def test_logout_all_revokes_every_session(auth_app):
 
 
 @pytest.mark.anyio
+async def test_workspace_session_policy_is_manage_access_and_revision_guarded(auth_app):
+    app, store = auth_app
+    owner = store.register("policy-owner@example.com", PASSWORD, "Policy Owner")
+    viewer = store.register("policy-viewer@example.com", PASSWORD, "Policy Viewer")
+    workspace_id = owner["workspace"]["workspace_id"]
+    store.add_member(
+        workspace_id,
+        viewer["user"]["user_id"],
+        "viewer",
+        owner["user"]["user_id"],
+    )
+
+    async with _client(app) as client:
+        denied = await client.get(
+            f"/v1/workspaces/{workspace_id}/session-policy",
+            headers=_headers(viewer["access_token"]),
+        )
+        default = await client.get(
+            f"/v1/workspaces/{workspace_id}/session-policy",
+            headers=_headers(owner["access_token"]),
+        )
+        created = await client.put(
+            f"/v1/workspaces/{workspace_id}/session-policy",
+            headers=_headers(owner["access_token"]),
+            json={
+                "idle_timeout_minutes": 30,
+                "absolute_timeout_hours": 24,
+                "max_active_sessions": 5,
+                "expected_revision": 0,
+            },
+        )
+        stale = await client.put(
+            f"/v1/workspaces/{workspace_id}/session-policy",
+            headers=_headers(owner["access_token"]),
+            json={"expected_revision": 0},
+        )
+        invalid = await client.put(
+            f"/v1/workspaces/{workspace_id}/session-policy",
+            headers=_headers(owner["access_token"]),
+            json={"idle_timeout_minutes": 1, "expected_revision": 1},
+        )
+
+    assert denied.status_code == 403
+    assert default.status_code == 200
+    assert default.json()["policy"]["revision"] == 0
+    assert default.json()["policy"]["idle_timeout_minutes"] is None
+    assert created.status_code == 200
+    assert created.json()["policy"] == {
+        "workspace_id": workspace_id,
+        "idle_timeout_minutes": 30,
+        "absolute_timeout_hours": 24,
+        "max_active_sessions": 5,
+        "revision": 1,
+        "created_at": created.json()["policy"]["created_at"],
+        "updated_at": created.json()["policy"]["updated_at"],
+    }
+    assert stale.status_code == 409
+    assert invalid.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_workspace_security_session_inventory_and_revocation_are_scoped(auth_app):
+    app, store = auth_app
+    owner = store.register("inventory-owner@example.com", PASSWORD, "Owner")
+    admin = store.register("inventory-admin@example.com", PASSWORD, "Admin")
+    viewer = store.register("inventory-user@example.com", PASSWORD, "Viewer")
+    workspace_id = owner["workspace"]["workspace_id"]
+    owner_id = owner["user"]["user_id"]
+    store.add_member(workspace_id, admin["user"]["user_id"], "admin", owner_id)
+    store.add_member(workspace_id, viewer["user"]["user_id"], "viewer", owner_id)
+    admin_login = store.login("inventory-admin@example.com", PASSWORD, workspace_id)
+    viewer_login = store.login("inventory-user@example.com", PASSWORD, workspace_id)
+
+    async with _client(app) as client:
+        denied = await client.get(
+            f"/v1/workspaces/{workspace_id}/security-sessions",
+            headers=_headers(viewer_login["access_token"]),
+        )
+        listed = await client.get(
+            f"/v1/workspaces/{workspace_id}/security-sessions",
+            params={"limit": 2},
+            headers=_headers(admin_login["access_token"]),
+        )
+        owner_denied = await client.delete(
+            f"/v1/workspaces/{workspace_id}/security-sessions/"
+            f"{owner['session']['session_id']}",
+            headers=_headers(admin_login["access_token"]),
+        )
+        cross_scope = await client.delete(
+            f"/v1/workspaces/{workspace_id}/security-sessions/"
+            f"{viewer['session']['session_id']}",
+            headers=_headers(admin_login["access_token"]),
+        )
+        revoked = await client.delete(
+            f"/v1/workspaces/{workspace_id}/security-sessions/"
+            f"{viewer_login['session']['session_id']}",
+            headers=_headers(admin_login["access_token"]),
+        )
+        viewer_after = await client.get(
+            "/v1/auth/me", headers=_headers(viewer_login["access_token"])
+        )
+
+    assert denied.status_code == 403
+    assert listed.status_code == 200
+    assert listed.json()["total"] == 3
+    assert len(listed.json()["sessions"]) == 2
+    assert listed.json()["next_before_session_id"] is not None
+    assert "access_token" not in repr(listed.json())
+    assert "token_hash" not in repr(listed.json())
+    assert owner_denied.status_code == 403
+    assert cross_scope.status_code == 404
+    assert revoked.status_code == 204
+    assert viewer_after.status_code == 401
+
+
+@pytest.mark.anyio
 async def test_auth_routes_reuse_middleware_context_but_revalidate_workspace(tmp_path):
     store = _CountingAuthStore(str(tmp_path / "counting.db"), scrypt_n=1 << 10)
     registered = store.register("alice@example.com", PASSWORD, "Alice")
@@ -501,6 +617,7 @@ async def test_member_removal_revokes_all_grants_before_reinvite(auth_app):
     store.add_member(workspace_id, member_id, "editor", owner_id)
     membership = store.membership(workspace_id, member_id)
     assert membership is not None
+    store.authenticate_session(member["access_token"], workspace_id=workspace_id)
 
     for kb_id in ("storage-a", "storage-b"):
         access_store.set_kb_policy(workspace_id, kb_id, owner_id, "private")
@@ -554,7 +671,7 @@ async def test_member_removal_revokes_all_grants_before_reinvite(auth_app):
         tenant_id=workspace_id,
         subject_id=member_id,
         role=Role.EDITOR,
-        key_fingerprint=f"session:{member_id}",
+        key_fingerprint=f"session:{member['session']['session_id']}",
         membership_id=membership["member_id"],
     )
     queued_upload_guard = _live_session_authorization_guard(
@@ -688,6 +805,57 @@ def test_api_principal_queued_mutation_revalidates_live_resource_grant(
     with pytest.raises(PermissionError, match="resource authorization was revoked"):
         guard()
     access_store.close()
+
+
+def test_user_session_queued_mutation_rejects_revoked_session(tmp_path, monkeypatch):
+    import cogdoc.api.routes.documents as docs_module
+
+    store = AuthStore(str(tmp_path / "auth.db"), scrypt_n=1 << 10)
+    access_store = ResourceAccessStore(tmp_path / "access.db")
+    owner = store.register("owner@example.com", PASSWORD, "Owner")
+    workspace_id = owner["workspace"]["workspace_id"]
+    user_id = owner["user"]["user_id"]
+    membership = store.membership(workspace_id, user_id)
+    assert membership is not None
+    access_store.set_kb_policy(workspace_id, "storage-a", user_id, "workspace")
+    principal = Principal.for_user_session(
+        tenant_id=workspace_id,
+        subject_id=user_id,
+        role=Role.OWNER,
+        session_id=owner["session"]["session_id"],
+        membership_id=membership["member_id"],
+    )
+    monkeypatch.setattr(
+        docs_module,
+        "shared_lifecycle_store",
+        lambda: SimpleNamespace(status=lambda _kb_id: "active"),
+    )
+    guard = _live_session_authorization_guard(
+        SimpleNamespace(
+            state=SimpleNamespace(principal=principal),
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    auth_store=store,
+                    resource_access_store=access_store,
+                    kb_registry=SimpleNamespace(get_by_storage_id=lambda _kb_id: None),
+                )
+            ),
+        ),
+        KnowledgeBaseScope(
+            tenant_id=workspace_id,
+            external_id="docs",
+            storage_id="storage-a",
+            owner_id=user_id,
+        ),
+        permission=Permission.WRITE,
+    )
+    assert guard is not None
+    guard()
+    assert store.revoke_session(user_id, owner["session"]["session_id"])
+    with pytest.raises(PermissionError, match="expired or was revoked"):
+        guard()
+    access_store.close()
+    store.close()
 
 
 @pytest.mark.anyio

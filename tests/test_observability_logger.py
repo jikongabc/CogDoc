@@ -65,8 +65,16 @@ def test_configure_logging_is_idempotent_for_same_settings(tmp_path):
     assert logger.handlers == first_handlers
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "/v1/auth/connector-oauth/callback/notion",
+        "/v1/auth/oidc/callback",
+    ],
+)
 def test_configure_logging_redacts_oauth_callback_query_from_uvicorn_access_log(
     tmp_path,
+    target,
 ):
     settings = Settings(
         cogdoc_log_file=str(tmp_path / "cogdoc.jsonl"),
@@ -87,8 +95,7 @@ def test_configure_logging_redacts_oauth_callback_query_from_uvicorn_access_log(
             '%s - "%s %s HTTP/%s" %d',
             "127.0.0.1:1",
             "GET",
-            "/v1/auth/connector-oauth/callback/notion"
-            "?state=state-secret-marker&code=code-secret-marker",
+            f"{target}?state=state-secret-marker&code=code-secret-marker",
             "1.1",
             200,
         )
@@ -98,7 +105,7 @@ def test_configure_logging_redacts_oauth_callback_query_from_uvicorn_access_log(
         access_logger.propagate = previous_propagate
 
     output = stream.getvalue()
-    assert "/v1/auth/connector-oauth/callback/notion" in output
+    assert target in output
     assert "state-secret-marker" not in output
     assert "code-secret-marker" not in output
 

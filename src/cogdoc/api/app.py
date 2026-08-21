@@ -13,6 +13,7 @@ from cogdoc.api.access_control import (
     build_rate_limiter,
 )
 from cogdoc.api.audit import AuditStore
+from cogdoc.api.audit_exports import AuditExportManager, AuditExportStore
 from cogdoc.api.auth_store import AuthStore
 from cogdoc.api.claim_verification_store import (
     ClaimVerificationObservationStore,
@@ -28,14 +29,22 @@ from cogdoc.api.feedback_analysis_store import FeedbackAnalysisStore
 from cogdoc.api.feedback_store import FeedbackStore
 from cogdoc.api.ingest import IndexJobManager, KnowledgeBaseRegistry
 from cogdoc.api.metrics import Metrics, MetricsMiddleware
+from cogdoc.api.oidc import (
+    OIDCClient,
+    OIDCFlowStore,
+    OIDCManager,
+    OIDCProviderConfig,
+)
 from cogdoc.api.persistence import SqliteJobStore, SqliteSessionStore
 from cogdoc.api.retrieval_feedback_store import RetrievalFeedbackStore
 from cogdoc.api.retrieval_eval_draft_store import RetrievalEvalDraftStore
 from cogdoc.api.research_job_store import ResearchJobStore
 from cogdoc.api.resource_access import ResourceAccessStore
+from cogdoc.api.scim import SCIMAccess, parse_scim_access_registry
 from cogdoc.api.routes import (
     agent_router,
     access_router,
+    audit_exports_router,
     auth_router,
     chat_router,
     claim_verification_router,
@@ -47,6 +56,10 @@ from cogdoc.api.routes import (
     health_router,
     index_migrations_router,
     knowledge_router,
+    oidc_router,
+    scim_router,
+    service_accounts_router,
+    service_account_policy_router,
     retrieval_eval_drafts_router,
     retrieval_diagnostics_router,
     research_router,
@@ -139,6 +152,20 @@ def _research_acl_checker(auth_store, access_store, job: Mapping) -> bool:
         if authorization.get("auth_kind") == "user_session":
             if auth_store is None:
                 return False
+            session_id = str(authorization.get("session_id") or "")
+            frozen_membership_id = str(authorization.get("membership_id") or "")
+            session_is_active = getattr(auth_store, "session_is_active", None)
+            if (
+                not session_id
+                or not frozen_membership_id
+                or not callable(session_is_active)
+                or not session_is_active(
+                    session_id=session_id,
+                    user_id=subject_id,
+                    workspace_id=tenant_id,
+                )
+            ):
+                return False
             membership = auth_store.membership(tenant_id, subject_id)
             if not isinstance(membership, Mapping):
                 return False
@@ -146,7 +173,7 @@ def _research_acl_checker(auth_store, access_store, job: Mapping) -> bool:
             membership_id = str(
                 membership.get("member_id") or membership.get("membership_id") or ""
             )
-            if not membership_id:
+            if not membership_id or membership_id != frozen_membership_id:
                 return False
         principal = Principal(
             tenant_id=tenant_id,
@@ -220,7 +247,10 @@ def create_app(
     eval_review_api_keys: set[str] | None = None,
     rate_limiter: TokenBucketRateLimiter | None = None,
     audit_store: AuditStore | None = None,
+    audit_export_manager: AuditExportManager | None = None,
     auth_store: AuthStore | None = None,
+    oidc_manager: Any | None = None,
+    scim_access_registry: Mapping[str, Any] | None = None,
     resource_access_store: ResourceAccessStore | None = None,
     claim_verification_observation_store: Any | None = None,
     claim_verification_review_store: Any | None = None,
@@ -241,6 +271,30 @@ def create_app(
         raise ValueError(
             "account authentication requires a fail-closed resource_access_store"
         )
+    if oidc_manager is not None:
+        if auth_store is None:
+            raise ValueError("OIDC requires account authentication")
+        if getattr(oidc_manager, "auth_store", None) is not auth_store:
+            raise ValueError("injected OIDC manager must share the app AuthStore")
+    if scim_access_registry and auth_store is None:
+        raise ValueError("SCIM requires account authentication")
+    scim_policies: dict[str, SCIMAccess] = {}
+    for fingerprint, access in dict(scim_access_registry or {}).items():
+        if (
+            not isinstance(fingerprint, str)
+            or not isinstance(access, SCIMAccess)
+            or fingerprint != access.token_fingerprint
+        ):
+            raise ValueError("SCIM access registry contains an invalid entry")
+        previous = scim_policies.setdefault(access.workspace_id, access)
+        if (
+            previous.issuer != access.issuer
+            or previous.default_role != access.default_role
+            or dict(previous.group_role_map) != dict(access.group_role_map)
+        ):
+            raise ValueError(
+                "SCIM tokens for one workspace must share one provisioning policy"
+            )
     if connector_oauth is not None:
         if connector_credential_vault is None:
             raise ValueError("injected connector_oauth requires a credential vault")
@@ -319,6 +373,9 @@ def create_app(
                     thread_name_prefix="cogdoc-connector-cleanup",
                 )
                 app.state.connector_cleanup_executor_shutdown = False
+            if app.state.audit_export_manager is not None:
+                app.state.audit_export_manager.reopen()
+                app.state.audit_export_manager.recover()
             # Every executor shut down by the previous lifespan is terminal.
             # Reopen all app-owned managers before accepting or reconciling
             # work so repeated embedded/test lifespans have identical service
@@ -343,6 +400,31 @@ def create_app(
                     purge_oauth_sessions,
                     limit=1000,
                 )
+            oidc_flows = getattr(app.state, "oidc_flow_store", None)
+            purge_oidc_flows = getattr(oidc_flows, "purge_expired", None)
+            if callable(purge_oidc_flows):
+                from cogdoc.api.offload import run_sync
+
+                await run_sync(
+                    app.state.offload_executor,
+                    purge_oidc_flows,
+                    limit=1000,
+                )
+            auth_directory = getattr(app.state, "auth_store", None)
+            reconcile_scim_policy = getattr(
+                auth_directory, "reconcile_scim_policy", None
+            )
+            if callable(reconcile_scim_policy):
+                from cogdoc.api.offload import run_sync
+
+                for access in app.state.scim_policies.values():
+                    await run_sync(
+                        app.state.offload_executor,
+                        reconcile_scim_policy,
+                        workspace_id=access.workspace_id,
+                        default_role=access.default_role,
+                        group_role_map=access.group_role_map,
+                    )
             reconcile_oauth_bindings = getattr(
                 app.state, "reconcile_connector_oauth_bindings", None
             )
@@ -473,6 +555,17 @@ def create_app(
                     error_class=type(exc).__name__,
                 )
             try:
+                if app.state.audit_export_manager is not None:
+                    app.state.audit_export_manager.shutdown()
+            except Exception as exc:
+                log_event(
+                    "shutdown",
+                    "audit_export_shutdown_failed",
+                    {},
+                    level=logging.ERROR,
+                    error_class=type(exc).__name__,
+                )
+            try:
                 app.state.connector_cleanup_executor.shutdown(wait=True)
             except Exception as exc:
                 log_event(
@@ -562,6 +655,8 @@ def create_app(
                     error_class=type(exc).__name__,
                 )
             for store_name, ownership_name in (
+                ("oidc_manager", "close_oidc_manager_on_shutdown"),
+                ("oidc_flow_store", "close_oidc_flow_store_on_shutdown"),
                 ("auth_store", "close_auth_store_on_shutdown"),
                 ("resource_access_store", "close_resource_access_store_on_shutdown"),
                 (
@@ -589,6 +684,10 @@ def create_app(
                 (
                     "external_acl_sync_store",
                     "close_external_acl_sync_store_on_shutdown",
+                ),
+                (
+                    "audit_export_store",
+                    "close_audit_export_store_on_shutdown",
                 ),
             ):
                 try:
@@ -625,6 +724,12 @@ def create_app(
     )
     app.state.lifecycle_status = "created"
     app.state.auth_store = auth_store
+    app.state.oidc_manager = oidc_manager
+    app.state.oidc_flow_store = (
+        getattr(oidc_manager, "flow_store", None) if oidc_manager is not None else None
+    )
+    app.state.scim_access_registry = dict(scim_access_registry or {})
+    app.state.scim_policies = dict(scim_policies)
     app.state.resource_access_store = resource_access_store
     # Keep account authentication distinct from optional static API-key auth.
     # Readiness requires both durable security stores only in account mode.
@@ -637,6 +742,8 @@ def create_app(
     # Injected stores are caller-owned. The module-level production stores are
     # closed explicitly by their process and can be shared by app factories.
     app.state.close_auth_store_on_shutdown = False
+    app.state.close_oidc_manager_on_shutdown = False
+    app.state.close_oidc_flow_store_on_shutdown = False
     app.state.close_resource_access_store_on_shutdown = False
     observation_settings = get_settings()
     app.state.claim_verification_observation_store = (
@@ -694,7 +801,8 @@ def create_app(
     )
     app.state.state_runtime = runtime
     app.state.close_state_runtime_on_shutdown = (
-        state_runtime is None and not any(store is not None for store in store_overrides)
+        state_runtime is None
+        and not any(store is not None for store in store_overrides)
         if close_state_runtime_on_shutdown is None
         else bool(close_state_runtime_on_shutdown)
     )
@@ -1564,7 +1672,9 @@ def create_app(
         thread_name_prefix="cogdoc-offload",
     )
     app.state.offload_executor_shutdown = False
-    selected_artifact_workers = 2 if artifact_io_workers is None else artifact_io_workers
+    selected_artifact_workers = (
+        2 if artifact_io_workers is None else artifact_io_workers
+    )
     if (
         isinstance(selected_artifact_workers, bool)
         or not isinstance(selected_artifact_workers, int)
@@ -1809,6 +1919,11 @@ def create_app(
     # production file; the module-level production app injects the durable
     # store explicitly below.
     app.state.audit_store = audit_store
+    app.state.audit_export_manager = audit_export_manager
+    app.state.audit_export_store = (
+        audit_export_manager.store if audit_export_manager is not None else None
+    )
+    app.state.close_audit_export_store_on_shutdown = False
 
     @app.get("/v1/tenant", tags=["tenant"])
     async def current_tenant(request: Request):
@@ -1834,10 +1949,18 @@ def create_app(
 
     @app.get("/v1/auth/config", tags=["auth"])
     async def auth_config():
+        oidc = getattr(app.state, "oidc_manager", None)
         return {
             "schema_version": "v1",
             "account_auth_enabled": app.state.account_auth_enabled,
             "self_registration_enabled": app.state.self_registration_enabled,
+            "oidc_enabled": oidc is not None,
+            "oidc_display_name": (
+                str(getattr(oidc, "display_name", "Enterprise SSO"))
+                if oidc is not None
+                else ""
+            ),
+            "scim_enabled": bool(app.state.scim_access_registry),
         }
 
     @app.get("/v1/audit-events", tags=["tenant"])
@@ -1896,12 +2019,17 @@ def create_app(
     app.include_router(connections_router)
     app.include_router(auth_router)
     app.include_router(access_router)
+    app.include_router(audit_exports_router)
     app.include_router(agent_router)
     app.include_router(health_router)
     app.include_router(index_migrations_router)
     app.include_router(documents_router)
     app.include_router(feedback_router)
     app.include_router(knowledge_router)
+    app.include_router(oidc_router)
+    app.include_router(scim_router)
+    app.include_router(service_accounts_router)
+    app.include_router(service_account_policy_router)
     app.include_router(retrieval_eval_drafts_router)
     app.include_router(retrieval_diagnostics_router)
     app.include_router(research_router)
@@ -1926,6 +2054,63 @@ _auth_store = (
     if _settings.cogdoc_account_auth_enabled
     else None
 )
+_oidc_flow_store = None
+_oidc_manager = None
+if _settings.cogdoc_oidc_enabled:
+    if _auth_store is None:
+        raise RuntimeError("COGDOC_OIDC_ENABLED requires COGDOC_ACCOUNT_AUTH_ENABLED")
+    if not _settings.cogdoc_oidc_flow_key.strip():
+        raise RuntimeError(
+            "COGDOC_OIDC_ENABLED requires COGDOC_OIDC_FLOW_KEY to contain "
+            "one base64url-encoded 32-byte key"
+        )
+    _oidc_config = OIDCProviderConfig(
+        issuer=_settings.cogdoc_oidc_issuer,
+        client_id=_settings.cogdoc_oidc_client_id,
+        client_secret=_settings.cogdoc_oidc_client_secret or None,
+        redirect_uri=_settings.cogdoc_oidc_redirect_uri,
+        display_name=_settings.cogdoc_oidc_display_name,
+        scopes=tuple(
+            value.strip()
+            for value in _settings.cogdoc_oidc_scopes.split(",")
+            if value.strip()
+        ),
+        allowed_endpoint_hosts=tuple(
+            value.strip()
+            for value in _settings.cogdoc_oidc_allowed_endpoint_hosts.split(",")
+            if value.strip()
+        ),
+        allowed_return_urls=tuple(
+            value.strip()
+            for value in _settings.cogdoc_oidc_allowed_return_urls.split(",")
+            if value.strip()
+        ),
+        timeout_seconds=_settings.cogdoc_oidc_timeout_seconds,
+        clock_skew_seconds=_settings.cogdoc_oidc_clock_skew_seconds,
+    ).validated()
+    _oidc_flow_store = OIDCFlowStore(
+        _db_path,
+        _settings.cogdoc_oidc_flow_key,
+        flow_ttl_seconds=_settings.cogdoc_oidc_flow_ttl_seconds,
+        result_ttl_seconds=_settings.cogdoc_oidc_handoff_ttl_seconds,
+    )
+    _oidc_manager = OIDCManager(
+        OIDCClient(_oidc_config),
+        _oidc_flow_store,
+        _auth_store,
+        jit_provisioning_enabled=(_settings.cogdoc_oidc_jit_provisioning_enabled),
+        allow_verified_email_link=(_settings.cogdoc_oidc_allow_verified_email_link),
+    )
+_scim_access_registry = {}
+if _settings.cogdoc_scim_enabled:
+    if _oidc_manager is None or _auth_store is None:
+        raise RuntimeError("COGDOC_SCIM_ENABLED requires account auth and OIDC")
+    _scim_access_registry = parse_scim_access_registry(
+        _settings.cogdoc_scim_bearer_tokens,
+        issuer=_settings.cogdoc_oidc_issuer,
+        default_role=_settings.cogdoc_scim_default_role,
+        group_role_map=_settings.cogdoc_scim_group_role_map,
+    )
 _resource_access_store = (
     ResourceAccessStore(_db_path, legacy_workspace_default=False)
     if _auth_store is not None
@@ -1941,6 +2126,12 @@ _claim_verification_review_store = SqliteClaimVerificationReviewStore(
     retention_days=_settings.claim_verification_review_retention_days,
     max_per_tenant=_settings.claim_verification_review_max_per_tenant,
 )
+_audit_store = AuditStore(_settings.audit_log_path)
+_audit_export_store = AuditExportStore(
+    _db_path,
+    _settings.audit_export_dir,
+)
+_audit_export_manager = AuditExportManager(_audit_export_store, _audit_store)
 app = create_app(
     state_runtime=_state_runtime,
     # The ASGI application object may be entered more than once by embedded
@@ -1955,14 +2146,20 @@ app = create_app(
         kb_exists=_kb_registry.exists,
         knowledge_store=_state_runtime.knowledge_store,
     ),
-    audit_store=AuditStore(_settings.audit_log_path),
+    audit_store=_audit_store,
+    audit_export_manager=_audit_export_manager,
     auth_store=_auth_store,
+    oidc_manager=_oidc_manager,
+    scim_access_registry=_scim_access_registry,
     resource_access_store=_resource_access_store,
     claim_verification_observation_store=_claim_verification_observation_store,
     claim_verification_review_store=_claim_verification_review_store,
     self_registration_enabled=_settings.cogdoc_self_registration_enabled,
 )
 app.state.close_auth_store_on_shutdown = _auth_store is not None
+app.state.close_oidc_manager_on_shutdown = _oidc_manager is not None
+app.state.close_oidc_flow_store_on_shutdown = _oidc_flow_store is not None
 app.state.close_resource_access_store_on_shutdown = _resource_access_store is not None
 app.state.close_claim_verification_observation_store_on_shutdown = True
 app.state.close_claim_verification_review_store_on_shutdown = True
+app.state.close_audit_export_store_on_shutdown = True

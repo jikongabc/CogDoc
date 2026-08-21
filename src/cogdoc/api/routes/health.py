@@ -112,6 +112,28 @@ def _readiness_snapshot(request: Request) -> tuple[bool, dict[str, Any]]:
         if oauth_configured
         else _component("disabled", required=False)
     )
+    oidc_manager = getattr(app_state, "oidc_manager", None)
+    oidc_flow_store = getattr(app_state, "oidc_flow_store", None)
+    oidc_configured = oidc_manager is not None or oidc_flow_store is not None
+    components["oidc_flow_store"] = (
+        _store_readiness_component(oidc_flow_store, required=True)
+        if oidc_configured
+        else _component("disabled", required=False)
+    )
+    scim_configured = bool(getattr(app_state, "scim_access_registry", {}))
+    components["scim_directory"] = (
+        _store_readiness_component(
+            getattr(app_state, "auth_store", None), required=True
+        )
+        if scim_configured
+        else _component("disabled", required=False)
+    )
+    audit_export_manager = getattr(app_state, "audit_export_manager", None)
+    components["audit_exports"] = (
+        _store_readiness_component(audit_export_manager.store, required=True)
+        if audit_export_manager is not None
+        else _component("disabled", required=False)
+    )
 
     try:
         ensure_rust_core(*REQUIRED_NATIVE_SYMBOLS)

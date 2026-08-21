@@ -365,6 +365,18 @@ def _live_session_authorization_guard(
                 )
                 if live_membership_id != captured_membership_id:
                     raise PermissionError("workspace membership incarnation changed")
+                session_is_active = getattr(auth_store, "session_is_active", None)
+                session_prefix = "session:"
+                if not callable(session_is_active) or not key_fingerprint.startswith(
+                    session_prefix
+                ):
+                    raise PermissionError("session authority is unavailable")
+                if not session_is_active(
+                    session_id=key_fingerprint[len(session_prefix) :],
+                    user_id=subject_id,
+                    workspace_id=tenant_id,
+                ):
+                    raise PermissionError("session authority expired or was revoked")
                 live_principal = Principal(
                     tenant_id=tenant_id,
                     subject_id=subject_id,

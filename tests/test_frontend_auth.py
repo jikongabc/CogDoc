@@ -330,6 +330,128 @@ def test_frontend_api_cache_is_partitioned_by_authentication_identity(monkeypatc
     assert all("token" not in str(key) for key in streamlit.session_state.api_cache)
 
 
+def test_oidc_handoff_is_exchanged_once_and_removed_from_browser_query(monkeypatch):
+    streamlit = _StreamlitStub(
+        **_base_state(
+            auth_token="",
+            auth_user={},
+            auth_workspace={},
+            oidc_authorization_url="provider-url",
+            oidc_authorization_expires_at=9999999999.0,
+            oidc_link_authorization_url="",
+            oidc_link_authorization_expires_at=0.0,
+        )
+    )
+    streamlit.query_params["oidc_code"] = "one-shot-browser-code"
+    exchanges = []
+
+    class FakeClient:
+        def __init__(self, api_url, api_key=None):
+            assert api_url
+            assert api_key == ""
+
+        def exchange_oidc_handoff(self, code):
+            exchanges.append(code)
+            return httpx.Response(
+                200,
+                json={
+                    "kind": "login",
+                    "session": {
+                        "access_token": "federated-session-token",
+                        "user": {
+                            "user_id": "oidc-user",
+                            "email": "oidc@example.com",
+                            "display_name": "OIDC User",
+                        },
+                        "workspace": {
+                            "workspace_id": "oidc-workspace",
+                            "name": "Enterprise",
+                            "role": "viewer",
+                        },
+                        "permissions": ["read", "query"],
+                    },
+                },
+            )
+
+    streamlit.session_state.api_url = "http://api"
+    monkeypatch.setattr(frontend_app, "st", streamlit)
+    monkeypatch.setattr(frontend_app, "CogDocClient", FakeClient)
+
+    frontend_app._consume_oidc_return()
+
+    assert exchanges == ["one-shot-browser-code"]
+    assert "oidc_code" not in streamlit.query_params
+    assert streamlit.session_state.auth_token == "federated-session-token"
+    assert streamlit.session_state.oidc_authorization_url == ""
+    assert streamlit.rerun_count == 1
+
+
+def test_oidc_provider_error_is_removed_without_entering_session_state(monkeypatch):
+    streamlit = _StreamlitStub(**_base_state(auth_token=""))
+    streamlit.query_params["oidc_error"] = "authorization_failed"
+    monkeypatch.setattr(frontend_app, "st", streamlit)
+
+    assert frontend_app._consume_oidc_return() is False
+    assert "oidc_error" not in streamlit.query_params
+    assert streamlit.session_state.auth_token == ""
+    assert streamlit.errors == ["企业身份提供方未完成授权，请重试。"]
+
+
+def test_scim_status_panel_renders_only_directory_metadata(monkeypatch):
+    class MetricColumn:
+        def __init__(self, metrics):
+            self.metrics = metrics
+
+        def metric(self, label, value):
+            self.metrics.append((label, value))
+
+    streamlit = _StreamlitStub(**_base_state())
+    streamlit.metrics = []
+    streamlit.captions = []
+    streamlit.json_values = []
+    streamlit.columns = lambda count: [
+        MetricColumn(streamlit.metrics) for _ in range(count)
+    ]
+    streamlit.caption = streamlit.captions.append
+    streamlit.json = lambda value, **_kwargs: streamlit.json_values.append(value)
+    monkeypatch.setattr(frontend_app, "st", streamlit)
+
+    class FakeClient:
+        def get_workspace_scim_status(self, workspace_id):
+            assert workspace_id == "workspace-a"
+            return httpx.Response(
+                200,
+                json={
+                    "status": {
+                        "enabled": True,
+                        "token_labels": ["Entra Production"],
+                        "default_role": "viewer",
+                        "group_role_map": {"cogdoc admins": "admin"},
+                        "active_users": 12,
+                        "inactive_users": 2,
+                        "deleted_users": 1,
+                        "groups": 4,
+                        "group_memberships": 18,
+                        "last_updated_at": "2026-08-21T00:00:00Z",
+                    }
+                },
+            )
+
+    frontend_app._render_scim_status(FakeClient(), "workspace-a")
+
+    assert streamlit.metrics == [
+        ("活动用户", 12),
+        ("停用用户", 2),
+        ("目录组", 4),
+        ("组成员关系", 18),
+    ]
+    assert streamlit.json_values == [{"cogdoc admins": "admin"}]
+    rendered = str(streamlit.captions) + str(streamlit.json_values)
+    assert "Entra Production" in rendered
+    assert "token" not in rendered.casefold()
+    assert "fingerprint" not in rendered.casefold()
+
+
 def test_background_workers_receive_explicit_current_bearer(monkeypatch):
     credentials = []
 

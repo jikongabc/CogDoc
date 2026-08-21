@@ -246,6 +246,86 @@ class Settings(BaseSettings):
         le=24 * 60 * 60,
         validation_alias="COGDOC_AUTH_LOCKOUT_SECONDS",
     )
+    # Enterprise OpenID Connect is independently opt-in and requires account
+    # authentication. Browser flow context and handoff results are encrypted
+    # with a dedicated 32-byte URL-safe base64 key.
+    cogdoc_oidc_enabled: bool = Field(
+        default=False, validation_alias="COGDOC_OIDC_ENABLED"
+    )
+    cogdoc_oidc_issuer: str = Field(default="", validation_alias="COGDOC_OIDC_ISSUER")
+    cogdoc_oidc_client_id: str = Field(
+        default="", validation_alias="COGDOC_OIDC_CLIENT_ID"
+    )
+    cogdoc_oidc_client_secret: str = Field(
+        default="", validation_alias="COGDOC_OIDC_CLIENT_SECRET"
+    )
+    cogdoc_oidc_redirect_uri: str = Field(
+        default="", validation_alias="COGDOC_OIDC_REDIRECT_URI"
+    )
+    cogdoc_oidc_flow_key: str = Field(
+        default="", validation_alias="COGDOC_OIDC_FLOW_KEY"
+    )
+    cogdoc_oidc_display_name: str = Field(
+        default="Enterprise SSO",
+        min_length=1,
+        max_length=120,
+        validation_alias="COGDOC_OIDC_DISPLAY_NAME",
+    )
+    cogdoc_oidc_scopes: str = Field(
+        default="openid,email,profile", validation_alias="COGDOC_OIDC_SCOPES"
+    )
+    cogdoc_oidc_allowed_endpoint_hosts: str = Field(
+        default="", validation_alias="COGDOC_OIDC_ALLOWED_ENDPOINT_HOSTS"
+    )
+    cogdoc_oidc_allowed_return_urls: str = Field(
+        default="", validation_alias="COGDOC_OIDC_ALLOWED_RETURN_URLS"
+    )
+    cogdoc_oidc_jit_provisioning_enabled: bool = Field(
+        default=False, validation_alias="COGDOC_OIDC_JIT_PROVISIONING_ENABLED"
+    )
+    cogdoc_oidc_allow_verified_email_link: bool = Field(
+        default=False, validation_alias="COGDOC_OIDC_ALLOW_VERIFIED_EMAIL_LINK"
+    )
+    cogdoc_oidc_flow_ttl_seconds: float = Field(
+        default=600.0,
+        ge=30.0,
+        le=1800.0,
+        validation_alias="COGDOC_OIDC_FLOW_TTL_SECONDS",
+    )
+    cogdoc_oidc_handoff_ttl_seconds: float = Field(
+        default=60.0,
+        ge=10.0,
+        le=300.0,
+        validation_alias="COGDOC_OIDC_HANDOFF_TTL_SECONDS",
+    )
+    cogdoc_oidc_timeout_seconds: float = Field(
+        default=15.0,
+        ge=1.0,
+        le=60.0,
+        validation_alias="COGDOC_OIDC_TIMEOUT_SECONDS",
+    )
+    cogdoc_oidc_clock_skew_seconds: float = Field(
+        default=60.0,
+        ge=0.0,
+        le=300.0,
+        validation_alias="COGDOC_OIDC_CLOCK_SKEW_SECONDS",
+    )
+    # SCIM uses dedicated bearer tokens scoped to one workspace. The JSON list
+    # is parsed only when enabled; raw tokens are hashed before app state use.
+    cogdoc_scim_enabled: bool = Field(
+        default=False, validation_alias="COGDOC_SCIM_ENABLED"
+    )
+    cogdoc_scim_bearer_tokens: str = Field(
+        default="[]", validation_alias="COGDOC_SCIM_BEARER_TOKENS"
+    )
+    cogdoc_scim_default_role: str = Field(
+        default="viewer",
+        pattern="^(admin|editor|reviewer|viewer)$",
+        validation_alias="COGDOC_SCIM_DEFAULT_ROLE",
+    )
+    cogdoc_scim_group_role_map: str = Field(
+        default="{}", validation_alias="COGDOC_SCIM_GROUP_ROLE_MAP"
+    )
     # 限流令牌桶：每分钟补充速率 + 突发容量；容量<=0 关闭限流。
     rate_limit_per_minute: int = Field(
         default=120, validation_alias="RATE_LIMIT_PER_MINUTE"
@@ -1164,6 +1244,10 @@ class Settings(BaseSettings):
     @property
     def audit_log_path(self) -> str:
         return str(self.data_dir / "audit" / "events.jsonl")
+
+    @property
+    def audit_export_dir(self) -> str:
+        return str(self.data_dir / "audit" / "exports")
 
     # 处理反馈数据库路径。
     @property

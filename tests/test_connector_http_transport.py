@@ -354,6 +354,23 @@ def test_redirect_revalidates_allowlist_dns_and_host_header_each_hop():
     ]
 
 
+def test_zero_redirect_budget_rejects_provider_redirect_before_following():
+    opener = _RecordingOpener(
+        responses=[(302, {"Location": "https://provider.example/final"}, b"")]
+    )
+    transport = HttpTransport(
+        allowed_hosts={"provider.example"},
+        max_redirects=0,
+        opener=opener,
+        resolver=lambda *_args, **_kwargs: [_address("93.184.216.34")],
+    )
+
+    with pytest.raises(ConnectorError, match="redirect"):
+        transport.request("POST", "https://provider.example/token", body=b"code=x")
+
+    assert len(opener.calls) == 1
+
+
 def test_redirect_drops_body_content_headers_like_urllib():
     opener = _RecordingOpener(
         responses=[

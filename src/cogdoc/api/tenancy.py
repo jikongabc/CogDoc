@@ -86,6 +86,7 @@ class Principal:
     role: Role
     key_fingerprint: str
     membership_id: str | None = None
+    permission_scope: frozenset[Permission] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -110,10 +111,21 @@ class Principal:
                 "membership_id",
                 _identity_part(self.membership_id, name="membership_id"),
             )
+        if self.permission_scope is not None:
+            try:
+                scope = frozenset(Permission(item) for item in self.permission_scope)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "permission_scope contains an unsupported permission"
+                ) from exc
+            object.__setattr__(self, "permission_scope", scope)
 
     @property
     def permissions(self) -> frozenset[Permission]:
-        return ROLE_PERMISSIONS[self.role]
+        role_permissions = ROLE_PERMISSIONS[self.role]
+        if self.permission_scope is None:
+            return role_permissions
+        return role_permissions & self.permission_scope
 
     @property
     def rate_limit_identity(self) -> str:
@@ -187,6 +199,9 @@ _PUBLIC_AUTH_PATHS = frozenset(
         "/v1/auth/config",
         "/v1/auth/register",
         "/v1/auth/login",
+        "/v1/auth/oidc/authorize",
+        "/v1/auth/oidc/callback",
+        "/v1/auth/oidc/exchange",
         "/v1/auth/invitations/accept",
         "/v1/auth/connector-oauth/callback/notion",
         "/v1/auth/connector-oauth/callback/atlassian",
@@ -265,6 +280,13 @@ def required_permission(method: str, path: str) -> Permission:
     ):
         return Permission.READ
     if normalized_path.startswith("/v1/workspaces/"):
+        if (
+            "/service-accounts" in normalized_path
+            or "/security-sessions" in normalized_path
+            or normalized_path.endswith("/service-account-policy")
+            or normalized_path.endswith("/session-policy")
+        ):
+            return Permission.MANAGE_ACCESS
         if "/members" in normalized_path or "/invites" in normalized_path:
             return (
                 Permission.READ
