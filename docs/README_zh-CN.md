@@ -27,6 +27,8 @@
 - **内容寻址的增量缓存** — 逐文件 SHA-256 manifest 加带版本的 chunk 身份契约：未变化的文件直接复用已建索引，只有 PDF 内容或切块方案真正变化时才增量重建。
 - **知识源运维控制面** — 本地目录、Git、URL、Zotero、Notion、Confluence、SharePoint 与 S3 共用一套可恢复同步 runtime，支持 checkpoint、健康快照、死信/重放、预算与 fail-closed ACL 映射。连接密钥可使用 AES-256-GCM 凭据库、手工轮换或 Notion/Atlassian/Microsoft OAuth，旧环境变量引用继续兼容；管理员还可浏览来源目录、下载/比较不可变版本，并软删除/恢复历史原始 artifact。详见[连接器说明](CONNECTORS_zh-CN.md)。
 
+- **可选分布式控制面与不可变索引发布** — PostgreSQL 租约队列、单线程持久调度、transactional outbox、S3 generation 和 fencing/CAS 发布协议可横向扩展后台 worker；任何不完整或过期 worker 生成的索引都不能切成 current。主 API 仍保持单 writer，完整边界与上线步骤见[高可用部署指南](HA_DEPLOYMENT_zh-CN.md)。
+
 - **多知识库 · 多对话 · 分层记忆** — 完整展示历史持久化用于回放；通过引用校验的近期回合组成有界短期记忆，被淘汰回合转为会话级摘要和决策，只有带明确记忆信号的稳定事实才进入跨会话长期记忆，错误答案不会进入 Agent 记忆。
 
 - **可复现证据的 Deep Research 工作台** — AI 生成或人工编辑带原子证据需求的大纲，每个需求复用生产混合检索链执行，并通过持久 attempt lease 安全暂停、恢复和取消。准入、阶段截止时间、检索/文档/LLM/输入预算以及旧 worker 的迟到提交均有界且 fail-closed。报告声明会被独立审计，每个原子需求还必须由已支持且有引用的声明覆盖；两道门共享最多一次修复，仍不充分则 fail-closed。每次执行都会冻结索引、来源、派生知识、调权与检索契约版本；证据过期后必须刷新才能审阅或发布，发布同时提供完整性校验过的 Markdown 与确定性验证包。带 keyset 分页和 ETag 的轻量摘要索引使任务轮询不再随报告和证据体积增长。

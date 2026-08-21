@@ -902,20 +902,31 @@ async def delete_document(kb_id: str, name: str, request: Request):
     path = os.path.join(registry.source_dir(storage_id), safe_name)
     access_store = getattr(request.app.state, "resource_access_store", None)
     on_succeeded: Callable[[], None] | None = None
+    on_retiring: Callable[[], None] | None = None
     if access_store is not None:
         document_id = build_document_id(safe_name)
+        managed_by = f"document-delete:{document_id}"
+
+        def fence_document_access() -> None:
+            access_store.begin_document_retirement(
+                scope.tenant_id,
+                storage_id,
+                managed_by,
+                (document_id,),
+            )
 
         def clear_document_access() -> None:
             # IndexJobManager invokes this only after the new index generation
-            # without the source has committed, and before publishing a
-            # succeeded job. delete_document_policy atomically removes both
-            # the document policy and its document-scoped grants.
-            access_store.delete_document_policy(
+            # without the source has committed and its HA mirror is current.
+            # The atomic finish removes policy, grants and the retirement fence.
+            access_store.finish_document_retirement(
                 scope.tenant_id,
                 storage_id,
-                document_id,
+                managed_by,
+                (document_id,),
             )
 
+        on_retiring = fence_document_access
         on_succeeded = clear_document_access
     authorization_guard = _live_session_authorization_guard(
         request,
@@ -931,6 +942,7 @@ async def delete_document(kb_id: str, name: str, request: Request):
         path,
         on_succeeded,
         authorization_guard,
+        on_retiring,
     )
     return _public_job(job, request)
 
@@ -941,6 +953,21 @@ async def get_index_job(job_id: str, request: Request):
     job = request.app.state.index_jobs.get(job_id)
     if job is None:
         return _error(ErrorCode.JOB_NOT_FOUND, f"任务不存在: {job_id}", 404)
-    if scope_for_storage_id(request, str(job.get("kb_id") or "")) is None:
+    storage_id = str(job.get("kb_id") or "")
+    readable = scope_for_storage_id(request, storage_id)
+    # A document retirement deliberately removes READ while an old index may
+    # still contain the source. The actor still needs to poll the deletion job;
+    # DELETE is not a content permission and remains fenced to authorized
+    # operators by ResourceAccessStore.
+    deletion_control = (
+        None
+        if readable is not None
+        else scope_for_storage_id(
+            request,
+            storage_id,
+            permission=Permission.DELETE,
+        )
+    )
+    if readable is None and deletion_control is None:
         return _error(ErrorCode.JOB_NOT_FOUND, f"任务不存在: {job_id}", 404)
     return _public_job(job, request)

@@ -134,6 +134,18 @@ def _readiness_snapshot(request: Request) -> tuple[bool, dict[str, Any]]:
         if audit_export_manager is not None
         else _component("disabled", required=False)
     )
+    ha_runtime = getattr(app_state, "ha_runtime", None)
+    components["ha_control_plane"] = (
+        _store_readiness_component(ha_runtime, required=True)
+        if ha_runtime is not None
+        else _component("disabled", required=False)
+    )
+    ha_index_mirror = getattr(app_state, "ha_index_mirror", None)
+    components["ha_index_mirror"] = (
+        _store_readiness_component(ha_index_mirror, required=True)
+        if ha_index_mirror is not None
+        else _component("disabled", required=False)
+    )
 
     try:
         ensure_rust_core(*REQUIRED_NATIVE_SYMBOLS)

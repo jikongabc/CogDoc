@@ -254,6 +254,90 @@ class Metrics:
         )
         self._research_in_progress_lock = Lock()
         self._research_in_progress_counts: dict[str, int] = {}
+        self._ha_snapshot = None
+        self.ha_snapshot_up = Gauge(
+            "cogdoc_ha_snapshot_up",
+            "HA control-plane operational snapshot availability",
+            registry=self.registry,
+        )
+        self.ha_jobs = Gauge(
+            "cogdoc_ha_jobs",
+            "HA jobs by bounded lifecycle status",
+            ["status"],
+            registry=self.registry,
+        )
+        self.ha_outbox_events = Gauge(
+            "cogdoc_ha_outbox_events",
+            "HA outbox events by bounded lifecycle status",
+            ["status"],
+            registry=self.registry,
+        )
+        self.ha_index_generations = Gauge(
+            "cogdoc_ha_index_generations",
+            "HA immutable index generations by bounded lifecycle status",
+            ["status"],
+            registry=self.registry,
+        )
+        self.ha_expired_job_leases = Gauge(
+            "cogdoc_ha_expired_job_leases",
+            "Running HA jobs whose durable lease has expired",
+            registry=self.registry,
+        )
+        self.ha_schedules = Gauge(
+            "cogdoc_ha_schedules",
+            "Enabled and currently due HA schedules",
+            ["state"],
+            registry=self.registry,
+        )
+        self.ha_current_generations = Gauge(
+            "cogdoc_ha_current_generations",
+            "Knowledge bases with an authoritative HA index generation",
+            registry=self.registry,
+        )
+        self.ha_live_instances = Gauge(
+            "cogdoc_ha_live_instances",
+            "Live application version heartbeats",
+            registry=self.registry,
+        )
+        self.ha_maintenance_failures = Gauge(
+            "cogdoc_ha_maintenance_failures",
+            "Cumulative HA maintenance cycle failures in this process",
+            registry=self.registry,
+        )
+
+    def bind_ha(self, runtime) -> None:
+        from cogdoc.ha.observability import HAOperationalSnapshot
+
+        self._ha_snapshot = HAOperationalSnapshot(runtime)
+
+    def _refresh_ha(self) -> None:
+        if self._ha_snapshot is None:
+            return
+        from cogdoc.ha.observability import (
+            GENERATION_STATUSES,
+            JOB_STATUSES,
+            OUTBOX_STATUSES,
+        )
+
+        try:
+            snapshot = self._ha_snapshot.collect()
+            for status in JOB_STATUSES:
+                self.ha_jobs.labels(status).set(snapshot["jobs"][status])
+            for status in OUTBOX_STATUSES:
+                self.ha_outbox_events.labels(status).set(snapshot["outbox"][status])
+            for status in GENERATION_STATUSES:
+                self.ha_index_generations.labels(status).set(
+                    snapshot["generations"][status]
+                )
+            self.ha_expired_job_leases.set(snapshot["expired_job_leases"])
+            self.ha_schedules.labels("enabled").set(snapshot["enabled_schedules"])
+            self.ha_schedules.labels("due").set(snapshot["due_schedules"])
+            self.ha_current_generations.set(snapshot["current_generations"])
+            self.ha_live_instances.set(snapshot["live_instances"])
+            self.ha_maintenance_failures.set(snapshot["maintenance_failures"])
+            self.ha_snapshot_up.set(1)
+        except Exception:
+            self.ha_snapshot_up.set(0)
 
     def observe_claim_audit(self, task_type: str, audit) -> None:
         # 指标是旁路可观测性：即使注入 runner 返回畸形 audit，也不能反向打断回答交付。
@@ -300,11 +384,7 @@ class Metrics:
             else "unknown"
         )
         raw_decision = str(rollout.get("decision") or "unknown")
-        decision = (
-            raw_decision
-            if raw_decision in ROLLOUT_DECISIONS
-            else "unknown"
-        )
+        decision = raw_decision if raw_decision in ROLLOUT_DECISIONS else "unknown"
         try:
             self.claim_verification_rollouts.labels(
                 str(task_type or "unknown"), mode, decision
@@ -488,6 +568,7 @@ class Metrics:
 
     # 渲染。
     def render(self) -> bytes:
+        self._refresh_ha()
         return generate_latest(self.registry)
 
 

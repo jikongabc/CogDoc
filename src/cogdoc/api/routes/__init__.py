@@ -12,6 +12,7 @@ from cogdoc.api.routes.connections import router as connections_router
 from cogdoc.api.routes.documents import router as documents_router
 from cogdoc.api.routes.feedback import router as feedback_router
 from cogdoc.api.routes.health import router as health_router
+from cogdoc.api.routes.ha_operations import router as ha_operations_router
 from cogdoc.api.routes.index_migrations import router as index_migrations_router
 from cogdoc.api.routes.knowledge import router as knowledge_router
 from cogdoc.api.routes.oidc import router as oidc_router
@@ -43,6 +44,7 @@ __all__ = [
     "documents_router",
     "feedback_router",
     "health_router",
+    "ha_operations_router",
     "index_migrations_router",
     "knowledge_router",
     "oidc_router",

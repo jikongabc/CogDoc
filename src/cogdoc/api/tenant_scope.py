@@ -333,7 +333,10 @@ def resolve_kb_scope(
 
 
 def scope_for_storage_id(
-    request: Request, storage_id: str
+    request: Request,
+    storage_id: str,
+    *,
+    permission: Permission | None = None,
 ) -> KnowledgeBaseScope | None:
     """Authorize an opaque persisted KB ID against the request tenant."""
 
@@ -351,7 +354,11 @@ def scope_for_storage_id(
         return None
     if not _lifecycle_active(scope.storage_id):
         return None
-    return scope if _decision_is_allowed(_access_decision(request, scope)) else None
+    return (
+        scope
+        if _decision_is_allowed(_access_decision(request, scope, permission=permission))
+        else None
+    )
 
 
 def tenant_kb_scopes(request: Request) -> list[KnowledgeBaseScope]:

@@ -93,6 +93,26 @@ jobs:
     needs: native
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_DB: cogdoc
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d cogdoc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      COGDOC_TEST_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/cogdoc
+      COGDOC_TEST_S3_ENDPOINT_URL: http://127.0.0.1:9000
+      AWS_ACCESS_KEY_ID: cogdoc-ci
+      AWS_SECRET_ACCESS_KEY: cogdoc-ci-secret
+      AWS_DEFAULT_REGION: us-east-1
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,8 +135,25 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install "pip==26.0.1"
-          python -m pip install -e ".[dev]"
+          python -m pip install -e ".[dev,ha]"
           python -m pip install dist/native/*.whl
+
+      - name: Start versioned S3-compatible storage
+        run: |
+          docker run --detach --rm --name cogdoc-ci-minio \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
+            --env MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            minio/minio@sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0 \
+            server /data --address :9000
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs cogdoc-ci-minio
+          exit 1
 
       - name: Verify release version sources
         run: python scripts/check_release_version.py

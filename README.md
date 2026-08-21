@@ -832,6 +832,16 @@ Requirements: Python 3.11+ (developed on 3.13; the extension targets 3.8+), a Ru
 
 ## Development & Testing
 
+For distributed index/control workers, install the optional `cogdoc[ha]`
+extra. It adds PostgreSQL leases and `SKIP LOCKED` queues, a durable scheduler,
+immutable generation publishing with fencing/CAS, versioned S3 objects,
+transactional outbox delivery, and staged schema migrations. The index pointer
+changes only after every object and manifest has been verified; an outbox
+failure rolls the pointer change back in the same transaction. See
+[HA deployment and index-safety operations](docs/HA_DEPLOYMENT_zh-CN.md) for
+the supported topology, rollout sequence, bucket policy, failure matrix, and
+the explicit single-writer boundary that still applies to the main API.
+
 | Command | Description |
 | --- | --- |
 | `make native` | Build / rebuild `rust_core` (required after editing `.rs`) |

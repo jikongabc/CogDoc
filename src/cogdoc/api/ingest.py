@@ -418,9 +418,11 @@ class IndexJobManager:
         kb_exists: "Callable[[str], bool] | None" = None,
         journal: object | None = None,
         knowledge_store: object | None = None,
+        after_index_commit: Callable[[str, object], None] | None = None,
     ):
         self._ingest_fn = ingest_fn
         self._knowledge_store = knowledge_store
+        self._after_index_commit = after_index_commit
         self._source_dir_for = source_dir_for or get_settings().kb_source_dir
         self._store = job_store or InMemoryJobStore()
         self._kb_exists = kb_exists  # 防复活：KB 已删未重建时拒绝陈旧 mutation
@@ -489,6 +491,21 @@ class IndexJobManager:
                 raise ValueError(
                     "IndexJobManager knowledge_store does not match StateRuntime"
                 )
+
+    def bind_after_index_commit(self, callback: Callable[[str, object], None]) -> None:
+        if not callable(callback):
+            raise TypeError("after_index_commit callback must be callable")
+        with self._ex_lock:
+            if any(self._inflight.values()):
+                raise RuntimeError(
+                    "cannot bind after_index_commit while index jobs are running"
+                )
+            if (
+                self._after_index_commit is not None
+                and self._after_index_commit is not callback
+            ):
+                raise ValueError("IndexJobManager after_index_commit is already bound")
+            self._after_index_commit = callback
 
     # 返回执行器locked。
     def _get_executor_locked(self, kb_id: str) -> ThreadPoolExecutor:
@@ -714,6 +731,7 @@ class IndexJobManager:
         path: str,
         on_succeeded: Callable[[], None] | None = None,
         authorization_guard: Callable[[], None] | None = None,
+        on_retiring: Callable[[], None] | None = None,
     ) -> dict:
         # 存在性检查在 executor command 内进行，保证与上传队列有序：upload 排在前则文件已落盘。
         return self._enqueue(
@@ -722,6 +740,7 @@ class IndexJobManager:
             path,
             on_succeeded,
             authorization_guard,
+            on_retiring,
         )
 
     # 运行blocking。
@@ -912,6 +931,7 @@ class IndexJobManager:
         path: str,
         on_succeeded: Callable[[], None] | None = None,
         authorization_guard: Callable[[], None] | None = None,
+        on_retiring: Callable[[], None] | None = None,
     ) -> None:
         if self._store.get(job_id) is None:
             return
@@ -937,6 +957,15 @@ class IndexJobManager:
                 error_code="DOCUMENT_NOT_FOUND",
             )
             return
+        if on_retiring is not None:
+            try:
+                # The old local/HA generation may remain queryable until the
+                # replacement is published. Fence access before moving the
+                # source so every later failure is fail-closed.
+                on_retiring()
+            except Exception as exc:
+                self._fail_job(job_id, kb_id, exc)
+                return
         quarantine = f"{path}.{job_id}{_BAK_SUFFIX}"  # 唯一名，避免覆盖遗留备份
         try:
             self._journal.begin_delete(job_id, kb_id, path, quarantine)
@@ -1002,15 +1031,21 @@ class IndexJobManager:
             # 构建未提交（active 仍是旧代）：返回 False 触发源文件回滚。
             self._fail_job(job_id, kb_id, exc)
             return False
+        if self._after_index_commit is not None:
+            try:
+                self._after_index_commit(kb_id, result)
+            except Exception as exc:
+                # The local generation is already committed. Report the mirror
+                # failure but never roll source files back across that authority
+                # transition. Destructive ACL cleanup remains pending, so an
+                # older HA generation cannot become visible under a newer policy.
+                self._fail_job(job_id, kb_id, exc, error_code="HA_MIRROR_FAILED")
+                return True
         if on_succeeded is not None:
             try:
-                # ingest_fn 返回代表新索引代已经提交。删除文档的 ACL 清理必须
-                # 位于此提交点之后、job succeeded 终态之前，确保客户端看到成功
-                # 时旧策略与 document grants 已不可见。
+                # Both local and HA authorities now exclude deleted sources.
                 on_succeeded()
             except Exception as exc:
-                # 索引提交不可逆，返回 True 让调用方完成 quarantine/journal
-                # 收尾；同时把 job 标失败，避免把未完成的安全清理报告为成功。
                 self._fail_job(job_id, kb_id, exc)
                 return True
         # 索引已提交：终态状态写入做退避重试（缓解 SQLite 瞬时锁），仍失败则记 error，不回滚已生效源文件。

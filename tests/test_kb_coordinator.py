@@ -118,6 +118,130 @@ def test_index_job_manager_does_not_keyword_inject_positional_only_parameters():
     assert seen == [(None, None)]
 
 
+def test_post_commit_mirror_failure_never_rolls_back_committed_index():
+    from cogdoc.api.persistence import InMemoryJobStore
+
+    store = InMemoryJobStore()
+    mirrored = []
+
+    def mirror(kb_id, result):
+        mirrored.append((kb_id, result.generation_id))
+        raise RuntimeError("mirror unavailable")
+
+    mgr = IndexJobManager(
+        ingest_fn=lambda _kb, _source: MagicMock(
+            document_count=1,
+            chunk_count=2,
+            generation_id="local-generation",
+        ),
+        source_dir_for=lambda _kb: "/fake",
+        job_store=store,
+        after_index_commit=mirror,
+    )
+    job = mgr.submit("kb")
+    mgr.run_blocking("kb", lambda: None)
+    mgr.shutdown()
+
+    assert mirrored == [("kb", "local-generation")]
+    assert store.get(job["job_id"])["status"] == "failed"
+    assert store.get(job["job_id"])["error_code"] == "HA_MIRROR_FAILED"
+
+
+def test_ha_publication_precedes_destructive_post_commit_cleanup():
+    order = []
+    mgr = IndexJobManager(
+        ingest_fn=lambda _kb, _source: MagicMock(
+            document_count=0,
+            chunk_count=0,
+            generation_id="local-generation",
+        ),
+        source_dir_for=lambda _kb: "/fake",
+        after_index_commit=lambda _kb, _result: order.append("ha-published"),
+    )
+
+    result = mgr._run_ingest(
+        "missing-job-is-tolerated",
+        "kb",
+        "/fake",
+        on_succeeded=lambda: order.append("acl-cleanup"),
+    )
+    mgr.shutdown()
+
+    assert result is True
+    assert order == ["ha-published", "acl-cleanup"]
+
+
+def test_delete_fences_access_before_mutation_and_keeps_fence_on_ha_failure(
+    tmp_path,
+):
+    from cogdoc.api.persistence import InMemoryJobStore
+    from cogdoc.api.resource_access import AccessMode, ResourceAccessStore
+    from cogdoc.api.tenancy import Principal, Role
+    from cogdoc.service.mutation_journal import MutationJournal
+
+    source = tmp_path / "document.txt"
+    source.write_text("private evidence")
+    order = []
+    access = ResourceAccessStore(tmp_path / "access.db")
+    access.set_kb_policy("tenant", "kb", "owner", "workspace")
+    access.set_document_policy(
+        "tenant", "kb", "document", source.name, policy="inherit"
+    )
+    viewer = Principal(
+        tenant_id="tenant",
+        subject_id="viewer",
+        role=Role.VIEWER,
+        key_fingerprint="test-viewer",
+    )
+    assert access.authorize_query(viewer, "kb").mode is AccessMode.ALL
+
+    def mirror(_kb_id, _result):
+        order.append("ha-failed")
+        raise RuntimeError("object store unavailable")
+
+    def begin_retirement():
+        order.append("access-fenced")
+        access.begin_document_retirement(
+            "tenant", "kb", "document-delete:document", ("document",)
+        )
+
+    def finish_retirement():
+        order.append("retirement-finished")
+        access.finish_document_retirement(
+            "tenant", "kb", "document-delete:document", ("document",)
+        )
+
+    store = InMemoryJobStore()
+    manager = IndexJobManager(
+        ingest_fn=lambda _kb, _source: MagicMock(
+            document_count=0,
+            chunk_count=0,
+            generation_id="local-without-document",
+        ),
+        source_dir_for=lambda _kb: str(tmp_path),
+        job_store=store,
+        journal=MutationJournal(str(tmp_path / "journal")),
+        after_index_commit=mirror,
+    )
+    job = manager.submit_delete_doc(
+        "kb",
+        str(source),
+        on_succeeded=finish_retirement,
+        on_retiring=begin_retirement,
+    )
+    manager.run_blocking("kb", lambda: None)
+    manager.shutdown()
+
+    assert order == ["access-fenced", "ha-failed"]
+    assert store.get(job["job_id"])["error_code"] == "HA_MIRROR_FAILED"
+    assert not source.exists()
+    assert access.authorize_query(viewer, "kb").mode is AccessMode.DENY
+    assert access.retiring_document_ids("tenant", "kb", "document-delete:document") == (
+        "document",
+    )
+    access.close()
+
+
 # 验证 run blocking serializes behind submitted job。
 def test_run_blocking_serializes_behind_submitted_job():
     # 同一 KB：先 submit 的 ingest 必须先完成，run_blocking 排在其后执行。

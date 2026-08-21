@@ -2,6 +2,11 @@
 
 本文档记录本地知识库状态如何备份、恢复，以及哪些索引变化需要重建。
 
+使用 PostgreSQL 分布式租约、S3 不可变索引 generation、持久调度或
+transactional outbox 的部署，还必须遵循
+[高可用部署指南](HA_DEPLOYMENT_zh-CN.md)中的同恢复点备份、fencing/CAS 发布和滚动迁移流程。
+当前主 API 仍要求单 writer，只有该指南明确列出的 HA worker 可以横向扩展。
+
 ## 备份与恢复
 
 需要备份的状态：

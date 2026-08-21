@@ -25,7 +25,7 @@ class DocMeta(TypedDict):
     page: int
     page_start: int
     page_end: int
-    score: float
+    score: NotRequired[float]
     origin: str
     context: NotRequired[str]
     source_type: NotRequired[str]

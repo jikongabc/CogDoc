@@ -38,6 +38,7 @@ dependencies = [
 cogdoc = "cogdoc.cli:main"
 # `cogdoc-debug` 启动独立 Debug 控制台（等价 python -m cogdoc.debug）。
 cogdoc-debug = "cogdoc.debug:main"
+cogdoc-ha = "cogdoc.ha.cli:main"
 
 [project.optional-dependencies]
 # 开发：原生扩展构建 + 测试 + BM25/分词对齐参照（原 requirements-dev.txt）。
@@ -52,6 +53,12 @@ dev = [
 # 前端瘦客户端（原 requirements-frontend.txt），与后端解耦，可单独安装。
 frontend = [
     "streamlit==1.58.0",
+]
+# 横向扩展控制面。SQLite 本地模式不安装 PostgreSQL 驱动。
+ha = [
+    "boto3==1.43.75",
+    "psycopg[binary]==3.3.4",
+    "psycopg-pool==3.3.1",
 ]
 
 [tool.setuptools.packages.find]

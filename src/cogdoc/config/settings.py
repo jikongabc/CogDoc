@@ -190,6 +190,121 @@ class Settings(BaseSettings):
         pattern="^(jsonl|sqlite)$",
         validation_alias="COGDOC_STATE_BACKEND",
     )
+    # Optional distributed control plane. Enabling it does not silently make
+    # legacy local API state multi-writer safe; only cogdoc-ha workers may run
+    # horizontally until the API is explicitly switched to distributed mode.
+    cogdoc_ha_enabled: bool = Field(default=False, validation_alias="COGDOC_HA_ENABLED")
+    cogdoc_ha_database_url: str = Field(
+        default="", validation_alias="COGDOC_HA_DATABASE_URL"
+    )
+    cogdoc_ha_database_schema: str = Field(
+        default="cogdoc",
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,62}$",
+        validation_alias="COGDOC_HA_DATABASE_SCHEMA",
+    )
+    cogdoc_ha_object_store: Literal["local", "s3"] = Field(
+        default="local", validation_alias="COGDOC_HA_OBJECT_STORE"
+    )
+    cogdoc_ha_object_root: str = Field(
+        default="", validation_alias="COGDOC_HA_OBJECT_ROOT"
+    )
+    cogdoc_ha_s3_bucket: str = Field(default="", validation_alias="COGDOC_HA_S3_BUCKET")
+    cogdoc_ha_s3_prefix: str = Field(
+        default="cogdoc", validation_alias="COGDOC_HA_S3_PREFIX"
+    )
+    cogdoc_ha_s3_endpoint_url: str = Field(
+        default="", validation_alias="COGDOC_HA_S3_ENDPOINT_URL"
+    )
+    cogdoc_ha_s3_region: str = Field(default="", validation_alias="COGDOC_HA_S3_REGION")
+    cogdoc_ha_s3_require_versioning: bool = Field(
+        default=True, validation_alias="COGDOC_HA_S3_REQUIRE_VERSIONING"
+    )
+    cogdoc_ha_worker_id: str = Field(default="", validation_alias="COGDOC_HA_WORKER_ID")
+    cogdoc_ha_scheduler_enabled: bool = Field(
+        default=True, validation_alias="COGDOC_HA_SCHEDULER_ENABLED"
+    )
+    cogdoc_ha_outbox_enabled: bool = Field(
+        default=True, validation_alias="COGDOC_HA_OUTBOX_ENABLED"
+    )
+    cogdoc_ha_maintenance_enabled: bool = Field(
+        default=True, validation_alias="COGDOC_HA_MAINTENANCE_ENABLED"
+    )
+    cogdoc_ha_maintenance_interval_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=3600.0,
+        validation_alias="COGDOC_HA_MAINTENANCE_INTERVAL_SECONDS",
+    )
+    cogdoc_ha_retention_seconds: float = Field(
+        default=604800.0,
+        ge=60.0,
+        le=316224000.0,
+        validation_alias="COGDOC_HA_RETENTION_SECONDS",
+    )
+    cogdoc_ha_scrub_interval_seconds: float = Field(
+        default=3600.0,
+        ge=1.0,
+        le=31622400.0,
+        validation_alias="COGDOC_HA_SCRUB_INTERVAL_SECONDS",
+    )
+    cogdoc_ha_maintenance_batch_size: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        validation_alias="COGDOC_HA_MAINTENANCE_BATCH_SIZE",
+    )
+    cogdoc_ha_index_worker_enabled: bool = Field(
+        default=True, validation_alias="COGDOC_HA_INDEX_WORKER_ENABLED"
+    )
+    cogdoc_ha_index_worker_count: int = Field(
+        default=2,
+        ge=1,
+        le=32,
+        validation_alias="COGDOC_HA_INDEX_WORKER_COUNT",
+    )
+    cogdoc_ha_index_worker_poll_seconds: float = Field(
+        default=0.5,
+        ge=0.05,
+        le=60.0,
+        validation_alias="COGDOC_HA_INDEX_WORKER_POLL_SECONDS",
+    )
+    cogdoc_ha_index_worker_lease_seconds: float = Field(
+        default=300.0,
+        ge=5.0,
+        le=3600.0,
+        validation_alias="COGDOC_HA_INDEX_WORKER_LEASE_SECONDS",
+    )
+    cogdoc_ha_release_id: str = Field(
+        default="", validation_alias="COGDOC_HA_RELEASE_ID"
+    )
+    cogdoc_ha_minimum_schema_version: int = Field(
+        default=1,
+        ge=1,
+        validation_alias="COGDOC_HA_MINIMUM_SCHEMA_VERSION",
+    )
+    cogdoc_ha_maximum_schema_version: int = Field(
+        default=1,
+        ge=1,
+        validation_alias="COGDOC_HA_MAXIMUM_SCHEMA_VERSION",
+    )
+    cogdoc_ha_version_heartbeat_interval_seconds: float = Field(
+        default=30.0,
+        ge=5.0,
+        le=3600.0,
+        validation_alias="COGDOC_HA_VERSION_HEARTBEAT_INTERVAL_SECONDS",
+    )
+    cogdoc_ha_version_heartbeat_ttl_seconds: float = Field(
+        default=90.0,
+        ge=10.0,
+        le=3600.0,
+        validation_alias="COGDOC_HA_VERSION_HEARTBEAT_TTL_SECONDS",
+    )
+    cogdoc_ha_index_reads_enabled: bool = Field(
+        default=True, validation_alias="COGDOC_HA_INDEX_READS_ENABLED"
+    )
+    cogdoc_ha_index_replica_cache_root: str = Field(
+        default="", validation_alias="COGDOC_HA_INDEX_REPLICA_CACHE_ROOT"
+    )
     cogdoc_derived_knowledge_index_auto_refresh: bool = Field(
         default=False,
         validation_alias="COGDOC_DERIVED_KNOWLEDGE_INDEX_AUTO_REFRESH",

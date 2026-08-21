@@ -54,6 +54,7 @@ from cogdoc.api.routes import (
     documents_router,
     feedback_router,
     health_router,
+    ha_operations_router,
     index_migrations_router,
     knowledge_router,
     oidc_router,
@@ -266,6 +267,7 @@ def create_app(
     source_catalog: Any | None = None,
     source_artifact_store: Any | None = None,
     sync_manager: Any | None = None,
+    ha_runtime: Any | None = None,
 ) -> FastAPI:
     if auth_store is not None and resource_access_store is None:
         raise ValueError(
@@ -373,6 +375,8 @@ def create_app(
                     thread_name_prefix="cogdoc-connector-cleanup",
                 )
                 app.state.connector_cleanup_executor_shutdown = False
+            if app.state.ha_runtime is not None:
+                app.state.ha_runtime.start()
             if app.state.audit_export_manager is not None:
                 app.state.audit_export_manager.reopen()
                 app.state.audit_export_manager.recover()
@@ -448,6 +452,8 @@ def create_app(
             # 必须在拿到单实例锁且变更日志恢复之后对账，避免误改其他实例的任务状态。
             app.state.index_jobs.reconcile_orphans()
             app.state.sync_manager.recover()
+            if app.state.ha_index_mirror is not None:
+                app.state.ha_index_mirror.start()
             research_manager = getattr(app.state, "research_execution_manager", None)
             if research_manager is not None:
                 research_manager.reconcile_orphans()
@@ -487,6 +493,18 @@ def create_app(
                 log_event(
                     "shutdown",
                     "sweeper_stop_failed",
+                    {},
+                    level=logging.ERROR,
+                    error_class=type(exc).__name__,
+                )
+            try:
+                if app.state.ha_index_mirror is not None:
+                    if not app.state.ha_index_mirror.stop():
+                        raise TimeoutError("HA index mirror did not stop")
+            except Exception as exc:
+                log_event(
+                    "shutdown",
+                    "ha_index_mirror_stop_failed",
                     {},
                     level=logging.ERROR,
                     error_class=type(exc).__name__,
@@ -619,6 +637,20 @@ def create_app(
                     level=logging.ERROR,
                     error_class=type(exc).__name__,
                 )
+            try:
+                # Local index commits can enqueue their HA mirror only while
+                # IndexJobManager drains.  The distributed runtime therefore
+                # remains available until every local commit callback finishes.
+                if app.state.ha_runtime is not None:
+                    app.state.ha_runtime.shutdown()
+            except Exception as exc:
+                log_event(
+                    "shutdown",
+                    "ha_runtime_shutdown_failed",
+                    {},
+                    level=logging.ERROR,
+                    error_class=type(exc).__name__,
+                )
             drained = False
             try:
                 # 所有定时器生产者都停止后再统一取消和等待。
@@ -723,6 +755,8 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.lifecycle_status = "created"
+    app.state.ha_runtime = ha_runtime
+    app.state.ha_index_mirror = None
     app.state.auth_store = auth_store
     app.state.oidc_manager = oidc_manager
     app.state.oidc_flow_store = (
@@ -849,6 +883,27 @@ def create_app(
                         pass
                 raise
         app.state.index_jobs = index_jobs
+    if (
+        ha_runtime is not None
+        and getattr(ha_runtime, "index_generations", None) is not None
+        and callable(getattr(ha_runtime, "publish_generation", None))
+    ):
+        from cogdoc.ha.index_mirror import HAIndexMirror
+
+        app.state.ha_index_mirror = HAIndexMirror(
+            ha_runtime,
+            app.state.kb_registry,
+        )
+        bind_after_index_commit = getattr(
+            app.state.index_jobs, "bind_after_index_commit", None
+        )
+        if not callable(bind_after_index_commit):
+            raise ValueError(
+                "HA index mirroring requires IndexJobManager.bind_after_index_commit"
+            )
+        bind_after_index_commit(app.state.ha_index_mirror.mirror_result)
+    if ha_runtime is not None:
+        app.state.metrics.bind_ha(ha_runtime)
     from cogdoc.connectors.connection_store import ConnectionStore
     from cogdoc.connectors.credential_store import (
         ACTIVE_KEY_VERSION_ENV,
@@ -2022,6 +2077,7 @@ def create_app(
     app.include_router(audit_exports_router)
     app.include_router(agent_router)
     app.include_router(health_router)
+    app.include_router(ha_operations_router)
     app.include_router(index_migrations_router)
     app.include_router(documents_router)
     app.include_router(feedback_router)
@@ -2132,6 +2188,23 @@ _audit_export_store = AuditExportStore(
     _settings.audit_export_dir,
 )
 _audit_export_manager = AuditExportManager(_audit_export_store, _audit_store)
+_ha_runtime = None
+if _settings.cogdoc_ha_enabled:
+    from cogdoc.ha.runtime import HAConfig, HARuntime
+    from cogdoc.ha.outbox import WebhookOutboxHandler
+
+    _ha_outbox_handler = (
+        WebhookOutboxHandler(
+            _settings.cogdoc_webhook_url,
+            secret=_settings.cogdoc_webhook_secret,
+            timeout_seconds=_settings.cogdoc_webhook_timeout_seconds,
+        )
+        if _settings.cogdoc_webhook_url.strip()
+        else None
+    )
+    _ha_runtime = HARuntime(
+        HAConfig.from_settings(_settings), outbox_handler=_ha_outbox_handler
+    )
 app = create_app(
     state_runtime=_state_runtime,
     # The ASGI application object may be entered more than once by embedded
@@ -2155,7 +2228,17 @@ app = create_app(
     claim_verification_observation_store=_claim_verification_observation_store,
     claim_verification_review_store=_claim_verification_review_store,
     self_registration_enabled=_settings.cogdoc_self_registration_enabled,
+    ha_runtime=_ha_runtime,
 )
+if _ha_runtime is not None and _ha_runtime.index_replica is not None:
+    from cogdoc.ha.index_replica import RegistryIndexProvider
+    from cogdoc.service.retriever_factory import RetrieverFactory
+
+    _ha_index_provider = RegistryIndexProvider(
+        _ha_runtime.index_replica,
+        _kb_registry,
+    )
+    RetrieverFactory.bind_external_provider(_ha_index_provider)
 app.state.close_auth_store_on_shutdown = _auth_store is not None
 app.state.close_oidc_manager_on_shutdown = _oidc_manager is not None
 app.state.close_oidc_flow_store_on_shutdown = _oidc_flow_store is not None

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Callable
 from threading import RLock
+from typing import Any
 
 from cogdoc.config.settings import get_settings
 from cogdoc.service.kb_lifecycle import LIFECYCLE_ACTIVE, shared_lifecycle_store
@@ -27,11 +29,20 @@ class RetrieverFactory:
     _engines: "OrderedDict[tuple, HybridRetriever]" = OrderedDict()
     _lock = RLock()
     _max_engines = 32
+    _external_provider: Callable[[str], Any] | None = None
 
     @classmethod
     def get_engine(cls, kb_id: str) -> HybridRetriever:
         if shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE:
             return HybridRetriever(NullRetriever(), NullRetriever())
+
+        with cls._lock:
+            provider = cls._external_provider
+        if provider is not None:
+            engine = provider(kb_id)
+            if shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE:
+                return HybridRetriever(NullRetriever(), NullRetriever())
+            return engine
 
         gen_id = cls._resolve_gen_id(kb_id)
         cache_key = (kb_id, gen_id)
@@ -101,3 +112,23 @@ class RetrieverFactory:
             stale_keys = [key for key in cls._engines if key[0] == kb_id]
             for key in stale_keys:
                 del cls._engines[key]
+
+    @classmethod
+    def bind_external_provider(cls, provider: Callable[[str], Any]) -> None:
+        if not callable(provider):
+            raise TypeError("retrieval engine provider must be callable")
+        with cls._lock:
+            if (
+                cls._external_provider is not None
+                and cls._external_provider is not provider
+            ):
+                raise RuntimeError("retrieval engine provider is already bound")
+            cls._external_provider = provider
+            cls._engines.clear()
+
+    @classmethod
+    def unbind_external_provider(cls, provider: Callable[[str], Any]) -> None:
+        with cls._lock:
+            if cls._external_provider is provider:
+                cls._external_provider = None
+                cls._engines.clear()
