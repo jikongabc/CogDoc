@@ -9,8 +9,8 @@ from concurrent.futures import CancelledError, Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, is_dataclass
 from functools import partial
-from threading import Event, RLock
-from typing import Any
+from threading import Event, RLock, Thread
+from typing import Any, cast
 
 from cogdoc.api.research_job_store import (
     ResearchJobStateConflictError,
@@ -22,6 +22,7 @@ from cogdoc.api.research_access import (
     research_retrieval_scope,
 )
 from cogdoc.config.settings import get_settings
+from cogdoc.graph.state import RetrievedDoc
 from cogdoc.daemon_executor import (
     DaemonExecutorCapacityError,
     DaemonFutureExecutor,
@@ -55,6 +56,12 @@ from cogdoc.service.research_provenance import (
 from cogdoc.service.research_observability import ResearchObserver
 from cogdoc.service.retriever_factory import RetrieverFactory
 from cogdoc.tools.reranker import BGEReranker, skipped_cpu_rerank_docs
+from cogdoc.ha.research import (
+    DISPATCH_CANCELLED,
+    DISPATCH_SUCCEEDED,
+    ResearchDispatchStore,
+    StaleResearchDispatch,
+)
 
 
 ResearchRetriever = Callable[[str, str], Sequence[Mapping[str, Any]]]
@@ -71,6 +78,8 @@ class _ResearchRunHandle:
     future: Future
     control: ResearchRunController
     started_monotonic: float
+    dispatch_id: str = ""
+    dispatch_token: str = ""
 
 
 class ResearchEvidenceStaleError(ResearchJobStateConflictError):
@@ -86,6 +95,21 @@ class ResearchExecutionCapacityError(ResearchJobStateConflictError):
     """The bounded background admission queue has no free slot."""
 
 
+class _NoAuxiliaryResearchRetriever:
+    """Derived-knowledge seam for HA until that state has shared authority."""
+
+    def search(
+        self,
+        kb_id: str,
+        query: str,
+        top_k: int = 3,
+        *,
+        scope=None,
+    ) -> list[RetrievedDoc]:
+        del kb_id, query, top_k, scope
+        return []
+
+
 def retrieve_research_evidence(
     kb_id: str,
     query: str,
@@ -93,16 +117,23 @@ def retrieve_research_evidence(
     state_runtime,
     top_k: int = 8,
     retrieval_scope=None,
+    include_auxiliary_state: bool = True,
 ) -> list[Mapping[str, Any]]:
     """Reuse the production hybrid retrieval path for one research section."""
 
     settings = get_settings()
     with kb_read_lease(kb_id):
         engine = RetrieverFactory.get_engine(kb_id)
+        if include_auxiliary_state:
+            knowledge_retriever = state_runtime.derived_knowledge_retriever
+            feedback_store = state_runtime.retrieval_feedback_store
+        else:
+            knowledge_retriever = _NoAuxiliaryResearchRetriever()
+            feedback_store = None
         result = retrieve_candidate_pool(
             engine,
-            state_runtime.derived_knowledge_retriever,
-            state_runtime.retrieval_feedback_store,
+            knowledge_retriever,
+            feedback_store,
             kb_id=kb_id,
             original_query=query,
             queries=build_retrieval_queries(query, max_queries=1),
@@ -136,6 +167,10 @@ def _safe_number(value: Any) -> int | float | None:
     return number if math.isfinite(number) else None
 
 
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def public_research_evidence(
     docs: Sequence[Mapping[str, Any]],
     *,
@@ -147,10 +182,8 @@ def public_research_evidence(
     evidence: list[dict[str, Any]] = []
     seen: set[tuple[str, int, int, str]] = set()
     for doc in docs:
-        meta = doc.get("meta") if isinstance(doc.get("meta"), Mapping) else {}
-        retrieval = (
-            doc.get("retrieval") if isinstance(doc.get("retrieval"), Mapping) else {}
-        )
+        meta = _as_mapping(doc.get("meta"))
+        retrieval = _as_mapping(doc.get("retrieval"))
         chunk_id = str(meta.get("chunk_id") or "")
         knowledge_id = str(meta.get("knowledge_id") or "")
         page = meta.get("page")
@@ -253,6 +286,10 @@ class ResearchExecutionManager:
         retrieval_doc_reservation: int | None = None,
         observer: ResearchObserver | None = None,
         authorization_checker: Callable[[Mapping[str, Any]], bool] | None = None,
+        dispatch_store: ResearchDispatchStore | None = None,
+        worker_id: str = "",
+        dispatch_lease_seconds: float = 60.0,
+        dispatch_poll_seconds: float = 0.5,
     ):
         self._store = store
         self._retrieve = retrieve
@@ -316,6 +353,19 @@ class ResearchExecutionManager:
         self._closed = False
         self._observer = observer
         self._authorization_checker = authorization_checker
+        self._dispatch_store = dispatch_store
+        self._dispatch_worker_id = worker_id
+        self._dispatch_lease_seconds = float(dispatch_lease_seconds)
+        self._dispatch_poll_seconds = float(dispatch_poll_seconds)
+        if dispatch_store is not None:
+            if not worker_id or len(worker_id) > 255:
+                raise ValueError("distributed research worker_id is invalid")
+            if not 5 <= self._dispatch_lease_seconds <= 3600:
+                raise ValueError("distributed research lease is invalid")
+            if not 0.05 <= self._dispatch_poll_seconds <= 60:
+                raise ValueError("distributed research poll interval is invalid")
+        self._dispatch_stop = Event()
+        self._dispatch_thread: Thread | None = None
 
     @classmethod
     def from_runtime(
@@ -329,6 +379,12 @@ class ResearchExecutionManager:
         max_pending: int | None = None,
         observer: ResearchObserver | None = None,
         authorization_checker: Callable[[Mapping[str, Any]], bool] | None = None,
+        dispatch_store: ResearchDispatchStore | None = None,
+        worker_id: str = "",
+        dispatch_lease_seconds: float = 60.0,
+        dispatch_poll_seconds: float = 0.5,
+        index_provenance_reader: Callable[[str], Mapping[str, Any]] | None = None,
+        include_auxiliary_state: bool = True,
     ) -> "ResearchExecutionManager":
         # Local import avoids coupling the evidence executor to report-generation
         # dependencies during module import.
@@ -340,6 +396,7 @@ class ResearchExecutionManager:
                 retrieve_research_evidence,
                 state_runtime=state_runtime,
                 top_k=top_k,
+                include_auxiliary_state=include_auxiliary_state,
             ),
             kb_exists=kb_exists,
             report_builder=lambda job: Builder.from_runtime(
@@ -349,12 +406,18 @@ class ResearchExecutionManager:
             provenance_reader=partial(
                 capture_research_provenance,
                 state_runtime=state_runtime,
+                index_provenance_reader=index_provenance_reader,
+                include_auxiliary_state=include_auxiliary_state,
             ),
             max_workers=max_workers,
             max_pending=max_pending,
             retrieval_doc_reservation=top_k,
             observer=observer,
             authorization_checker=authorization_checker,
+            dispatch_store=dispatch_store,
+            worker_id=worker_id,
+            dispatch_lease_seconds=dispatch_lease_seconds,
+            dispatch_poll_seconds=dispatch_poll_seconds,
         )
 
     def bind_observer(self, observer: ResearchObserver | None) -> None:
@@ -364,6 +427,144 @@ class ResearchExecutionManager:
         self, checker: Callable[[Mapping[str, Any]], bool] | None
     ) -> None:
         self._authorization_checker = checker
+
+    @property
+    def dispatch_store(self) -> ResearchDispatchStore | None:
+        return self._dispatch_store
+
+    @property
+    def store(self) -> ResearchJobStore:
+        return self._store
+
+    def check(self) -> bool:
+        store_check = getattr(self._store, "check", None)
+        if callable(store_check) and store_check() is not True:
+            return False
+        dispatch_store = self._dispatch_store
+        if dispatch_store is None:
+            return not self._closed
+        if dispatch_store.check() is not True:
+            return False
+        thread = self._dispatch_thread
+        return not self._closed and thread is not None and thread.is_alive()
+
+    def start_dispatcher(self) -> None:
+        if self._dispatch_store is None:
+            return
+        with self._lock:
+            current = self._dispatch_thread
+            if current is not None and current.is_alive():
+                return
+            if self._closed:
+                raise RuntimeError("ResearchExecutionManager is closed")
+            self._dispatch_stop.clear()
+            self._dispatch_thread = Thread(
+                target=self._dispatch_loop,
+                name=f"cogdoc-research-dispatch-{self._dispatch_worker_id}",
+                daemon=True,
+            )
+            self._dispatch_thread.start()
+
+    def _dispatch_loop(self) -> None:
+        heartbeat_at = 0.0
+        reconcile_at = time.monotonic() + min(
+            60.0, max(5.0, self._dispatch_lease_seconds / 2)
+        )
+        while not self._dispatch_stop.is_set():
+            try:
+                now = time.monotonic()
+                if now >= heartbeat_at:
+                    self._heartbeat_distributed_runs()
+                    heartbeat_at = now + self._dispatch_lease_seconds / 3
+                if now >= reconcile_at:
+                    self.reconcile_orphans()
+                    reconcile_at = now + min(
+                        60.0, max(5.0, self._dispatch_lease_seconds / 2)
+                    )
+                claimed = self.dispatch_once()
+            except Exception:
+                claimed = False
+            self._dispatch_stop.wait(0.0 if claimed else self._dispatch_poll_seconds)
+
+    def _heartbeat_distributed_runs(self) -> None:
+        store = self._dispatch_store
+        if store is None:
+            return
+        with self._lock:
+            handles = tuple(self._active.values())
+        for handle in handles:
+            if not handle.dispatch_id or handle.future.done():
+                continue
+            try:
+                store.heartbeat(
+                    handle.dispatch_id,
+                    self._dispatch_worker_id,
+                    handle.dispatch_token,
+                    lease_seconds=self._dispatch_lease_seconds,
+                )
+            except StaleResearchDispatch:
+                handle.control.request_stop("superseded")
+                handle.future.cancel()
+
+    def dispatch_once(self) -> bool:
+        store = self._dispatch_store
+        if store is None:
+            return False
+        dispatch = store.claim(
+            self._dispatch_worker_id,
+            lease_seconds=self._dispatch_lease_seconds,
+        )
+        if dispatch is None:
+            return False
+        dispatch_id = str(dispatch["dispatch_id"])
+        token = str(dispatch["lease_token"])
+        job_id = str(dispatch["research_job_id"])
+        phase = str(dispatch["phase"])
+        attempt_id = str(dispatch["attempt_id"])
+        try:
+            row = self._store.activate_distributed_attempt(
+                job_id,
+                phase=phase,
+                attempt_id=attempt_id,
+            )
+            expected_status = "running" if phase == "evidence" else "generating"
+            live_attempt = (
+                row.get("execution_id")
+                if phase == "evidence"
+                else row.get("report_execution_id")
+            )
+            if row.get("status") != expected_status or live_attempt != attempt_id:
+                store.finish(
+                    dispatch_id,
+                    self._dispatch_worker_id,
+                    token,
+                    status=DISPATCH_CANCELLED,
+                )
+                return True
+            scheduler = (
+                self._schedule_evidence
+                if phase == "evidence"
+                else self._schedule_report
+            )
+            scheduled = scheduler(
+                job_id,
+                row,
+                dispatch_id=dispatch_id,
+                dispatch_token=token,
+            )
+            if not scheduled:
+                store.requeue(dispatch_id, self._dispatch_worker_id, token)
+                return False
+        except (DaemonExecutorCapacityError, ResearchExecutionCapacityError):
+            store.requeue(dispatch_id, self._dispatch_worker_id, token)
+            return False
+        except BaseException:
+            try:
+                store.requeue(dispatch_id, self._dispatch_worker_id, token)
+            except StaleResearchDispatch:
+                pass
+            raise
+        return True
 
     def _assert_authorized(self, job: Mapping[str, Any]) -> None:
         authorization = research_authorization(job)
@@ -398,7 +599,10 @@ class ResearchExecutionManager:
         except (TypeError, ValueError):
             accepts_scope = False
         if accepts_scope:
-            docs = self._retrieve(kb_id, query, retrieval_scope=scope)
+            scoped_retrieve = cast(
+                Callable[..., Sequence[Mapping[str, Any]]], self._retrieve
+            )
+            docs = scoped_retrieve(kb_id, query, retrieval_scope=scope)
         elif scope.allows_all_sources:
             docs = self._retrieve(kb_id, query)
         else:
@@ -421,6 +625,39 @@ class ResearchExecutionManager:
             return
 
     def reconcile_orphans(self) -> int:
+        if self._dispatch_store is not None:
+            recovered = 0
+            after_job_id = ""
+            while True:
+                rows = self._store.list_dispatchable(
+                    after_job_id=after_job_id,
+                    limit=1000,
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    phase = "evidence" if row.get("status") == "running" else "report"
+                    attempt_id = str(
+                        row.get(
+                            "execution_id"
+                            if phase == "evidence"
+                            else "report_execution_id"
+                        )
+                        or ""
+                    )
+                    if not attempt_id:
+                        continue
+                    self._dispatch_store.enqueue(str(row["job_id"]), phase, attempt_id)
+                    recovered += 1
+                after_job_id = str(rows[-1]["job_id"])
+                if len(rows) < 1000:
+                    break
+            self._observe(
+                "orphan_reconciled",
+                count=recovered,
+                termination_counts={"redispatched": recovered},
+            )
+            return recovered
         detailed_reconcile = getattr(self._store, "reconcile_running_outcomes", None)
         if callable(detailed_reconcile):
             outcomes = dict(detailed_reconcile())
@@ -439,9 +676,14 @@ class ResearchExecutionManager:
         with self._lock:
             if self._closed:
                 raise RuntimeError("ResearchExecutionManager is closed")
-            occupied = self._executor.pending_count() + self._submission_reservations
-            if occupied >= self._max_pending:
-                raise ResearchExecutionCapacityError("research execution queue is full")
+            if self._dispatch_store is None:
+                occupied = (
+                    self._executor.pending_count() + self._submission_reservations
+                )
+                if occupied >= self._max_pending:
+                    raise ResearchExecutionCapacityError(
+                        "research execution queue is full"
+                    )
             self._submission_reservations += 1
 
     def _release_submission(self) -> None:
@@ -686,7 +928,25 @@ class ResearchExecutionManager:
                 self._release_submission()
                 raise
             try:
-                scheduler(job_id, row)
+                if self._dispatch_store is None:
+                    scheduler(job_id, row)
+                else:
+                    phase = (
+                        "report" if row.get("status") == "generating" else "evidence"
+                    )
+                    attempt_id = str(
+                        row.get(
+                            "execution_id"
+                            if phase == "evidence"
+                            else "report_execution_id"
+                        )
+                        or ""
+                    )
+                    if not attempt_id:
+                        raise ResearchJobStateConflictError(
+                            "research attempt is unavailable for dispatch"
+                        )
+                    self._dispatch_store.enqueue(job_id, phase, attempt_id)
             except BaseException:
                 self._release_submission()
                 raise
@@ -817,11 +1077,15 @@ class ResearchExecutionManager:
 
     def pause(self, job_id: str) -> dict[str, Any]:
         row = self._store.pause(job_id)
+        if self._dispatch_store is not None:
+            self._dispatch_store.cancel_job(job_id)
         self._signal_job(job_id, phase="evidence", reason="paused")
         return row
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         row = self._store.cancel(job_id)
+        if self._dispatch_store is not None:
+            self._dispatch_store.cancel_job(job_id)
         self._signal_job(job_id, reason="cancelled")
         return row
 
@@ -999,7 +1263,10 @@ class ResearchExecutionManager:
         return status
 
     def shutdown(self, *, wait: bool = True) -> bool:
+        self._dispatch_stop.set()
+        dispatch_thread = self._dispatch_thread
         already_closed = False
+        handles: Sequence[_ResearchRunHandle]
         with self._lock:
             if self._closed:
                 already_closed = True
@@ -1020,13 +1287,16 @@ class ResearchExecutionManager:
             handle.future.cancel()
         reconciliation_error: BaseException | None = None
         try:
-            reconcile = getattr(self._store, "reconcile_running_outcomes", None)
-            if callable(reconcile):
-                reconcile(terminal_reason="service_shutdown")
+            if self._dispatch_store is not None:
+                self._dispatch_store.release_owned(self._dispatch_worker_id)
             else:
-                legacy_reconcile = getattr(self._store, "reconcile_running", None)
-                if callable(legacy_reconcile):
-                    legacy_reconcile()
+                reconcile = getattr(self._store, "reconcile_running_outcomes", None)
+                if callable(reconcile):
+                    reconcile(terminal_reason="service_shutdown")
+                else:
+                    legacy_reconcile = getattr(self._store, "reconcile_running", None)
+                    if callable(legacy_reconcile):
+                        legacy_reconcile()
         except BaseException as exc:
             reconciliation_error = exc
         finally:
@@ -1038,6 +1308,9 @@ class ResearchExecutionManager:
             # worker can stop immediately after lease invalidation even if an
             # opaque client ignores its native transport timeout.
             self._provider_executor.shutdown(wait=False, cancel_futures=True)
+            if dispatch_thread is not None:
+                dispatch_thread.join(timeout=max(1.0, self._dispatch_poll_seconds * 2))
+                self._dispatch_thread = None
         if reconciliation_error is not None:
             raise reconciliation_error
         with self._lock:
@@ -1079,6 +1352,7 @@ class ResearchExecutionManager:
                 max_pending=self._provider_max_pending,
                 thread_name_prefix="cogdoc-research-provider",
             )
+            self._dispatch_stop.clear()
             self._closed = False
 
     def _signal_job(
@@ -1147,7 +1421,14 @@ class ResearchExecutionManager:
             deadline_callback=persist_deadline,
         )
 
-    def _schedule_evidence(self, job_id: str, row: Mapping[str, Any]) -> bool:
+    def _schedule_evidence(
+        self,
+        job_id: str,
+        row: Mapping[str, Any],
+        *,
+        dispatch_id: str = "",
+        dispatch_token: str = "",
+    ) -> bool:
         execution_id = str(row.get("execution_id") or "")
         control_snapshot = research_run_control(row, "evidence")
         lease_id = str(control_snapshot.get("lease_id") or "")
@@ -1180,6 +1461,10 @@ class ResearchExecutionManager:
                     controller,
                 )
             except BaseException as exc:
+                if dispatch_id and isinstance(exc, DaemonExecutorCapacityError):
+                    raise ResearchExecutionCapacityError(
+                        "research execution queue is full"
+                    ) from exc
                 failed = self._store.fail_run(
                     job_id,
                     phase="evidence",
@@ -1212,6 +1497,8 @@ class ResearchExecutionManager:
                 future=future,
                 control=controller,
                 started_monotonic=time.monotonic(),
+                dispatch_id=dispatch_id,
+                dispatch_token=dispatch_token,
             )
             self._active[active_key] = handle
             self._observe(
@@ -1225,7 +1512,14 @@ class ResearchExecutionManager:
             future.add_done_callback(lambda completed: self._forget(handle, completed))
             return True
 
-    def _schedule_report(self, job_id: str, row: Mapping[str, Any]) -> bool:
+    def _schedule_report(
+        self,
+        job_id: str,
+        row: Mapping[str, Any],
+        *,
+        dispatch_id: str = "",
+        dispatch_token: str = "",
+    ) -> bool:
         report_execution_id = str(row.get("report_execution_id") or "")
         control_snapshot = research_run_control(row, "report")
         lease_id = str(control_snapshot.get("lease_id") or "")
@@ -1254,6 +1548,10 @@ class ResearchExecutionManager:
                     controller,
                 )
             except BaseException as exc:
+                if dispatch_id and isinstance(exc, DaemonExecutorCapacityError):
+                    raise ResearchExecutionCapacityError(
+                        "research execution queue is full"
+                    ) from exc
                 failed = self._store.fail_run(
                     job_id,
                     phase="report",
@@ -1286,6 +1584,8 @@ class ResearchExecutionManager:
                 future=future,
                 control=controller,
                 started_monotonic=time.monotonic(),
+                dispatch_id=dispatch_id,
+                dispatch_token=dispatch_token,
             )
             self._active[active_key] = handle
             self._observe(
@@ -1370,6 +1670,7 @@ class ResearchExecutionManager:
         return "superseded", status, kb_id, error_class, "superseded"
 
     def _forget(self, handle: _ResearchRunHandle, future: Future) -> None:
+        dispatch_outcome = DISPATCH_CANCELLED
         try:
             error: BaseException | None = None
             was_cancelled = future.cancelled()
@@ -1396,6 +1697,11 @@ class ResearchExecutionManager:
                 error,
                 cancelled=was_cancelled,
             )
+            dispatch_outcome = (
+                DISPATCH_CANCELLED
+                if outcome in {"cancelled", "superseded"}
+                else DISPATCH_SUCCEEDED
+            )
             if termination:
                 self._observe(
                     "control_terminated",
@@ -1419,6 +1725,16 @@ class ResearchExecutionManager:
                 error_class=error_class,
             )
         finally:
+            if handle.dispatch_id and self._dispatch_store is not None:
+                try:
+                    self._dispatch_store.finish(
+                        handle.dispatch_id,
+                        self._dispatch_worker_id,
+                        handle.dispatch_token,
+                        status=dispatch_outcome,
+                    )
+                except StaleResearchDispatch:
+                    pass
             # Admission cleanup must not depend on Future exception inspection
             # or on the availability of the durable store.
             with self._lock:
@@ -1452,8 +1768,8 @@ class ResearchExecutionManager:
                         raise RuntimeError("research report builder returned no result")
                     if isinstance(result, Mapping):
                         payload = dict(result)
-                    elif is_dataclass(result):
-                        payload = asdict(result)
+                    elif is_dataclass(result) and not isinstance(result, type):
+                        payload = asdict(cast(Any, result))
                         # Dataclass report results use immutable tuples internally.
                         # Normalize only this trusted representation before crossing
                         # the store's strict JSON artifact boundary.
@@ -1575,11 +1891,7 @@ class ResearchExecutionManager:
                                 }
                             )
                             for doc in retrieved:
-                                meta = (
-                                    doc.get("meta")
-                                    if isinstance(doc.get("meta"), Mapping)
-                                    else {}
-                                )
+                                meta = _as_mapping(doc.get("meta"))
                                 identity = (
                                     str(meta.get("chunk_id") or ""),
                                     str(meta.get("knowledge_id") or ""),

@@ -85,14 +85,27 @@ def _readiness_snapshot(request: Request) -> tuple[bool, dict[str, Any]]:
             state_ready = False
     components["state"] = _component("ready" if state_ready else "not_ready")
 
+    source_multiwriter = bool(getattr(app_state, "ha_document_multiwriter_mode", False))
+    connector_multiwriter = bool(
+        getattr(app_state, "ha_connector_multiwriter_mode", False)
+    )
     for state_name in (
         "connection_store",
         "connector_sync_store",
         "source_catalog",
         "source_artifact_store",
     ):
+        required = (
+            not source_multiwriter
+            or connector_multiwriter
+            or state_name
+            in {
+                "source_catalog",
+                "source_artifact_store",
+            }
+        )
         components[state_name] = _store_readiness_component(
-            getattr(app_state, state_name, None), required=True
+            getattr(app_state, state_name, None), required=required
         )
 
     oauth_sessions = getattr(app_state, "connector_oauth_session_store", None)
@@ -110,6 +123,69 @@ def _readiness_snapshot(request: Request) -> tuple[bool, dict[str, Any]]:
     components["connector_oauth_session_store"] = (
         _store_readiness_component(oauth_sessions, required=True)
         if oauth_configured
+        else _component("disabled", required=False)
+    )
+    components["connector_reference_lock"] = (
+        _store_readiness_component(
+            getattr(app_state, "connector_credential_reference_lock", None),
+            required=True,
+        )
+        if connector_multiwriter
+        else _component("disabled", required=False)
+    )
+    external_acl_store = getattr(app_state, "external_acl_sync_store", None)
+    components["external_acl_sync_store"] = (
+        _store_readiness_component(external_acl_store, required=True)
+        if getattr(app_state, "resource_access_store", None) is not None
+        else _component("disabled", required=False)
+    )
+    identity_multiwriter = bool(
+        getattr(app_state, "ha_identity_multiwriter_mode", False)
+    )
+    components["ha_identity_config"] = (
+        _store_readiness_component(
+            getattr(app_state, "ha_identity_config_registry", None), required=True
+        )
+        if identity_multiwriter
+        else _component("disabled", required=False)
+    )
+    research_multiwriter = bool(
+        getattr(app_state, "ha_research_multiwriter_mode", False)
+    )
+    components["ha_research_jobs"] = (
+        _store_readiness_component(
+            getattr(app_state, "research_job_store", None), required=True
+        )
+        if research_multiwriter
+        else _component("disabled", required=False)
+    )
+    components["ha_research_dispatch"] = (
+        _store_readiness_component(
+            getattr(app_state, "ha_research_dispatch_store", None), required=True
+        )
+        if research_multiwriter
+        else _component("disabled", required=False)
+    )
+    components["ha_research_worker"] = (
+        _store_readiness_component(
+            getattr(app_state, "research_execution_manager", None), required=True
+        )
+        if research_multiwriter
+        else _component("disabled", required=False)
+    )
+    chat_multiwriter = bool(getattr(app_state, "ha_chat_multiwriter_mode", False))
+    components["ha_chat_memory"] = (
+        _store_readiness_component(
+            getattr(app_state, "session_store", None), required=True
+        )
+        if chat_multiwriter
+        else _component("disabled", required=False)
+    )
+    components["ha_chat_execution"] = (
+        _store_readiness_component(
+            getattr(app_state, "ha_chat_coordinator", None), required=True
+        )
+        if chat_multiwriter
         else _component("disabled", required=False)
     )
     oidc_manager = getattr(app_state, "oidc_manager", None)

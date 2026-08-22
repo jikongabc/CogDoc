@@ -15,6 +15,8 @@ from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 from cogdoc.api.persistence import connect_sqlite
+from cogdoc.ha.dbapi_compat import BackendDBAPIConnection
+from cogdoc.ha.storage import DatabaseBackend
 from cogdoc.connectors.credential_store import (
     CredentialRevisionConflict,
     CredentialVault,
@@ -202,7 +204,7 @@ class OAuthTokens:
 
 
 class OAuthSessionStore:
-    """One-shot OAuth state with only a digest persisted in SQLite.
+    """One-shot OAuth state with only a digest persisted durably.
 
     The PKCE verifier is a short-lived encrypted vault credential. Consuming a
     state commits the one-shot marker before releasing the verifier, so crashes
@@ -211,17 +213,25 @@ class OAuthSessionStore:
 
     def __init__(
         self,
-        db_path: str,
+        db_path: str | None,
         credential_vault: CredentialVault,
         *,
+        backend: DatabaseBackend | None = None,
         clock: Callable[[], float] = time.time,
         epoch_reader: Callable[[str], int] | None = None,
     ) -> None:
+        if (db_path is None) == (backend is None):
+            raise ValueError("exactly one of db_path or backend is required")
         self._vault = credential_vault
         self._clock = clock
         self._epoch_reader = epoch_reader or (lambda _kb_id: 0)
         self._lock = RLock()
-        self._conn = connect_sqlite(db_path)
+        self._distributed = backend is not None
+        self._conn: Any = (
+            BackendDBAPIConnection(backend)
+            if backend is not None
+            else connect_sqlite(str(db_path))
+        )
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS connector_oauth_sessions (
@@ -237,16 +247,21 @@ class OAuthSessionStore:
                 created_at REAL NOT NULL,
                 expires_at REAL NOT NULL,
                 consumed_at REAL,
-                cancelled_at REAL
+                cancelled_at REAL,
+                kb_epoch INTEGER NOT NULL DEFAULT 0,
+                membership_id TEXT,
+                principal_fingerprint TEXT,
+                connection_revision INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_connector_oauth_sessions_expiry
                 ON connector_oauth_sessions(expires_at,consumed_at,cancelled_at);
             """
         )
-        self._ensure_column("kb_epoch", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_column("membership_id", "TEXT")
-        self._ensure_column("principal_fingerprint", "TEXT")
-        self._ensure_column("connection_revision", "INTEGER")
+        if not self._distributed:
+            self._ensure_column("kb_epoch", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("membership_id", "TEXT")
+            self._ensure_column("principal_fingerprint", "TEXT")
+            self._ensure_column("connection_revision", "INTEGER")
         # Reconcile both ordinary expired sessions and an encrypted verifier
         # orphaned by a crash between vault creation and session insertion.
         self.purge_expired(limit=100)
@@ -551,19 +566,27 @@ class OAuthSessionStore:
         tenant, kb, connection, user = _scope(tenant_id, kb_id, connection_id, user_id)
         now = self._clock()
         with self._lock:
-            row = self._conn.execute(
-                "SELECT verifier_credential_id FROM connector_oauth_sessions WHERE session_id=? "
-                "AND tenant_id=? AND kb_id=? AND connection_id IS ? AND user_id=? AND consumed_at IS NULL "
-                "AND cancelled_at IS NULL",
-                (session_id, tenant, kb, connection, user),
-            ).fetchone()
-            if row is None:
-                return False
-            updated = self._conn.execute(
-                "UPDATE connector_oauth_sessions SET cancelled_at=? WHERE session_id=? "
-                "AND consumed_at IS NULL AND cancelled_at IS NULL",
-                (now, session_id),
-            ).rowcount
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT verifier_credential_id FROM connector_oauth_sessions WHERE session_id=? "
+                    "AND tenant_id=? AND kb_id=? AND connection_id IS ? AND user_id=? AND consumed_at IS NULL "
+                    "AND cancelled_at IS NULL",
+                    (session_id, tenant, kb, connection, user),
+                ).fetchone()
+                if row is None:
+                    self._conn.execute("COMMIT")
+                    return False
+                updated = self._conn.execute(
+                    "UPDATE connector_oauth_sessions SET cancelled_at=? WHERE session_id=? "
+                    "AND consumed_at IS NULL AND cancelled_at IS NULL",
+                    (now, session_id),
+                ).rowcount
+                self._conn.execute("COMMIT")
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
         if updated == 1:
             self._cleanup_verifier(
                 _OAuthVerifierRecord(
@@ -1548,9 +1571,7 @@ class OAuthCoordinator:
             except Exception:
                 authorized = False
             if not authorized:
-                raise OAuthSessionExpired(
-                    "OAuth credential refresh authority changed"
-                )
+                raise OAuthSessionExpired("OAuth credential refresh authority changed")
 
         if kb_epoch is not None and not self._sessions.epoch_is_current(
             kb_id, kb_epoch

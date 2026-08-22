@@ -200,6 +200,35 @@ class StateRuntime:
         if store is not None and store is not self.knowledge_store:
             raise ValueError("knowledge store does not belong to this StateRuntime")
 
+    def bind_derived_knowledge_index(self, index: Any) -> None:
+        """Bind a preconfigured index authority before retrieval starts.
+
+        HA deployments use this seam to replace the node-local mutable Chroma
+        collection with immutable, content-verified shared generations.  A
+        runtime that has already materialized another index cannot be rebound:
+        silently swapping it would let concurrent readers observe two
+        authorities for the same knowledge base.
+        """
+
+        if index is None:
+            raise TypeError("derived knowledge index is required")
+        if self._closed:
+            raise RuntimeError("StateRuntime is closed")
+        with self._index_lock, self._retriever_lock:
+            current = self._derived_knowledge_index
+            if current is not None and current is not index:
+                raise ValueError("derived knowledge index is already initialized")
+            # A retriever only captures an index factory, but replacing an
+            # already-used retriever would still make in-flight callers depend
+            # on construction order.  Fail closed instead.
+            if self._derived_knowledge_retriever is not None:
+                raise ValueError("derived knowledge retriever is already initialized")
+            self._derived_knowledge_index = index
+
+    @property
+    def has_bound_derived_knowledge_index(self) -> bool:
+        return self._derived_knowledge_index is not None
+
     def refresh_derived_knowledge_index(
         self,
         kb_id: str,

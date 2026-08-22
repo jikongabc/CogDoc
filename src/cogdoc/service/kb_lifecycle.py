@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from threading import Lock
+from typing import Any
 from cogdoc.config.settings import get_settings
 from cogdoc.observability.logger import log_event
 
@@ -111,12 +112,12 @@ class LifecycleStore:
         )
 
 
-_shared: LifecycleStore | None = None
+_shared: Any | None = None
 _shared_lock = Lock()
 
 
 # 完成 shared生命周期状态存储 处理。
-def shared_lifecycle_store() -> LifecycleStore:
+def shared_lifecycle_store() -> Any:
     # 进程内共享单例；双重检查锁防并发重复构造。
     global _shared
     if _shared is None:
@@ -124,3 +125,21 @@ def shared_lifecycle_store() -> LifecycleStore:
             if _shared is None:
                 _shared = LifecycleStore()
     return _shared
+
+
+def bind_shared_lifecycle_store(store: Any, *, replace_local: bool = False) -> None:
+    """Bind the process to one durable lifecycle authority before startup."""
+
+    if not callable(getattr(store, "status", None)) or not callable(
+        getattr(store, "set", None)
+    ):
+        raise TypeError("lifecycle store must expose status and set")
+    global _shared
+    with _shared_lock:
+        if (
+            _shared is not None
+            and _shared is not store
+            and not (replace_local and isinstance(_shared, LifecycleStore))
+        ):
+            raise RuntimeError("shared lifecycle store is already bound")
+        _shared = store

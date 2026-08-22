@@ -4,7 +4,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +12,7 @@ from cogdoc.ha.index_generation import IndexGenerationStore
 from cogdoc.ha.object_store import ObjectIndexRepository
 from cogdoc.ha.outbox import OutboxStore
 from cogdoc.ha.scheduler import ScheduleStore
+from cogdoc.ha.source_generation import SourceGenerationStore
 from cogdoc.ha.tasks import LeaseJobStore
 
 
@@ -38,6 +39,8 @@ class MaintenanceSnapshot:
     outbox_pruned: int
     fires_pruned: int
     generations_removed: int
+    source_generations_removed: int
+    artifact_orphans_removed: int
     generations_scrubbed: int
 
 
@@ -52,6 +55,8 @@ class HAMaintenance:
         generations: IndexGenerationStore,
         repository: ObjectIndexRepository,
         *,
+        source_generations: SourceGenerationStore | None = None,
+        source_artifacts: Any | None = None,
         interval_seconds: float = 30.0,
         retention_seconds: float = 7 * 86_400.0,
         scrub_interval_seconds: float = 3600.0,
@@ -83,6 +88,10 @@ class HAMaintenance:
         self.outbox = outbox
         self.generations = generations
         self.repository = repository
+        self._index_repositories: dict[str, ObjectIndexRepository] = {}
+        self._derived_refresh_recoverer: Callable[[], None] | None = None
+        self.source_generations = source_generations
+        self.source_artifacts = source_artifacts
         self.interval_seconds = float(interval_seconds)
         self.retention_seconds = float(retention_seconds)
         self.scrub_interval_seconds = float(scrub_interval_seconds)
@@ -107,8 +116,45 @@ class HAMaintenance:
             "outbox_pruned": 0,
             "fires_pruned": 0,
             "generations_removed": 0,
+            "source_generations_removed": 0,
+            "artifact_orphans_removed": 0,
             "generations_scrubbed": 0,
         }
+
+    def bind_index_repository(
+        self, repository: ObjectIndexRepository, *, chunk_version: str
+    ) -> None:
+        """Route a manifest contract to its immutable object namespace."""
+
+        if not isinstance(chunk_version, str) or not chunk_version.strip():
+            raise ValueError("index repository chunk version is invalid")
+        normalized = chunk_version.strip()
+        previous = self._index_repositories.get(normalized)
+        if previous is not None and previous is not repository:
+            raise ValueError("index repository contract is already bound")
+        self._index_repositories[normalized] = repository
+
+    def bind_derived_refresh_recoverer(self, recoverer: Callable[[], None]) -> None:
+        """Schedule durable derived-index recovery from every maintenance tick."""
+
+        if not callable(recoverer):
+            raise TypeError("derived refresh recoverer must be callable")
+        previous = self._derived_refresh_recoverer
+        if previous is not None and previous is not recoverer:
+            raise ValueError("derived refresh recoverer is already bound")
+        self._derived_refresh_recoverer = recoverer
+
+    def _index_repository_for(
+        self, generation: Mapping[str, Any]
+    ) -> ObjectIndexRepository:
+        manifest = generation.get("manifest")
+        contract = manifest.get("contract") if isinstance(manifest, Mapping) else None
+        version = (
+            str(contract.get("chunk_version") or "")
+            if isinstance(contract, Mapping)
+            else ""
+        )
+        return self._index_repositories.get(version, self.repository)
 
     def run_once(self) -> dict[str, int]:
         now = self._clock()
@@ -137,10 +183,25 @@ class HAMaintenance:
                 lambda: self.jobs.prune_terminal(before=before, limit=self.batch_size),
             ),
             ("generations_removed", lambda: self._collect(before)),
+            ("source_generations_removed", lambda: self._collect_sources(before)),
+            (
+                "artifact_orphans_removed",
+                lambda: (
+                    self.source_artifacts.collect_orphans(limit=self.batch_size)
+                    if self.source_artifacts is not None
+                    else 0
+                ),
+            ),
             ("generations_scrubbed", self._scrub_if_due),
         )
         result = {key: 0 for key, _operation in operations}
         failures: list[tuple[str, Exception]] = []
+        if self._derived_refresh_recoverer is not None:
+            try:
+                self._derived_refresh_recoverer()
+            except Exception as exc:
+                failures.append(("derived_refresh_recovery", exc))
+                LOGGER.exception("HA derived index refresh recovery scheduling failed")
         for key, operation in operations:
             try:
                 result[key] = operation()
@@ -172,7 +233,7 @@ class HAMaintenance:
             before=before, limit=self.batch_size
         ):
             try:
-                self.repository.delete_generation(generation)
+                self._index_repository_for(generation).delete_generation(generation)
                 removed += int(
                     self.generations.forget_collectable(
                         str(generation["generation_id"]), before=before
@@ -195,6 +256,38 @@ class HAMaintenance:
             )
         return removed
 
+    def _collect_sources(self, before: float) -> int:
+        if self.source_generations is None:
+            return 0
+        removed = 0
+        failures = 0
+        for generation in self.source_generations.garbage_candidates(
+            before=before, limit=self.batch_size
+        ):
+            try:
+                self.source_generations.delete_generation_objects(generation)
+                removed += int(
+                    self.source_generations.forget_collectable(
+                        str(generation["generation_id"]), before=before
+                    )
+                )
+            except Exception:
+                failures += 1
+                LOGGER.exception(
+                    "HA source generation collection failed",
+                    extra={
+                        "tenant_id": generation["tenant_id"],
+                        "kb_id": generation["storage_id"],
+                        "generation_id": generation["generation_id"],
+                    },
+                )
+        if failures:
+            raise _MaintenanceOperationError(
+                f"HA source collection failed for {failures} generation(s)",
+                completed=removed,
+            )
+        return removed
+
     def _scrub_if_due(self) -> int:
         now = self._monotonic()
         if now < self._next_scrub:
@@ -205,7 +298,7 @@ class HAMaintenance:
         failures = 0
         for generation in rows:
             try:
-                self.repository.verify(generation)
+                self._index_repository_for(generation).verify(generation)
             except Exception:
                 failures += 1
                 LOGGER.exception(

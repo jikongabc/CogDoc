@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from typing import Any
 from threading import Lock
 from cogdoc.config.settings import get_settings
 
@@ -82,12 +83,12 @@ class EpochStore:
             return nxt
 
 
-_shared: EpochStore | None = None
+_shared: Any | None = None
 _shared_lock = Lock()
 
 
 # 完成 sharedepoch存储 处理。
-def shared_epoch_store() -> EpochStore:
+def shared_epoch_store() -> Any:
     # 进程内共享单例，保证所有 KBState 实例看到同一份 epoch；双重检查锁防并发重复构造。
     global _shared
     if _shared is None:
@@ -95,3 +96,21 @@ def shared_epoch_store() -> EpochStore:
             if _shared is None:
                 _shared = EpochStore()
     return _shared
+
+
+def bind_shared_epoch_store(store: Any, *, replace_local: bool = False) -> None:
+    """Bind the process to one durable epoch authority before serving traffic."""
+
+    if not callable(getattr(store, "current", None)) or not callable(
+        getattr(store, "bump", None)
+    ):
+        raise TypeError("epoch store must expose current and bump")
+    global _shared
+    with _shared_lock:
+        if (
+            _shared is not None
+            and _shared is not store
+            and not (replace_local and isinstance(_shared, EpochStore))
+        ):
+            raise RuntimeError("shared epoch store is already bound")
+        _shared = store

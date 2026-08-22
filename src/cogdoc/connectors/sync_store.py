@@ -11,6 +11,8 @@ from uuid import uuid4
 
 from cogdoc.api.persistence import connect_sqlite
 from cogdoc.connectors.base import StaleSyncLease, SyncCancelled
+from cogdoc.ha.dbapi_compat import BackendDBAPIConnection
+from cogdoc.ha.storage import DatabaseBackend
 
 
 SYNC_PENDING = "pending"
@@ -55,10 +57,23 @@ _JOB_SELECT = (
 
 
 class ConnectorSyncStore:
-    def __init__(self, db_path: str, *, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        db_path: str | None = None,
+        *,
+        backend: DatabaseBackend | None = None,
+        clock: Callable[[], float] = time.time,
+    ):
+        if (db_path is None) == (backend is None):
+            raise ValueError("exactly one of db_path or backend is required")
         self._lock = RLock()
         self._clock = clock
-        self._conn = connect_sqlite(db_path)
+        self._distributed = backend is not None
+        self._conn: Any = (
+            BackendDBAPIConnection(backend)
+            if backend is not None
+            else connect_sqlite(str(db_path))
+        )
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS connector_sync_jobs (
@@ -139,28 +154,33 @@ class ConnectorSyncStore:
                 ON connector_sync_checkpoints(last_job_id);
             """
         )
-        self._ensure_start_cursor_column()
-        self._ensure_job_column("replay_of", "TEXT")
-        self._ensure_job_column("connection_revision", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_job_column("health_duration_seconds", "REAL")
-        self._ensure_job_column("health_failure_recorded", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_job_column("credential_id", "TEXT")
-        self._ensure_job_column("credential_revision", "INTEGER NOT NULL DEFAULT 0")
-        cleanup_columns = {
-            str(row[1])
-            for row in self._conn.execute(
-                "PRAGMA table_info(connector_sync_jobs)"
-            ).fetchall()
-        }
-        cleanup_migration = "cleanup_pending" not in cleanup_columns
-        self._ensure_job_column("cleanup_pending", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_job_column("attempt_started_at", "REAL")
-        if cleanup_migration:
-            self._conn.execute(
-                "UPDATE connector_sync_jobs SET cleanup_pending=1 WHERE status=?",
-                (SYNC_SUCCEEDED,),
+        if self._distributed:
+            self._initialize_distributed_schema()
+        else:
+            self._ensure_start_cursor_column()
+            self._ensure_job_column("replay_of", "TEXT")
+            self._ensure_job_column("connection_revision", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_job_column("health_duration_seconds", "REAL")
+            self._ensure_job_column(
+                "health_failure_recorded", "INTEGER NOT NULL DEFAULT 0"
             )
-        self._ensure_job_sequence()
+            self._ensure_job_column("credential_id", "TEXT")
+            self._ensure_job_column("credential_revision", "INTEGER NOT NULL DEFAULT 0")
+            cleanup_columns = {
+                str(row[1])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(connector_sync_jobs)"
+                ).fetchall()
+            }
+            cleanup_migration = "cleanup_pending" not in cleanup_columns
+            self._ensure_job_column("cleanup_pending", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_job_column("attempt_started_at", "REAL")
+            if cleanup_migration:
+                self._conn.execute(
+                    "UPDATE connector_sync_jobs SET cleanup_pending=1 WHERE status=?",
+                    (SYNC_SUCCEEDED,),
+                )
+            self._ensure_job_sequence()
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_connector_sync_jobs_replay_of "
             "ON connector_sync_jobs(replay_of)"
@@ -169,7 +189,52 @@ class ConnectorSyncStore:
             "CREATE INDEX IF NOT EXISTS idx_connector_sync_jobs_terminal_cleanup "
             "ON connector_sync_jobs(status,cleanup_pending,finished_at,job_sequence)"
         )
-        self._ensure_health_projection()
+        if self._distributed:
+            self._reconcile_health_distributed()
+        else:
+            self._ensure_health_projection()
+
+    def _initialize_distributed_schema(self) -> None:
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS connector_sync_job_sequence ("
+            "singleton INTEGER PRIMARY KEY CHECK(singleton=1),last_value INTEGER NOT NULL)"
+        )
+        self._conn.execute(
+            "INSERT INTO connector_sync_job_sequence(singleton,last_value) VALUES (1,0) "
+            "ON CONFLICT(singleton) DO NOTHING"
+        )
+        self._conn.execute(
+            "UPDATE connector_sync_job_sequence SET last_value=(SELECT COALESCE("
+            "MAX(job_sequence),0) FROM connector_sync_jobs) WHERE last_value<(SELECT "
+            "COALESCE(MAX(job_sequence),0) FROM connector_sync_jobs)"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_sync_jobs_sequence "
+            "ON connector_sync_jobs(job_sequence)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_connector_sync_jobs_scope_sequence "
+            "ON connector_sync_jobs(tenant_id,kb_id,connection_id,job_sequence DESC)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_connector_sync_jobs_replay_of "
+            "ON connector_sync_jobs(replay_of)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_connector_sync_jobs_terminal_cleanup "
+            "ON connector_sync_jobs(status,cleanup_pending,finished_at,job_sequence)"
+        )
+
+    def _reconcile_health_distributed(self) -> None:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._reconcile_health_locked()
+                self._conn.execute("COMMIT")
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
 
     def _ensure_start_cursor_column(self) -> None:
         """Add and backfill the legacy cursor column in one migration transaction.

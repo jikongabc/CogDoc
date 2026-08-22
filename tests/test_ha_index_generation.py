@@ -194,6 +194,69 @@ def test_delayed_gc_never_returns_current_generation(index):
     repository.verify(store.resolve_current("tenant", "kb", repository.verify))
 
 
+def test_live_reader_lease_protects_superseded_generation_from_gc(index):
+    store, _repository, clock, _tmp_path = index
+    first = _prepare(index, "reader-first", {"index.bin": b"old"})
+    store.publish(first["generation_id"], first["lease_token"], lambda _: None)
+    reader = store.acquire_reader("tenant", "kb", "api-node", lease_seconds=30)
+    assert reader is not None
+    second = _prepare(index, "reader-second", {"index.bin": b"new"})
+    store.publish(second["generation_id"], second["lease_token"], lambda _: None)
+    clock.value += 10
+
+    assert store.garbage_candidates(before=clock.value) == []
+    assert not store.forget_collectable(first["generation_id"], before=clock.value)
+    store.heartbeat_reader(
+        str(reader["reader_id"]),
+        str(reader["reader_lease_token"]),
+        lease_seconds=30,
+    )
+    assert store.release_reader(
+        str(reader["reader_id"]), str(reader["reader_lease_token"])
+    )
+    assert [
+        row["generation_id"] for row in store.garbage_candidates(before=clock.value)
+    ] == [first["generation_id"]]
+
+
+def test_expired_reader_lease_is_collectable_and_prunable(index):
+    store, _repository, clock, _tmp_path = index
+    first = _prepare(index, "expired-first", {"index.bin": b"old"})
+    store.publish(first["generation_id"], first["lease_token"], lambda _: None)
+    reader = store.acquire_reader("tenant", "kb", "api-node", lease_seconds=5)
+    assert reader is not None
+    second = _prepare(index, "expired-second", {"index.bin": b"new"})
+    store.publish(second["generation_id"], second["lease_token"], lambda _: None)
+    clock.value += 6
+
+    assert [
+        row["generation_id"] for row in store.garbage_candidates(before=clock.value)
+    ] == [first["generation_id"]]
+    with pytest.raises(StaleIndexFence, match="reader lease"):
+        store.heartbeat_reader(
+            str(reader["reader_id"]),
+            str(reader["reader_lease_token"]),
+            lease_seconds=5,
+        )
+    assert store.prune_reader_leases(before=clock.value) == 1
+
+
+def test_expired_prepared_generation_is_collectable_after_kb_head_is_deleted(index):
+    store, _repository, clock, _tmp_path = index
+    prepared = _prepare(index, "delete-race", {"index.bin": b"orphan"})
+    with store.backend.transaction(write=True) as connection:
+        connection.execute(
+            "DELETE FROM ha_index_heads WHERE tenant_id=? AND kb_id=?",
+            ("tenant", "kb"),
+        )
+    clock.value += 10_000
+
+    assert [
+        row["generation_id"] for row in store.garbage_candidates(before=clock.value)
+    ] == [prepared["generation_id"]]
+    assert store.forget_collectable(prepared["generation_id"], before=clock.value)
+
+
 def test_current_generation_listing_is_stable_and_cursor_paginated(tmp_path):
     backend = SQLiteBackend(tmp_path / "authority.db")
     store = IndexGenerationStore(backend)

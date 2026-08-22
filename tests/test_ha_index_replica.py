@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
 
-from cogdoc.ha.index_generation import IndexGenerationStore
-from cogdoc.ha.index_replica import HAIndexReplica
+from cogdoc.ha.index_generation import IndexGenerationStore, StaleIndexFence
+from cogdoc.ha.index_replica import HAIndexReplica, RegistryIndexProvider
 from cogdoc.ha.object_store import LocalObjectStore, ObjectIndexRepository
 from cogdoc.ha.portable_index import (
     PORTABLE_INDEX_FILENAME,
@@ -145,7 +147,6 @@ def test_replica_head_race_never_returns_superseded_engine(tmp_path, monkeypatch
 
 
 def test_registry_provider_and_factory_never_fall_back_to_local_stale_index():
-    from cogdoc.ha.index_replica import RegistryIndexProvider
     from cogdoc.service.kb_lifecycle import LIFECYCLE_ACTIVE, shared_lifecycle_store
     from cogdoc.service.retriever_factory import RetrieverFactory
 
@@ -171,3 +172,110 @@ def test_registry_provider_and_factory_never_fall_back_to_local_stale_index():
         assert RetrieverFactory.get_engine("kb") is engine
     finally:
         RetrieverFactory.unbind_external_provider(provider)
+
+
+def test_registry_provider_pins_one_generation_across_head_switch(tmp_path):
+    backend = SQLiteBackend(tmp_path / "authority.db")
+    repository = ObjectIndexRepository(LocalObjectStore(tmp_path / "objects"))
+    first_dir = tmp_path / "first"
+    first_dir.mkdir()
+    first = _publish(backend, repository, first_dir, "one")
+    installer = Installer()
+    generations = IndexGenerationStore(backend)
+    replica = HAIndexReplica(
+        generations, repository, tmp_path / "cache", installer=installer
+    )
+    provider = RegistryIndexProvider(
+        replica,
+        SimpleNamespace(
+            get_by_storage_id=lambda value: {
+                "tenant_id": "tenant",
+                "storage_id": value,
+            }
+        ),
+        worker_id="node-a",
+        reader_lease_seconds=30,
+    )
+
+    with provider.pin("kb") as snapshot:
+        assert snapshot["generation_id"] == first["generation_id"]
+        assert provider("kb").generation_id == first["generation_id"]
+        second_dir = tmp_path / "second"
+        second_dir.mkdir()
+        second = _publish(backend, repository, second_dir, "two")
+        assert provider("kb").generation_id == first["generation_id"]
+        assert generations.garbage_candidates(before=time.time() + 3600) == []
+
+    assert provider("kb").generation_id == second["generation_id"]
+    assert [
+        row["generation_id"]
+        for row in generations.garbage_candidates(before=time.time() + 3600)
+    ] == [first["generation_id"]]
+    backend.close()
+
+
+def test_registry_provider_rejects_a_spawned_thread_without_pin_context(tmp_path):
+    backend = SQLiteBackend(tmp_path / "authority.db")
+    repository = ObjectIndexRepository(LocalObjectStore(tmp_path / "objects"))
+    source = tmp_path / "source"
+    source.mkdir()
+    _publish(backend, repository, source, "one")
+    provider = RegistryIndexProvider(
+        HAIndexReplica(
+            IndexGenerationStore(backend),
+            repository,
+            tmp_path / "cache",
+            installer=Installer(),
+        ),
+        SimpleNamespace(
+            get_by_storage_id=lambda value: {
+                "tenant_id": "tenant",
+                "storage_id": value,
+            }
+        ),
+        worker_id="node-a",
+        reader_lease_seconds=30,
+    )
+
+    with provider.pin("kb"):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with pytest.raises(StaleIndexFence, match="lost"):
+                pool.submit(provider, "kb").result()
+    backend.close()
+
+
+def test_registry_provider_fails_closed_for_thread_hop_across_two_generations(
+    tmp_path,
+):
+    backend = SQLiteBackend(tmp_path / "authority.db")
+    repository = ObjectIndexRepository(LocalObjectStore(tmp_path / "objects"))
+    first_dir = tmp_path / "first"
+    first_dir.mkdir()
+    _publish(backend, repository, first_dir, "one")
+    provider = RegistryIndexProvider(
+        HAIndexReplica(
+            IndexGenerationStore(backend),
+            repository,
+            tmp_path / "cache",
+            installer=Installer(),
+        ),
+        SimpleNamespace(
+            get_by_storage_id=lambda value: {
+                "tenant_id": "tenant",
+                "storage_id": value,
+            }
+        ),
+        worker_id="node-a",
+        reader_lease_seconds=30,
+    )
+
+    with provider.pin("kb"):
+        second_dir = tmp_path / "second"
+        second_dir.mkdir()
+        _publish(backend, repository, second_dir, "two")
+        with provider.pin("kb"):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(provider, "kb")
+                with pytest.raises(StaleIndexFence, match="lost"):
+                    future.result()
+    backend.close()

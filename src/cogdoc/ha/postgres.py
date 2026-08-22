@@ -148,6 +148,48 @@ class PostgresBackend:
             raise
 
     @contextmanager
+    def exported_snapshot(
+        self, *, statement_timeout_seconds: float = 3600.0
+    ) -> Iterator[tuple[DatabaseConnection, str]]:
+        """Hold a repeatable-read snapshot open for pg_dump and inventory reads."""
+
+        if self._closed:
+            raise StorageError("database backend is closed")
+        if (
+            not isinstance(statement_timeout_seconds, (int, float))
+            or isinstance(statement_timeout_seconds, bool)
+            or not math.isfinite(float(statement_timeout_seconds))
+            or not 1 <= float(statement_timeout_seconds) <= 86_400
+        ):
+            raise ValueError("snapshot statement timeout is invalid")
+        timeout_ms = max(1, int(float(statement_timeout_seconds) * 1000))
+        try:
+            with self._pool.connection(timeout=self._pool_timeout) as connection:
+                with connection.transaction():
+                    connection.execute(
+                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                    )
+                    connection.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+                    connection.execute(
+                        f"SET LOCAL lock_timeout = {self._lock_timeout_ms}"
+                    )
+                    connection.execute(
+                        "SET LOCAL idle_in_transaction_session_timeout = 0"
+                    )
+                    connection.execute(f'SET LOCAL search_path TO "{self.schema}"')
+                    row = connection.execute("SELECT pg_export_snapshot()").fetchone()
+                    snapshot_id = str(_first(row) or "")
+                    if not snapshot_id or len(snapshot_id.encode()) > 255:
+                        raise StorageError("PostgreSQL exported snapshot is invalid")
+                    yield connection, snapshot_id
+        except BaseException as exc:
+            if _sqlstate(exc) in _RETRYABLE_SQLSTATES:
+                raise TransientStorageError(
+                    "PostgreSQL exported snapshot must be retried"
+                ) from exc
+            raise
+
+    @contextmanager
     def advisory_lock(
         self,
         name: str,

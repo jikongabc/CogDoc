@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,10 @@ import pytest
 import cogdoc.ha.index_mirror as mirror_module
 from cogdoc.config.settings import get_settings
 from cogdoc.ha.index_mirror import HAIndexMirror
+from cogdoc.ha.api_state import (
+    DistributedKnowledgeBaseRegistry,
+    DistributedMutationCoordinator,
+)
 from cogdoc.ha.portable_index import PORTABLE_INDEX_FILENAME, PortableIndexStore
 from cogdoc.ha.runtime import HAConfig, HARuntime
 from cogdoc.service.kb_state import KBState
@@ -106,6 +111,91 @@ def test_post_commit_mirror_publishes_prepared_portable_generation(
     current = runtime.index_generations.current("tenant", "kb")
     assert current is not None
     assert current["build_id"] == f"local:{local_generation}"
+    runtime.shutdown()
+
+
+def test_multiwriter_mirror_publishes_source_and_index_heads_atomically(
+    tmp_path, monkeypatch, isolated_settings
+):
+    monkeypatch.setattr(mirror_module, "export_retrieval_generation", _fake_export)
+    runtime = HARuntime(_config(tmp_path))
+    registry = DistributedKnowledgeBaseRegistry(
+        runtime.backend, tmp_path / "source-cache"
+    )
+    record = registry.create("docs", "tenant", "owner")
+    storage_id = str(record["storage_id"])
+    source = Path(registry.source_dir(storage_id))
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "document.md").write_text("shared source", encoding="utf-8")
+    coordinator = DistributedMutationCoordinator(
+        runtime.backend, registry, owner_id="api-a", lease_seconds=30
+    )
+    runtime.api_registry = registry
+    runtime.api_mutation_coordinator = coordinator
+    local_generation = _active_generation(storage_id)
+    mirror = HAIndexMirror(runtime, registry)
+
+    with coordinator.lease(storage_id):
+        published = mirror.mirror_result(
+            storage_id, SimpleNamespace(generation_id=local_generation)
+        )
+    assert published["status"] == "published"
+    assert runtime.index_generations.current("tenant", storage_id) is not None
+    source_head = runtime.source_generations.current(storage_id)
+    assert source_head is not None
+    replica = tmp_path / "source-replica"
+    runtime.source_generations.materialize_current(storage_id, replica)
+    assert (replica / "document.md").read_text(encoding="utf-8") == "shared source"
+    runtime.shutdown()
+
+
+def test_connector_mirror_advances_existing_source_head_with_index(
+    tmp_path, monkeypatch, isolated_settings
+):
+    monkeypatch.setattr(mirror_module, "export_retrieval_generation", _fake_export)
+    runtime = HARuntime(_config(tmp_path))
+    registry = DistributedKnowledgeBaseRegistry(
+        runtime.backend, tmp_path / "source-cache"
+    )
+    record = registry.create("docs", "tenant", "owner")
+    storage_id = str(record["storage_id"])
+    source = Path(registry.source_dir(storage_id))
+    source.mkdir(parents=True, exist_ok=True)
+    coordinator = DistributedMutationCoordinator(
+        runtime.backend, registry, owner_id="api-a", lease_seconds=30
+    )
+    runtime.api_registry = registry
+    runtime.api_mutation_coordinator = coordinator
+    mirror = HAIndexMirror(runtime, registry)
+
+    (source / "document.md").write_text("old source", encoding="utf-8")
+    with coordinator.lease(storage_id) as lease:
+        old = runtime.source_generations.stage_for_commit(
+            storage_id=storage_id,
+            source_dir=source,
+            lease=lease,
+            build_id="old-index",
+        )
+        runtime.source_generations.publish(old["generation_id"], lease)
+
+    (source / "document.md").write_text("connector source", encoding="utf-8")
+    local_generation = _active_generation(storage_id)
+    with coordinator.lease(storage_id) as lease:
+        runtime.source_generations.stage_for_commit(
+            storage_id=storage_id,
+            source_dir=source,
+            lease=lease,
+            build_id=local_generation,
+        )
+        published = mirror.mirror_result(
+            storage_id, SimpleNamespace(generation_id=local_generation)
+        )
+
+    assert published["status"] == "published"
+    replica = tmp_path / "connector-replica"
+    runtime.source_generations.materialize_current(storage_id, replica)
+    assert (replica / "document.md").read_text(encoding="utf-8") == "connector source"
+    assert runtime.index_generations.current("tenant", storage_id) is not None
     runtime.shutdown()
 
 

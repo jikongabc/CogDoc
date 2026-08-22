@@ -155,6 +155,14 @@ async def create_connection(kb_id: str, body: ConnectionCreate, request: Request
     if scope is None:
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
     kb_epoch = capture_kb_epoch(scope.storage_id)
+    if getattr(request.app.state, "ha_connector_multiwriter_mode", False) and (
+        body.connector_type in {"local-directory", "git"}
+    ):
+        return _error(
+            ErrorCode.BAD_REQUEST,
+            "HA 多写节点不接受依赖节点本地文件系统的连接器",
+            400,
+        )
     if body.secret_env and request.app.state.auth_enabled:
         return _error(
             ErrorCode.BAD_REQUEST,

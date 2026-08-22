@@ -11,6 +11,8 @@ from threading import RLock
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from cogdoc.api.tenancy import Permission, Principal, ROLE_PERMISSIONS, Role
+from cogdoc.ha.dbapi_compat import BackendDBAPIConnection
+from cogdoc.ha.storage import DatabaseBackend
 
 
 class ResourceAccessError(RuntimeError):
@@ -171,17 +173,22 @@ class ResourceAccessStore:
 
     def __init__(
         self,
-        db_path: str | os.PathLike[str],
+        db_path: str | os.PathLike[str] | None,
         *,
         legacy_workspace_default: bool = False,
         busy_timeout_ms: int = 5000,
+        backend: DatabaseBackend | None = None,
     ) -> None:
-        try:
-            normalized_path = os.fspath(db_path)
-        except TypeError as exc:
-            raise TypeError("db_path must be path-like") from exc
-        if not isinstance(normalized_path, str) or not normalized_path:
-            raise ValueError("db_path must not be empty")
+        if (db_path is None) == (backend is None):
+            raise ValueError("configure exactly one resource access backend")
+        normalized_path = ""
+        if db_path is not None:
+            try:
+                normalized_path = os.fspath(db_path)
+            except TypeError as exc:
+                raise TypeError("db_path must be path-like") from exc
+            if not isinstance(normalized_path, str) or not normalized_path:
+                raise ValueError("db_path must not be empty")
         if type(legacy_workspace_default) is not bool:
             raise TypeError("legacy_workspace_default must be a boolean")
         if type(busy_timeout_ms) is not int or busy_timeout_ms < 0:
@@ -191,24 +198,33 @@ class ResourceAccessStore:
         if directory:
             os.makedirs(directory, exist_ok=True)
         self._db_path = normalized_path
+        self._backend = backend
         self._legacy_workspace_default = legacy_workspace_default
         self._lock = RLock()
-        self._conn = sqlite3.connect(
-            normalized_path,
-            check_same_thread=False,
-            isolation_level=None,
-            timeout=busy_timeout_ms / 1000.0,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn: Any
+        if backend is not None:
+            self._conn = BackendDBAPIConnection(backend)
+        else:
+            self._conn = sqlite3.connect(
+                normalized_path,
+                check_same_thread=False,
+                isolation_level=None,
+                timeout=busy_timeout_ms / 1000.0,
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
         self._initialize_schema()
 
     @property
     def legacy_workspace_default(self) -> bool:
         return self._legacy_workspace_default
+
+    @property
+    def backend(self) -> DatabaseBackend | None:
+        return self._backend
 
     def _initialize_schema(self) -> None:
         statements = (
@@ -273,6 +289,14 @@ class ResourceAccessStore:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS resource_access_subject_locks (
+                tenant_id TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, subject_id)
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS resource_access_retiring_documents (
                 tenant_id TEXT NOT NULL,
                 kb_id TEXT NOT NULL,
@@ -302,10 +326,10 @@ class ResourceAccessStore:
             # v1 databases predate membership-incarnation-bound creator access.
             # NULL is intentionally fail-closed for human sessions while keeping
             # local/static-key deployments source compatible.
-            for table in (
+            for table in (() if self._backend is not None else (
                 "resource_access_kb_policies",
                 "resource_access_document_policies",
-            ):
+            )):
                 columns = {
                     str(row[1])
                     for row in self._conn.execute(f"PRAGMA table_info({table})")
@@ -325,12 +349,16 @@ class ResourceAccessStore:
                         }
                         if "owner_membership_id" not in refreshed:
                             raise
-            grant_columns = {
-                str(row[1])
-                for row in self._conn.execute(
-                    "PRAGMA table_info(resource_access_subject_grants)"
-                )
-            }
+            grant_columns = (
+                {"managed_by"}
+                if self._backend is not None
+                else {
+                    str(row[1])
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(resource_access_subject_grants)"
+                    )
+                }
+            )
             if "managed_by" not in grant_columns:
                 self._conn.execute(
                     "ALTER TABLE resource_access_subject_grants "
@@ -375,6 +403,30 @@ class ResourceAccessStore:
     ) -> None:
         if self._membership_revoked_locked(tenant_id, subject_id, membership_id):
             raise ResourceAccessConflictError("membership incarnation was revoked")
+
+    def _lock_subjects_locked(
+        self, tenant_id: str, subject_ids: Iterable[str]
+    ) -> None:
+        """Serialize membership tombstones with every grant publication."""
+
+        for subject_id in sorted(set(subject_ids)):
+            self._conn.execute(
+                "INSERT INTO resource_access_subject_locks "
+                "(tenant_id,subject_id,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(tenant_id,subject_id) DO NOTHING",
+                (tenant_id, subject_id, _now_iso()),
+            )
+            self._conn.execute(
+                "SELECT 1 FROM resource_access_subject_locks "
+                "WHERE tenant_id=? AND subject_id=?"
+                + (
+                    " FOR UPDATE"
+                    if self._backend is not None
+                    and self._backend.kind == "postgres"
+                    else ""
+                ),
+                (tenant_id, subject_id),
+            ).fetchone()
 
     def _membership_revoked_locked(
         self,
@@ -457,6 +509,7 @@ class ResourceAccessStore:
                 if owner_membership_id is _UNSET
                 else owner_membership_id
             )
+            self._lock_subjects_locked(tenant_id, (owner_id,))
             self._reject_revoked_membership_locked(
                 tenant_id, owner_id, effective_owner_membership_id
             )
@@ -599,6 +652,7 @@ class ResourceAccessStore:
                     if owner_membership_id is _UNSET
                     else owner_membership_id
                 )
+                self._lock_subjects_locked(tenant_id, (effective_owner,))
                 self._reject_revoked_membership_locked(
                     tenant_id, effective_owner, effective_owner_membership_id
                 )
@@ -712,6 +766,9 @@ class ResourceAccessStore:
         changed = False
         try:
             with self._write_transaction():
+                self._lock_subjects_locked(
+                    tenant_id, (*desired.keys(), owner_id)
+                )
                 self._reject_retiring_document_locked(tenant_id, kb_id, document_id)
                 kb_row = self._conn.execute(
                     "SELECT 1 FROM resource_access_kb_policies "
@@ -1190,6 +1247,7 @@ class ResourceAccessStore:
         )
         now = _now_iso()
         with self._write_transaction():
+            self._lock_subjects_locked(tenant_id, (subject_id,))
             if membership_id is None:
                 revoked = self._conn.execute(
                     "SELECT 1 FROM resource_access_membership_tombstones "
@@ -1317,6 +1375,7 @@ class ResourceAccessStore:
         manual_preserved = 0
         changed = False
         with self._write_transaction():
+            self._lock_subjects_locked(tenant_id, desired.keys())
             self._reject_retiring_document_locked(tenant_id, kb_id, document_id)
             document = self._conn.execute(
                 "SELECT 1 FROM resource_access_document_policies "
@@ -1454,6 +1513,7 @@ class ResourceAccessStore:
         if membership_id is not None:
             membership_id = _identity(membership_id, field="membership_id")
         with self._write_transaction():
+            self._lock_subjects_locked(tenant_id, (subject_id,))
             tombstone_created = False
             if membership_id is not None:
                 tombstone_created = bool(
@@ -1819,6 +1879,10 @@ class ResourceAccessStore:
                 "DELETE FROM resource_access_membership_tombstones WHERE tenant_id=?",
                 (tenant_id,),
             )
+            self._conn.execute(
+                "DELETE FROM resource_access_subject_locks WHERE tenant_id=?",
+                (tenant_id,),
+            )
             if not kb_ids:
                 return 0
             for table in (
@@ -1837,7 +1901,7 @@ class ResourceAccessStore:
     cleanup_tenant = clear_tenant
 
     def check(self) -> bool:
-        """Run a cheap, fail-closed SQLite readiness probe.
+        """Run a cheap, fail-closed ACL-store readiness probe.
 
         Each security-critical table is referenced so a missing or unreadable
         ACL schema cannot be mistaken for an empty, permissive store.
@@ -1851,6 +1915,7 @@ class ResourceAccessStore:
                     "resource_access_subject_grants",
                     "resource_access_acl_epochs",
                     "resource_access_membership_tombstones",
+                    "resource_access_subject_locks",
                     "resource_access_retiring_documents",
                 ):
                     self._conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()

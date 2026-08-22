@@ -274,6 +274,55 @@ class Settings(BaseSettings):
         le=3600.0,
         validation_alias="COGDOC_HA_INDEX_WORKER_LEASE_SECONDS",
     )
+    cogdoc_ha_research_worker_poll_seconds: float = Field(
+        default=0.5,
+        ge=0.05,
+        le=60.0,
+        validation_alias="COGDOC_HA_RESEARCH_WORKER_POLL_SECONDS",
+    )
+    cogdoc_ha_research_worker_lease_seconds: float = Field(
+        default=120.0,
+        ge=5.0,
+        le=3600.0,
+        validation_alias="COGDOC_HA_RESEARCH_WORKER_LEASE_SECONDS",
+    )
+    cogdoc_ha_chat_session_lease_seconds: float = Field(
+        default=300.0,
+        ge=5.0,
+        le=3600.0,
+        validation_alias="COGDOC_HA_CHAT_SESSION_LEASE_SECONDS",
+    )
+    cogdoc_ha_chat_index_reader_lease_seconds: float = Field(
+        default=600.0,
+        ge=15.0,
+        le=3600.0,
+        validation_alias="COGDOC_HA_CHAT_INDEX_READER_LEASE_SECONDS",
+    )
+    cogdoc_ha_chat_max_sessions_per_scope: int = Field(
+        default=1024,
+        ge=1,
+        le=100000,
+        validation_alias="COGDOC_HA_CHAT_MAX_SESSIONS_PER_SCOPE",
+    )
+    cogdoc_ha_chat_session_ttl_seconds: int = Field(
+        default=604800,
+        ge=0,
+        le=315360000,
+        validation_alias="COGDOC_HA_CHAT_SESSION_TTL_SECONDS",
+    )
+    cogdoc_ha_chat_max_display_messages: int = Field(
+        default=2000,
+        ge=2,
+        le=100000,
+        multiple_of=2,
+        validation_alias="COGDOC_HA_CHAT_MAX_DISPLAY_MESSAGES",
+    )
+    cogdoc_ha_chat_max_session_bytes: int = Field(
+        default=4194304,
+        ge=4096,
+        le=134217728,
+        validation_alias="COGDOC_HA_CHAT_MAX_SESSION_BYTES",
+    )
     cogdoc_ha_release_id: str = Field(
         default="", validation_alias="COGDOC_HA_RELEASE_ID"
     )
@@ -286,6 +335,12 @@ class Settings(BaseSettings):
         default=1,
         ge=1,
         validation_alias="COGDOC_HA_MAXIMUM_SCHEMA_VERSION",
+    )
+    cogdoc_ha_identity_config_version: int = Field(
+        default=1,
+        ge=1,
+        le=1_000_000,
+        validation_alias="COGDOC_HA_IDENTITY_CONFIG_VERSION",
     )
     cogdoc_ha_version_heartbeat_interval_seconds: float = Field(
         default=30.0,
@@ -305,9 +360,43 @@ class Settings(BaseSettings):
     cogdoc_ha_index_replica_cache_root: str = Field(
         default="", validation_alias="COGDOC_HA_INDEX_REPLICA_CACHE_ROOT"
     )
+    cogdoc_ha_api_multi_writer_enabled: bool = Field(
+        default=False, validation_alias="COGDOC_HA_API_MULTI_WRITER_ENABLED"
+    )
+    cogdoc_ha_mutation_lease_seconds: float = Field(
+        default=300.0,
+        ge=5.0,
+        le=3600.0,
+        validation_alias="COGDOC_HA_MUTATION_LEASE_SECONDS",
+    )
+    cogdoc_ha_source_cache_root: str = Field(
+        default="", validation_alias="COGDOC_HA_SOURCE_CACHE_ROOT"
+    )
+    cogdoc_ha_source_max_files: int = Field(
+        default=100_000,
+        ge=1,
+        le=1_000_000,
+        validation_alias="COGDOC_HA_SOURCE_MAX_FILES",
+    )
+    cogdoc_ha_source_max_total_bytes: int = Field(
+        default=10 * 1024 * 1024 * 1024,
+        ge=1,
+        validation_alias="COGDOC_HA_SOURCE_MAX_TOTAL_BYTES",
+    )
+    cogdoc_ha_source_artifact_max_total_bytes: int = Field(
+        default=10 * 1024 * 1024 * 1024,
+        ge=1,
+        validation_alias="COGDOC_HA_SOURCE_ARTIFACT_MAX_TOTAL_BYTES",
+    )
     cogdoc_derived_knowledge_index_auto_refresh: bool = Field(
         default=False,
         validation_alias="COGDOC_DERIVED_KNOWLEDGE_INDEX_AUTO_REFRESH",
+    )
+    cogdoc_derived_knowledge_index_workers: int = Field(
+        default=2,
+        ge=1,
+        le=16,
+        validation_alias="COGDOC_DERIVED_KNOWLEDGE_INDEX_WORKERS",
     )
     cogdoc_trace_enabled: bool = Field(
         default=True, validation_alias="COGDOC_TRACE_ENABLED"
@@ -464,6 +553,15 @@ class Settings(BaseSettings):
     )
     cogdoc_offload_workers: int = Field(
         default=2, validation_alias="COGDOC_OFFLOAD_WORKERS"
+    )
+    # Streaming generators may block inside a model/provider call.  Keep them
+    # off the shared control-plane pool so live authorization checks and other
+    # tenants cannot be starved by long-lived SSE responses.
+    cogdoc_chat_stream_workers: int = Field(
+        default=8,
+        ge=1,
+        le=256,
+        validation_alias="COGDOC_CHAT_STREAM_WORKERS",
     )
     # SSE worker events cross a thread/event-loop boundary.  Bound the time
     # without any event so a wedged provider cannot leave an HTTP request open

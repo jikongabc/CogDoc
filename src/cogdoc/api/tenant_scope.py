@@ -39,6 +39,17 @@ def is_user_session_principal(principal: Principal) -> bool:
     return principal.key_fingerprint.startswith("session:")
 
 
+def _uses_private_session_namespace(request: Request, principal: Principal) -> bool:
+    explicit: set[str] | frozenset[str] = getattr(
+        request.app.state, "explicit_principal_fingerprints", frozenset()
+    )
+    return (
+        is_user_session_principal(principal)
+        or principal.key_fingerprint.startswith("service-token:")
+        or principal.key_fingerprint in explicit
+    )
+
+
 def _user_namespace(principal: Principal) -> str:
     return hashlib.sha256(
         b"cogdoc-user-resource-v1\0"
@@ -52,7 +63,7 @@ def session_store_doc_id(request: Request, storage_id: str) -> str:
     """Namespace chat memory per real user while preserving legacy API-key data."""
 
     principal = request_principal(request)
-    if not is_user_session_principal(principal):
+    if not _uses_private_session_namespace(request, principal):
         return storage_id
     return f"{storage_id}~u-{_user_namespace(principal)}"
 
@@ -63,14 +74,14 @@ def internal_session_id(request: Request, session_id: str | None) -> str | None:
     if not session_id:
         return session_id
     principal = request_principal(request)
-    if not is_user_session_principal(principal):
+    if not _uses_private_session_namespace(request, principal):
         return session_id
     return f"u-{_user_namespace(principal)}:{session_id}"
 
 
 def external_session_id(request: Request, session_id: str) -> str | None:
     principal = request_principal(request)
-    if not is_user_session_principal(principal):
+    if not _uses_private_session_namespace(request, principal):
         return session_id
     prefix = f"u-{_user_namespace(principal)}:"
     return session_id[len(prefix) :] if session_id.startswith(prefix) else None
@@ -78,7 +89,7 @@ def external_session_id(request: Request, session_id: str) -> str | None:
 
 def session_id_is_authorized(request: Request, session_id: str | None) -> bool:
     principal = request_principal(request)
-    if not is_user_session_principal(principal):
+    if not _uses_private_session_namespace(request, principal):
         return True
     if not session_id:
         return False

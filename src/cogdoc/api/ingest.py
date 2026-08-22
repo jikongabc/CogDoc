@@ -6,10 +6,11 @@ import os
 import shutil
 import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Lock, RLock
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 from cogdoc.api.persistence import InMemoryJobStore
 from cogdoc.config.settings import get_settings
@@ -17,7 +18,16 @@ from cogdoc.observability.logger import log_event
 from cogdoc.service.ingest_service import KBCleanupError, build_kb_index_transactional
 from cogdoc.service.kb_epoch import shared_epoch_store
 from cogdoc.service.kb_lifecycle import LIFECYCLE_ACTIVE, shared_lifecycle_store
-from cogdoc.service.mutation_journal import shared_mutation_journal
+from cogdoc.service.mutation_journal import MutationJournal, shared_mutation_journal
+
+
+class _DelegatedMutationCall:
+    def __init__(self, function: Callable, mutation_lease: object) -> None:
+        self.function = function
+        self.mutation_lease = mutation_lease
+
+    def __call__(self, *args):
+        return self.function(*args)
 
 
 # 返回当前 UTC 时间字符串。
@@ -286,10 +296,11 @@ class KnowledgeBaseRegistry:
         tenant_id: str = "default",
         owner_id: str = "default",
     ) -> dict:
-        kb_id, tenant_id, owner_id = self._validated_identity(
+        kb_id, tenant_id, validated_owner_id = self._validated_identity(
             kb_id, tenant_id, owner_id
         )
-        assert owner_id is not None
+        assert validated_owner_id is not None
+        owner_id = validated_owner_id
         storage_id = self._make_storage_id(kb_id, tenant_id)
         with self._lock:
             if self._get_unlocked(kb_id, tenant_id) is not None:
@@ -412,17 +423,25 @@ class IndexJobManager:
     # 每个 kb_id 独享一个单线程 executor：不同 KB 并发构建，同 KB 内 mutation + 构建全部串行。
     def __init__(
         self,
-        ingest_fn: Callable[[str, str], object] = build_kb_index_transactional,
+        ingest_fn: Callable[..., Any] = build_kb_index_transactional,
         source_dir_for: Callable[[str], str] | None = None,
-        job_store: object | None = None,
+        job_store: Any | None = None,
         kb_exists: "Callable[[str], bool] | None" = None,
-        journal: object | None = None,
+        journal: MutationJournal | None = None,
         knowledge_store: object | None = None,
         after_index_commit: Callable[[str, object], None] | None = None,
+        epoch_reader: Callable[[str], int] | None = None,
+        lifecycle_reader: Callable[[str], str] | None = None,
+        mutation_coordinator: object | None = None,
+        source_generation_store: object | None = None,
     ):
         self._ingest_fn = ingest_fn
         self._knowledge_store = knowledge_store
         self._after_index_commit = after_index_commit
+        self._epoch_reader = epoch_reader or shared_epoch_store().current
+        self._lifecycle_reader = lifecycle_reader or shared_lifecycle_store().status
+        self._mutation_coordinator = mutation_coordinator
+        self._source_generation_store = source_generation_store
         self._source_dir_for = source_dir_for or get_settings().kb_source_dir
         self._store = job_store or InMemoryJobStore()
         self._kb_exists = kb_exists  # 防复活：KB 已删未重建时拒绝陈旧 mutation
@@ -449,6 +468,10 @@ class IndexJobManager:
         except (TypeError, ValueError):
             self._ingest_takes_on_commit = False
             self._ingest_takes_knowledge_store = False
+        if self._mutation_coordinator is not None and not self._ingest_takes_on_commit:
+            raise ValueError(
+                "distributed KB mutations require an ingest commit-fence callback"
+            )
         self._executors: dict[str, ThreadPoolExecutor] = {}
         self._retired_executors: set[ThreadPoolExecutor] = set()
         self._retire_when_idle: set[str] = set()
@@ -544,9 +567,9 @@ class IndexJobManager:
             return self._get_executor_locked(kb_id)
 
     # 新建记录。
-    def _new_record(self, kb_id: str) -> dict:
+    def _new_record(self, kb_id: str, *, job_id: str | None = None) -> dict:
         return {
-            "job_id": uuid4().hex,
+            "job_id": job_id or uuid4().hex,
             "kb_id": kb_id,
             "status": "pending",
             "created_at": _now_iso(),
@@ -630,12 +653,70 @@ class IndexJobManager:
         job_id: str,
         gen_id: str,
         authorization_guard: Callable[[], None] | None,
+        kb_id: str,
+        source_dir: str,
     ) -> None:
         # Persist crash-recovery evidence first, then make the live authorization
         # check the final fallible operation immediately before switch_active.
         self._prepare_commit(job_id, gen_id)
         if authorization_guard is not None:
             authorization_guard()
+        if self._mutation_coordinator is not None:
+            assert_live = getattr(self._mutation_coordinator, "assert_live", None)
+            if not callable(assert_live):
+                raise RuntimeError("mutation coordinator does not support fencing")
+            # This is the last fallible authority check before switch_active.
+            # A worker whose lease expired can finish expensive construction,
+            # but can never publish over the new lease owner's generation.
+            assert_live()
+            if self._source_generation_store is not None:
+                current_lease = getattr(
+                    self._mutation_coordinator, "current_lease", None
+                )
+                stage = getattr(self._source_generation_store, "stage_for_commit", None)
+                lease = current_lease() if callable(current_lease) else None
+                if lease is None or not callable(stage):
+                    raise RuntimeError(
+                        "distributed source generation staging is unavailable"
+                    )
+                stage(
+                    storage_id=kb_id,
+                    source_dir=source_dir,
+                    lease=lease,
+                    build_id=gen_id,
+                )
+                # Object upload may outlive the lease. Recheck immediately
+                # before returning to the local switch_active call.
+                assert_live()
+
+    def _assert_distributed_commit(self) -> None:
+        if self._mutation_coordinator is None:
+            return
+        assert_live = getattr(self._mutation_coordinator, "assert_live", None)
+        if not callable(assert_live):
+            raise RuntimeError("mutation coordinator does not support fencing")
+        assert_live()
+
+    def _prepare_delegated_commit(
+        self, generation_id: str, kb_id: str, source_dir: str
+    ) -> None:
+        """Stage the caller-mutated source tree for the same index generation."""
+
+        self._assert_distributed_commit()
+        if self._source_generation_store is None or self._mutation_coordinator is None:
+            raise RuntimeError("delegated source generation staging is unavailable")
+        current_lease = getattr(self._mutation_coordinator, "current_lease", None)
+        stage = getattr(self._source_generation_store, "stage_for_commit", None)
+        lease = current_lease() if callable(current_lease) else None
+        if lease is None or not callable(stage):
+            raise RuntimeError("delegated source generation staging is unavailable")
+        stage(
+            storage_id=kb_id,
+            source_dir=source_dir,
+            lease=lease,
+            build_id=generation_id,
+        )
+        self._assert_distributed_commit()
 
     # 拒绝ifunresolved。
     def _reject_if_unresolved(self, job_id: str, kb_id: str) -> bool:
@@ -647,6 +728,16 @@ class IndexJobManager:
             RuntimeError(f"KB {kb_id} 存在未恢复 mutation journal，拒绝继续写入"),
         )
         return True
+
+    def _prepare_source_cache(self, kb_id: str, source_dir: str) -> None:
+        if self._source_generation_store is None:
+            return
+        materialize = getattr(
+            self._source_generation_store, "materialize_current", None
+        )
+        if not callable(materialize):
+            raise RuntimeError("source generation store cannot materialize snapshots")
+        materialize(kb_id, source_dir)
 
     # 提交tracked。
     def _submit_tracked(self, ex, kb_id: str, fn: Callable, *args):
@@ -679,22 +770,168 @@ class IndexJobManager:
 
         return ex.submit(runner)
 
+    def _run_distributed_claimed(
+        self,
+        fn: Callable,
+        job_id: str,
+        kb_id: str,
+        base_epoch: int,
+        *args,
+    ) -> object:
+        distributed = getattr(self._store, "distributed", False) is True
+        claim = getattr(self._store, "claim", None) if distributed else None
+        bind_claim = getattr(self._store, "bind_claim", None) if distributed else None
+        heartbeat = getattr(self._store, "heartbeat", None) if distributed else None
+        token = claim(job_id) if callable(claim) else None
+        if callable(claim) and not isinstance(token, str):
+            return None
+
+        stopped = threading.Event()
+        lost: list[Exception] = []
+
+        def keep_job_alive() -> None:
+            if not callable(heartbeat) or not isinstance(token, str):
+                return
+            interval = max(1.0, float(getattr(self._store, "lease_seconds", 300)) / 3)
+            while not stopped.wait(interval):
+                try:
+                    heartbeat(job_id, token)
+                except Exception as exc:
+                    lost.append(exc)
+                    return
+
+        claim_context = (
+            bind_claim(job_id, token)
+            if isinstance(token, str) and callable(bind_claim)
+            else nullcontext()
+        )
+        lease_factory = (
+            getattr(self._mutation_coordinator, "lease", None)
+            if self._mutation_coordinator is not None
+            else None
+        )
+        delegated_lease = getattr(fn, "mutation_lease", None)
+        bind_lease = (
+            getattr(self._mutation_coordinator, "bind_lease", None)
+            if self._mutation_coordinator is not None
+            else None
+        )
+        if delegated_lease is not None:
+            if not callable(bind_lease):
+                raise RuntimeError("mutation coordinator cannot bind delegated leases")
+            mutation_context = bind_lease(delegated_lease)
+        else:
+            mutation_context = (
+                lease_factory(kb_id) if callable(lease_factory) else nullcontext()
+            )
+        keeper = None
+        if isinstance(token, str) and callable(heartbeat):
+            keeper = threading.Thread(
+                target=keep_job_alive,
+                name=f"cogdoc-index-job-lease-{job_id[:12]}",
+                daemon=True,
+            )
+            keeper.start()
+        try:
+            with claim_context:
+                try:
+                    with mutation_context:
+                        result = fn(job_id, kb_id, base_epoch, *args)
+                    stopped.set()
+                    if keeper is not None:
+                        keeper.join(
+                            min(
+                                10.0,
+                                float(getattr(self._store, "lease_seconds", 300)),
+                            )
+                        )
+                    if lost:
+                        raise RuntimeError(
+                            "index job lease heartbeat was lost"
+                        ) from lost[0]
+                    return result
+                except Exception as exc:
+                    # Distributed stores require the claim token for every
+                    # transition. Keep the binding alive while recording a
+                    # mutation-lease conflict or worker failure, otherwise the
+                    # row remains spuriously running until lease reconciliation.
+                    try:
+                        self._fail_job(job_id, kb_id, exc)
+                    except Exception:
+                        pass
+                    return None
+        finally:
+            stopped.set()
+            if keeper is not None:
+                keeper.join(
+                    min(10.0, float(getattr(self._store, "lease_seconds", 300)))
+                )
+
     # 入队。
-    def _enqueue(self, kb_id: str, fn: Callable, *args) -> dict:
+    def _enqueue(
+        self,
+        kb_id: str,
+        fn: Callable,
+        *args,
+        idempotency_key: str | None = None,
+    ) -> dict:
         # get-create-submit 全程持锁与 release_executor 互斥：失败不留 pending，入队成功则 ex 必存活。
         with self._ex_lock:
             ex = self._get_executor_locked(kb_id)
-            record = self._new_record(kb_id)
-            base_epoch = shared_epoch_store().current(kb_id)  # 执行期错配守卫基线
-            self._store.create(record)
+            deterministic_job_id = None
+            if idempotency_key is not None:
+                if (
+                    not isinstance(idempotency_key, str)
+                    or not idempotency_key
+                    or len(idempotency_key.encode()) > 1024
+                ):
+                    raise ValueError("index idempotency key is invalid")
+                deterministic_job_id = hashlib.sha256(
+                    f"{kb_id}\x00{idempotency_key}".encode()
+                ).hexdigest()
+                existing = self._store.get(deterministic_job_id)
+                if existing is not None:
+                    return dict(existing)
+            record = self._new_record(kb_id, job_id=deterministic_job_id)
+            base_epoch = self._epoch_reader(kb_id)  # 执行期错配守卫基线
+            try:
+                self._store.create(record)
+            except Exception:
+                existing = (
+                    self._store.get(deterministic_job_id)
+                    if deterministic_job_id is not None
+                    else None
+                )
+                if existing is not None:
+                    return dict(existing)
+                raise
             try:
                 self._submit_tracked(
-                    ex, kb_id, fn, record["job_id"], kb_id, base_epoch, *args
+                    ex,
+                    kb_id,
+                    self._run_distributed_claimed,
+                    fn,
+                    record["job_id"],
+                    kb_id,
+                    base_epoch,
+                    *args,
                 )
             except Exception as exc:
                 # 线程创建失败/资源耗尽：record 已建，标记失败而非遗留 pending。
                 self._inflight[kb_id] = max(0, self._inflight.get(kb_id, 1) - 1)
-                self._fail_job(record["job_id"], kb_id, exc)
+                claim = getattr(self._store, "claim", None)
+                bind_claim = getattr(self._store, "bind_claim", None)
+                if (
+                    getattr(self._store, "distributed", False) is True
+                    and callable(claim)
+                    and callable(bind_claim)
+                ):
+                    token = claim(record["job_id"])
+                    if isinstance(token, str):
+                        with bind_claim(record["job_id"], token):
+                            self._fail_job(record["job_id"], kb_id, exc)
+                else:
+                    self._fail_job(record["job_id"], kb_id, exc)
                 raise
         return dict(record)
 
@@ -702,6 +939,27 @@ class IndexJobManager:
     def submit(self, kb_id: str) -> dict:
         # 向后兼容：仅触发索引，不含文件 mutation（文件变更已在调用方完成）。
         return self._enqueue(kb_id, self._run)
+
+    def submit_with_mutation_lease(
+        self,
+        kb_id: str,
+        mutation_lease: object,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """Index an already-materialized source snapshot under its live lease."""
+
+        if self._mutation_coordinator is None:
+            raise RuntimeError("delegated mutation requires a distributed coordinator")
+        assert_live = getattr(self._mutation_coordinator, "assert_live", None)
+        if not callable(assert_live):
+            raise RuntimeError("mutation coordinator does not support fencing")
+        assert_live(mutation_lease)
+        return self._enqueue(
+            kb_id,
+            _DelegatedMutationCall(self._run_delegated, mutation_lease),
+            idempotency_key=idempotency_key,
+        )
 
     # 提交上传。
     def submit_upload(
@@ -800,14 +1058,14 @@ class IndexJobManager:
     def _stale(self, kb_id: str, base_epoch: int) -> bool:
         # epoch 变更 = KB 已删（可能已重建）；exists=False = 已删未重建；非 active = 删库进行中，禁新 mutation。 epoch/lifecycle 读损坏抛错时 fail-closed 视为 stale：拦掉 mutation 而非把损坏当 epoch 0。
         try:
-            if shared_epoch_store().current(kb_id) != base_epoch:
+            if self._epoch_reader(kb_id) != base_epoch:
                 return True
         except Exception:
             return True
         if self._kb_exists is not None and not self._kb_exists(kb_id):
             return True
         try:
-            if shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE:
+            if self._lifecycle_reader(kb_id) != LIFECYCLE_ACTIVE:
                 return True
         except Exception:
             return True
@@ -824,7 +1082,45 @@ class IndexJobManager:
             return
         if self._reject_if_unresolved(job_id, kb_id):
             return
-        self._run_ingest(job_id, kb_id, self._source_dir_for(kb_id))
+        source_dir = self._source_dir_for(kb_id)
+        try:
+            self._prepare_source_cache(kb_id, source_dir)
+        except Exception as exc:
+            self._fail_job(job_id, kb_id, exc)
+            return
+        self._run_ingest(
+            job_id,
+            kb_id,
+            source_dir,
+            on_commit=(
+                (lambda _generation_id: self._assert_distributed_commit())
+                if self._mutation_coordinator is not None
+                else None
+            ),
+        )
+
+    def _run_delegated(self, job_id: str, kb_id: str, base_epoch: int) -> None:
+        """Build the caller's source snapshot without restoring an older head."""
+
+        if self._store.get(job_id) is None:
+            return
+        if self._stale(kb_id, base_epoch):
+            self._fail_job(
+                job_id, kb_id, RuntimeError(f"KB {kb_id} 已被删除或重建，构建取消")
+            )
+            return
+        if self._reject_if_unresolved(job_id, kb_id):
+            return
+        self._assert_distributed_commit()
+        source_dir = self._source_dir_for(kb_id)
+        self._run_ingest(
+            job_id,
+            kb_id,
+            source_dir,
+            on_commit=lambda generation_id: self._prepare_delegated_commit(
+                generation_id, kb_id, source_dir
+            ),
+        )
 
     # 运行with写入。
     def _run_with_write(
@@ -871,6 +1167,11 @@ class IndexJobManager:
             return
         if self._reject_if_unresolved(job_id, kb_id):
             return
+        try:
+            self._prepare_source_cache(kb_id, source_dir)
+        except Exception as exc:
+            self._fail_job(job_id, kb_id, exc)
+            return
         if authorization_guard is not None and not self._ingest_takes_on_commit:
             self._fail_job(
                 job_id,
@@ -901,7 +1202,7 @@ class IndexJobManager:
             kb_id,
             source_dir,
             on_commit=lambda gid: self._prepare_authorized_commit(
-                job_id, gid, authorization_guard
+                job_id, gid, authorization_guard, kb_id, source_dir
             ),
         )
         if ok:
@@ -941,6 +1242,11 @@ class IndexJobManager:
             )
             return
         if self._reject_if_unresolved(job_id, kb_id):
+            return
+        try:
+            self._prepare_source_cache(kb_id, os.path.dirname(path))
+        except Exception as exc:
+            self._fail_job(job_id, kb_id, exc)
             return
         if authorization_guard is not None and not self._ingest_takes_on_commit:
             self._fail_job(
@@ -985,7 +1291,7 @@ class IndexJobManager:
             kb_id,
             os.path.dirname(path),
             on_commit=lambda gid: self._prepare_authorized_commit(
-                job_id, gid, authorization_guard
+                job_id, gid, authorization_guard, kb_id, os.path.dirname(path)
             ),
             on_succeeded=on_succeeded,
         )

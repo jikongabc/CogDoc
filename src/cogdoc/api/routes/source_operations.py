@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
 from concurrent.futures import Executor
-from typing import BinaryIO
+from typing import Any, BinaryIO
 from urllib.parse import quote
 
 from fastapi import APIRouter, Query, Request
@@ -35,6 +35,7 @@ from cogdoc.api.tenant_scope import (
     resolve_kb_scope,
 )
 from cogdoc.api.tenancy import Permission
+from cogdoc.ha.api_state import MutationBusy, StaleMutationFence
 from cogdoc.service.source_artifact_store import (
     ArtifactConflictError,
     ArtifactIntegrityError,
@@ -87,7 +88,9 @@ def _public_source(request: Request, scope, row: Mapping) -> SourceCatalogEntry:
         document_id = build_document_id(source_name)
         values["document_id"] = document_id
         access_store = getattr(request.app.state, "resource_access_store", None)
-        if access_store is not None:
+        if access_store is not None and not getattr(
+            request.app.state, "ha_document_multiwriter_mode", False
+        ):
             policy = access_store.get_document_policy(
                 scope.tenant_id, scope.storage_id, document_id
             )
@@ -107,6 +110,46 @@ async def _catalog_source(request: Request, scope, source_id: str):
         source_id,
         include_deleted=True,
     )
+
+
+def _guarded_source_mutation(
+    request: Request,
+    scope: Any,
+    expected_epoch: int,
+    operation: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Serialize shared source mutations with the HA KB fencing lease."""
+
+    coordinator = getattr(
+        getattr(request.app.state, "ha_runtime", None),
+        "api_mutation_coordinator",
+        None,
+    )
+    try:
+        if coordinator is not None:
+            with coordinator.lease(scope.storage_id):
+                return guarded_kb_mutation(
+                    request.app.state.kb_registry,
+                    scope.tenant_id,
+                    scope.storage_id,
+                    expected_epoch,
+                    operation,
+                    *args,
+                    **kwargs,
+                )
+        return guarded_kb_mutation(
+            request.app.state.kb_registry,
+            scope.tenant_id,
+            scope.storage_id,
+            expected_epoch,
+            operation,
+            *args,
+            **kwargs,
+        )
+    except (MutationBusy, StaleMutationFence) as exc:
+        raise KBIncarnationChanged("knowledge base mutation authority changed") from exc
 
 
 def _assert_catalog_artifact_match(
@@ -389,6 +432,10 @@ async def delete_source_artifact(
     try:
         result = await run_sync(
             request.app.state.source_artifact_executor,
+            _guarded_source_mutation,
+            request,
+            scope,
+            kb_epoch,
             delete_historical_version,
         )
     except KBIncarnationChanged:
@@ -419,10 +466,9 @@ async def restore_source_artifact(kb_id: str, recovery_token: str, request: Requ
     try:
         row = await run_sync(
             request.app.state.source_artifact_executor,
-            guarded_kb_mutation,
-            request.app.state.kb_registry,
-            scope.tenant_id,
-            scope.storage_id,
+            _guarded_source_mutation,
+            request,
+            scope,
             kb_epoch,
             request.app.state.source_artifact_store.restore,
             scope.tenant_id,
@@ -470,10 +516,9 @@ async def purge_source_artifact_trash(
     try:
         purged = await run_sync(
             request.app.state.source_artifact_executor,
-            guarded_kb_mutation,
-            request.app.state.kb_registry,
-            scope.tenant_id,
-            scope.storage_id,
+            _guarded_source_mutation,
+            request,
+            scope,
             kb_epoch,
             request.app.state.source_artifact_store.purge_trash,
             scope.tenant_id,

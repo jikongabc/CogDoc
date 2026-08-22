@@ -29,6 +29,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from cogdoc.connectors.base import ConnectorError
 from cogdoc.connectors.http_transport import HttpTransport
+from cogdoc.ha.dbapi_compat import BackendDBAPIConnection
+from cogdoc.ha.storage import DatabaseBackend
 
 
 OIDC_FLOW_SCHEMA_VERSION = "1"
@@ -306,15 +308,22 @@ class OIDCFlowStore:
 
     def __init__(
         self,
-        db_path: str,
+        db_path: str | None,
         key: str | bytes,
         *,
         clock: Callable[[], float] = time.time,
         flow_ttl_seconds: float = 600.0,
         result_ttl_seconds: float = 60.0,
         busy_timeout_ms: int = 5000,
+        backend: DatabaseBackend | None = None,
     ) -> None:
-        self._aes = AESGCM(decode_flow_key(key))
+        if (db_path is None) == (backend is None):
+            raise OIDCConfigurationError("configure exactly one OIDC flow backend")
+        decoded_key = decode_flow_key(key)
+        self._key_fingerprint = hashlib.sha256(
+            b"cogdoc-oidc-flow-key-v1\0" + decoded_key
+        ).hexdigest()
+        self._aes = AESGCM(decoded_key)
         self._clock = clock
         self.flow_ttl_seconds = self._duration(
             flow_ttl_seconds, "flow_ttl_seconds", 30.0, 1800.0
@@ -324,12 +333,18 @@ class OIDCFlowStore:
         )
         self._lock = RLock()
         self._closed = False
-        self._conn = sqlite3.connect(
-            db_path, check_same_thread=False, isolation_level=None
-        )
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.execute(f"PRAGMA busy_timeout={max(0, int(busy_timeout_ms))}")
+        self._backend = backend
+        self._conn: Any
+        if backend is not None:
+            self._conn = BackendDBAPIConnection(backend)
+        else:
+            assert db_path is not None
+            self._conn = sqlite3.connect(
+                db_path, check_same_thread=False, isolation_level=None
+            )
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute(f"PRAGMA busy_timeout={max(0, int(busy_timeout_ms))}")
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS auth_oidc_flow_meta (
@@ -357,17 +372,39 @@ class OIDCFlowStore:
             );
             CREATE INDEX IF NOT EXISTS idx_auth_oidc_flows_expiry
                 ON auth_oidc_flows(expires_at, result_expires_at);
+            CREATE TABLE IF NOT EXISTS ha_oidc_flow_keys (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                key_fingerprint TEXT NOT NULL,
+                registered_at REAL NOT NULL
+            );
             """
         )
+        if backend is not None:
+            self._conn.execute(
+                "INSERT INTO ha_oidc_flow_keys(singleton,key_fingerprint,registered_at) "
+                "VALUES(1,?,?) ON CONFLICT(singleton) DO NOTHING",
+                (self._key_fingerprint, float(self._clock())),
+            )
+            key_row = self._conn.execute(
+                "SELECT key_fingerprint FROM ha_oidc_flow_keys WHERE singleton=1"
+            ).fetchone()
+            if key_row is None or str(key_row[0]) != self._key_fingerprint:
+                self._conn.close()
+                self._closed = True
+                raise OIDCConfigurationError("OIDC flow key differs across HA nodes")
         row = self._conn.execute(
             "SELECT value FROM auth_oidc_flow_meta WHERE key='schema_version'"
         ).fetchone()
         if row is None:
             self._conn.execute(
-                "INSERT INTO auth_oidc_flow_meta(key,value) VALUES('schema_version',?)",
+                "INSERT INTO auth_oidc_flow_meta(key,value) VALUES('schema_version',?) "
+                "ON CONFLICT(key) DO NOTHING",
                 (OIDC_FLOW_SCHEMA_VERSION,),
             )
-        elif row[0] != OIDC_FLOW_SCHEMA_VERSION:
+            row = self._conn.execute(
+                "SELECT value FROM auth_oidc_flow_meta WHERE key='schema_version'"
+            ).fetchone()
+        if row is None or row[0] != OIDC_FLOW_SCHEMA_VERSION:
             self._conn.close()
             self._closed = True
             raise OIDCConfigurationError("unsupported OIDC flow schema version")
@@ -380,6 +417,10 @@ class OIDCFlowStore:
         if not math.isfinite(result) or not lower <= result <= upper:
             raise OIDCConfigurationError(f"invalid {field}")
         return result
+
+    @property
+    def backend(self) -> DatabaseBackend | None:
+        return self._backend
 
     def _now(self) -> float:
         value = float(self._clock())
@@ -616,6 +657,12 @@ class OIDCFlowStore:
                 if row is None or row[0] != OIDC_FLOW_SCHEMA_VERSION:
                     raise OIDCFlowError("OIDC flow schema is unavailable")
                 self._conn.execute("SELECT 1 FROM auth_oidc_flows LIMIT 1").fetchone()
+                if self._backend is not None:
+                    key_row = self._conn.execute(
+                        "SELECT key_fingerprint FROM ha_oidc_flow_keys WHERE singleton=1"
+                    ).fetchone()
+                    if key_row is None or str(key_row[0]) != self._key_fingerprint:
+                        raise OIDCFlowError("OIDC flow key registry is inconsistent")
             except sqlite3.Error as exc:
                 raise OIDCFlowError("OIDC flow readiness check failed") from exc
             return True

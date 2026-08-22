@@ -81,6 +81,7 @@ class ErrorCode(str, Enum):
     RESEARCH_JOB_STATE_CONFLICT = "RESEARCH_JOB_STATE_CONFLICT"
     RESEARCH_EVIDENCE_STALE = "RESEARCH_EVIDENCE_STALE"
     RESEARCH_CAPACITY_EXHAUSTED = "RESEARCH_CAPACITY_EXHAUSTED"
+    CHAT_SESSION_CONFLICT = "CHAT_SESSION_CONFLICT"
     CLAIM_REVIEW_REVISION_CONFLICT = "CLAIM_REVIEW_REVISION_CONFLICT"
     CLAIM_REVIEW_NOT_FOUND = "CLAIM_REVIEW_NOT_FOUND"
     CREDENTIAL_NOT_FOUND = "CREDENTIAL_NOT_FOUND"
@@ -1072,6 +1073,12 @@ class ResearchSourceVersion(ApiModel):
 class ResearchProvenanceSnapshot(ApiModel):
     schema_version: Literal["research-provenance-v1"] = "research-provenance-v1"
     kb_id: str = ""
+    kb_epoch: int | None = Field(
+        default=None, ge=0, strict=True, exclude_if=lambda value: value is None
+    )
+    acl_epoch: int | None = Field(
+        default=None, ge=0, strict=True, exclude_if=lambda value: value is None
+    )
     index_generation: str = ""
     index_build_version: str = ""
     chunk_identity_version: str = ""

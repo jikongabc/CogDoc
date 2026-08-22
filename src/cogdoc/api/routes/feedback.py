@@ -18,6 +18,11 @@ from cogdoc.api.schemas import (
     FeedbackResponse,
     FeedbackType,
 )
+from cogdoc.api.ha_chat_authority import (
+    HAChatAuthorityChanged,
+    capture_ha_chat_epoch,
+    ha_authority_guard,
+)
 from cogdoc.api.tenant_scope import (
     externalize_kb_fields,
     request_principal,
@@ -26,8 +31,10 @@ from cogdoc.api.tenant_scope import (
     scope_for_storage_id,
 )
 from cogdoc.api.webhooks import notify_pending_created
+from cogdoc.api.tenancy import Permission
 from cogdoc.observability.logger import log_event
 from cogdoc.observability.trace import trace_path
+from cogdoc.ha.feedback import HA_KB_EPOCH_FIELD, StaleAuxiliaryWrite
 from cogdoc.tools.eval.retrieval_eval_drafts import build_retrieval_eval_draft
 
 router = APIRouter(prefix="/v1", tags=["feedback"])
@@ -51,6 +58,29 @@ def _kb_storage_id(request: Request, kb_id: str) -> str:
     return scope.storage_id
 
 
+def _ha_feedback_authority(
+    request: Request, storage_id: str | None, permission: Permission
+) -> tuple[int, Mapping[str, object]] | None:
+    if not storage_id or not getattr(
+        request.app.state, "ha_feedback_multiwriter_mode", False
+    ):
+        return None
+    scope = scope_for_storage_id(request, storage_id)
+    if scope is None:
+        raise HAChatAuthorityChanged("shared feedback scope is unavailable")
+    expected_epoch = capture_ha_chat_epoch(request.app.state.kb_registry, storage_id)
+    guard = ha_authority_guard(
+        request,
+        scope,
+        expected_epoch,
+        permission=permission,
+    )
+    evidence = getattr(guard, "evidence", None)
+    if not isinstance(evidence, Mapping):
+        raise HAChatAuthorityChanged("shared feedback authority is unavailable")
+    return expected_epoch, evidence
+
+
 def _owns_storage_id(request: Request, storage_id: object) -> bool:
     value = str(storage_id or "")
     if not value:
@@ -72,11 +102,7 @@ def _owns_storage_id(request: Request, storage_id: object) -> bool:
 def _feedback_record(request: Request, feedback_id: str) -> Mapping | None:
     rows = request.app.state.feedback_store.export_records()
     return next(
-        (
-            row
-            for row in rows
-            if str(row.get("feedback_id") or "") == feedback_id
-        ),
+        (row for row in rows if str(row.get("feedback_id") or "") == feedback_id),
         None,
     )
 
@@ -103,9 +129,7 @@ def _retrieval_feedback_record(request: Request, feedback_id: str) -> Mapping | 
     )
 
 
-def _require_owned_retrieval_feedback(
-    request: Request, feedback_id: str
-) -> Mapping:
+def _require_owned_retrieval_feedback(request: Request, feedback_id: str) -> Mapping:
     row = _retrieval_feedback_record(request, feedback_id)
     source_row = (
         _feedback_record(request, str(row.get("feedback_id") or ""))
@@ -214,6 +238,7 @@ def _create_retrieval_eval_draft_quiet(
     feedback_id: str,
     payload: Mapping[str, object],
     trace: Mapping[str, object] | None,
+    authority: tuple[int, Mapping[str, object]] | None = None,
 ) -> tuple[str | None, str | None]:
     store = getattr(request.app.state, "retrieval_eval_draft_store", None)
     if store is None or trace is None or not _eligible_retrieval_eval_trace(trace):
@@ -223,7 +248,16 @@ def _create_retrieval_eval_draft_quiet(
             {**payload, "feedback_id": feedback_id},
             trace,
         )
-        row = store.ensure(draft)
+        ensure_authorized = getattr(store, "ensure_authorized", None)
+        row = (
+            ensure_authorized(
+                draft,
+                expected_epoch=authority[0],
+                authority=authority[1],
+            )
+            if callable(ensure_authorized) and authority is not None
+            else store.ensure(draft)
+        )
         return str(row["draft_id"]), str(row["status"])
     except Exception as exc:
         # Feedback recording is the primary user action. A curation-pipeline
@@ -373,10 +407,21 @@ def _record_feedback_analysis_quiet(
     feedback_id: str,
     payload: dict,
     analysis: FeedbackAnalysis,
+    authority: tuple[int, Mapping[str, object]] | None = None,
 ) -> dict | None:
     try:
-        return request.app.state.feedback_analysis_store.record(
-            feedback_id, payload, analysis
+        store = request.app.state.feedback_analysis_store
+        record_authorized = getattr(store, "record_authorized", None)
+        return (
+            record_authorized(
+                feedback_id,
+                payload,
+                analysis,
+                expected_epoch=authority[0],
+                authority=authority[1],
+            )
+            if authority is not None and callable(record_authorized)
+            else store.record(feedback_id, payload, analysis)
         )
     except Exception as exc:
         log_event(
@@ -395,10 +440,19 @@ def _create_knowledge_quiet(
     request: Request,
     feedback_id: str,
     knowledge_payload: dict,
+    authority: tuple[int, Mapping[str, object]] | None = None,
 ) -> tuple[str | None, str | None, bool]:
     try:
-        knowledge, deduplicated = request.app.state.knowledge_store.create(
-            knowledge_payload
+        store = request.app.state.knowledge_store
+        create_authorized = getattr(store, "create_authorized", None)
+        knowledge, deduplicated = (
+            create_authorized(
+                knowledge_payload,
+                expected_epoch=authority[0],
+                authority=authority[1],
+            )
+            if authority is not None and callable(create_authorized)
+            else store.create(knowledge_payload)
         )
         if not deduplicated:
             notify_pending_created(request.app, knowledge, "feedback")
@@ -427,10 +481,15 @@ async def submit_feedback(body: FeedbackRequest, request: Request):
     else:
         raise HTTPException(status_code=404, detail="知识库不存在")
     created_by = principal.subject_id
-    body = body.model_copy(
-        update={"kb_id": storage_id, "created_by": created_by}
-    )
+    body = body.model_copy(update={"kb_id": storage_id, "created_by": created_by})
     payload = body.model_dump(exclude_none=True)
+    if storage_id is not None and getattr(
+        request.app.state, "ha_feedback_multiwriter_mode", False
+    ):
+        current_epoch = request.app.state.kb_registry.current(storage_id)
+        if type(current_epoch) is not int or current_epoch < 1:
+            raise HTTPException(status_code=409, detail="知识库代际已变化")
+        payload[HA_KB_EPOCH_FIELD] = current_epoch
     if body.feedback_text and not payload.get("comment"):
         payload["comment"] = body.feedback_text
     if body.correction_text and not payload.get("correction"):
@@ -444,7 +503,21 @@ async def submit_feedback(body: FeedbackRequest, request: Request):
             scope is None or not row_is_authorized(request, scope, payload)
         ):
             raise HTTPException(status_code=404, detail="文档不存在")
-    result = request.app.state.feedback_store.record(payload)
+    try:
+        authority = _ha_feedback_authority(request, storage_id, Permission.WRITE)
+        feedback_store = request.app.state.feedback_store
+        record_authorized = getattr(feedback_store, "record_authorized", None)
+        result = (
+            record_authorized(
+                payload,
+                expected_epoch=authority[0],
+                authority=authority[1],
+            )
+            if authority is not None and callable(record_authorized)
+            else feedback_store.record(payload)
+        )
+    except (HAChatAuthorityChanged, StaleAuxiliaryWrite) as exc:
+        raise HTTPException(status_code=409, detail="知识库代际已变化") from exc
     if result.get("deduplicated"):
         existing = _feedback_record(request, str(result["feedback_id"]))
         if existing is None or not _row_allowed(request, existing):
@@ -463,6 +536,7 @@ async def submit_feedback(body: FeedbackRequest, request: Request):
                 result["feedback_id"],
                 payload,
                 trace,
+                authority,
             )
         )
     if result.get("deduplicated"):
@@ -474,14 +548,27 @@ async def submit_feedback(body: FeedbackRequest, request: Request):
             retrieval_eval_draft_status=retrieval_eval_draft_status,
         )
     if not body.skip_retrieval_feedback:
-        request.app.state.retrieval_feedback_store.record_from_feedback(
-            result["feedback_id"], payload
+        retrieval_store = request.app.state.retrieval_feedback_store
+        record_retrieval_authorized = getattr(
+            retrieval_store, "record_from_feedback_authorized", None
         )
+        try:
+            if authority is not None and callable(record_retrieval_authorized):
+                record_retrieval_authorized(
+                    result["feedback_id"],
+                    payload,
+                    expected_epoch=authority[0],
+                    authority=authority[1],
+                )
+            else:
+                retrieval_store.record_from_feedback(result["feedback_id"], payload)
+        except (HAChatAuthorityChanged, StaleAuxiliaryWrite):
+            pass
     analysis = _analyze_feedback_quiet(result["feedback_id"], payload)
     analysis_row = None
     if analysis is not None:
         analysis_row = _record_feedback_analysis_quiet(
-            request, result["feedback_id"], payload, analysis
+            request, result["feedback_id"], payload, analysis, authority
         )
     knowledge_id = None
     knowledge_status = None
@@ -496,8 +583,15 @@ async def submit_feedback(body: FeedbackRequest, request: Request):
             trusted_trace=trusted_trace,
         )
     if knowledge_payload is not None:
+        if HA_KB_EPOCH_FIELD in payload:
+            knowledge_payload[HA_KB_EPOCH_FIELD] = payload[HA_KB_EPOCH_FIELD]
         knowledge_id, knowledge_status, knowledge_deduplicated = (
-            _create_knowledge_quiet(request, result["feedback_id"], knowledge_payload)
+            _create_knowledge_quiet(
+                request,
+                result["feedback_id"],
+                knowledge_payload,
+                authority,
+            )
         )
     return FeedbackResponse(
         feedback_id=result["feedback_id"],
@@ -542,9 +636,7 @@ async def list_feedback(
         limit=limit,
     )
     rows = [row for row in rows if _row_allowed(request, row)]
-    return FeedbackListResponse(
-        feedback=externalize_kb_fields(rows, request)
-    )
+    return FeedbackListResponse(feedback=externalize_kb_fields(rows, request))
 
 
 # 查询反馈理解结果。
@@ -585,9 +677,7 @@ async def list_feedback_analysis(
             _feedback_record(request, str(row.get("feedback_id") or "")) or row,
         )
     ]
-    return {
-        "feedback_analysis": externalize_kb_fields(rows, request)
-    }
+    return {"feedback_analysis": externalize_kb_fields(rows, request)}
 
 
 # 查询检索反馈。
@@ -610,23 +700,40 @@ async def list_retrieval_feedback(
             _feedback_record(request, str(row.get("feedback_id") or "")) or row,
         )
     ]
-    return {
-        "retrieval_feedback": externalize_kb_fields(rows, request)
-    }
+    return {"retrieval_feedback": externalize_kb_fields(rows, request)}
 
 
 # 禁用检索反馈。
 @router.post("/retrieval-feedback/{feedback_id}/disable")
 async def disable_retrieval_feedback(feedback_id: str, body: dict, request: Request):
-    _require_owned_retrieval_feedback(request, feedback_id)
+    current = _require_owned_retrieval_feedback(request, feedback_id)
     principal = request_principal(request)
     actor = principal.subject_id
-    row = request.app.state.retrieval_feedback_store.set_enabled(
-        feedback_id,
-        False,
-        actor=actor,
-        reason=body.get("reason"),
-    )
+    try:
+        authority = _ha_feedback_authority(
+            request, str(current.get("kb_id") or ""), Permission.WRITE
+        )
+        store = request.app.state.retrieval_feedback_store
+        set_authorized = getattr(store, "set_enabled_authorized", None)
+        row = (
+            set_authorized(
+                feedback_id,
+                False,
+                actor=actor,
+                reason=body.get("reason"),
+                expected_epoch=authority[0],
+                authority=authority[1],
+            )
+            if authority is not None and callable(set_authorized)
+            else store.set_enabled(
+                feedback_id,
+                False,
+                actor=actor,
+                reason=body.get("reason"),
+            )
+        )
+    except (HAChatAuthorityChanged, StaleAuxiliaryWrite):
+        return JSONResponse(status_code=409, content={"message": "访问权限已变化"})
     if row is None:
         return JSONResponse(status_code=404, content={"message": "检索反馈不存在"})
     return {"status": "disabled", "retrieval_feedback_id": feedback_id}
@@ -635,8 +742,25 @@ async def disable_retrieval_feedback(feedback_id: str, body: dict, request: Requ
 # 启用检索反馈。
 @router.post("/retrieval-feedback/{feedback_id}/enable")
 async def enable_retrieval_feedback(feedback_id: str, request: Request):
-    _require_owned_retrieval_feedback(request, feedback_id)
-    row = request.app.state.retrieval_feedback_store.set_enabled(feedback_id, True)
+    current = _require_owned_retrieval_feedback(request, feedback_id)
+    try:
+        authority = _ha_feedback_authority(
+            request, str(current.get("kb_id") or ""), Permission.WRITE
+        )
+        store = request.app.state.retrieval_feedback_store
+        set_authorized = getattr(store, "set_enabled_authorized", None)
+        row = (
+            set_authorized(
+                feedback_id,
+                True,
+                expected_epoch=authority[0],
+                authority=authority[1],
+            )
+            if authority is not None and callable(set_authorized)
+            else store.set_enabled(feedback_id, True)
+        )
+    except (HAChatAuthorityChanged, StaleAuxiliaryWrite):
+        return JSONResponse(status_code=409, content={"message": "访问权限已变化"})
     if row is None:
         return JSONResponse(status_code=404, content={"message": "检索反馈不存在"})
     return {"status": "enabled", "retrieval_feedback_id": feedback_id}

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from threading import RLock
 from typing import Any
 
@@ -30,14 +32,19 @@ class RetrieverFactory:
     _lock = RLock()
     _max_engines = 32
     _external_provider: Callable[[str], Any] | None = None
+    _context_provider: ContextVar[Callable[[str], Any] | None] = ContextVar(
+        "cogdoc_retriever_provider", default=None
+    )
 
     @classmethod
     def get_engine(cls, kb_id: str) -> HybridRetriever:
         if shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE:
             return HybridRetriever(NullRetriever(), NullRetriever())
 
-        with cls._lock:
-            provider = cls._external_provider
+        provider = cls._context_provider.get()
+        if provider is None:
+            with cls._lock:
+                provider = cls._external_provider
         if provider is not None:
             engine = provider(kb_id)
             if shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE:
@@ -125,6 +132,19 @@ class RetrieverFactory:
                 raise RuntimeError("retrieval engine provider is already bound")
             cls._external_provider = provider
             cls._engines.clear()
+
+    @classmethod
+    @contextmanager
+    def provider_context(cls, provider: Callable[[str], Any]):
+        """Bind a request-scoped provider without mutating process-global state."""
+
+        if not callable(provider):
+            raise TypeError("retrieval engine provider must be callable")
+        token = cls._context_provider.set(provider)
+        try:
+            yield
+        finally:
+            cls._context_provider.reset(token)
 
     @classmethod
     def unbind_external_provider(cls, provider: Callable[[str], Any]) -> None:

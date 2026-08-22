@@ -2,7 +2,7 @@
 
 本章描述 `cogdoc[ha]` 提供的 PostgreSQL、分布式任务/调度、不可变索引 generation、S3 兼容对象存储、transactional outbox 和滚动迁移能力。首要不变量是：**任何不完整、损坏、由过期 worker 写出的索引，都不能成为在线 current generation。**
 
-> 当前边界：`cogdoc-ha` 调度、索引发布和 outbox worker 可以横向扩展；主 API 仍包含本地会话、ACL、Chroma/BM25 缓存和文件 mutation 状态，因此仍必须持有单实例锁。不要用 `COGDOC_ALLOW_MULTI=1` 把多个主 API 写实例放到同一数据目录。完成全部 API 状态的 PostgreSQL 化以前，支持的拓扑是一个主 API 写实例加多个 `cogdoc-ha` worker，而不是多个主 API writer。这个限制是 fail-closed 的部署边界，不应通过共享 NFS 绕过。
+> 当前边界：`cogdoc-ha` API worker 可横向扩展文档、connector、账号身份与资源授权、Chat/摘要/对比/检索、反馈闭环，以及 Research 研究任务控制面。KB identity/lifecycle/epoch、账号/登录会话、聊天记忆与执行租约、OIDC/SCIM/service account、资源 ACL/外部 ACL checkpoint、连接、同步 job/health/schedule、加密凭据/OAuth state、Research job/dispatch、反馈/分析/检索调优/评测草稿/派生知识 ledger、source/index head 均使用 PostgreSQL；来源、提交快照、核心索引代和派生知识索引代使用 versioned S3。HA Chat 可读取共享检索调优与经过摘要/epoch 校验的派生知识索引；HA Research 仍显式禁用这些辅助通道，直到研究 attempt provenance 同时冻结它们的 revision。禁止用共享 NFS 或单独设置 `COGDOC_ALLOW_MULTI=1` 绕过此边界。
 
 ## 索引不会写坏的提交协议
 
@@ -66,13 +66,28 @@ COGDOC_HA_INDEX_WORKER_ENABLED=true
 COGDOC_HA_INDEX_WORKER_COUNT=2
 COGDOC_HA_INDEX_WORKER_POLL_SECONDS=0.5
 COGDOC_HA_INDEX_WORKER_LEASE_SECONDS=300
+COGDOC_HA_RESEARCH_WORKER_POLL_SECONDS=0.5
+COGDOC_HA_RESEARCH_WORKER_LEASE_SECONDS=120
 COGDOC_HA_RELEASE_ID=2026.08.22
 COGDOC_HA_MINIMUM_SCHEMA_VERSION=1
-COGDOC_HA_MAXIMUM_SCHEMA_VERSION=1
+COGDOC_HA_MAXIMUM_SCHEMA_VERSION=9
+COGDOC_HA_IDENTITY_CONFIG_VERSION=1
 COGDOC_HA_VERSION_HEARTBEAT_INTERVAL_SECONDS=30
 COGDOC_HA_VERSION_HEARTBEAT_TTL_SECONDS=90
 COGDOC_HA_INDEX_READS_ENABLED=true
 COGDOC_HA_INDEX_REPLICA_CACHE_ROOT=/var/lib/cogdoc/ha-index-cache
+COGDOC_HA_CHAT_SESSION_LEASE_SECONDS=300
+COGDOC_HA_CHAT_INDEX_READER_LEASE_SECONDS=600
+COGDOC_HA_CHAT_MAX_SESSIONS_PER_SCOPE=1024
+COGDOC_HA_CHAT_SESSION_TTL_SECONDS=604800
+COGDOC_HA_CHAT_MAX_DISPLAY_MESSAGES=2000
+COGDOC_HA_CHAT_MAX_SESSION_BYTES=4194304
+COGDOC_HA_API_MULTI_WRITER_ENABLED=true
+COGDOC_HA_MUTATION_LEASE_SECONDS=300
+COGDOC_HA_SOURCE_CACHE_ROOT=/var/lib/cogdoc/ha-source-cache
+COGDOC_HA_SOURCE_MAX_FILES=100000
+COGDOC_HA_SOURCE_MAX_TOTAL_BYTES=10737418240
+COGDOC_HA_SOURCE_ARTIFACT_MAX_TOTAL_BYTES=10737418240
 ```
 
 每个同时在线的进程必须有唯一且稳定的 `COGDOC_HA_WORKER_ID`。发布版本必须显式设置
@@ -137,6 +152,117 @@ portable generation 使用严格 SQLite/二进制格式，不包含 pickle：BM2
 JSON，向量为 little-endian float32，每行有 checksum。安装器先在 generation 专属 collection
 安装向量和 BM25，再核对 chunk identity 集，最后原子写 installation marker。部分安装或维度、
 embedding contract 不一致不会变成可查询索引。
+
+多 writer 模式下，每条 KB mutation 还持有 PostgreSQL lease token、单调 fencing token 与
+冻结的 KB epoch。来源目录先写入 generation 专属对象前缀，所有文件完成后再写 canonical
+manifest 和 `COMMITTED` marker；HA portable index 也完成对象校验后，source head 与 index
+head 才在同一个 PostgreSQL 事务内一起 CAS 切换并追加 outbox。旧节点即使在超时后完成构建，
+也会在本地 `switch_active` 前的最后一道 fence 被拒绝；source/index 任一 hook 或 outbox 失败
+都会回滚两个 head。API 节点不共享本地来源或索引目录，它们只是可丢弃 cache。
+
+当前 `COGDOC_HA_API_MULTI_WRITER_ENABLED=1` 是严格的“文档、connector、身份/ACL、Chat、Research 与索引 writer”节点角色，不是把
+仍使用本地 SQLite 的整套 API 直接横向扩容。节点只开放健康/指标、HA 控制面、KB 创建与读取、
+文档读写、索引任务读取，以及共享来源 catalog/raw artifact 的查询、下载、软删、恢复与
+purge，并开放连接/凭据/OAuth/sync job/health 控制面；这些来源 mutation 会取得同一 PostgreSQL
+KB fencing lease。连接定义、周期调度、同步 checkpoint/health、credential envelope/audit、OAuth
+one-shot state 与 callback binding journal 均在 PostgreSQL 中跨节点 CAS。凭据引用更新另持有带
+heartbeat 的集群 lease，避免一个节点绑定连接时另一节点删除同一 credential。
+
+账号、登录 session、邀请、workspace membership、OIDC identity/policy、SCIM directory、service
+account/token/session policy 与资源 ACL epoch/tombstone/retirement fence 同样使用 PostgreSQL。session
+撤销、成员 incarnation tombstone 与 ACL epoch 在下一请求立即跨节点可见；删除成员时先提交全 workspace
+grant 撤销和 membership tombstone，再删除 membership，因此任一步崩溃都只会少授权，不会让旧 grant
+在重新邀请后复活。OIDC browser flow 保持一次性 CAS，所有节点还会注册 flow encryption key 指纹；同一
+集群出现不同 key 会启动失败。外部 provider ACL checkpoint 也在共享库中，避免另一 connector worker
+用旧 checkpoint 跳过撤权。
+身份安全参数、OIDC trust contract 与 SCIM token fingerprint 另有集群一致性指纹。普通滚动发布保持
+`COGDOC_HA_IDENTITY_CONFIG_VERSION` 不变；确实要变更这些配置时只递增 1，新版本首次启动会 CAS
+推进指纹，此后旧配置节点无法重新加入。禁止跳版本或复用同一版本号承载不同配置。
+版本推进后，仍持旧指纹的在线节点会立即在 readiness 中变为 `not_ready`，必须让负载均衡停止
+向它发送新请求并完成滚动下线。
+
+Research job 的完整 JSON 状态、紧凑列表投影和 execution/revision CAS 存在 PostgreSQL；
+`ha_research_dispatches` 只负责为同一 durable attempt 选举一个执行节点。领取使用
+`FOR UPDATE SKIP LOCKED` 与带过期时间的随机 lease token，节点接管时还会在 research job
+内部轮换 execution lease，并把旧 worker 已领取但未完成的 section 恢复为 pending。旧节点
+晚到后不能提交 evidence、失败状态或 report。节点关闭会先停止领取并释放自己持有的 dispatch；
+进程崩溃则由 lease expiry 接管。启动和低频 reconciliation 都会分页补投 active job，避免
+“job 状态已提交、dispatch enqueue 前崩溃”造成永久孤儿；超过 HA retention 的终态 dispatch
+由有界批次清理，Research 正文与审计记录不会随 queue envelope 一起删除。
+
+每次 evidence attempt 会冻结当前 KB epoch、ACL epoch、HA index generation/build contract 与
+source version 集。写入 evidence/report/review/publication 前，同一 PostgreSQL 事务锁定 KB
+incarnation、index head、ACL epoch，以及用户 session/membership（若适用），再写 research row。
+索引在检索期间发布新代、KB 被删除重建、ACL 收窄、session 撤销或 membership incarnation
+变化，都会使本次提交 fail-closed；不会把两个索引代的证据拼进一份报告。Research worker 只读
+已校验的 HA current portable index。派生知识与 retrieval feedback/tuning 已迁入共享 authority，
+但 HA Research 当前仍明确禁用这些辅助通道：研究 attempt 的 provenance 尚未冻结派生索引 generation
+和调优 revision，不能让长任务混用两个辅助状态版本。HA Chat 的请求边界会逐次验证这些共享 revision，
+因此可安全启用；单机模式保持原行为。
+
+Chat 的短期/中期/长期记忆、展示历史、turn 幂等键与 session execution lease 同样存入
+PostgreSQL。相同 session 在集群内一次只允许一个活跃执行者；节点失联后必须等租约过期接管，
+旧执行者的晚到答案会被 capability token 拒绝。每次 `/chat`、流式 Chat、`/summary`、
+`/compare` 与 `/retrieve` 都先取得一个 index reader lease，并在整个执行期间固定同一不可变
+generation；即使 head 中途切换也不会把两个代的证据混入同一答案。LangGraph 换工作线程却未
+传播执行上下文时，provider 只在唯一活跃 generation 可确定时继续，否则 fail-closed。
+
+最终写入聊天记忆的数据库事务会同时锁定并复核 KB lifecycle/epoch、ACL epoch，以及用户登录
+session + membership incarnation 或 service-account token。删库、撤权、降权、session/token
+撤销和同 slug 重建后，旧节点均不能向新 incarnation 写入历史。展示记录保存回答所用的
+`index_generation_id`，便于审计。终态 session 受 TTL、每 scope 数量、单 session 字节与展示消息
+上限约束；后台维护有界清理过期 session、execution lease 与 index reader lease。
+
+反馈、分析、retrieval feedback/tuning、评测草稿和派生知识使用共享 append-only/CAS ledger；每个
+mutation 在 PostgreSQL 写事务内复核 KB epoch、登录或 service token、ACL epoch 和所需权限。知识
+review/revise/delete 还冻结最新 event sequence，防止路由检查后条目被并发改绑到另一个文档。派生知识
+索引使用独立、epoch-scoped 的 immutable generation 和对象前缀，不会改写核心文档 index head。
+每次 ledger mutation 在同一事务写 durable refresh outbox；跨节点租约去重，进程重启和周期维护会
+恢复漏掉的刷新。读路径在查询前后比较当前 approved snapshot digest、KB epoch 与 generation，任何
+stale/missing 状态都丢弃向量结果并回退共享词法 ledger，绝不返回旧 incarnation 的缓存。
+
+同步抓取完成后，私有 connection snapshot 会在 `connector_sync_jobs` 进入 `committing` 前写入
+versioned S3，并把 canonical manifest/hash/phase/index job ID 写入 PostgreSQL。worker 进程损失后，
+另一节点从该证据逐文件校验恢复 staging，幂等重放 catalog/artifact/ACL/materialization；索引线程
+继承而不是重新获取同步任务持有的 KB lease。新 source generation 与 portable index generation
+只有在相同 KB epoch/fencing token 下才会同事务推进，任一对象、head CAS 或 outbox 失败都保持旧
+source/index head。`local-directory` 与本地 `git` 连接在多 writer 角色中 fail-closed 禁用，避免节点
+本地目录差异生成非确定快照；应改用 S3、HTTPS URL 或 SaaS connector。
+
+KB 删除使用可恢复的
+`fenced → cleaned → deleted` saga：先在 PostgreSQL 中提升 KB epoch 并冻结 source/index head，
+再清理共享 catalog/raw artifact，最后在同一事务撤销两个 current head、写 KB tombstone 与
+`kb.deleted` outbox。任何中途失败都保持 `deleting`，启动恢复会继续执行；同 slug 重建只有在
+旧 saga 完成后才以更高 epoch 原子激活，旧 generation 只进入 retention GC，绝不会直接成为新
+实例的 current。删除 saga 也清理共享反馈、分析、检索调优、评测草稿、派生知识与其待刷新任务；
+后台 connector recovery 会在每个节点启动，但共享 active-job CAS、job lease 与 KB lease 保证只有一个 worker
+取得发布权。不要通过反向代理绕过该保护。现有 tenant quota
+在该角色会自动切到 PostgreSQL 权威 ledger：按 tenant 行锁串行 admission，实际文档/字节用量
+来自 current source-generation head，in-flight reservation 由节点 heartbeat 续租，节点崩溃后
+才会过期释放。因此 `COGDOC_TENANT_MAX_KNOWLEDGE_BASES`、`COGDOC_TENANT_MAX_DOCUMENTS`、
+`COGDOC_TENANT_MAX_STORAGE_MB` 是集群硬限制，而不是每个 pod 各自一份额度。
+
+来源 catalog 与 raw artifact 的权威元数据也已迁入 PostgreSQL。raw bytes 只写入内容寻址、
+不可覆盖的对象 key；下载会交叉校验数据库 identity、对象版本、大小与完整 SHA-256。同步在
+进入 `committing` 前取得集群级 batch reservation，物理总量、tenant 总量和每来源版本槽均
+包含其他节点的在途写入；reservation 由 owner heartbeat 续租。软删只改变 PostgreSQL lifecycle，
+恢复仍重新验证对象；显式 purge 才删除对象。上传后数据库提交前崩溃产生的不可见对象由 HA
+maintenance 在确认不存在 active row 和 upload intent 后有界回收。
+
+所有 API 节点必须配置相同的 `COGDOC_CREDENTIAL_MASTER_KEYS`。启动会在 PostgreSQL 登记每个
+key version 的不可逆 fingerprint：同名不同 key 立即拒绝；数据库中仍有 credential 使用而本节点
+缺少的版本也会拒绝。轮换采用两阶段发布：先把新 version 加到所有节点但保持旧 active version，
+确认 readiness 全绿后再统一切换 active version；旧 version 只能在审计确认已无引用后移除。密钥
+本身、明文 token、OAuth verifier 均不写入共享数据库日志或对象 manifest。
+
+在线备份会拒绝存在 `ha_connector_commits` 的快照：该行表示同步正跨越 source/index authority
+边界，其私有对象会在终态立即回收，不具备已发布 generation 的保留期。等待该次同步成功、失败
+并完成 cleanup 后重试备份；不要直接删除 commit 行或对象，否则恢复任务会永久失去 staging。
+
+`index.published` 与 `kb.source-generation.published` 除常规竞争消费外，还有每个 API 节点独立
+的持久 invalidation cursor；所以每个节点都会清除自己的 portable engine/retriever cache。
+handler 失败不会推进 cursor，重启会从 `(created_at,event_id)` 继续，不能把普通 outbox 单消费者
+当成广播总线。
 
 S3 发布时由请求 checksum、逐 part checksum、不可覆盖 key 和 manifest metadata 共同校验写入；正常读取 `iter_bytes()` 还会重新计算完整 SHA-256。`doctor`/热路径的 HEAD 验证不会每次下载整个大型索引，因此生产还应启用 S3 原生 checksum/完整性能力，并运行低频全量 scrub；不要把 HEAD metadata 当作对存储介质 bit-rot 的完整扫描。
 
@@ -208,11 +334,72 @@ Webhook 只接受 HTTPS。配置 secret 时发送 `X-CogDoc-Signature: sha256=<H
 冒充健康。
 
 `/health/ready` 同时要求 HA 数据库、对象存储、scheduler、outbox、maintenance、index
-worker、版本心跳与 API mirror 健康。探测在有界线程池中 single-flight 并短暂缓存，不在
+worker、Research job store/dispatch/dispatcher、版本心跳与 API mirror 健康。探测在有界线程池中 single-flight 并短暂缓存，不在
 ASGI 事件循环里做对象 hash 或文件系统写入。readiness 失败时停止新流量，但保留进程供
 正在持 lease 的操作完成或被 fencing 接管。
 
-备份必须在同一恢复点保留 PostgreSQL snapshot 和 S3 versioned objects。只恢复数据库而没有对应 object versions，会使 current 验证失败；只恢复 bucket 不恢复数据库，不会自动选择某个 generation。恢复演练应：恢复 DB → 恢复/保留所引用的 object versions → `cogdoc-ha doctor` → 对每个 current 执行 manifest 验证 → 再开放 reader。不要通过手改 `ha_index_heads.current_generation_id` 修复；应重新构建或使用经过审计的发布流程。
+备份必须在同一恢复点保留 PostgreSQL snapshot 和 S3 versioned objects。只恢复数据库而没有对应 object versions，会使 current 验证失败；只恢复 bucket 不恢复数据库，不会自动选择某个 generation。`recovery-manifest` 不会替你运行 `pg_dump`，它只把已经完成的数据库备份标识、可选 dump 哈希与当前数据库 authority 引用的对象清单绑定起来。存在任何未完成 KB 删除 saga 时，清单和完整 backup 都会拒绝生成，避免恢复出“raw 已删但 head 尚未撤销”或相反的混合状态。标准顺序是：
+
+推荐使用完整备份命令。它在一个保持打开的 PostgreSQL `REPEATABLE READ READ ONLY`
+事务中调用 `pg_export_snapshot()`，让 `pg_dump --snapshot` 与 authority 清单读取同一个数据库
+快照；DSN 只通过子进程环境传递，不出现在命令行参数中。dump、恢复清单与 bundle metadata
+全部写入私有 staging 目录并 fsync，所有校验成功后才通过一次目录 rename 对外发布：
+
+```bash
+cogdoc-ha backup \
+  --output-dir /secure-backups/cogdoc \
+  --name recovery-20260822T120000Z \
+  --timeout-seconds 7200
+```
+
+产物目录固定包含 `database.dump`、`recovery-manifest.json`、`bundle.json`。命令要求
+PostgreSQL HA backend 与可执行的 `pg_dump`，默认逐对象流式校验内容；只有在另有独立 scrub
+证据时才可显式使用 `--skip-content-verification`。DSN 所指用户必须有读取目标 schema 所有
+HA 表及导出 snapshot 的权限。
+
+若数据库 dump 由外部备份平台创建，也可使用拆分流程：
+
+1. 确认 migration 1–6 都处于 `validated` 或 `contracted`，并暂停会推进 current head 或清理 noncurrent object version 的维护窗口。
+2. 生成 PostgreSQL snapshot/dump，保存不可复用的备份 ID，并计算 dump 的 SHA-256。
+3. 在对应 authority 仍有效、S3 lifecycle 尚未回收 noncurrent versions 时捕获恢复清单；生产备份应启用内容校验：
+
+   ```bash
+   cogdoc-ha recovery-manifest \
+     --database-snapshot-id pgdump-20260822T120000Z \
+     --database-sha256 "$PG_DUMP_SHA256" \
+     --output /secure-backups/cogdoc/recovery-20260822.json \
+     --verify-content
+   ```
+
+4. 将数据库备份、恢复清单和 S3 VersionId 保留策略作为一个恢复点归档。清单采用原子写入并包含自身 SHA-256，但仍应由备份系统做不可变保留、访问控制与异地复制。
+5. 演练时先恢复 DB，再恢复或保留清单中引用的精确 object versions，然后运行：
+
+   ```bash
+   cogdoc-ha doctor
+   cogdoc-ha verify-recovery-manifest \
+     --manifest /secure-backups/cogdoc/recovery-20260822.json \
+     --verify-content
+   ```
+
+完整 bundle 则直接执行：
+
+```bash
+cogdoc-ha verify-backup \
+  --path /secure-backups/cogdoc/recovery-20260822T120000Z
+```
+
+完整 bundle 只携带数据库 dump 与对象 inventory，不复制 S3 payload；必须由 bucket versioning、
+Object Lock/不可变备份或跨区域复制保留 inventory 中的精确 VersionId。只有输出
+`status=verified` 后才能开放 reader。校验会拒绝 dump hash/size 漂移、bundle/manifest 校验和
+错误、schema 不匹配、schema migration 未验证、current head 非 published/active、对象缺失、
+hash/size/VersionId 漂移、raw artifact content-address 不一致。不要通过手改
+`ha_index_heads.current_generation_id` 修复；应恢复对应对象版本、重新构建，或使用经过审计
+的发布流程。
+
+数据库时间点恢复也会把身份与撤权状态回退到该时间点。灾备切流前必须按事故时间窗批量撤销
+恢复出的 login session、invite、service token 与未完成 OIDC flow，并轮换静态 API/SCIM token、
+connector credential 及可能受影响的用户密码；随后从权威 IdP/SCIM 重放 membership 并核对 ACL
+epoch。不能把“恢复清单对象全部通过 hash”误解成“备份之后发生的凭据撤销仍然存在”。
 
 ## 上线清单
 
@@ -220,5 +407,5 @@ ASGI 事件循环里做对象 hash 或文件系统写入。readiness 失败时�
 2. 验证 bucket versioning、conditional multipart、拒绝覆盖、incomplete upload lifecycle。
 3. 运行旧 worker 晚到、marker 后崩溃、outbox 回滚、八调度实例并发、current 损坏和 GC 故障注入。
 4. 先启动一个 `cogdoc-ha serve`，观察一个完整调度和 outbox 周期，再扩容 worker。
-5. 保持主 API 单 writer；确认 `COGDOC_ALLOW_MULTI` 未被用于绕过其本地状态边界。
+5. 对所有 API pod 核对相同的 identity config version/fingerprint；确认 Chat 跨节点历史、session 并发拒绝、固定 index generation、ACL/session 撤销拒写，以及 Research 跨节点创建、领取、租约过期接管均通过；未迁移的本地状态端点仍返回 503，且 `COGDOC_ALLOW_MULTI` 未被用于绕过边界。
 6. 完成 PostgreSQL + S3 同恢复点备份与恢复演练后才宣布生产就绪。

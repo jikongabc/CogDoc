@@ -1,9 +1,16 @@
 import logging
 from collections.abc import Mapping
+from typing import Any
 
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse
 
+from cogdoc.api.ha_chat_authority import (
+    HAChatAuthorityChanged,
+    capture_ha_chat_epoch,
+    ha_authority_guard,
+)
+from cogdoc.api.offload import run_sync
 from cogdoc.api.schemas import (
     DerivedKnowledge,
     ErrorCode,
@@ -25,6 +32,7 @@ from cogdoc.api.schemas import (
     ReviewQueueSummaryResponse,
     build_error_response,
 )
+from cogdoc.api.tenancy import Permission
 from cogdoc.api.time_utils import now_iso
 from cogdoc.api.tenant_scope import (
     externalize_kb_fields,
@@ -35,11 +43,13 @@ from cogdoc.api.tenant_scope import (
     scope_for_storage_id,
 )
 from cogdoc.api.webhooks import notify_pending_created
+from cogdoc.ha.feedback import StaleAuxiliaryWrite
 from cogdoc.observability.logger import log_event
 from cogdoc.service.kb_state import KBState
 from cogdoc.tools.manifest import load_index_manifest
 
 router = APIRouter(prefix="/v1", tags=["knowledge"])
+_HA_EVENT_SEQUENCE = "_ha_event_sequence"
 
 _ERROR_RESPONSES = {
     400: {"model": ErrorResponse},
@@ -121,6 +131,29 @@ def _refresh_derived_knowledge_index_quiet(
         )
 
 
+def _run_coalesced_derived_refresh(request: Request, kb_id: str, refresher) -> None:
+    """Run at most one refresh per KB while preserving a dirty rerun signal."""
+
+    while True:
+        _refresh_derived_knowledge_index_quiet(
+            refresher,
+            kb_id,
+            request.app.state.knowledge_store,
+            getattr(
+                request.app.state,
+                "derived_knowledge_index_error_recorder",
+                None,
+            ),
+        )
+        with request.app.state.derived_index_refresh_lock:
+            dirty = bool(request.app.state.derived_index_refresh_pending.get(kb_id))
+            if dirty:
+                request.app.state.derived_index_refresh_pending[kb_id] = False
+                continue
+            request.app.state.derived_index_refresh_pending.pop(kb_id, None)
+            return
+
+
 # 后台刷新派生知识索引。
 def _queue_derived_knowledge_index_refresh(request: Request, kb_id: str | None) -> None:
     if not kb_id:
@@ -135,19 +168,22 @@ def _queue_derived_knowledge_index_refresh(request: Request, kb_id: str | None) 
         )
         or _refresh_derived_knowledge_index
     )
+    lock = request.app.state.derived_index_refresh_lock
+    with lock:
+        if kb_id in request.app.state.derived_index_refresh_pending:
+            request.app.state.derived_index_refresh_pending[kb_id] = True
+            return
+        request.app.state.derived_index_refresh_pending[kb_id] = False
     try:
-        request.app.state.offload_executor.submit(
-            _refresh_derived_knowledge_index_quiet,
-            refresher,
+        request.app.state.derived_index_executor.submit(
+            _run_coalesced_derived_refresh,
+            request,
             kb_id,
-            request.app.state.knowledge_store,
-            getattr(
-                request.app.state,
-                "derived_knowledge_index_error_recorder",
-                None,
-            ),
+            refresher,
         )
     except RuntimeError as exc:
+        with lock:
+            request.app.state.derived_index_refresh_pending.pop(kb_id, None)
         log_event(
             "knowledge",
             "derived_knowledge_index_refresh_submit_failed",
@@ -204,7 +240,18 @@ def _resolve_external_kb(request: Request, kb_id: str):
 def _knowledge_row_for_request(request: Request, knowledge_id: str):
     """Fetch an opaque knowledge ID only when it belongs to this tenant."""
 
-    row = request.app.state.knowledge_store.get(knowledge_id)
+    store = request.app.state.knowledge_store
+    authority_snapshot = getattr(store, "authority_snapshot", None)
+    if getattr(request.app.state, "ha_feedback_multiwriter_mode", False) and callable(
+        authority_snapshot
+    ):
+        snapshot = authority_snapshot(knowledge_id)
+        if snapshot is None:
+            return None
+        snapshot_row, event_sequence = snapshot
+        row = {**snapshot_row, _HA_EVENT_SEQUENCE: event_sequence}
+    else:
+        row = store.get(knowledge_id)
     if not isinstance(row, Mapping):
         return None
     storage_id = str(row.get("kb_id") or "")
@@ -230,6 +277,35 @@ def _knowledge_not_found(knowledge_id: str) -> JSONResponse:
     )
 
 
+def _stale_mutation() -> JSONResponse:
+    return _error(ErrorCode.AUTH_CONFLICT, "知识库或访问权限已变化", 409)
+
+
+def _expected_event_sequence(row: Mapping[str, Any]) -> int:
+    value = row.get(_HA_EVENT_SEQUENCE)
+    if type(value) is not int or value < 1:
+        raise HAChatAuthorityChanged("shared knowledge row version is unavailable")
+    return value
+
+
+def _ha_mutation_authority(request: Request, scope, permission: Permission):
+    if not getattr(request.app.state, "ha_feedback_multiwriter_mode", False):
+        return None
+    expected_epoch = capture_ha_chat_epoch(
+        request.app.state.kb_registry, scope.storage_id
+    )
+    guard = ha_authority_guard(
+        request,
+        scope,
+        expected_epoch,
+        permission=permission,
+    )
+    evidence = getattr(guard, "evidence", None)
+    if not isinstance(evidence, Mapping):
+        raise HAChatAuthorityChanged("shared mutation authority is unavailable")
+    return expected_epoch, evidence
+
+
 # 构建公开知识视图。
 def _public(row: Mapping, request: Request) -> DerivedKnowledge:
     return DerivedKnowledge.model_validate(externalize_kb_fields(row, request))
@@ -237,9 +313,10 @@ def _public(row: Mapping, request: Request) -> DerivedKnowledge:
 
 def _full_kb_access(request: Request, scope) -> bool:
     decision = resource_access_decision(request, scope)
-    return decision is None or str(
-        getattr(getattr(decision, "mode", None), "value", "")
-    ) == "all"
+    return (
+        decision is None
+        or str(getattr(getattr(decision, "mode", None), "value", "")) == "all"
+    )
 
 
 # 查询派生知识索引状态。
@@ -289,7 +366,18 @@ def _conflict_public(row: dict) -> KnowledgeConflictCandidate:
 
 
 # 读取当前知识库文档清单。
-def _current_documents(kb_id: str) -> list[dict]:
+def _current_documents(kb_id: str, manifest_reader=None) -> list[dict]:
+    if callable(manifest_reader):
+        manifest = manifest_reader(kb_id)
+        files = manifest.get("files", []) if isinstance(manifest, Mapping) else []
+        return [
+            {
+                "name": str(document.get("path") or ""),
+                "sha256": str(document.get("sha256") or ""),
+            }
+            for document in files
+            if isinstance(document, Mapping) and document.get("path")
+        ]
     active = KBState(kb_id).active()
     documents = (
         active.get("documents", [])
@@ -384,7 +472,21 @@ async def create_knowledge(body: KnowledgeCreateRequest, request: Request):
     if not row_is_authorized(request, scope, payload):
         return _error(ErrorCode.DOCUMENT_NOT_FOUND, "文档不存在", 404)
     try:
-        row, deduplicated = request.app.state.knowledge_store.create(payload)
+        authority = _ha_mutation_authority(request, scope, Permission.WRITE)
+        create_authorized = getattr(
+            request.app.state.knowledge_store, "create_authorized", None
+        )
+        row, deduplicated = (
+            create_authorized(
+                payload,
+                expected_epoch=authority[0],
+                authority=authority[1],
+            )
+            if authority is not None and callable(create_authorized)
+            else request.app.state.knowledge_store.create(payload)
+        )
+    except (HAChatAuthorityChanged, StaleAuxiliaryWrite):
+        return _stale_mutation()
     except ValueError as exc:
         return _error(ErrorCode.BAD_REQUEST, str(exc), 400)
     conflicts = []
@@ -448,9 +550,7 @@ async def pending_knowledge_count(
     if not _full_kb_access(request, scope):
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
     knowledge = request.app.state.knowledge_store.counts(kb_id=scope.storage_id)
-    analysis = request.app.state.feedback_analysis_store.counts(
-        kb_id=scope.storage_id
-    )
+    analysis = request.app.state.feedback_analysis_store.counts(kb_id=scope.storage_id)
     by_status = knowledge["by_status"]
     pending = int(by_status.get(KnowledgeStatus.PENDING.value, 0))
     stale = int(by_status.get(KnowledgeStatus.STALE.value, 0))
@@ -668,7 +768,28 @@ async def delete_knowledge(knowledge_id: str, request: Request):
     current = _knowledge_row_for_request(request, knowledge_id)
     if current is None:
         return _knowledge_not_found(knowledge_id)
-    row = request.app.state.knowledge_store.delete(knowledge_id)
+    scope = scope_for_storage_id(request, str(current.get("kb_id") or ""))
+    if scope is None and getattr(
+        request.app.state, "ha_feedback_multiwriter_mode", False
+    ):
+        return _knowledge_not_found(knowledge_id)
+    try:
+        authority = _ha_mutation_authority(request, scope, Permission.DELETE)
+        delete_authorized = getattr(
+            request.app.state.knowledge_store, "delete_authorized", None
+        )
+        row = (
+            delete_authorized(
+                knowledge_id,
+                expected_epoch=authority[0],
+                expected_event_sequence=_expected_event_sequence(current),
+                authority=authority[1],
+            )
+            if authority is not None and callable(delete_authorized)
+            else request.app.state.knowledge_store.delete(knowledge_id)
+        )
+    except (HAChatAuthorityChanged, StaleAuxiliaryWrite):
+        return _stale_mutation()
     if row is None:
         return _knowledge_not_found(knowledge_id)
     _queue_derived_knowledge_index_refresh(request, row.get("kb_id"))
@@ -686,9 +807,34 @@ async def scan_stale_knowledge(request: Request, kb_id: str = Query(min_length=1
     if scope is None:
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
     storage_id = scope.storage_id
-    stale = request.app.state.knowledge_store.mark_stale_by_documents(
-        storage_id, _current_documents(storage_id)
+    manifest_reader = getattr(request.app.state, "ha_source_manifest_reader", None)
+    documents = await run_sync(
+        request.app.state.offload_executor,
+        _current_documents,
+        storage_id,
+        *(() if manifest_reader is None else (manifest_reader,)),
     )
+    try:
+        authority = _ha_mutation_authority(request, scope, Permission.WRITE)
+        mark_authorized = getattr(
+            request.app.state.knowledge_store,
+            "mark_stale_by_documents_authorized",
+            None,
+        )
+        stale = (
+            mark_authorized(
+                storage_id,
+                documents,
+                expected_epoch=authority[0],
+                authority=authority[1],
+            )
+            if authority is not None and callable(mark_authorized)
+            else request.app.state.knowledge_store.mark_stale_by_documents(
+                storage_id, documents
+            )
+        )
+    except (HAChatAuthorityChanged, StaleAuxiliaryWrite):
+        return _stale_mutation()
     if stale:
         _queue_derived_knowledge_index_refresh(request, storage_id)
     return KnowledgeStaleScanResponse(
@@ -726,13 +872,31 @@ def _set_status(request: Request, knowledge_id: str, status: str, body):
     ):
         return _knowledge_not_found(knowledge_id)
     try:
-        row = request.app.state.knowledge_store.set_status(
-            knowledge_id,
-            status,
-            actor=request_principal(request).subject_id,
-            note=body.note,
-            binding_updates=binding_updates,
+        authority = _ha_mutation_authority(request, scope, Permission.REVIEW)
+        set_authorized = getattr(
+            request.app.state.knowledge_store, "set_status_authorized", None
         )
+        options = {
+            "actor": request_principal(request).subject_id,
+            "note": body.note,
+            "binding_updates": binding_updates,
+        }
+        row = (
+            set_authorized(
+                knowledge_id,
+                status,
+                expected_epoch=authority[0],
+                expected_event_sequence=_expected_event_sequence(current),
+                authority=authority[1],
+                **options,
+            )
+            if authority is not None and callable(set_authorized)
+            else request.app.state.knowledge_store.set_status(
+                knowledge_id, status, **options
+            )
+        )
+    except (HAChatAuthorityChanged, StaleAuxiliaryWrite):
+        return _stale_mutation()
     except ValueError as exc:
         return _error(ErrorCode.BAD_REQUEST, str(exc), 400)
     if row is None:
@@ -801,7 +965,23 @@ async def revise_knowledge(
     ):
         return _knowledge_not_found(knowledge_id)
     try:
-        row = request.app.state.knowledge_store.revise(knowledge_id, payload)
+        authority = _ha_mutation_authority(request, scope, Permission.WRITE)
+        revise_authorized = getattr(
+            request.app.state.knowledge_store, "revise_authorized", None
+        )
+        row = (
+            revise_authorized(
+                knowledge_id,
+                payload,
+                expected_epoch=authority[0],
+                expected_event_sequence=_expected_event_sequence(current),
+                authority=authority[1],
+            )
+            if authority is not None and callable(revise_authorized)
+            else request.app.state.knowledge_store.revise(knowledge_id, payload)
+        )
+    except (HAChatAuthorityChanged, StaleAuxiliaryWrite):
+        return _stale_mutation()
     except ValueError as exc:
         return _error(ErrorCode.BAD_REQUEST, str(exc), 400)
     if row is None:
@@ -817,18 +997,56 @@ async def revise_knowledge(
 def _batch_set_status(request: Request, body: KnowledgeBatchReviewRequest, status: str):
     owned_ids = []
     unavailable_ids = []
+    scopes = {}
+    expected_event_sequences = {}
     for knowledge_id in body.knowledge_ids:
-        if _knowledge_row_for_request(request, knowledge_id) is None:
+        current = _knowledge_row_for_request(request, knowledge_id)
+        if current is None:
             unavailable_ids.append(knowledge_id)
         else:
             owned_ids.append(knowledge_id)
+            if _HA_EVENT_SEQUENCE in current:
+                expected_event_sequences[knowledge_id] = int(
+                    current[_HA_EVENT_SEQUENCE]
+                )
+            storage_id = str(current.get("kb_id") or "")
+            scope = scope_for_storage_id(request, storage_id)
+            if scope is None and getattr(
+                request.app.state, "ha_feedback_multiwriter_mode", False
+            ):
+                unavailable_ids.append(knowledge_id)
+                owned_ids.pop()
+            elif scope is not None:
+                scopes[storage_id] = scope
     try:
-        updated, missing = request.app.state.knowledge_store.batch_set_status(
-            owned_ids,
-            status,
-            actor=request_principal(request).subject_id,
-            note=body.note,
+        authorities = {
+            storage_id: frozen
+            for storage_id, scope in scopes.items()
+            if (frozen := _ha_mutation_authority(request, scope, Permission.REVIEW))
+            is not None
+        }
+        batch_authorized = getattr(
+            request.app.state.knowledge_store, "batch_set_status_authorized", None
         )
+        options = {
+            "actor": request_principal(request).subject_id,
+            "note": body.note,
+        }
+        updated, missing = (
+            batch_authorized(
+                owned_ids,
+                status,
+                authorities=authorities,
+                expected_event_sequences=expected_event_sequences,
+                **options,
+            )
+            if authorities and callable(batch_authorized)
+            else request.app.state.knowledge_store.batch_set_status(
+                owned_ids, status, **options
+            )
+        )
+    except (HAChatAuthorityChanged, StaleAuxiliaryWrite):
+        return _stale_mutation()
     except ValueError as exc:
         return _error(ErrorCode.BAD_REQUEST, str(exc), 400)
     unavailable = set(unavailable_ids) | set(missing)

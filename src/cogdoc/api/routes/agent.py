@@ -9,6 +9,11 @@ from cogdoc.api.claim_verification_observability import (
     record_claim_verification_observation,
 )
 from cogdoc.api.offload import run_sync
+from cogdoc.api.ha_chat_authority import (
+    HAChatAuthorityChanged,
+    capture_ha_chat_epoch,
+    ha_chat_authority_guard,
+)
 from cogdoc.api.runners import run_with_optional_session
 from cogdoc.api.schemas import (
     ChatResponse,
@@ -28,6 +33,10 @@ from cogdoc.api.tenant_scope import (
     session_store_doc_id,
 )
 from cogdoc.config.settings import get_settings
+from cogdoc.ha.chat_execution import ha_retrieval_scope
+from cogdoc.ha.index_generation import StaleIndexFence
+from cogdoc.ha.index_replica import IndexReplicaError
+from cogdoc.ha.session_store import SessionBusy, StaleSessionLease
 from cogdoc.service.chat_service import ChatResult, ChatServiceError, run_chat_sync
 
 
@@ -43,6 +52,24 @@ _ERROR_RESPONSES = {
     500: {"model": ErrorResponse},
 }
 _RETRIEVE_PREVIEW_CHARS = 240
+
+
+def _ha_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, SessionBusy):
+        return _error(
+            ErrorCode.CHAT_SESSION_CONFLICT,
+            "该会话已有请求正在处理，请等待完成后重试",
+            409,
+        )
+    if isinstance(exc, (HAChatAuthorityChanged, StaleSessionLease)):
+        return _error(
+            ErrorCode.CHAT_SESSION_CONFLICT,
+            "会话权限或状态已变化，请重试",
+            409,
+        )
+    if isinstance(exc, (IndexReplicaError, StaleIndexFence)):
+        return _error(ErrorCode.MODEL_UNAVAILABLE, "索引快照暂不可用，请稍后重试", 503)
+    raise exc
 
 
 # 构建稳定错误响应。
@@ -111,22 +138,65 @@ async def _task_endpoint(
 
     runner = getattr(request.app.state, "chat_runner", run_chat_sync)
     session_store = request.app.state.session_store
-    chat_history = session_store.get_history(
-        session_store_doc_id(request, body.doc_id), body.session_id, body.query
-    )
+    session_scope_id = session_store_doc_id(request, body.doc_id)
+    coordinator = getattr(request.app.state, "ha_chat_coordinator", None)
     try:
-        result = await run_sync(
-            request.app.state.offload_executor,
-            run_with_optional_session,
-            runner,
-            body.doc_id,
-            body.query,
-            body.is_local,
-            chat_history,
-            forced_task,
-            internal_session_id(request, body.session_id),
-            retrieval_scope,
+        expected_epoch = capture_ha_chat_epoch(
+            request.app.state.kb_registry, scope.storage_id
         )
+        if coordinator is not None:
+            retrieval_scope = ha_retrieval_scope(
+                retrieval_scope,
+                include_shared_auxiliary=bool(
+                    getattr(
+                        request.app.state,
+                        "ha_auxiliary_retrieval_enabled",
+                        False,
+                    )
+                ),
+            )
+            authority_guard = ha_chat_authority_guard(request, scope, expected_epoch)
+            chat_history = []
+        else:
+            authority_guard = None
+            chat_history = session_store.get_history(
+                session_scope_id, body.session_id, body.query
+            )
+        if coordinator is not None:
+            result = await run_sync(
+                request.app.state.offload_executor,
+                coordinator.run,
+                tenant_id=scope.tenant_id,
+                storage_id=scope.storage_id,
+                expected_epoch=expected_epoch,
+                session_scope_id=session_scope_id,
+                session_id=body.session_id,
+                query=body.query,
+                authority_guard=authority_guard,
+                runner=lambda history: run_with_optional_session(
+                    runner,
+                    body.doc_id,
+                    body.query,
+                    body.is_local,
+                    history,
+                    forced_task,
+                    internal_session_id(request, body.session_id),
+                    retrieval_scope,
+                ),
+            )
+        else:
+            result = await run_sync(
+                request.app.state.offload_executor,
+                run_with_optional_session,
+                runner,
+                body.doc_id,
+                body.query,
+                body.is_local,
+                chat_history,
+                forced_task,
+                internal_session_id(request, body.session_id),
+                retrieval_scope,
+            )
     except ChatServiceError as exc:
         code = classify_error_code(exc.stage, exc.error_class, exc.message)
         return _error(
@@ -137,11 +207,20 @@ async def _task_endpoint(
             trace_id=exc.trace_id,
             details={"error_class": exc.error_class, "stage": exc.stage},
         )
+    except (
+        SessionBusy,
+        StaleSessionLease,
+        HAChatAuthorityChanged,
+        IndexReplicaError,
+        StaleIndexFence,
+    ) as exc:
+        return _ha_error(exc)
 
     session_body = body.model_copy(
         update={"doc_id": session_store_doc_id(request, body.doc_id)}
     )
-    _record_task_session(request, session_body, result)
+    if coordinator is None:
+        _record_task_session(request, session_body, result)
     request.app.state.metrics.chat_results.labels(
         result.task_type, str(result.is_valid).lower()
     ).inc()
@@ -247,7 +326,8 @@ def _json_safe(value: Any) -> Any:
 
 # 构建检索命中项。
 def _retrieve_hit(rank: int, doc: Mapping[str, Any]) -> RetrieveHit:
-    meta = doc.get("meta") if isinstance(doc.get("meta"), Mapping) else {}
+    raw_meta = doc.get("meta")
+    meta: Mapping[str, Any] = raw_meta if isinstance(raw_meta, Mapping) else {}
     retrieval = _safe_mapping(doc.get("retrieval"))
     page = meta.get("page")
     return RetrieveHit(
@@ -299,17 +379,53 @@ async def retrieve(body: RetrieveRequest, request: Request):
     external_doc_id = body.doc_id
     retrieval_scope = retrieval_scope_for_request(request, scope)
     body = body.model_copy(update={"doc_id": scope.storage_id})
+    coordinator = getattr(request.app.state, "ha_chat_coordinator", None)
+    authority_guard = None
     retrieve_runner = getattr(request.app.state, "retrieve_runner", None) or partial(
         _run_retrieve,
-        state_runtime=request.app.state.state_runtime,
+        state_runtime=getattr(
+            request.app.state,
+            "ha_chat_state_runtime",
+            request.app.state.state_runtime,
+        ),
     )
-    docs = await run_sync(
-        request.app.state.offload_executor,
-        _call_retrieve_runner,
-        retrieve_runner,
-        body,
-        retrieval_scope,
-    )
+
+    def retrieve_once():
+        if coordinator is None:
+            return _call_retrieve_runner(retrieve_runner, body, retrieval_scope)
+        assert authority_guard is not None
+        authority_guard()
+        with request.app.state.ha_chat_index_provider.pin(scope.storage_id):
+            rows = _call_retrieve_runner(retrieve_runner, body, retrieval_scope)
+            authority_guard()
+            return rows
+
+    try:
+        expected_epoch = capture_ha_chat_epoch(
+            request.app.state.kb_registry, scope.storage_id
+        )
+        if coordinator is not None:
+            retrieval_scope = ha_retrieval_scope(
+                retrieval_scope,
+                include_shared_auxiliary=bool(
+                    getattr(
+                        request.app.state,
+                        "ha_auxiliary_retrieval_enabled",
+                        False,
+                    )
+                ),
+            )
+            authority_guard = ha_chat_authority_guard(request, scope, expected_epoch)
+        docs = await run_sync(
+            request.app.state.offload_executor,
+            retrieve_once,
+        )
+    except (
+        HAChatAuthorityChanged,
+        IndexReplicaError,
+        StaleIndexFence,
+    ) as exc:
+        return _ha_error(exc)
     hits = [
         _retrieve_hit(rank, doc)
         for rank, doc in enumerate(docs, start=1)

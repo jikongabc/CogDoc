@@ -53,6 +53,12 @@ class PublicationHook(Protocol):
     ) -> None: ...
 
 
+class IndexAuthorityGuard(Protocol):
+    def __call__(
+        self, connection: DatabaseConnection, tenant_id: str, kb_id: str
+    ) -> None: ...
+
+
 def _clean(value: str, field: str, maximum: int = 255) -> str:
     if (
         not isinstance(value, str)
@@ -152,6 +158,7 @@ class IndexGenerationStore:
     ) -> None:
         self.backend = backend
         self._clock = clock
+        self._authority_guard: IndexAuthorityGuard | None = None
         execute_script(
             backend,
             [
@@ -184,8 +191,25 @@ class IndexGenerationStore:
                 ),
                 "CREATE INDEX IF NOT EXISTS idx_ha_index_generations_scope ON ha_index_generations(tenant_id,kb_id,created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_ha_index_generations_cleanup ON ha_index_generations(status,published_at,aborted_at)",
+                backend.sql(
+                    sqlite="""CREATE TABLE IF NOT EXISTS ha_index_reader_leases (
+                    reader_id TEXT PRIMARY KEY,generation_id TEXT NOT NULL,lease_owner TEXT NOT NULL,
+                    lease_token TEXT NOT NULL,lease_expires_at REAL NOT NULL,
+                    created_at REAL NOT NULL,updated_at REAL NOT NULL)""",
+                    postgres="""CREATE TABLE IF NOT EXISTS ha_index_reader_leases (
+                    reader_id TEXT PRIMARY KEY,generation_id TEXT NOT NULL,lease_owner TEXT NOT NULL,
+                    lease_token TEXT NOT NULL,lease_expires_at DOUBLE PRECISION NOT NULL,
+                    created_at DOUBLE PRECISION NOT NULL,updated_at DOUBLE PRECISION NOT NULL)""",
+                ),
+                "CREATE INDEX IF NOT EXISTS idx_ha_index_reader_generation ON ha_index_reader_leases(generation_id,lease_expires_at)",
+                "CREATE INDEX IF NOT EXISTS idx_ha_index_reader_expiry ON ha_index_reader_leases(lease_expires_at,reader_id)",
             ],
         )
+
+    def bind_authority_guard(self, guard: IndexAuthorityGuard) -> None:
+        if self._authority_guard is not None and self._authority_guard is not guard:
+            raise RuntimeError("index authority guard is already bound")
+        self._authority_guard = guard
 
     @staticmethod
     def _row(row: Any | None) -> dict[str, Any] | None:
@@ -221,6 +245,8 @@ class IndexGenerationStore:
             postgres="INSERT INTO ha_index_heads(tenant_id,kb_id,updated_at) VALUES(%s,%s,%s) ON CONFLICT(tenant_id,kb_id) DO NOTHING",
         )
         with self.backend.transaction(write=True) as connection:
+            if self._authority_guard is not None:
+                self._authority_guard(connection, tenant_id, kb_id)
             connection.execute(insert_head, (tenant_id, kb_id, now))
             lock = self.backend.sql(sqlite="", postgres=" FOR UPDATE")
             head = connection.execute(
@@ -448,6 +474,10 @@ class IndexGenerationStore:
             )
             self._require_live(current, lease_token, now, {GEN_PREPARED})
             assert current is not None
+            if self._authority_guard is not None:
+                self._authority_guard(
+                    connection, str(current["tenant_id"]), str(current["kb_id"])
+                )
             self._require_current_fence(connection, current)
             # Verify again after taking the authority locks. Local verification
             # is cheap relative to an index build; remote implementations use
@@ -567,6 +597,127 @@ class IndexGenerationStore:
             ).fetchone()
             return self._row(row)
 
+    def acquire_reader(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        lease_owner: str,
+        *,
+        lease_seconds: float = 600.0,
+    ) -> dict[str, Any] | None:
+        """Freeze the current published generation against retention GC."""
+
+        tenant_id = _clean(tenant_id, "tenant_id")
+        kb_id = _clean(kb_id, "kb_id")
+        lease_owner = _clean(lease_owner, "lease_owner")
+        if not math.isfinite(lease_seconds) or not 5 <= lease_seconds <= 3600:
+            raise ValueError("reader lease_seconds must be between 5 and 3600")
+        now = self._clock()
+        reader_id = f"reader-{uuid.uuid4().hex}"
+        token = secrets.token_urlsafe(32)
+        marker = self.backend.sql(sqlite="?", postgres="%s")
+        lock = self.backend.sql(sqlite="", postgres=" FOR UPDATE")
+        with self.backend.transaction(write=True) as connection:
+            head = connection.execute(
+                "SELECT current_generation_id FROM ha_index_heads "
+                f"WHERE tenant_id={marker} AND kb_id={marker}{lock}",
+                (tenant_id, kb_id),
+            ).fetchone()
+            generation_id = (
+                None if head is None else dict(head).get("current_generation_id")
+            )
+            if not generation_id:
+                return None
+            generation_row = connection.execute(
+                "SELECT * FROM ha_index_generations "
+                f"WHERE generation_id={marker} AND tenant_id={marker} "
+                f"AND kb_id={marker} AND status='{GEN_PUBLISHED}'",
+                (str(generation_id), tenant_id, kb_id),
+            ).fetchone()
+            generation = self._row(generation_row)
+            if generation is None:
+                raise IndexIntegrityError(
+                    "current index head does not reference a published generation"
+                )
+            placeholders = self.backend.sql(
+                sqlite="?,?,?,?,?,?,?", postgres="%s,%s,%s,%s,%s,%s,%s"
+            )
+            connection.execute(
+                "INSERT INTO ha_index_reader_leases(reader_id,generation_id,lease_owner,"
+                "lease_token,lease_expires_at,created_at,updated_at) "
+                f"VALUES({placeholders})",
+                (
+                    reader_id,
+                    str(generation_id),
+                    lease_owner,
+                    token,
+                    now + lease_seconds,
+                    now,
+                    now,
+                ),
+            )
+        return {
+            **generation,
+            "reader_id": reader_id,
+            "reader_lease_token": token,
+            "reader_lease_expires_at": now + lease_seconds,
+        }
+
+    def heartbeat_reader(
+        self,
+        reader_id: str,
+        lease_token: str,
+        *,
+        lease_seconds: float = 600.0,
+    ) -> None:
+        reader_id = _clean(reader_id, "reader_id")
+        lease_token = _clean(lease_token, "reader_lease_token", 512)
+        if not math.isfinite(lease_seconds) or not 5 <= lease_seconds <= 3600:
+            raise ValueError("reader lease_seconds must be between 5 and 3600")
+        now = self._clock()
+        marker = self.backend.sql(sqlite="?", postgres="%s")
+        with self.backend.transaction(write=True) as connection:
+            changed = connection.execute(
+                "UPDATE ha_index_reader_leases SET lease_expires_at="
+                f"{marker},updated_at={marker} WHERE reader_id={marker} "
+                f"AND lease_token={marker} AND lease_expires_at>{marker}",
+                (now + lease_seconds, now, reader_id, lease_token, now),
+            )
+            if changed.rowcount != 1:
+                raise StaleIndexFence("index reader lease is stale")
+
+    def release_reader(self, reader_id: str, lease_token: str) -> bool:
+        reader_id = _clean(reader_id, "reader_id")
+        lease_token = _clean(lease_token, "reader_lease_token", 512)
+        marker = self.backend.sql(sqlite="?", postgres="%s")
+        with self.backend.transaction(write=True) as connection:
+            changed = connection.execute(
+                "DELETE FROM ha_index_reader_leases "
+                f"WHERE reader_id={marker} AND lease_token={marker}",
+                (reader_id, lease_token),
+            )
+            return changed.rowcount == 1
+
+    def prune_reader_leases(self, *, before: float, limit: int = 1000) -> int:
+        if not math.isfinite(before):
+            raise ValueError("reader lease cutoff must be finite")
+        if type(limit) is not int or not 1 <= limit <= 10_000:
+            raise ValueError("reader lease limit is invalid")
+        marker = self.backend.sql(sqlite="?", postgres="%s")
+        with self.backend.transaction(write=True) as connection:
+            rows = connection.execute(
+                "SELECT reader_id FROM ha_index_reader_leases "
+                f"WHERE lease_expires_at<={marker} "
+                f"ORDER BY lease_expires_at,reader_id LIMIT {marker}",
+                (before, limit),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    f"DELETE FROM ha_index_reader_leases WHERE reader_id={marker}",
+                    (str(dict(row)["reader_id"]),),
+                )
+        return len(rows)
+
     def list_current(
         self,
         *,
@@ -679,6 +830,7 @@ class IndexGenerationStore:
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("garbage collection limit must be between 1 and 1000")
         marker = self.backend.sql(sqlite="?", postgres="%s")
+        now = self._clock()
         with self.backend.transaction() as connection:
             rows = connection.execute(
                 "SELECT generations.* FROM ha_index_generations AS generations "
@@ -690,10 +842,14 @@ class IndexGenerationStore:
                 f"(generations.status='{GEN_PUBLISHED}' AND generations.published_at<={marker}) OR "
                 f"(generations.status IN ('{GEN_BUILDING}','{GEN_PREPARED}') "
                 f"AND generations.lease_expires_at<={marker} "
-                "AND generations.fencing_token<heads.fencing_token)) "
+                "AND (heads.fencing_token IS NULL OR "
+                "generations.fencing_token<heads.fencing_token))) "
+                "AND NOT EXISTS (SELECT 1 FROM ha_index_reader_leases AS readers "
+                "WHERE readers.generation_id=generations.generation_id "
+                f"AND readers.lease_expires_at>{marker}) "
                 "ORDER BY generations.created_at,generations.generation_id "
                 f"LIMIT {limit}",
-                (before, before, before),
+                (before, before, before, now),
             ).fetchall()
             return [item for row in rows if (item := self._row(row)) is not None]
 
@@ -704,6 +860,7 @@ class IndexGenerationStore:
         if not math.isfinite(before):
             raise ValueError("garbage collection cutoff must be finite")
         marker = self.backend.sql(sqlite="?", postgres="%s")
+        now = self._clock()
         with self.backend.transaction(write=True) as connection:
             changed = connection.execute(
                 "DELETE FROM ha_index_generations WHERE generation_id="
@@ -712,10 +869,15 @@ class IndexGenerationStore:
                 "WHERE current_generation_id IS NOT NULL) AND ((status="
                 f"'{GEN_ABORTED}' AND aborted_at<={marker}) OR (status='{GEN_PUBLISHED}' "
                 f"AND published_at<={marker}) OR (status IN ('{GEN_BUILDING}','{GEN_PREPARED}') "
-                f"AND lease_expires_at<={marker} AND fencing_token<(SELECT fencing_token "
+                f"AND lease_expires_at<={marker} AND (NOT EXISTS (SELECT 1 FROM "
+                "ha_index_heads WHERE tenant_id=ha_index_generations.tenant_id AND "
+                "kb_id=ha_index_generations.kb_id) OR fencing_token<(SELECT fencing_token "
                 "FROM ha_index_heads WHERE tenant_id=ha_index_generations.tenant_id "
-                "AND kb_id=ha_index_generations.kb_id)))",
-                (generation_id, before, before, before),
+                "AND kb_id=ha_index_generations.kb_id)))) AND NOT EXISTS ("
+                "SELECT 1 FROM ha_index_reader_leases AS readers WHERE "
+                "readers.generation_id=ha_index_generations.generation_id "
+                f"AND readers.lease_expires_at>{marker})",
+                (generation_id, before, before, before, now),
             )
             return changed.rowcount == 1
 
@@ -891,6 +1053,7 @@ __all__ = [
     "GEN_PREPARED",
     "GEN_PUBLISHED",
     "IndexConflict",
+    "IndexAuthorityGuard",
     "IndexGenerationError",
     "IndexGenerationStore",
     "IndexIntegrityError",

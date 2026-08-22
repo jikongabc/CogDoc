@@ -21,11 +21,11 @@ class Clock:
         return self.value
 
 
-def _manifest(content: bytes) -> dict:
+def _manifest(content: bytes, *, chunk_version: str = "v1") -> dict:
     return {
         "schema_version": "index-manifest-v1",
         "contract": {
-            "chunk_version": "v1",
+            "chunk_version": chunk_version,
             "embedding_model": "model",
             "dimensions": 3,
         },
@@ -47,13 +47,16 @@ def _publish(
     content: bytes,
     *,
     kb_id: str = "kb",
+    chunk_version: str = "v1",
 ):
     source = tmp_path / build_id
     source.mkdir()
     (source / "index.bin").write_bytes(content)
     generation = authority.begin_build("tenant", kb_id, build_id, "worker")
     prepared = authority.prepare(
-        generation["generation_id"], generation["lease_token"], _manifest(content)
+        generation["generation_id"],
+        generation["lease_token"],
+        _manifest(content, chunk_version=chunk_version),
     )
     repository.materialize(prepared, source)
     return authority.publish(
@@ -122,6 +125,8 @@ def test_maintenance_reaps_prunes_scrubs_and_never_collects_current(tmp_path):
         "outbox_pruned": 1,
         "fires_pruned": 1,
         "generations_removed": 1,
+        "source_generations_removed": 0,
+        "artifact_orphans_removed": 0,
         "generations_scrubbed": 1,
     }
     assert authority.get(first["generation_id"]) is None
@@ -155,6 +160,58 @@ def test_maintenance_thread_reports_failure_and_stops(tmp_path):
     maintenance.wake()
     assert maintenance.stop()
     assert not maintenance.snapshot().running
+    backend.close()
+
+
+def test_maintenance_routes_derived_generations_to_their_object_namespace(tmp_path):
+    clock = Clock()
+    backend = SQLiteBackend(tmp_path / "ha.db")
+    jobs = LeaseJobStore(backend, clock=clock)
+    schedules = ScheduleStore(backend, clock=clock)
+    outbox = OutboxStore(backend, clock=clock)
+    authority = IndexGenerationStore(backend, clock=clock)
+    objects = LocalObjectStore(tmp_path / "objects")
+    core = ObjectIndexRepository(objects)
+    derived = ObjectIndexRepository(objects, prefix="derived-knowledge-indexes")
+    first = _publish(
+        authority,
+        derived,
+        tmp_path,
+        "derived-first",
+        b"old",
+        kb_id="derived-scope",
+        chunk_version="derived-knowledge-v1",
+    )
+    second = _publish(
+        authority,
+        derived,
+        tmp_path,
+        "derived-second",
+        b"current",
+        kb_id="derived-scope",
+        chunk_version="derived-knowledge-v1",
+    )
+    clock.value += 120
+    maintenance = HAMaintenance(
+        jobs,
+        schedules,
+        outbox,
+        authority,
+        core,
+        retention_seconds=60,
+        interval_seconds=1,
+        scrub_interval_seconds=10,
+        clock=clock,
+        monotonic=clock,
+    )
+    maintenance.bind_index_repository(derived, chunk_version="derived-knowledge-v1")
+
+    result = maintenance.run_once()
+
+    assert result["generations_removed"] == 1
+    assert result["generations_scrubbed"] == 1
+    assert authority.get(first["generation_id"]) is None
+    derived.verify(second)
     backend.close()
 
 

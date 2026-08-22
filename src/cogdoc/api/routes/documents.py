@@ -1,8 +1,14 @@
 from collections.abc import Callable, Mapping
+import mimetypes
 import os
 from fastapi import APIRouter, File, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from cogdoc.api.ingest import KBExistsError
+from cogdoc.api.ha_chat_authority import (
+    HAChatAuthorityChanged,
+    capture_ha_chat_epoch,
+    ha_authority_guard,
+)
 from cogdoc.api.offload import run_sync
 from cogdoc.api.tenant_quota import (
     TenantMutationInProgress,
@@ -31,6 +37,7 @@ from cogdoc.api.schemas import (
     build_error_response,
 )
 from cogdoc.config.settings import get_settings
+from cogdoc.ha.session_store import StaleSessionLease
 from cogdoc.observability.trace import delete_trace_files
 from cogdoc.service.ingest_service import (
     KBCleanupError,
@@ -49,6 +56,7 @@ from cogdoc.service.kb_lifecycle import (
     shared_lifecycle_store,
 )
 from cogdoc.service.kb_state import KBState
+from cogdoc.source_model import build_source_id, build_version_id
 from cogdoc.tools.manifest import load_index_manifest
 from cogdoc.tools.chunk_identity import build_document_id
 from cogdoc.tools.source_parser import (
@@ -283,7 +291,35 @@ def _public_job(job: dict, request: Request | None = None) -> IndexJob:
 
 
 # 完成 知识库documents 处理。
-def _kb_documents(kb_id: str) -> list[Document]:
+def _kb_documents(
+    kb_id: str, manifest_reader: Callable[[str], Mapping | None] | None = None
+) -> list[Document]:
+    if manifest_reader is not None:
+        manifest = manifest_reader(kb_id)
+        files = manifest.get("files", []) if isinstance(manifest, Mapping) else []
+        documents: list[Document] = []
+        for item in files:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("path") or "")
+            sha256 = str(item.get("sha256") or "")
+            if os.path.splitext(name)[1].casefold() not in SUPPORTED_EXTENSIONS:
+                continue
+            source_id = build_source_id("legacy-upload", name)
+            documents.append(
+                Document(
+                    name=name,
+                    sha256=sha256,
+                    document_id=build_document_id(name),
+                    source_id=source_id,
+                    version_id=build_version_id(source_id, sha256),
+                    connector_type="legacy-upload",
+                    media_type=mimetypes.guess_type(name)[0]
+                    or "application/octet-stream",
+                    kind="file",
+                )
+            )
+        return documents
     # generation state 是事务提交指针且内含 documents；manifest 是提交后的派生缓存，写失败时可能滞后。
     active = KBState(kb_id).active()
     documents = (
@@ -306,6 +342,18 @@ def _kb_documents(kb_id: str) -> list[Document]:
         for doc in documents
         if doc.get("name")
     ]
+
+
+async def _request_kb_documents(request: Request, kb_id: str) -> list[Document]:
+    manifest_reader = getattr(request.app.state, "ha_source_manifest_reader", None)
+    if manifest_reader is None:
+        return _kb_documents(kb_id)
+    return await run_sync(
+        request.app.state.offload_executor,
+        _kb_documents,
+        kb_id,
+        manifest_reader,
+    )
 
 
 def _allowed_sources_for_scope(request: Request, scope, sources) -> list[str]:
@@ -496,7 +544,7 @@ async def create_knowledge_base(body: KnowledgeBaseCreate, request: Request):
 async def list_knowledge_bases(request: Request):
     result = []
     for scope in tenant_kb_scopes(request):
-        documents = _kb_documents(scope.storage_id)
+        documents = await _request_kb_documents(request, scope.storage_id)
         visible_sources = _allowed_sources_for_scope(
             request, scope, (document.name for document in documents)
         )
@@ -518,7 +566,7 @@ async def get_knowledge_base(kb_id: str, request: Request):
     scope = resolve_kb_scope(request, kb_id)
     if scope is None:
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
-    documents = _kb_documents(scope.storage_id)
+    documents = await _request_kb_documents(request, scope.storage_id)
     visible_sources = _allowed_sources_for_scope(
         request, scope, (document.name for document in documents)
     )
@@ -539,6 +587,55 @@ async def delete_knowledge_base(kb_id: str, request: Request):
     if scope is None:
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
     storage_id = scope.storage_id
+    if getattr(request.app.state, "ha_document_multiwriter_mode", False):
+        coordinator = getattr(request.app.state.ha_runtime, "api_kb_deletion", None)
+        if coordinator is None:
+            return _error(
+                ErrorCode.KB_CLEANUP_FAILED,
+                "HA 知识库删除控制面未就绪",
+                503,
+            )
+        authority_evidence = None
+        try:
+            deletion = coordinator.get(storage_id)
+            if deletion is None:
+                expected_epoch = capture_ha_chat_epoch(
+                    request.app.state.kb_registry, storage_id
+                )
+                authority_guard = ha_authority_guard(
+                    request,
+                    scope,
+                    expected_epoch,
+                    permission=Permission.DELETE,
+                )
+                authority_evidence = getattr(authority_guard, "evidence", None)
+            # Once the transactional HA deletion fence exists, the original
+            # live DELETE authority has already been checked in that exact DB
+            # transaction. Cleanup deliberately removes ACL rows before the
+            # tombstone commit, so retries must resume the durable saga instead
+            # of requiring authority state that may already be gone.
+            await run_sync(
+                request.app.state.connector_cleanup_executor,
+                coordinator.delete,
+                scope.tenant_id,
+                storage_id,
+                authority=authority_evidence,
+            )
+        except KeyError:
+            return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
+        except (HAChatAuthorityChanged, StaleSessionLease, PermissionError):
+            return _error(
+                ErrorCode.KB_CLEANUP_FAILED,
+                "知识库删除权限或状态已变化，请重试",
+                409,
+            )
+        except Exception:
+            return _error(
+                ErrorCode.KB_CLEANUP_FAILED,
+                "HA 知识库清理未完成，请重试",
+                500,
+            )
+        return Response(status_code=204)
     authorization_guard = _live_session_authorization_guard(
         request,
         scope,
@@ -691,7 +788,7 @@ async def list_documents(kb_id: str, request: Request):
     scope = resolve_kb_scope(request, kb_id)
     if scope is None:
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
-    documents = _kb_documents(scope.storage_id)
+    documents = await _request_kb_documents(request, scope.storage_id)
     allowed = set(
         _allowed_sources_for_scope(
             request, scope, (document.name for document in documents)

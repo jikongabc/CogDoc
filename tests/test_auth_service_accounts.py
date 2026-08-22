@@ -44,6 +44,11 @@ def test_service_token_is_one_time_scoped_and_uses_live_account_role(tmp_path):
             actor_user_id=owner["user"]["user_id"],
         )
     )
+    assert store.service_token_is_active(
+        workspace_id=workspace_id,
+        service_account_id=account["service_account_id"],
+        token_id=created["token_id"],
+    )
 
     context = store.authenticate_service_token(raw, workspace_id)
     assert (
@@ -96,6 +101,11 @@ def test_service_token_is_one_time_scoped_and_uses_live_account_role(tmp_path):
     )
     with pytest.raises(AuthAuthenticationError):
         store.authenticate_service_token(raw)
+    assert not store.service_token_is_active(
+        workspace_id=workspace_id,
+        service_account_id=account["service_account_id"],
+        token_id=created["token_id"],
+    )
     store.update_service_account(
         workspace_id=workspace_id,
         service_account_id=account["service_account_id"],

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from concurrent.futures import Executor
+from typing import BinaryIO
+
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from cogdoc.api.audit_exports import AuditExportConflict, AuditExportError
@@ -10,6 +14,16 @@ from cogdoc.api.tenant_scope import request_principal
 
 
 router = APIRouter(prefix="/v1/audit-events/exports", tags=["audit"])
+
+
+async def _stream_verified_handle(
+    handle: BinaryIO, executor: Executor
+) -> AsyncIterator[bytes]:
+    try:
+        while chunk := await run_sync(executor, handle.read, 64 * 1024):
+            yield chunk
+    finally:
+        handle.close()
 
 
 class AuditExportCreate(BaseModel):
@@ -96,13 +110,13 @@ async def get_audit_export(job_id: str, request: Request):
     return row
 
 
-@router.get("/{job_id}/content", response_class=FileResponse)
+@router.get("/{job_id}/content")
 async def download_audit_export(job_id: str, request: Request):
     principal = request_principal(request)
     try:
-        path = await run_sync(
+        handle = await run_sync(
             request.app.state.source_artifact_executor,
-            _manager(request).store.artifact_path,
+            _manager(request).store.open_artifact,
             job_id,
             principal.tenant_id,
         )
@@ -110,11 +124,14 @@ async def download_audit_export(job_id: str, request: Request):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except AuditExportError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return FileResponse(
-        path,
+    return StreamingResponse(
+        _stream_verified_handle(handle, request.app.state.source_artifact_executor),
         media_type="application/x-ndjson",
-        filename=f"{job_id}.ndjson",
-        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'attachment; filename="{job_id}.ndjson"',
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

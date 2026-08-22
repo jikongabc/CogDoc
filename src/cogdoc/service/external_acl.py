@@ -12,6 +12,8 @@ from cogdoc.api.persistence import connect_sqlite
 from cogdoc.api.resource_access import AccessPolicy, ResourceAccessStore
 from cogdoc.api.tenancy import Role
 from cogdoc.connectors.base import MAX_CONNECTOR_ACL_BYTES, MAX_CONNECTOR_ACL_GRANTS
+from cogdoc.ha.dbapi_compat import BackendDBAPIConnection
+from cogdoc.ha.storage import DatabaseBackend
 
 
 @dataclass(frozen=True)
@@ -162,9 +164,18 @@ class WorkspaceIdentityResolver:
 
 
 class ExternalAclSyncStore:
-    def __init__(self, db_path: str):
+    def __init__(
+        self, db_path: str | None, *, backend: DatabaseBackend | None = None
+    ) -> None:
+        if (db_path is None) == (backend is None):
+            raise ValueError("configure exactly one external ACL backend")
         self._lock = RLock()
-        self._conn = connect_sqlite(db_path)
+        self._backend = backend
+        self._conn = (
+            BackendDBAPIConnection(backend)
+            if backend is not None
+            else connect_sqlite(str(db_path))
+        )
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS external_acl_sync_state ("
             "tenant_id TEXT NOT NULL,kb_id TEXT NOT NULL,document_id TEXT NOT NULL,"
@@ -172,6 +183,10 @@ class ExternalAclSyncStore:
             "provider_version TEXT,resolved_count INTEGER NOT NULL,unresolved_count INTEGER NOT NULL,"
             "updated_at REAL NOT NULL,PRIMARY KEY(tenant_id,kb_id,document_id,managed_by))"
         )
+
+    @property
+    def backend(self) -> DatabaseBackend | None:
+        return self._backend
 
     def close(self) -> None:
         with self._lock:
@@ -306,6 +321,11 @@ class ExternalAclSyncStore:
                 tuple(parameters),
             )
         return int(cursor.rowcount)
+
+    def check(self) -> bool:
+        with self._lock:
+            self._conn.execute("SELECT 1 FROM external_acl_sync_state LIMIT 1").fetchone()
+        return True
 
 
 class ExternalAclSynchronizer:

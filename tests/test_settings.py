@@ -150,6 +150,7 @@ def test_settings_reads_environment_overrides(monkeypatch):
     monkeypatch.setenv("QA_ADAPTIVE_RETRIEVAL_MAX_TOP_K", "24")
     monkeypatch.setenv("COGDOC_EVAL_REVIEW_API_KEYS", "review-a, review-b")
     monkeypatch.setenv("COGDOC_CHAT_STREAM_IDLE_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("COGDOC_CHAT_STREAM_WORKERS", "12")
     monkeypatch.setenv("COGDOC_CONNECTOR_INDEX_TIMEOUT_SECONDS", "75")
 
     settings = get_settings()
@@ -186,6 +187,7 @@ def test_settings_reads_environment_overrides(monkeypatch):
     assert settings.qa_adaptive_retrieval_max_top_k == 24
     assert settings.eval_review_api_key_set == {"review-a", "review-b"}
     assert settings.cogdoc_chat_stream_idle_timeout_seconds == 45.0
+    assert settings.cogdoc_chat_stream_workers == 12
     assert settings.cogdoc_connector_index_timeout_seconds == 75.0
 
 

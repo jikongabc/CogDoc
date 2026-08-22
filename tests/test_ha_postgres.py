@@ -53,6 +53,12 @@ class FakeConnection:
             return FakeCursor({"locked": value} if self.mapping_rows else (value,))
         if "pg_advisory_unlock" in sql:
             return FakeCursor({"unlocked": True} if self.mapping_rows else (True,))
+        if sql == "SELECT pg_export_snapshot()":
+            return FakeCursor(
+                {"snapshot": "00000003-0000001B-1"}
+                if self.mapping_rows
+                else ("00000003-0000001B-1",)
+            )
         if sql == "SELECT 1":
             return FakeCursor({"value": 1} if self.mapping_rows else (1,))
         return FakeCursor()
@@ -135,6 +141,29 @@ def test_postgres_advisory_lock_polls_and_releases():
 def test_postgres_check_supports_production_dict_rows():
     backend = _backend(FakeConnection(mapping_rows=True), [])
     assert backend.check()
+    backend.close()
+
+
+def test_postgres_exported_snapshot_holds_repeatable_read_transaction():
+    connection = FakeConnection(mapping_rows=True)
+    backend = _backend(connection, [])
+
+    with backend.exported_snapshot(statement_timeout_seconds=600) as (
+        active,
+        snapshot_id,
+    ):
+        assert active is connection
+        assert snapshot_id == "00000003-0000001B-1"
+        assert connection.events[-1] == ("SELECT pg_export_snapshot()", None)
+
+    sql = [event[0] for event in connection.events if isinstance(event, tuple)]
+    assert "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY" in sql
+    assert "SET LOCAL statement_timeout = 600000" in sql
+    assert "SET LOCAL idle_in_transaction_session_timeout = 0" in sql
+    assert connection.events[-1] == "commit"
+    with pytest.raises(ValueError, match="snapshot statement timeout"):
+        with backend.exported_snapshot(statement_timeout_seconds=0):
+            pass
     backend.close()
 
 

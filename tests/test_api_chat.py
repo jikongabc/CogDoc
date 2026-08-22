@@ -4,9 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from starlette.requests import Request
 from cogdoc.api.app import create_app
 from cogdoc.api.persistence import SqliteSessionStore
-from cogdoc.api.routes.chat import _event_to_frame
+from cogdoc.api.routes.chat import _event_to_frame, chat_stream
+from cogdoc.api.schemas import ChatRequest
 from cogdoc.api.session_store import SessionStore
 from cogdoc.memory.manager import MemoryPolicy
 from cogdoc.service.chat_service import ChatEvent, ChatResult, ChatServiceError
@@ -405,6 +407,147 @@ async def test_chat_stream_watchdog_recovers_lost_threadsafe_wakeup(monkeypatch)
     assert response.status_code == 200
     assert "event: final" in response.text
     assert "trace-watchdog" in response.text
+
+
+@pytest.mark.anyio
+async def test_chat_stream_workers_do_not_starve_live_authorization(monkeypatch):
+    """Two long-lived producers must not occupy the control-plane pool."""
+
+    import cogdoc.api.app as app_module
+    import cogdoc.api.routes.chat as chat_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    barrier = threading.Barrier(2)
+    result = _result("并发答案", "trace-concurrent")
+
+    class Coordinator:
+        def stream(self, **_kwargs):
+            yield ChatEvent("request_started", {"trace_id": "trace-concurrent"})
+            barrier.wait(1)
+            yield ChatEvent("final", {"result": result, "output": result.raw_output})
+
+    def guard():
+        return None
+
+    monkeypatch.setattr(chat_module, "capture_ha_chat_epoch", lambda *_args: 1)
+    monkeypatch.setattr(chat_module, "ha_chat_authority_guard", lambda *_a, **_k: guard)
+    app = create_app(
+        session_store=SessionStore(),
+        offload_workers=1,
+        chat_stream_workers=2,
+    )
+    app.state.ha_chat_coordinator = Coordinator()
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            first, second = await asyncio.wait_for(
+                asyncio.gather(
+                    client.post(
+                        "/v1/chat/stream",
+                        json={"query": "一", "doc_id": "kb", "session_id": "s1"},
+                    ),
+                    client.post(
+                        "/v1/chat/stream",
+                        json={"query": "二", "doc_id": "kb", "session_id": "s2"},
+                    ),
+                ),
+                timeout=3,
+            )
+
+    assert first.status_code == second.status_code == 200
+    assert "event: final" in first.text
+    assert "event: final" in second.text
+    assert app.state.chat_stream_executor_shutdown is True
+
+
+@pytest.mark.anyio
+async def test_ha_stream_rechecks_authority_at_network_release(monkeypatch):
+    import cogdoc.api.app as app_module
+    import cogdoc.api.routes.chat as chat_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    allowed = [True]
+    result = _result("不得提交", "trace-revoked")
+
+    class Coordinator:
+        def stream(self, **_kwargs):
+            yield ChatEvent("request_started", {"trace_id": "trace-revoked"})
+            yield ChatEvent("token", {"content": "SECRET-AFTER-REVOKE"})
+            yield ChatEvent("final", {"result": result, "output": result.raw_output})
+
+    def guard():
+        if not allowed[0]:
+            raise PermissionError("revoked")
+
+    monkeypatch.setattr(chat_module, "capture_ha_chat_epoch", lambda *_args: 1)
+    monkeypatch.setattr(chat_module, "ha_chat_authority_guard", lambda *_a, **_k: guard)
+    app = create_app(session_store=SessionStore())
+    app.state.ha_chat_coordinator = Coordinator()
+
+    async with app.router.lifespan_context(app):
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/chat/stream",
+                "query_string": b"",
+                "headers": [],
+                "app": app,
+                "state": {},
+            }
+        )
+        response = await chat_stream(
+            ChatRequest(query="问题", doc_id="kb", session_id="s1"), request
+        )
+        iterator = response.body_iterator
+        first = await anext(iterator)
+        assert "event: start" in first
+        allowed[0] = False
+        second = await anext(iterator)
+        assert "event: error" in second
+        assert "SECRET-AFTER-REVOKE" not in second
+        await iterator.aclose()
+
+
+@pytest.mark.anyio
+async def test_stream_disconnect_does_not_advance_or_record_provider(monkeypatch):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    advanced_after_disconnect = threading.Event()
+    result = _result("幽灵答案", "trace-ghost")
+
+    def stream_runner(*_args, **_kwargs):
+        yield ChatEvent("request_started", {"trace_id": "trace-ghost"})
+        advanced_after_disconnect.set()
+        yield ChatEvent("final", {"result": result, "output": result.raw_output})
+
+    store = SessionStore()
+    app = create_app(chat_stream_runner=stream_runner, session_store=store)
+    async with app.router.lifespan_context(app):
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/chat/stream",
+                "query_string": b"",
+                "headers": [],
+                "app": app,
+                "state": {},
+            }
+        )
+        response = await chat_stream(
+            ChatRequest(query="问题", doc_id="kb", session_id="s1"), request
+        )
+        iterator = response.body_iterator
+        assert "event: start" in await anext(iterator)
+        await iterator.aclose()
+        await asyncio.sleep(0.1)
+
+    assert not advanced_after_disconnect.is_set()
+    assert store.get_display("kb", "s1") == []
 
 
 @pytest.mark.anyio

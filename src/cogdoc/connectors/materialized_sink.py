@@ -64,6 +64,7 @@ class MaterializedSyncSink:
         catalog: SourceCatalog,
         index_submitter: Callable[[str], Mapping[str, Any]],
         index_status_reader: Callable[[str], Mapping[str, Any] | None] | None = None,
+        keyed_index_submitter: Callable[[str, str], Mapping[str, Any]] | None = None,
         owner_id: str,
         workspace_visible: bool,
         acl_sync: ExternalAclSynchronizer | None = None,
@@ -74,6 +75,7 @@ class MaterializedSyncSink:
         ) = None,
         quota_releaser: Callable[[str | None], None] | None = None,
         index_timeout_seconds: float = 30.0,
+        commit_store: Any | None = None,
     ) -> None:
         if (
             isinstance(index_timeout_seconds, bool)
@@ -86,6 +88,7 @@ class MaterializedSyncSink:
         self.catalog = catalog
         self.index_submitter = index_submitter
         self.index_status_reader = index_status_reader
+        self.keyed_index_submitter = keyed_index_submitter
         self.owner_id = owner_id
         self.workspace_visible = workspace_visible
         self.acl_sync = acl_sync
@@ -94,6 +97,7 @@ class MaterializedSyncSink:
         self.quota_reserver = quota_reserver
         self.quota_releaser = quota_releaser
         self.index_timeout_seconds = float(index_timeout_seconds)
+        self.commit_store = commit_store
         self.job_id = ""
         self.tenant_id = ""
         self.kb_id = ""
@@ -108,6 +112,7 @@ class MaterializedSyncSink:
         self._staging_prepared = False
         self._artifact_reservation_token: str | None = None
         self._index_job_id: str | None = None
+        self._authority_committed = False
 
     def begin(
         self,
@@ -128,6 +133,7 @@ class MaterializedSyncSink:
         self.connector_type = _safe_component(connector_type, "connector_type")
         self._staging_prepared = False
         self._index_job_id = None
+        self._authority_committed = recovering_commit
         self.source_dir.mkdir(parents=True, exist_ok=True)
         connection_root = self.source_dir / ".connections"
         connection_root.mkdir(exist_ok=True)
@@ -137,6 +143,30 @@ class MaterializedSyncSink:
         self.staging = work_root / f"{self.connection_id}-{self.job_id}.staging"
         self.backup = work_root / f"{self.connection_id}-{self.job_id}.backup"
         self.journal = work_root / f"{self.connection_id}-{self.job_id}.journal.json"
+        if recovering_commit and self.commit_store is not None:
+            restored = self.commit_store.restore(
+                job_id=self.job_id,
+                tenant_id=self.tenant_id,
+                kb_id=self.kb_id,
+                connection_id=self.connection_id,
+                connector_type=self.connector_type,
+                staging=self.staging,
+            )
+            raw_index_job_id = restored.get("index_job_id")
+            self._index_job_id = (
+                _safe_component(raw_index_job_id, "index_job_id")
+                if isinstance(raw_index_job_id, str)
+                else None
+            )
+            self._write_json_atomic(
+                self.journal,
+                {
+                    "phase": "prepared",
+                    "job_id": self.job_id,
+                    "connection_id": self.connection_id,
+                    "index_job_id": self._index_job_id,
+                },
+            )
         if self.journal.exists() or self._staging_prepared:
             return
         if recovering_commit:
@@ -261,7 +291,23 @@ class MaterializedSyncSink:
             self._validate_publish_ownership()
         self._reserve_quota(self.current, self.staging)
         self._reserve_artifacts(self.staging)
+        if self.commit_store is not None:
+            self.commit_store.prepare(
+                job_id=self.job_id,
+                tenant_id=self.tenant_id,
+                kb_id=self.kb_id,
+                connection_id=self.connection_id,
+                connector_type=self.connector_type,
+                staging=self.staging,
+            )
         self._staging_prepared = True
+
+    def mark_committing(self) -> None:
+        """Record that the canonical sync ledger crossed its commit boundary."""
+
+        if not self._staging_prepared:
+            raise RuntimeError("sync staging is not prepared")
+        self._authority_committed = True
 
     def commit(
         self,
@@ -349,6 +395,8 @@ class MaterializedSyncSink:
 
     def finalize(self) -> None:
         try:
+            if self.commit_store is not None:
+                self.commit_store.finalize(self.job_id)
             for path in (self.staging, self.backup):
                 if path and path.exists():
                     shutil.rmtree(path)
@@ -891,8 +939,10 @@ class MaterializedSyncSink:
 
     def abort(self) -> None:
         try:
-            if self.journal and self.journal.exists():
+            if self._authority_committed or (self.journal and self.journal.exists()):
                 return
+            if self.commit_store is not None:
+                self.commit_store.finalize(self.job_id)
             if self.staging and self.staging.exists():
                 shutil.rmtree(self.staging)
         finally:
@@ -1152,7 +1202,17 @@ class MaterializedSyncSink:
             time.sleep(min(0.1, remaining))
 
     def _submit_index_job(self) -> str | None:
-        job = self.index_submitter(self.kb_id)
+        previous_job_id = self._index_job_id
+        idempotency_key = (
+            f"connector-sync:{self.job_id}:initial"
+            if previous_job_id is None
+            else f"connector-sync:{self.job_id}:after:{previous_job_id}"
+        )
+        job = (
+            self.keyed_index_submitter(self.kb_id, idempotency_key)
+            if self.keyed_index_submitter is not None
+            else self.index_submitter(self.kb_id)
+        )
         raw_job_id = job.get("job_id") if isinstance(job, Mapping) else None
         if not raw_job_id:
             if self.index_status_reader is not None:
@@ -1302,6 +1362,8 @@ class MaterializedSyncSink:
                 "index_job_id": self._index_job_id,
             },
         )
+        if self.commit_store is not None:
+            self.commit_store.set_phase(self.job_id, phase, self._index_job_id)
 
     def _read_journal(self) -> str:
         if self.journal is None:

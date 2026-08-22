@@ -309,6 +309,9 @@ class ConnectorSyncRuntime:
             )
             self.store.prepare_commit(job_id, token)
             commit_prepared = True
+            mark_committing = getattr(sink, "mark_committing", None)
+            if callable(mark_committing):
+                mark_committing()
             sink.commit(
                 snapshot=bool(snapshot),
                 seen_external_ids=frozenset(seen_external_ids),

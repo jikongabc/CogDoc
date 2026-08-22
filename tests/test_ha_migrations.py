@@ -14,7 +14,7 @@ from cogdoc.ha.migrations import (
     MigrationConflict,
     MigrationRunner,
 )
-from cogdoc.ha.migration_catalog import REGISTERED_MIGRATIONS
+from cogdoc.ha.migration_catalog import REGISTERED_MIGRATIONS, migrations_are_current
 from cogdoc.ha.runtime import HAConfig, HARuntime
 from cogdoc.ha.storage import SQLiteBackend
 
@@ -237,5 +237,104 @@ def test_registered_catalog_validates_runtime_baseline(tmp_path):
     rows = MigrationRunner(
         runtime.backend, REGISTERED_MIGRATIONS, owner_id="migration"
     ).run()
-    assert [(row["version"], row["phase"]) for row in rows] == [(1, "validated")]
+    assert [(row["version"], row["phase"]) for row in rows] == [
+        (1, "validated"),
+        (2, "validated"),
+        (3, "validated"),
+        (4, "validated"),
+        (5, "validated"),
+        (6, "validated"),
+        (7, "validated"),
+        (8, "validated"),
+        (9, "validated"),
+    ]
+    runtime.shutdown()
+
+
+def test_v9_backfills_existing_derived_knowledge_ledgers(tmp_path):
+    runtime = HARuntime(
+        HAConfig(
+            enabled=True,
+            database_url="",
+            database_schema="cogdoc",
+            object_store="local",
+            object_root=str(tmp_path / "objects"),
+            s3_bucket="",
+            s3_prefix="cogdoc",
+            s3_endpoint_url=None,
+            s3_region=None,
+            s3_require_versioning=True,
+            worker_id="v8-upgrade",
+            scheduler_enabled=False,
+            outbox_enabled=False,
+        )
+    )
+    backend = runtime.backend
+    with backend.transaction(write=True) as connection:
+        # HARuntime bootstraps the current schema in local mode. Roll only the
+        # v9 objects/ledger entry back to construct an exact v8 upgrade fixture.
+        connection.execute("DELETE FROM ha_schema_migrations WHERE version=9")
+        connection.execute("DROP INDEX idx_ha_knowledge_refresh_recovery")
+        connection.execute("DROP TABLE ha_derived_knowledge_refreshes")
+        connection.execute(
+            "UPDATE ha_derived_knowledge_sequence SET last_value=7 WHERE singleton=1"
+        )
+        connection.execute(
+            "INSERT INTO ha_derived_knowledge_events("
+            "event_sequence,event_key,knowledge_id,kb_id,status,created_at,record_json"
+            ") VALUES(7,'upgrade-event','knowledge-1','storage-kb','approved','now',"
+            '\'{"knowledge_id":"knowledge-1","kb_id":"storage-kb",'
+            '"status":"approved","text":"existing"}\')'
+        )
+
+    MigrationRunner(backend, REGISTERED_MIGRATIONS, owner_id="v9").run()
+
+    with backend.transaction() as connection:
+        row = connection.execute(
+            "SELECT requested_sequence,status FROM ha_derived_knowledge_refreshes "
+            "WHERE kb_id='storage-kb'"
+        ).fetchone()
+    assert tuple(row) == (7, "pending")
+    assert migrations_are_current(backend) is True
+    runtime.shutdown()
+
+
+def test_migration_readiness_rejects_missing_ledger_and_v7_columns(tmp_path):
+    backend = SQLiteBackend(tmp_path / "readiness.db")
+    with backend.transaction(write=True) as connection:
+        connection.execute(
+            "CREATE TABLE ha_chat_memory_scopes(doc_id TEXT PRIMARY KEY)"
+        )
+        connection.execute(
+            "CREATE TABLE ha_chat_session_leases(doc_id TEXT,session_id TEXT)"
+        )
+    assert migrations_are_current(backend) is False
+    backend.close()
+
+
+def test_migration_readiness_rejects_corrupt_completed_ledger(tmp_path):
+    runtime = HARuntime(
+        HAConfig(
+            enabled=True,
+            database_url="",
+            database_schema="cogdoc",
+            object_store="local",
+            object_root=str(tmp_path / "objects"),
+            s3_bucket="",
+            s3_prefix="cogdoc",
+            s3_endpoint_url=None,
+            s3_region=None,
+            s3_require_versioning=True,
+            worker_id="readiness-test",
+            scheduler_enabled=False,
+            outbox_enabled=False,
+        )
+    )
+    assert migrations_are_current(runtime.backend) is True
+    with runtime.backend.transaction(write=True) as connection:
+        connection.execute(
+            "UPDATE ha_schema_migrations SET checksum=? WHERE version=7",
+            ("0" * 64,),
+        )
+    assert migrations_are_current(runtime.backend) is False
     runtime.shutdown()

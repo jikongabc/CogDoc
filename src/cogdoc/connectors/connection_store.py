@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from cogdoc.api.persistence import connect_sqlite
+from cogdoc.ha.dbapi_compat import BackendDBAPIConnection
+from cogdoc.ha.storage import DatabaseBackend
 
 
 SUPPORTED_CONNECTOR_TYPES = frozenset(
@@ -242,8 +244,9 @@ class ConnectionStore:
 
     def __init__(
         self,
-        db_path: str,
+        db_path: str | None = None,
         *,
+        backend: DatabaseBackend | None = None,
         max_connections_global: int = 10_000,
         max_connections_per_tenant: int = 1_000,
         max_connections_per_kb: int = 100,
@@ -266,8 +269,15 @@ class ConnectionStore:
         self.max_connections_global = max_connections_global
         self.max_connections_per_tenant = max_connections_per_tenant
         self.max_connections_per_kb = max_connections_per_kb
+        if (db_path is None) == (backend is None):
+            raise ValueError("exactly one of db_path or backend is required")
         self._lock = RLock()
-        self._conn = connect_sqlite(db_path)
+        self._distributed = backend is not None
+        self._conn: Any = (
+            BackendDBAPIConnection(backend)
+            if backend is not None
+            else connect_sqlite(str(db_path))
+        )
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS connector_connections ("
             "connection_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,kb_id TEXT NOT NULL,"
@@ -277,10 +287,11 @@ class ConnectionStore:
             "credential_id TEXT,credential_fields_json TEXT NOT NULL DEFAULT '[]',"
             "deleting INTEGER NOT NULL DEFAULT 0,delete_index_job_id TEXT)"
         )
-        self._ensure_column("credential_id", "TEXT")
-        self._ensure_column("credential_fields_json", "TEXT NOT NULL DEFAULT '[]'")
-        self._ensure_column("deleting", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_column("delete_index_job_id", "TEXT")
+        if not self._distributed:
+            self._ensure_column("credential_id", "TEXT")
+            self._ensure_column("credential_fields_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column("deleting", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("delete_index_job_id", "TEXT")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_connector_connections_scope ON "
             "connector_connections(tenant_id,kb_id,created_at,connection_id)"
@@ -497,19 +508,26 @@ class ConnectionStore:
         if type(enabled) is not bool:
             raise TypeError("enabled must be a boolean")
         with self._lock:
-            row = self._conn.execute(
-                "SELECT deleting FROM connector_connections WHERE connection_id=?",
-                (connection_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(connection_id)
-            if bool(row[0]):
-                raise ValueError("connection deletion is in progress")
-            updated = self._conn.execute(
-                "UPDATE connector_connections SET enabled=?,updated_at=?,revision=revision+1 "
-                "WHERE connection_id=?",
-                (int(enabled), time.time(), connection_id),
-            ).rowcount
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT deleting FROM connector_connections WHERE connection_id=?",
+                    (connection_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(connection_id)
+                if bool(row[0]):
+                    raise ValueError("connection deletion is in progress")
+                updated = self._conn.execute(
+                    "UPDATE connector_connections SET enabled=?,updated_at=?,revision=revision+1 "
+                    "WHERE connection_id=?",
+                    (int(enabled), time.time(), connection_id),
+                ).rowcount
+                self._conn.execute("COMMIT")
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
         if updated != 1:
             raise KeyError(connection_id)
         return self.get(connection_id) or {}
@@ -523,27 +541,33 @@ class ConnectionStore:
         knowledge_base = _text(kb_id, "kb_id", limit=160)
         connection = _text(connection_id, "connection_id", limit=160)
         with self._lock:
-            row = self._conn.execute(
-                "SELECT tenant_id,kb_id,enabled,deleting,delete_index_job_id "
-                "FROM connector_connections "
-                "WHERE connection_id=?",
-                (connection,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(connection)
-            if str(row[0]) != tenant or str(row[1]) != knowledge_base:
-                raise ValueError("connection does not belong to knowledge base")
-            if bool(row[2]) or not bool(row[3]):
-                self._conn.execute(
-                    "UPDATE connector_connections SET enabled=0,deleting=1,"
-                    "delete_index_job_id=?,updated_at=?,revision=revision+1 "
-                    "WHERE connection_id=?",
-                    (
-                        None if not bool(row[3]) else row[4],
-                        time.time(),
-                        connection,
-                    ),
-                )
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT tenant_id,kb_id,enabled,deleting,delete_index_job_id "
+                    "FROM connector_connections WHERE connection_id=?",
+                    (connection,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(connection)
+                if str(row[0]) != tenant or str(row[1]) != knowledge_base:
+                    raise ValueError("connection does not belong to knowledge base")
+                if bool(row[2]) or not bool(row[3]):
+                    self._conn.execute(
+                        "UPDATE connector_connections SET enabled=0,deleting=1,"
+                        "delete_index_job_id=?,updated_at=?,revision=revision+1 "
+                        "WHERE connection_id=?",
+                        (
+                            None if not bool(row[3]) else row[4],
+                            time.time(),
+                            connection,
+                        ),
+                    )
+                self._conn.execute("COMMIT")
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
         return self.get(connection, include_secret_refs=True) or {}
 
     def record_delete_index_job(
@@ -595,35 +619,39 @@ class ConnectionStore:
         ):
             raise ValueError("expected_revision must be a positive integer")
         with self._lock:
-            row = self._conn.execute(
-                "SELECT connector_type,config_json,revision,deleting "
-                "FROM connector_connections "
-                "WHERE connection_id=?",
-                (connection_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(connection_id)
-            if bool(row[3]):
-                raise ConnectionRevisionConflict("connection deletion is in progress")
-            if expected_revision is not None and int(row[2]) != expected_revision:
-                raise ConnectionRevisionConflict("connection revision has changed")
-            # Re-run the connector contract before replacing the active secret
-            # source.  This prevents an OAuth callback (or a future rotation
-            # API) from binding a credential whose fields cannot satisfy the
-            # connection at runtime.
-            _config(str(row[0]), json.loads(row[1]), {}, clean_fields)
-            updated = self._conn.execute(
-                "UPDATE connector_connections SET credential_id=?,credential_fields_json=?,"
-                "secret_env_json='{}',updated_at=?,revision=revision+1 WHERE connection_id=? "
-                "AND revision=?",
-                (
-                    clean_id,
-                    json.dumps(clean_fields),
-                    time.time(),
-                    connection_id,
-                    int(row[2]),
-                ),
-            ).rowcount
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT connector_type,config_json,revision,deleting "
+                    "FROM connector_connections WHERE connection_id=?",
+                    (connection_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(connection_id)
+                if bool(row[3]):
+                    raise ConnectionRevisionConflict(
+                        "connection deletion is in progress"
+                    )
+                if expected_revision is not None and int(row[2]) != expected_revision:
+                    raise ConnectionRevisionConflict("connection revision has changed")
+                _config(str(row[0]), json.loads(row[1]), {}, clean_fields)
+                updated = self._conn.execute(
+                    "UPDATE connector_connections SET credential_id=?,credential_fields_json=?,"
+                    "secret_env_json='{}',updated_at=?,revision=revision+1 WHERE connection_id=? "
+                    "AND revision=?",
+                    (
+                        clean_id,
+                        json.dumps(clean_fields),
+                        time.time(),
+                        connection_id,
+                        int(row[2]),
+                    ),
+                ).rowcount
+                self._conn.execute("COMMIT")
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
         if updated != 1:  # pragma: no cover - guarded inside the same lock
             raise ConnectionRevisionConflict("connection revision has changed")
         return self.get(connection_id) or {}
@@ -666,41 +694,49 @@ class ConnectionStore:
         if isinstance(expected_revision, bool) or expected_revision < 1:
             raise ValueError("expected_revision must be a positive integer")
         with self._lock:
-            row = self._conn.execute(
-                "SELECT connector_type,config_json,revision,deleting "
-                "FROM connector_connections "
-                "WHERE connection_id=?",
-                (clean_connection_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(clean_connection_id)
-            if bool(row[3]):
-                raise ConnectionRevisionConflict("connection deletion is in progress")
-            if int(row[2]) != expected_revision:
-                raise ConnectionRevisionConflict("connection revision has changed")
-            _config(
-                str(row[0]),
-                json.loads(row[1]),
-                secret_env,
-                clean_fields,
-            )
-            clean_secret_env = {
-                str(field).strip().casefold(): str(env_name)
-                for field, env_name in secret_env.items()
-            }
-            updated = self._conn.execute(
-                "UPDATE connector_connections SET credential_id=?,"
-                "credential_fields_json=?,secret_env_json=?,updated_at=?,"
-                "revision=revision+1 WHERE connection_id=? AND revision=?",
-                (
-                    clean_credential_id,
-                    json.dumps(clean_fields),
-                    json.dumps(clean_secret_env, sort_keys=True),
-                    time.time(),
-                    clean_connection_id,
-                    expected_revision,
-                ),
-            ).rowcount
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT connector_type,config_json,revision,deleting "
+                    "FROM connector_connections WHERE connection_id=?",
+                    (clean_connection_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(clean_connection_id)
+                if bool(row[3]):
+                    raise ConnectionRevisionConflict(
+                        "connection deletion is in progress"
+                    )
+                if int(row[2]) != expected_revision:
+                    raise ConnectionRevisionConflict("connection revision has changed")
+                _config(
+                    str(row[0]),
+                    json.loads(row[1]),
+                    secret_env,
+                    clean_fields,
+                )
+                clean_secret_env = {
+                    str(field).strip().casefold(): str(env_name)
+                    for field, env_name in secret_env.items()
+                }
+                updated = self._conn.execute(
+                    "UPDATE connector_connections SET credential_id=?,"
+                    "credential_fields_json=?,secret_env_json=?,updated_at=?,"
+                    "revision=revision+1 WHERE connection_id=? AND revision=?",
+                    (
+                        clean_credential_id,
+                        json.dumps(clean_fields),
+                        json.dumps(clean_secret_env, sort_keys=True),
+                        time.time(),
+                        clean_connection_id,
+                        expected_revision,
+                    ),
+                ).rowcount
+                self._conn.execute("COMMIT")
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
         if updated != 1:  # pragma: no cover - guarded by the same store lock
             raise ConnectionRevisionConflict("connection revision has changed")
         return self.get(clean_connection_id, include_secret_refs=True) or {}

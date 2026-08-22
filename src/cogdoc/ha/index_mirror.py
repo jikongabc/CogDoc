@@ -51,14 +51,54 @@ class HAIndexMirror:
         record = self.registry.get_by_storage_id(kb_id)
         if not isinstance(record, Mapping) or str(record.get("storage_id")) != kb_id:
             raise RuntimeError("committed index knowledge base is not registered")
+        source_publication = self._stage_source_publication(
+            str(record["tenant_id"]), kb_id, generation_id
+        )
         return self.mirror(
             str(record["tenant_id"]),
             kb_id,
             generation_id,
+            source_publication=source_publication,
+        )
+
+    def _stage_source_publication(
+        self, tenant_id: str, kb_id: str, local_generation_id: str
+    ):
+        coordinator = getattr(self.runtime, "api_mutation_coordinator", None)
+        if coordinator is None:
+            return None
+        lease = coordinator.current_lease()
+        if lease is None or lease.storage_id != kb_id:
+            raise RuntimeError("HA source publication requires the active KB lease")
+        prepared = self.runtime.source_generations.prepared_for_build(
+            kb_id, local_generation_id, lease
+        )
+        if prepared is not None:
+            return self.runtime.source_generations.publication_hook(
+                str(prepared["generation_id"]), lease
+            )
+        if self.runtime.source_generations.current(kb_id) is not None:
+            # A non-mutating local rebuild reuses the already published source
+            # head; it must not create an unrelated source generation.
+            return None
+        manifest = self.runtime.source_generations.stage_directory(
+            tenant_id=tenant_id,
+            storage_id=kb_id,
+            source_dir=self.registry.source_dir(kb_id),
+            lease=lease,
+            build_id=local_generation_id,
+        )
+        return self.runtime.source_generations.publication_hook(
+            str(manifest["generation_id"]), lease
         )
 
     def mirror(
-        self, tenant_id: str, kb_id: str, local_generation_id: str
+        self,
+        tenant_id: str,
+        kb_id: str,
+        local_generation_id: str,
+        *,
+        source_publication: Any | None = None,
     ) -> dict[str, Any]:
         active = KBState(kb_id).active()
         if active is None or active.get("id") != local_generation_id:
@@ -136,7 +176,9 @@ class HAIndexMirror:
                 except Exception:
                     pass
                 raise RuntimeError("local index advanced while HA mirror was uploading")
-            published = self.runtime.publish_generation(generation)
+            published = self.runtime.publish_generation(
+                generation, publication_hook=source_publication
+            )
             self._wake.set()
             return published
         finally:
@@ -165,7 +207,20 @@ class HAIndexMirror:
             ):
                 continue
             try:
-                self.mirror(tenant_id, kb_id, str(active["id"]))
+                coordinator = getattr(self.runtime, "api_mutation_coordinator", None)
+                if coordinator is None:
+                    self.mirror(tenant_id, kb_id, str(active["id"]))
+                else:
+                    with coordinator.lease(kb_id):
+                        source_publication = self._stage_source_publication(
+                            tenant_id, kb_id, str(active["id"])
+                        )
+                        self.mirror(
+                            tenant_id,
+                            kb_id,
+                            str(active["id"]),
+                            source_publication=source_publication,
+                        )
                 mirrored += 1
             except Exception:
                 # One corrupt or temporarily unavailable KB must not starve

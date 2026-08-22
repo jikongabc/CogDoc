@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, BinaryIO
 
 from cogdoc.api.audit import AuditStore
 
@@ -254,6 +254,16 @@ class AuditExportStore:
             ]
 
     def artifact_path(self, job_id: str, tenant_id: str) -> Path:
+        with self.open_artifact(job_id, tenant_id):
+            return self.root / f"{job_id}.ndjson"
+
+    def open_artifact(self, job_id: str, tenant_id: str) -> BinaryIO:
+        """Return a verified, seekable descriptor for an immutable export.
+
+        Keeping the verified descriptor open closes the verify-then-open race
+        with concurrent expiry or deletion and lets HTTP callers stream without
+        relying on Starlette's synchronous file iterator.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT status,artifact_sha256,byte_size FROM audit_export_jobs WHERE job_id=? AND tenant_id=?",
@@ -264,15 +274,29 @@ class AuditExportStore:
             target = self.root / f"{job_id}.ndjson"
             digest = hashlib.sha256()
             size = 0
-            with target.open("rb") as handle:
+            try:
+                handle = target.open("rb")
+            except OSError as exc:
+                raise AuditExportError("audit export artifact is unavailable") from exc
+            try:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     size += len(chunk)
                     digest.update(chunk)
-            if size != row["byte_size"] or digest.hexdigest() != row["artifact_sha256"]:
-                raise AuditExportError(
-                    "audit export artifact failed integrity verification"
-                )
-            return target
+                if (
+                    size != row["byte_size"]
+                    or digest.hexdigest() != row["artifact_sha256"]
+                ):
+                    raise AuditExportError(
+                        "audit export artifact failed integrity verification"
+                    )
+                handle.seek(0)
+                return handle
+            except OSError as exc:
+                handle.close()
+                raise AuditExportError("audit export artifact is unavailable") from exc
+            except BaseException:
+                handle.close()
+                raise
 
     def delete(self, job_id: str, tenant_id: str, *, expected_revision: int) -> bool:
         with self._lock:

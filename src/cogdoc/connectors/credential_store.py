@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -17,6 +18,8 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from cogdoc.api.persistence import connect_sqlite
+from cogdoc.ha.dbapi_compat import BackendDBAPIConnection
+from cogdoc.ha.storage import DatabaseBackend
 
 
 MASTER_KEYS_ENV = "COGDOC_CREDENTIAL_MASTER_KEYS"
@@ -175,7 +178,7 @@ def _aad(
 
 
 class CredentialVault:
-    """SQLite metadata plus AES-256-GCM envelope-encrypted secret payloads.
+    """Durable metadata plus AES-256-GCM envelope-encrypted secret payloads.
 
     Public metadata methods never decrypt. ``get_for_use`` is deliberately
     scope-bound and is the only plaintext-returning operation. A random data
@@ -185,8 +188,9 @@ class CredentialVault:
 
     def __init__(
         self,
-        db_path: str,
+        db_path: str | None = None,
         *,
+        backend: DatabaseBackend | None = None,
         master_keys: Mapping[str, bytes] | None = None,
         active_key_version: str | None = None,
         env: Mapping[str, str] = os.environ,
@@ -199,12 +203,19 @@ class CredentialVault:
         else:
             loaded_keys = dict(master_keys)
             loaded_active = str(active_key_version or "")
+        if (db_path is None) == (backend is None):
+            raise ValueError("exactly one of db_path or backend is required")
         self._master_keys, self.active_key_version = _validated_keys(
             loaded_keys, loaded_active
         )
         self._clock = clock
         self._lock = RLock()
-        self._conn = connect_sqlite(db_path)
+        self._distributed = backend is not None
+        self._conn: Any = (
+            BackendDBAPIConnection(backend)
+            if backend is not None
+            else connect_sqlite(str(db_path))
+        )
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS connector_credentials (
@@ -236,6 +247,7 @@ class CredentialVault:
                 ON connector_credentials(tenant_id,kb_id,connection_id,created_at,credential_id);
             CREATE TABLE IF NOT EXISTS connector_credential_events (
                 event_id TEXT PRIMARY KEY,
+                event_sequence INTEGER,
                 credential_id TEXT NOT NULL,
                 tenant_id TEXT NOT NULL,
                 kb_id TEXT NOT NULL,
@@ -247,7 +259,7 @@ class CredentialVault:
                 occurred_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_connector_credential_events_scope
-                ON connector_credential_events(tenant_id,kb_id,occurred_at,event_id);
+                ON connector_credential_events(tenant_id,kb_id,event_sequence);
             CREATE INDEX IF NOT EXISTS idx_connector_credential_use_retention
                 ON connector_credential_events(occurred_at,event_id)
                 WHERE action='use';
@@ -266,26 +278,13 @@ class CredentialVault:
             );
             CREATE INDEX IF NOT EXISTS idx_connector_pending_bindings_scope
                 ON connector_credential_pending_bindings(tenant_id,kb_id,created_at,credential_id);
+            CREATE TABLE IF NOT EXISTS connector_credential_event_sequence (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                last_value INTEGER NOT NULL
+            );
             """
         )
-        columns = {
-            str(row[1])
-            for row in self._conn.execute(
-                "PRAGMA table_info(connector_credentials)"
-            ).fetchall()
-        }
-        if "lifecycle" not in columns:
-            try:
-                self._conn.execute(
-                    "ALTER TABLE connector_credentials ADD COLUMN "
-                    "lifecycle TEXT NOT NULL DEFAULT 'active'"
-                )
-            except sqlite3.OperationalError as exc:
-                # Multiple app processes can race while opening the same
-                # legacy database.  Accept only the exact migration race and
-                # verify the resulting schema before continuing.
-                if "duplicate column name" not in str(exc).casefold():
-                    raise
+        if not self._distributed:
             columns = {
                 str(row[1])
                 for row in self._conn.execute(
@@ -293,13 +292,130 @@ class CredentialVault:
                 ).fetchall()
             }
             if "lifecycle" not in columns:
-                raise CredentialVaultError(
-                    "credential lifecycle migration did not complete"
-                )
+                try:
+                    self._conn.execute(
+                        "ALTER TABLE connector_credentials ADD COLUMN "
+                        "lifecycle TEXT NOT NULL DEFAULT 'active'"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).casefold():
+                        raise
+                columns = {
+                    str(row[1])
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(connector_credentials)"
+                    ).fetchall()
+                }
+                if "lifecycle" not in columns:
+                    raise CredentialVaultError(
+                        "credential lifecycle migration did not complete"
+                    )
+            self._ensure_event_sequence()
+        else:
+            self._conn.execute(
+                "INSERT INTO connector_credential_event_sequence(singleton,last_value) "
+                "VALUES(1,0) ON CONFLICT(singleton) DO NOTHING"
+            )
+            self._validate_distributed_keyring()
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_connector_credentials_lifecycle "
             "ON connector_credentials(lifecycle,updated_at,credential_id)"
         )
+
+    def _validate_distributed_keyring(self) -> None:
+        """Reject same-version key drift and keys missing for persisted rows."""
+
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS ha_connector_keyring_versions ("
+            "key_version TEXT PRIMARY KEY,key_fingerprint TEXT NOT NULL,"
+            "registered_at REAL NOT NULL)"
+        )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for version, key in sorted(self._master_keys.items()):
+                fingerprint = hashlib.sha256(
+                    b"cogdoc-connector-key-v1\x00"
+                    + version.encode("utf-8")
+                    + b"\x00"
+                    + key
+                ).hexdigest()
+                self._conn.execute(
+                    "INSERT INTO ha_connector_keyring_versions(key_version,key_fingerprint,"
+                    "registered_at) VALUES(?,?,?) ON CONFLICT(key_version) DO NOTHING",
+                    (version, fingerprint, float(self._clock())),
+                )
+                row = self._conn.execute(
+                    "SELECT key_fingerprint FROM ha_connector_keyring_versions "
+                    "WHERE key_version=?",
+                    (version,),
+                ).fetchone()
+                if row is None or row[0] != fingerprint:
+                    raise CredentialVaultError(
+                        f"credential master key version {version!r} differs across nodes"
+                    )
+            required = {
+                str(row[0])
+                for row in self._conn.execute(
+                    "SELECT DISTINCT key_version FROM connector_credentials"
+                ).fetchall()
+            }
+            missing = sorted(required - self._master_keys.keys())
+            if missing:
+                raise CredentialVaultError(
+                    "credential keyring is missing persisted versions: "
+                    + ",".join(missing)
+                )
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def _ensure_event_sequence(self) -> None:
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                str(row[1])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(connector_credential_events)"
+                ).fetchall()
+            }
+            if "event_sequence" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE connector_credential_events ADD COLUMN event_sequence INTEGER"
+                )
+                self._conn.execute(
+                    "UPDATE connector_credential_events SET event_sequence=rowid"
+                )
+            self._conn.execute(
+                "INSERT INTO connector_credential_event_sequence(singleton,last_value) "
+                "VALUES(1,0) ON CONFLICT(singleton) DO NOTHING"
+            )
+            self._conn.execute(
+                "UPDATE connector_credential_event_sequence SET last_value=(SELECT "
+                "COALESCE(MAX(event_sequence),0) FROM connector_credential_events) "
+                "WHERE last_value<(SELECT COALESCE(MAX(event_sequence),0) "
+                "FROM connector_credential_events)"
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def _next_event_sequence(self) -> int:
+        updated = self._conn.execute(
+            "UPDATE connector_credential_event_sequence SET last_value=last_value+1 "
+            "WHERE singleton=1"
+        ).rowcount
+        if updated != 1:
+            raise CredentialVaultError("credential audit sequence is unavailable")
+        row = self._conn.execute(
+            "SELECT last_value FROM connector_credential_event_sequence WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            raise CredentialVaultError("credential audit sequence is unavailable")
+        return int(row[0])
 
     def close(self) -> None:
         with self._lock:
@@ -321,6 +437,35 @@ class CredentialVault:
             ).fetchone()
             if invalid is not None:
                 raise CredentialIntegrityError("credential lifecycle is invalid")
+            if self._distributed:
+                registered = {
+                    str(row[0]): str(row[1])
+                    for row in self._conn.execute(
+                        "SELECT key_version,key_fingerprint "
+                        "FROM ha_connector_keyring_versions"
+                    ).fetchall()
+                }
+                required = {
+                    str(row[0])
+                    for row in self._conn.execute(
+                        "SELECT DISTINCT key_version FROM connector_credentials"
+                    ).fetchall()
+                }
+                if not required <= self._master_keys.keys():
+                    raise CredentialIntegrityError(
+                        "credential keyring is missing a persisted version"
+                    )
+                for version, key in self._master_keys.items():
+                    expected = hashlib.sha256(
+                        b"cogdoc-connector-key-v1\x00"
+                        + version.encode("utf-8")
+                        + b"\x00"
+                        + key
+                    ).hexdigest()
+                    if registered.get(version) != expected:
+                        raise CredentialIntegrityError(
+                            "credential keyring fingerprint changed"
+                        )
         return True
 
     def create(
@@ -1024,7 +1169,7 @@ class CredentialVault:
                 "WHERE c.credential_id=e.credential_id AND "
                 "(c.credential_kind='oauth-session' OR c.lifecycle!='active'))"
                 + clause
-                + " ORDER BY e.occurred_at DESC,e.rowid DESC LIMIT ?",
+                + " ORDER BY e.event_sequence DESC LIMIT ?",
                 params,
             ).fetchall()
         return [
@@ -1063,7 +1208,7 @@ class CredentialVault:
                     "DELETE FROM connector_credential_events WHERE event_id IN ("
                     "SELECT event_id FROM connector_credential_events "
                     "WHERE action='use' AND occurred_at<? "
-                    "ORDER BY occurred_at,event_id LIMIT ?)",
+                    "ORDER BY event_sequence LIMIT ?)",
                     (boundary, limit),
                 ).rowcount
             )
@@ -1336,10 +1481,11 @@ class CredentialVault:
     ) -> None:
         self._conn.execute(
             "INSERT INTO connector_credential_events "
-            "(event_id,credential_id,tenant_id,kb_id,connection_id,action,actor_id,revision,key_version,"
-            "occurred_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "(event_id,event_sequence,credential_id,tenant_id,kb_id,connection_id,action,actor_id,revision,key_version,"
+            "occurred_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 f"cevt-{uuid4().hex}",
+                self._next_event_sequence(),
                 credential_id,
                 tenant_id,
                 kb_id,

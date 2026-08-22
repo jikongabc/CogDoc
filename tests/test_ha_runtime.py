@@ -7,7 +7,13 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from cogdoc.ha.index_generation import IndexIntegrityError
+from cogdoc.ha.api_state import (
+    DistributedKnowledgeBaseRegistry,
+    DistributedMutationCoordinator,
+)
 from cogdoc.ha.object_store import LocalObjectStore
+from cogdoc.ha.source_artifact_store import DistributedSourceArtifactStore
+from cogdoc.ha.source_catalog import DistributedSourceCatalog
 from cogdoc.ha.runtime import (
     DistributedIndexWorker,
     HAConfig,
@@ -17,6 +23,8 @@ from cogdoc.ha.runtime import (
 )
 from cogdoc.ha.storage import SQLiteBackend
 from cogdoc.ha.tasks import JOB_SUCCEEDED
+from cogdoc.api.tenant_quota import TenantQuotaPolicy
+from cogdoc.source_model import SourceDocument
 
 
 def _config(tmp_path, worker="worker"):
@@ -228,6 +236,17 @@ def test_runtime_starts_and_stops_configured_index_worker_threads(tmp_path):
     assert runtime.index_worker.check() is False
 
 
+def test_runtime_owns_distributed_tenant_quota_heartbeat(tmp_path):
+    runtime = HARuntime(_config(tmp_path))
+    quota = runtime.bind_api_tenant_quota(TenantQuotaPolicy(max_documents=10))
+
+    runtime.start()
+    assert quota.check()
+    assert quota._thread is not None and quota._thread.is_alive()
+    runtime.shutdown()
+    assert quota._thread is None
+
+
 def test_runtime_current_reader_refuses_post_publish_object_damage(tmp_path):
     backend = SQLiteBackend(tmp_path / "ha.db")
     objects = LocalObjectStore(tmp_path / "objects")
@@ -281,6 +300,24 @@ def test_ha_config_requires_postgres_and_versioned_s3_for_multi_instance(tmp_pat
     assert safe.multi_instance_safe
 
 
+def test_api_multiwriter_fails_closed_without_postgres_and_versioned_s3(tmp_path):
+    local = _config(tmp_path)
+    unsafe = HAConfig(**{**local.__dict__, "api_multi_writer_enabled": True})
+    with pytest.raises(HAConfigurationError, match="multi-writer API"):
+        unsafe.validate()
+    safe = HAConfig(
+        **{
+            **local.__dict__,
+            "database_url": "postgresql://db/cogdoc",
+            "object_store": "s3",
+            "s3_bucket": "bucket",
+            "api_multi_writer_enabled": True,
+        }
+    )
+    safe.validate()
+    assert safe.api_multi_writer_safe
+
+
 def test_config_from_settings_has_stable_safe_defaults(tmp_path):
     settings = SimpleNamespace(
         cogdoc_ha_enabled=True,
@@ -302,6 +339,12 @@ def test_config_from_settings_has_stable_safe_defaults(tmp_path):
     assert config.worker_id
     assert config.object_root.endswith("ha-objects")
     assert config.index_replica_cache_root.endswith("ha-index-cache")
+    assert config.chat_session_lease_seconds == 300.0
+    assert config.chat_index_reader_lease_seconds == 600.0
+    assert config.chat_max_sessions_per_scope == 1024
+    assert config.chat_session_ttl_seconds == 604800
+    assert config.chat_max_display_messages == 2000
+    assert config.chat_max_session_bytes == 4 * 1024 * 1024
 
 
 def test_empty_generation_is_valid_and_content_addressed(tmp_path):
@@ -472,3 +515,224 @@ async def test_same_app_can_restart_ha_runtime_and_mirror_lifespan(
                 assert (await client.get("/health/ready")).status_code == 200
         assert app.state.ha_index_mirror.check() is False
     runtime.backend.close()
+
+
+@pytest.mark.anyio
+async def test_document_multiwriter_node_rejects_local_state_api_surface(monkeypatch):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    runtime = SimpleNamespace(api_multi_writer_safe=True, index_generations=None)
+    app = app_module.create_app(
+        ha_runtime=runtime,
+        close_state_runtime_on_shutdown=False,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        allowed = await client.get("/v1/knowledge-bases")
+        blocked = await client.get("/v1/chat/sessions")
+        blocked_sources = await client.get("/v1/knowledge-bases/docs/sources")
+        shared_source_catalog = await client.get(
+            "/v1/knowledge-bases/docs/source-catalog"
+        )
+        shared_artifact_mutation = await client.delete(
+            "/v1/knowledge-bases/docs/source-artifacts/trash?older_than=0"
+        )
+        shared_kb_delete = await client.delete("/v1/knowledge-bases/docs")
+
+    assert allowed.status_code == 200
+    assert blocked.status_code == 503
+    assert blocked.json()["error_code"] == "MODEL_UNAVAILABLE"
+    assert blocked_sources.status_code == 503
+    assert shared_source_catalog.status_code != 503
+    assert shared_artifact_mutation.status_code != 503
+    assert shared_kb_delete.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_document_multiwriter_deletes_shared_kb_authority(tmp_path, monkeypatch):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    runtime = HARuntime(_config(tmp_path))
+    registry = DistributedKnowledgeBaseRegistry(
+        runtime.backend, tmp_path / "source-cache"
+    )
+    kb = registry.create("docs", "default", "default")
+    storage_id = str(kb["storage_id"])
+    mutations = DistributedMutationCoordinator(
+        runtime.backend, registry, owner_id="api-delete", lease_seconds=30
+    )
+    runtime.api_mutation_coordinator = mutations
+    deletion = runtime.bind_api_kb_deletion(registry)
+    deletion.activate("default", storage_id, kb_epoch=int(kb["epoch"]))
+    content = b"private raw"
+    document = SourceDocument.create(
+        connector_type="url",
+        external_id="connection:private",
+        display_name="private.md",
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        byte_size=len(content),
+    )
+    runtime.source_catalog.upsert("default", storage_id, document)
+    runtime.source_artifact_store.put(
+        "default",
+        storage_id,
+        document.source_id,
+        document.version.version_id,
+        content,
+        content_sha256=document.version.content_sha256,
+        media_type="text/plain",
+        display_name="private.md",
+        created_at=1,
+    )
+    api_runtime = SimpleNamespace(
+        api_multi_writer_safe=True,
+        index_generations=runtime.index_generations,
+        source_generations=runtime.source_generations,
+        api_mutation_coordinator=mutations,
+        api_kb_deletion=deletion,
+    )
+    app = app_module.create_app(
+        ha_runtime=api_runtime,
+        kb_registry=registry,
+        source_catalog=runtime.source_catalog,
+        source_artifact_store=runtime.source_artifact_store,
+        close_state_runtime_on_shutdown=False,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        deleted = await client.delete("/v1/knowledge-bases/docs")
+        missing = await client.get("/v1/knowledge-bases/docs")
+
+    assert deleted.status_code == 204
+    assert missing.status_code == 404
+    assert registry.get_by_storage_id(storage_id) is None
+    assert runtime.source_catalog.list_sources("default", storage_id) == []
+    assert (
+        runtime.source_artifact_store.usage("default", storage_id)["active_versions"]
+        == 0
+    )
+    runtime.shutdown()
+
+
+@pytest.mark.anyio
+async def test_document_multiwriter_reads_shared_catalog_and_raw_artifact(
+    tmp_path, monkeypatch
+):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    backend = SQLiteBackend(tmp_path / "shared.db")
+    objects = LocalObjectStore(tmp_path / "objects")
+    catalog = DistributedSourceCatalog(backend)
+    artifacts = DistributedSourceArtifactStore(backend, objects, owner_id="reader-test")
+    registry = DistributedKnowledgeBaseRegistry(
+        backend,
+        tmp_path / "source-cache",
+    )
+    kb = registry.create("docs", "default", "owner")
+    storage_id = str(kb["storage_id"])
+    coordinator = DistributedMutationCoordinator(
+        backend, registry, owner_id="api-reader", lease_seconds=30
+    )
+    old_content = b"old shared raw source"
+    old_document = SourceDocument.create(
+        connector_type="git",
+        external_id="connection:document.md",
+        display_name="document.md",
+        content_sha256=hashlib.sha256(old_content).hexdigest(),
+        byte_size=len(old_content),
+    )
+    catalog.upsert("default", storage_id, old_document)
+    artifacts.put(
+        "default",
+        storage_id,
+        old_document.source_id,
+        old_document.version.version_id,
+        old_content,
+        content_sha256=old_document.version.content_sha256,
+        media_type="text/plain",
+        display_name="document.md",
+        created_at=1,
+    )
+    content = b"new shared raw source"
+    document = SourceDocument.create(
+        connector_type="git",
+        external_id="connection:document.md",
+        display_name="document.md",
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        byte_size=len(content),
+    )
+    catalog.upsert("default", storage_id, document)
+    artifacts.put(
+        "default",
+        storage_id,
+        document.source_id,
+        document.version.version_id,
+        content,
+        content_sha256=document.version.content_sha256,
+        media_type="text/plain",
+        display_name="document.md",
+        created_at=2,
+    )
+    runtime = SimpleNamespace(
+        api_multi_writer_safe=True,
+        index_generations=None,
+        api_mutation_coordinator=coordinator,
+    )
+    app = app_module.create_app(
+        ha_runtime=runtime,
+        kb_registry=registry,
+        source_catalog=catalog,
+        source_artifact_store=artifacts,
+        close_state_runtime_on_shutdown=False,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        listed = await client.get("/v1/knowledge-bases/docs/source-catalog")
+        downloaded = await client.get(
+            "/v1/knowledge-bases/docs/source-catalog/"
+            f"{document.source_id}/versions/{document.version.version_id}/content"
+        )
+        deleted = await client.delete(
+            "/v1/knowledge-bases/docs/source-catalog/"
+            f"{old_document.source_id}/versions/{old_document.version.version_id}/artifact"
+        )
+        restored = await client.post(
+            "/v1/knowledge-bases/docs/source-artifacts/"
+            f"{deleted.json()['recovery_token']}/restore"
+        )
+
+    assert listed.status_code == 200
+    assert listed.json()["sources"][0]["source_id"] == document.source_id
+    assert downloaded.status_code == 200
+    assert downloaded.content == content
+    assert deleted.status_code == 200
+    assert restored.status_code == 200
+    assert coordinator.current_lease() is None
+    backend.close()
+
+
+def test_document_multiwriter_fails_closed_for_process_local_tenant_quota(
+    monkeypatch,
+):
+    import cogdoc.api.app as app_module
+
+    settings = app_module.get_settings().model_copy(
+        update={"cogdoc_tenant_max_documents": 10}
+    )
+    monkeypatch.setattr(app_module, "get_settings", lambda: settings)
+    runtime = SimpleNamespace(api_multi_writer_safe=True, index_generations=None)
+
+    with pytest.raises(ValueError, match="distributed tenant quota"):
+        app_module.create_app(
+            ha_runtime=runtime,
+            close_state_runtime_on_shutdown=False,
+        )

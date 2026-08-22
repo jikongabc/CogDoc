@@ -6,12 +6,18 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from cogdoc.api.eval_review_auth import require_eval_reviewer
+from cogdoc.api.ha_chat_authority import (
+    HAChatAuthorityChanged,
+    capture_ha_chat_epoch,
+    ha_authority_guard,
+)
 from cogdoc.api.offload import run_sync
 from cogdoc.api.retrieval_eval_draft_store import (
     DraftRevisionConflictError,
     RetrievalEvalDraftStore,
 )
 from cogdoc.api.schemas import RetrievalEvalDraftReviewRequest
+from cogdoc.api.tenancy import Permission
 from cogdoc.api.tenant_scope import (
     externalize_kb_fields,
     request_principal,
@@ -21,6 +27,7 @@ from cogdoc.api.tenant_scope import (
     scope_for_storage_id,
 )
 from cogdoc.config.settings import get_settings
+from cogdoc.ha.feedback import StaleAuxiliaryWrite
 from cogdoc.service.kb_readers import kb_read_lease
 from cogdoc.service.index_provenance import current_index_provenance
 from cogdoc.service.retrieval_pipeline import (
@@ -396,6 +403,14 @@ async def review_retrieval_eval_draft(
 ):
     store = _store(request)
     current = _require_owned_draft(request, draft_id)
+    frozen_revision = int(current.get("revision") or 0)
+    frozen_index_generation: str | None = None
+    if (
+        frozen_revision < 1
+        or body.expected_revision is not None
+        and body.expected_revision != frozen_revision
+    ):
+        raise HTTPException(status_code=409, detail="草稿版本已变化")
     if body.decision == DraftStatus.APPROVED.value:
         try:
             preview: Mapping[str, Any] = current
@@ -414,15 +429,47 @@ async def review_retrieval_eval_draft(
                     "reasons": reasons,
                 },
             )
+        frozen_index_generation = str(preview.get("index_generation") or "")
     try:
-        updated = store.review(
-            draft_id,
-            decision=body.decision,
-            reviewer=_review_actor(request, reviewer),
-            annotations=body.annotations,
-            reason=body.reason,
-            expected_revision=body.expected_revision,
+        authority = None
+        if getattr(request.app.state, "ha_feedback_multiwriter_mode", False):
+            scope = scope_for_storage_id(request, str(current.get("kb_id") or ""))
+            if scope is None:
+                raise HAChatAuthorityChanged("shared draft scope is unavailable")
+            expected_epoch = capture_ha_chat_epoch(
+                request.app.state.kb_registry, scope.storage_id
+            )
+            guard = ha_authority_guard(
+                request,
+                scope,
+                expected_epoch,
+                permission=Permission.REVIEW,
+            )
+            evidence = getattr(guard, "evidence", None)
+            if not isinstance(evidence, Mapping):
+                raise HAChatAuthorityChanged("shared draft authority is unavailable")
+            authority = (expected_epoch, evidence)
+        review_authorized = getattr(store, "review_authorized", None)
+        options = {
+            "decision": body.decision,
+            "reviewer": _review_actor(request, reviewer),
+            "annotations": body.annotations,
+            "reason": body.reason,
+            "expected_revision": frozen_revision,
+        }
+        updated = (
+            review_authorized(
+                draft_id,
+                expected_epoch=authority[0],
+                authority=authority[1],
+                expected_index_generation=frozen_index_generation,
+                **options,
+            )
+            if authority is not None and callable(review_authorized)
+            else store.review(draft_id, **options)
         )
+    except (HAChatAuthorityChanged, StaleAuxiliaryWrite) as exc:
+        raise HTTPException(status_code=409, detail="访问权限已变化") from exc
     except DraftRevisionConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except KeyError as exc:

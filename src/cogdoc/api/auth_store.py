@@ -23,6 +23,8 @@ import unicodedata
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from cogdoc.api.tenancy import Permission, Principal, ROLE_PERMISSIONS, Role
+from cogdoc.ha.dbapi_compat import BackendDBAPIConnection
+from cogdoc.ha.storage import DatabaseBackend
 
 
 AUTH_SCHEMA_VERSION = "8"
@@ -310,11 +312,11 @@ def _iso(timestamp: float) -> str:
 
 
 class AuthStore:
-    """Thread-safe SQLite identity store intended for CogDoc's single process."""
+    """Thread-safe identity store backed by local SQLite or the HA database."""
 
     def __init__(
         self,
-        db_path: str,
+        db_path: str | None,
         *,
         scrypt_params: ScryptParams | Mapping[str, int] | None = None,
         scrypt_n: int | None = None,
@@ -326,7 +328,10 @@ class AuthStore:
         lockout_seconds: float = 15 * 60,
         clock: Callable[[], float] = time.time,
         busy_timeout_ms: int = 5000,
+        backend: DatabaseBackend | None = None,
     ):
+        if (db_path is None) == (backend is None):
+            raise AuthValidationError("configure exactly one authentication backend")
         if isinstance(scrypt_params, Mapping):
             params = ScryptParams(**dict(scrypt_params))
         elif isinstance(scrypt_params, ScryptParams):
@@ -361,14 +366,23 @@ class AuthStore:
         self._clock = clock
         self._lock = RLock()
         self._closed = False
-        self._conn = sqlite3.connect(
-            db_path, check_same_thread=False, isolation_level=None
-        )
+        self._backend = backend
+        self._conn: Any
+        if backend is not None:
+            self._conn = BackendDBAPIConnection(backend)
+        else:
+            assert db_path is not None
+            self._conn = sqlite3.connect(
+                db_path, check_same_thread=False, isolation_level=None
+            )
         try:
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=FULL")
-            self._conn.execute(f"PRAGMA busy_timeout={max(0, int(busy_timeout_ms))}")
+            if backend is None:
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=FULL")
+                self._conn.execute(
+                    f"PRAGMA busy_timeout={max(0, int(busy_timeout_ms))}"
+                )
             self._create_schema()
             # Unknown emails must pay the same KDF cost as known users.
             self._dummy_password_hash = _hash_password(
@@ -387,6 +401,10 @@ class AuthStore:
         if not math.isfinite(result) or result <= 0 or result > 10 * 365 * 86400:
             raise AuthValidationError(f"invalid {field}")
         return result
+
+    @property
+    def backend(self) -> DatabaseBackend | None:
+        return self._backend
 
     def _create_schema(self) -> None:
         self._conn.executescript(
@@ -650,10 +668,24 @@ class AuthStore:
             );
             """
         )
-        token_columns = {
-            str(item[1])
-            for item in self._conn.execute("PRAGMA table_info(auth_service_tokens)")
-        }
+        if self._backend is not None:
+            token_columns = {"permissions_json"}
+            oidc_policy_columns = {
+                "group_claim",
+                "group_role_map_json",
+                "require_mapped_group",
+            }
+        else:
+            token_columns = {
+                str(item[1])
+                for item in self._conn.execute("PRAGMA table_info(auth_service_tokens)")
+            }
+            oidc_policy_columns = {
+                str(item[1])
+                for item in self._conn.execute(
+                    "PRAGMA table_info(auth_workspace_oidc_policies)"
+                )
+            }
         if "permissions_json" not in token_columns:
             try:
                 self._conn.execute(
@@ -662,12 +694,6 @@ class AuthStore:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).casefold():
                     raise
-        oidc_policy_columns = {
-            str(item[1])
-            for item in self._conn.execute(
-                "PRAGMA table_info(auth_workspace_oidc_policies)"
-            )
-        }
         for column, definition in (
             ("group_claim", "TEXT NOT NULL DEFAULT 'groups'"),
             ("group_role_map_json", "TEXT NOT NULL DEFAULT '{}'"),
@@ -691,15 +717,22 @@ class AuthStore:
         ).fetchone()
         if row is None:
             self._conn.execute(
-                "INSERT INTO auth_schema_meta(key, value) VALUES('schema_version', ?)",
+                "INSERT INTO auth_schema_meta(key, value) VALUES('schema_version', ?) "
+                "ON CONFLICT(key) DO NOTHING",
                 (AUTH_SCHEMA_VERSION,),
             )
+            row = self._conn.execute(
+                "SELECT value FROM auth_schema_meta WHERE key='schema_version'"
+            ).fetchone()
         elif row[0] in {"1", "2", "3", "4", "5", "6", "7"}:
             self._conn.execute(
                 "UPDATE auth_schema_meta SET value=? WHERE key='schema_version' AND value=?",
                 (AUTH_SCHEMA_VERSION, row[0]),
             )
-        elif row[0] != AUTH_SCHEMA_VERSION:
+            row = self._conn.execute(
+                "SELECT value FROM auth_schema_meta WHERE key='schema_version'"
+            ).fetchone()
+        if row is None or row[0] != AUTH_SCHEMA_VERSION:
             raise AuthStoreError("unsupported authentication schema version")
 
     @contextmanager
@@ -1291,14 +1324,32 @@ class AuthStore:
             valid = _verify_password(candidate_password, encoded) and password_enabled
             if row is None:
                 raise AuthAuthenticationError("invalid email or password")
-            user_id, _, personal_workspace_id, failed_count, locked_until = row[:5]
+            user_id, _, personal_workspace_id, _failed_count, locked_until = row[:5]
             locked = locked_until is not None and locked_until > now
             if locked:
                 raise AuthLockedError("login is temporarily locked")
             if not valid:
                 with self._transaction():
+                    counter_row = self._conn.execute(
+                        "SELECT failed_login_count,locked_until FROM auth_users "
+                        "WHERE user_id=?"
+                        + (
+                            " FOR UPDATE"
+                            if self._backend is not None
+                            and self._backend.kind == "postgres"
+                            else ""
+                        ),
+                        (user_id,),
+                    ).fetchone()
+                    if counter_row is None:
+                        raise AuthAuthenticationError("invalid email or password")
+                    current_failed, current_locked_until = counter_row
+                    if current_locked_until is not None and current_locked_until > now:
+                        raise AuthLockedError("login is temporarily locked")
                     # An expired lock starts a fresh failure window.
-                    prior = 0 if locked_until is not None else int(failed_count)
+                    prior = (
+                        0 if current_locked_until is not None else int(current_failed)
+                    )
                     failures = prior + 1
                     new_locked_until = (
                         now + self.lockout_seconds
@@ -1316,6 +1367,25 @@ class AuthStore:
             if not self._scim_account_enabled_locked(str(user_id)):
                 raise AuthAuthorizationError("SCIM-managed account is inactive")
             with self._transaction():
+                current = self._conn.execute(
+                    "SELECT u.password_hash,u.locked_until,COALESCE(p.enabled,1) "
+                    "FROM auth_users u LEFT JOIN auth_password_capabilities p "
+                    "ON p.user_id=u.user_id WHERE u.user_id=?"
+                    + (
+                        " FOR UPDATE OF u"
+                        if self._backend is not None
+                        and self._backend.kind == "postgres"
+                        else ""
+                    ),
+                    (user_id,),
+                ).fetchone()
+                if (
+                    current is None
+                    or str(current[0]) != str(encoded)
+                    or not bool(current[2])
+                    or (current[1] is not None and float(current[1]) > now)
+                ):
+                    raise AuthAuthenticationError("invalid email or password")
                 target = requested_workspace or personal_workspace_id
                 if self._membership_row(target, user_id) is None:
                     raise AuthAuthorizationError("user is not a workspace member")
@@ -1841,6 +1911,50 @@ class AuthStore:
                 now=now,
             )
 
+    def service_token_is_active(
+        self,
+        *,
+        workspace_id: str,
+        service_account_id: str,
+        token_id: str,
+        permission: Permission | str | None = None,
+    ) -> bool:
+        """Revalidate an already-authenticated service token without its secret."""
+
+        workspace = _clean_id(workspace_id, field="workspace_id")
+        account = _clean_id(service_account_id, field="service_account_id")
+        token = _clean_id(token_id, field="token_id")
+        required = None if permission is None else Permission(permission)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT accounts.role,tokens.permissions_json FROM "
+                "auth_service_tokens AS tokens JOIN "
+                "auth_service_accounts AS accounts ON "
+                "accounts.service_account_id=tokens.service_account_id "
+                "WHERE tokens.token_id=? AND tokens.service_account_id=? "
+                "AND accounts.workspace_id=? AND tokens.revoked_at IS NULL "
+                "AND (tokens.expires_at IS NULL OR tokens.expires_at>?) "
+                "AND accounts.active=1 AND accounts.deleted_at IS NULL",
+                (token, account, workspace, now),
+            ).fetchone()
+            if row is None or required is None:
+                return row is not None
+            stored_permissions = self._service_permissions(row[1])
+            token_scope = (
+                ROLE_PERMISSIONS[Role(str(row[0]))]
+                if stored_permissions is None
+                else frozenset(Permission(item) for item in stored_permissions)
+            )
+            policy_scope = frozenset(
+                Permission(item)
+                for item in self._service_account_policy_locked(workspace)[
+                    "allowed_permissions"
+                ]
+            )
+            return required in token_scope & policy_scope
+
     def link_oidc_identity(
         self,
         *,
@@ -2156,11 +2270,18 @@ class AuthStore:
         return row
 
     def _scim_group_row_locked(self, workspace_id: str, scim_group_id: str):
+        members_aggregate = (
+            "COALESCE(json_group_array(m.scim_user_id) FILTER "
+            "(WHERE m.scim_user_id IS NOT NULL AND u.deleted_at IS NULL),'[]')"
+            if self._backend is None or self._backend.kind == "sqlite"
+            else "COALESCE((json_agg(m.scim_user_id) FILTER "
+            "(WHERE m.scim_user_id IS NOT NULL AND u.deleted_at IS NULL))::text,'[]')"
+        )
         row = self._conn.execute(
             "SELECT g.scim_group_id,g.workspace_id,g.external_id,g.display_name,"
             "g.mapped_role,g.revision,g.created_at,g.updated_at,g.deleted_at,"
-            "COALESCE(json_group_array(m.scim_user_id) FILTER "
-            "(WHERE m.scim_user_id IS NOT NULL AND u.deleted_at IS NULL),'[]') "
+            + members_aggregate
+            + " "
             "FROM auth_scim_groups g LEFT JOIN auth_scim_group_members m "
             "ON m.scim_group_id=g.scim_group_id LEFT JOIN auth_scim_users u "
             "ON u.scim_user_id=m.scim_user_id WHERE g.workspace_id=? "
@@ -4416,7 +4537,7 @@ class AuthStore:
                 return cursor.rowcount
 
     def check(self) -> bool:
-        """Run a cheap, fail-closed SQLite readiness probe.
+        """Run a cheap, fail-closed identity-store readiness probe.
 
         Referencing every identity table makes a partially initialized or
         damaged schema unavailable without scanning user data.  The schema

@@ -5,7 +5,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeGuard
 
 from cogdoc.config.settings import get_settings
 from cogdoc.service.index_provenance import current_index_provenance
@@ -14,6 +14,8 @@ from cogdoc.service.index_provenance import current_index_provenance
 RESEARCH_PROVENANCE_VERSION = "research-provenance-v1"
 RESEARCH_CONTRACT_VERSION = "research-retrieval-verification-v2"
 _IDENTITY_FIELDS = (
+    "kb_epoch",
+    "acl_epoch",
     "index_generation",
     "index_build_version",
     "chunk_identity_version",
@@ -236,23 +238,44 @@ def _research_contract_revision() -> str:
     return _canonical_hash([contract])
 
 
-def capture_research_provenance(kb_id: str, *, state_runtime) -> dict[str, Any]:
+def capture_research_provenance(
+    kb_id: str,
+    *,
+    state_runtime,
+    index_provenance_reader=None,
+    include_auxiliary_state: bool = True,
+) -> dict[str, Any]:
     """Freeze every persisted input that can alter a research evidence run."""
 
-    snapshot = current_index_provenance(kb_id)
+    snapshot = (
+        current_index_provenance(kb_id)
+        if index_provenance_reader is None
+        else dict(index_provenance_reader(kb_id))
+    )
+    auxiliary_revision = hashlib.sha256(b"ha-primary-index-only-v1").hexdigest()
     return {
         "schema_version": RESEARCH_PROVENANCE_VERSION,
         "kb_id": kb_id,
         **snapshot,
-        "derived_knowledge_revision": _derived_knowledge_revision(state_runtime, kb_id),
-        "retrieval_tuning_revision": _retrieval_tuning_revision(state_runtime, kb_id),
+        "derived_knowledge_revision": (
+            _derived_knowledge_revision(state_runtime, kb_id)
+            if include_auxiliary_state
+            else auxiliary_revision
+        ),
+        "retrieval_tuning_revision": (
+            _retrieval_tuning_revision(state_runtime, kb_id)
+            if include_auxiliary_state
+            else auxiliary_revision
+        ),
         "research_contract_version": RESEARCH_CONTRACT_VERSION,
         "research_contract_revision": _research_contract_revision(),
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def is_trackable_research_provenance(snapshot: Mapping[str, Any] | None) -> bool:
+def is_trackable_research_provenance(
+    snapshot: Mapping[str, Any] | None,
+) -> TypeGuard[Mapping[str, Any]]:
     if not isinstance(snapshot, Mapping):
         return False
     return bool(
@@ -549,11 +572,15 @@ def _repair_summary(value: Any) -> dict[str, Any]:
     }
 
 
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def _claim_audit_summary(value: Any) -> dict[str, Any]:
     raw = value if isinstance(value, Mapping) else {}
-    counts = raw.get("counts") if isinstance(raw.get("counts"), Mapping) else {}
-    metrics = raw.get("metrics") if isinstance(raw.get("metrics"), Mapping) else {}
-    verifier = raw.get("verifier") if isinstance(raw.get("verifier"), Mapping) else {}
+    counts = _as_mapping(raw.get("counts"))
+    metrics = _as_mapping(raw.get("metrics"))
+    verifier = _as_mapping(raw.get("verifier"))
     return {
         "status": _bounded_source_text(raw, "status", default="not_run", limit=32),
         "reason_code": _bounded_source_text(raw, "reason_code", limit=128),
@@ -595,7 +622,7 @@ def _coverage_audit_summary(value: Any) -> dict[str, Any]:
         missing_ids.append(requirement_id)
     if len(set(missing_ids)) != len(missing_ids):
         raise ValueError("coverage missing requirement IDs must be unique")
-    auditor = raw.get("auditor") if isinstance(raw.get("auditor"), Mapping) else {}
+    auditor = _as_mapping(raw.get("auditor"))
     return {
         "status": _bounded_source_text(raw, "status", default="not_run", limit=32),
         "reason_code": _bounded_source_text(raw, "reason_code", limit=128),
@@ -620,15 +647,16 @@ def _requirement_results(value: Any) -> list[dict[str, Any]]:
     for raw in value:
         if not isinstance(raw, Mapping):
             raise TypeError("evidence requirement results must contain mappings")
+        requirement_id = _bounded_source_text(raw, "requirement_id", limit=128)
         result = {
-            "requirement_id": _bounded_source_text(raw, "requirement_id", limit=128),
+            "requirement_id": requirement_id,
             "status": _bounded_source_text(raw, "status", limit=32),
             "reason_code": _bounded_source_text(raw, "reason_code", limit=128),
             "evidence_count": _bounded_source_int(raw, "evidence_count"),
         }
-        if not result["requirement_id"] or result["requirement_id"] in seen:
+        if not requirement_id or requirement_id in seen:
             raise ValueError("evidence requirement IDs must be non-empty and unique")
-        seen.add(result["requirement_id"])
+        seen.add(requirement_id)
         results.append(result)
     return results
 
@@ -1305,9 +1333,20 @@ def research_artifact_integrity_status(report: Any) -> str:
     verification = report.get("verification")
     if type(verification) is not dict:
         return "invalid"
-    if type(report.get("verification_metrics")) is not dict:
+    verification_metrics = report.get("verification_metrics")
+    if type(verification_metrics) is not dict:
         return "invalid"
-    if report["verification_metrics"] != verification.get("aggregate"):
+    if verification_metrics != verification.get("aggregate"):
+        return "invalid"
+    content = report.get("content")
+    citation_ledger = report.get("citation_ledger")
+    provenance = report.get("provenance")
+    if (
+        type(content) is not str
+        or type(citation_ledger) is not list
+        or any(type(row) is not dict for row in citation_ledger)
+        or type(provenance) is not dict
+    ):
         return "invalid"
     if verification.get("schema_version") == "research-verification-v1":
         try:
@@ -1325,9 +1364,9 @@ def research_artifact_integrity_status(report: Any) -> str:
         return "legacy-unverified" if report["sha256"] == expected else "invalid"
     try:
         expected = research_artifact_sha256(
-            content=report.get("content"),
-            citation_ledger=report.get("citation_ledger"),
-            provenance=report.get("provenance"),
+            content=content,
+            citation_ledger=citation_ledger,
+            provenance=provenance,
             verification=verification,
             metadata={
                 "version": report.get("version"),
@@ -1373,9 +1412,12 @@ def research_artifact_matches_job_projection(
         )
 
         content, ledger = compose_research_markdown(job, sections)
+        verification_metrics = report.get("verification_metrics")
+        if not isinstance(verification_metrics, Mapping):
+            return False
         verification = build_research_verification_snapshot(
             job=job,
-            verification_metrics=report.get("verification_metrics"),
+            verification_metrics=verification_metrics,
             sections=sections,
         )
     except (TypeError, ValueError):

@@ -178,6 +178,15 @@ def test_cli_replays_dead_letter_with_operator_idempotency_key(
         ],
         ["gc-index", "--retention-seconds", "0"],
         ["gc-index", "--limit", "1001"],
+        [
+            "backup",
+            "--output-dir",
+            ".",
+            "--name",
+            "backup",
+            "--timeout-seconds",
+            "1",
+        ],
     ],
 )
 def test_cli_rejects_unsafe_operational_bounds(arguments):
@@ -206,7 +215,78 @@ def test_cli_local_operational_commands_close_owned_runtime(
         assert output == {"delivered": 0, "fires": 0}
     else:
         assert [(row["version"], row["phase"]) for row in output["migrations"]] == [
-            (1, "validated")
-        ]
+            (1, "validated"),
+            (2, "validated"),
+            (3, "validated"),
+            (4, "validated"),
+            (5, "validated"),
+                (6, "validated"),
+                (7, "validated"),
+                (8, "validated"),
+                (9, "validated"),
+            ]
     with pytest.raises(Exception, match="closed"):
         created[0].backend.check()
+
+
+def test_cli_captures_and_verifies_recovery_manifest(tmp_path, monkeypatch, capsys):
+    config = _config(tmp_path)
+    monkeypatch.setattr(cli, "_runtime", lambda: HARuntime(config))
+    manifest_path = tmp_path / "backup" / "recovery.json"
+
+    assert cli.main(["migrate"]) == 0
+    capsys.readouterr()
+    assert (
+        cli.main(
+            [
+                "recovery-manifest",
+                "--database-snapshot-id",
+                "pgdump-test",
+                "--database-sha256",
+                "a" * 64,
+                "--output",
+                str(manifest_path),
+                "--verify-content",
+            ]
+        )
+        == 0
+    )
+    captured = json.loads(capsys.readouterr().out)
+    assert captured["manifest"] == str(manifest_path)
+    assert captured["objects"] == 0
+    assert len(captured["manifest_sha256"]) == 64
+
+    assert (
+        cli.main(
+            [
+                "verify-recovery-manifest",
+                "--manifest",
+                str(manifest_path),
+                "--verify-content",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {
+        "bytes": 0,
+        "objects": 0,
+        "status": "verified",
+    }
+
+
+def test_cli_backup_fails_closed_without_postgres(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_runtime", lambda: HARuntime(_config(tmp_path)))
+
+    assert (
+        cli.main(
+            [
+                "backup",
+                "--output-dir",
+                str(tmp_path),
+                "--name",
+                "backup",
+            ]
+        )
+        == 1
+    )
+    assert "requires the PostgreSQL backend" in capsys.readouterr().err

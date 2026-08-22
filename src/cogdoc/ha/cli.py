@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from cogdoc.config.settings import get_settings
+from cogdoc.ha.backup import HABackupCoordinator
 from cogdoc.ha.migration_catalog import REGISTERED_MIGRATIONS
 from cogdoc.ha.migrations import MigrationRunner
 from cogdoc.ha.outbox import WebhookOutboxHandler
+from cogdoc.ha.postgres import PostgresBackend
 from cogdoc.ha.runtime import HAConfig, HARuntime, manifest_for_directory
 
 
@@ -39,6 +41,10 @@ def _retention_seconds(value: str) -> float:
         maximum=10 * 366 * 86_400,
         field="retention seconds",
     )
+
+
+def _backup_timeout(value: str) -> float:
+    return _bounded_number(value, minimum=60, maximum=86_400, field="backup timeout")
 
 
 def _dimensions(value: str) -> int:
@@ -298,6 +304,40 @@ def _parser() -> argparse.ArgumentParser:
     replay = commands.add_parser("replay-job", help="replay one dead-letter job")
     replay.add_argument("--job-id", required=True)
     replay.add_argument("--replay-key", required=True)
+    checkpoint = commands.add_parser(
+        "recovery-manifest",
+        help="capture the object inventory for an external PostgreSQL snapshot",
+    )
+    checkpoint.add_argument("--database-snapshot-id", required=True)
+    checkpoint.add_argument("--database-sha256")
+    checkpoint.add_argument("--output", type=Path, required=True)
+    checkpoint.add_argument("--verify-content", action="store_true")
+    verify = commands.add_parser(
+        "verify-recovery-manifest",
+        help="verify a recovery inventory against the configured object store",
+    )
+    verify.add_argument("--manifest", type=Path, required=True)
+    verify.add_argument("--verify-content", action="store_true")
+    backup = commands.add_parser(
+        "backup",
+        help="create one atomic PostgreSQL dump and object recovery bundle",
+    )
+    backup.add_argument("--output-dir", type=Path, required=True)
+    backup.add_argument("--name", required=True)
+    backup.add_argument("--pg-dump-binary", default="pg_dump")
+    backup.add_argument("--pg-restore-binary", default="pg_restore")
+    backup.add_argument("--timeout-seconds", type=_backup_timeout, default=3600.0)
+    backup.add_argument("--skip-content-verification", action="store_true")
+    verify_backup = commands.add_parser(
+        "verify-backup",
+        help="verify a complete HA database/object recovery bundle",
+    )
+    verify_backup.add_argument("--path", type=Path, required=True)
+    verify_backup.add_argument("--pg-restore-binary", default="pg_restore")
+    verify_backup.add_argument(
+        "--timeout-seconds", type=_backup_timeout, default=3600.0
+    )
+    verify_backup.add_argument("--skip-content-verification", action="store_true")
     return parser
 
 
@@ -357,6 +397,59 @@ def main(argv: list[str] | None = None) -> int:
                     "replay_of": row["replay_of"],
                     "status": row["status"],
                 }
+            )
+            return 0
+        if args.command == "recovery-manifest":
+            manifest = runtime.recovery.capture(
+                args.database_snapshot_id,
+                database_sha256=args.database_sha256,
+                verify_content=args.verify_content,
+            )
+            destination = runtime.recovery.write(args.output, manifest)
+            _json(
+                {
+                    "manifest": str(destination),
+                    "manifest_sha256": manifest["manifest_sha256"],
+                    "objects": len(manifest["objects"]),
+                }
+            )
+            return 0
+        if args.command == "verify-recovery-manifest":
+            manifest = runtime.recovery.read(args.manifest)
+            result = runtime.recovery.verify(
+                manifest, verify_content=args.verify_content
+            )
+            _json({"status": "verified", **result})
+            return 0
+        if args.command in {"backup", "verify-backup"}:
+            if not isinstance(runtime.backend, PostgresBackend):
+                raise RuntimeError("HA backup requires the PostgreSQL backend")
+            backup = HABackupCoordinator(runtime.backend, runtime.recovery)
+            if args.command == "backup":
+                backup_result = backup.create(
+                    args.output_dir,
+                    name=args.name,
+                    pg_dump_binary=args.pg_dump_binary,
+                    pg_restore_binary=args.pg_restore_binary,
+                    timeout_seconds=args.timeout_seconds,
+                    verify_content=not args.skip_content_verification,
+                )
+                _json(
+                    {
+                        "status": "created",
+                        "path": backup_result["path"],
+                        "bundle_sha256": backup_result["bundle_sha256"],
+                        "objects": backup_result["recovery_manifest"]["objects"],
+                    }
+                )
+                return 0
+            _json(
+                backup.verify(
+                    args.path,
+                    pg_restore_binary=args.pg_restore_binary,
+                    timeout_seconds=args.timeout_seconds,
+                    verify_content=not args.skip_content_verification,
+                )
             )
             return 0
         raise AssertionError("unhandled command")

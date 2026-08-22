@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Any
 
 from cogdoc.connectors.base import (
@@ -24,6 +25,7 @@ from cogdoc.connectors.sync_store import (
     SYNC_RETRY_WAIT,
     SYNC_RUNNING,
     SYNC_SUCCEEDED,
+    SYNC_TERMINAL,
     ConnectorSyncStore,
 )
 
@@ -45,6 +47,7 @@ class SyncManager:
         | None = None,
         cleanup_callback: Callable[[Mapping[str, Any]], None] | None = None,
         maintenance_callback: Callable[[], None] | None = None,
+        execution_context: Callable[[Mapping[str, Any]], Any] | None = None,
         terminal_retention_seconds: float = 30 * 86_400,
         maintenance_interval_seconds: float = 3_600,
         maintenance_max_items: int = 10_000,
@@ -64,6 +67,8 @@ class SyncManager:
         )
         self.cleanup_callback = cleanup_callback
         self.maintenance_callback = maintenance_callback
+        self.execution_context = execution_context or (lambda _job: nullcontext())
+        self._execution_context_explicit = execution_context is not None
         if terminal_retention_seconds <= 0 or maintenance_interval_seconds <= 0:
             raise ValueError("sync maintenance intervals must be positive")
         if not 1 <= maintenance_max_items <= 100_000:
@@ -89,6 +94,24 @@ class SyncManager:
         self._scheduler_stop = False
         self._control_plane_started = False
         self._closed = False
+
+    def bind_execution_context(
+        self, execution_context: Callable[[Mapping[str, Any]], Any]
+    ) -> None:
+        """Bind the trusted HA lease/rebase context before any dispatch."""
+
+        if not callable(execution_context):
+            raise TypeError("sync execution context must be callable")
+        with self._lock:
+            if self._control_plane_started or self._futures:
+                raise RuntimeError("cannot bind sync execution context after startup")
+            if (
+                self._execution_context_explicit
+                and self.execution_context is not execution_context
+            ):
+                raise RuntimeError("sync execution context is already bound")
+            self.execution_context = execution_context
+            self._execution_context_explicit = True
 
     @staticmethod
     def _default_credential_snapshot(
@@ -745,6 +768,36 @@ class SyncManager:
                 self._condition.notify_all()
 
     def _run(self, job_id: str) -> None:
+        job = self.sync_store.get(job_id)
+        if job is None or job.get("status") in {
+            SYNC_SUCCEEDED,
+            SYNC_FAILED,
+            SYNC_DEAD_LETTER,
+            "cancelled",
+        }:
+            return
+        connection = self.connection_store.get(
+            str(job["connection_id"]), include_secret_refs=True
+        )
+        if job.get("status") != SYNC_COMMITTING and not self._job_is_admitted(
+            job, connection
+        ):
+            self._cancel_before_build(job)
+            return
+        try:
+            with self.execution_context(job):
+                self._run_in_context(job_id)
+        except Exception:
+            # Distributed KB leases are intentionally non-blocking. Another
+            # writer may own the KB for a short document/index mutation; keep
+            # the durable job runnable and retry instead of losing its only
+            # dispatch future. Persistent integrity/configuration failures are
+            # likewise bounded by this single scheduler entry and stay visible.
+            current = self.sync_store.get(job_id)
+            if current is not None and current.get("status") not in SYNC_TERMINAL:
+                self._dispatch(job_id, delay=1.0, replace_timer=True)
+
+    def _run_in_context(self, job_id: str) -> None:
         job = self.sync_store.get(job_id)
         if job is None or job.get("status") in {
             SYNC_SUCCEEDED,

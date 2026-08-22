@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any
@@ -12,6 +12,8 @@ from uuid import uuid4
 from cogdoc.api.persistence import connect_sqlite
 from cogdoc.api.time_utils import now_iso
 from cogdoc.config.settings import get_settings
+from cogdoc.ha.dbapi_compat import BackendDBAPIConnection
+from cogdoc.ha.storage import DatabaseBackend
 from cogdoc.research_control import (
     RESEARCH_RESOURCE_NAMES,
     ResearchBudgetExceeded,
@@ -34,6 +36,9 @@ from cogdoc.service.research_summary import (
     RESEARCH_SUMMARY_STORAGE_VERSION,
     compact_research_job_summary,
 )
+
+
+ResearchRows = list[dict[str, Any]]
 
 
 class ResearchJobRevisionConflictError(ValueError):
@@ -1425,10 +1430,15 @@ def _publish_report(
     report = row.get("report")
     if not isinstance(report, Mapping):
         raise ResearchJobStateConflictError("research report is unavailable")
+    verification_metrics = report.get("verification_metrics")
+    if not isinstance(verification_metrics, Mapping):
+        raise ResearchJobStateConflictError(
+            "research report verification metrics are invalid"
+        )
     try:
         current_verification = build_research_verification_snapshot(
             job=row,
-            verification_metrics=report.get("verification_metrics"),
+            verification_metrics=verification_metrics,
             sections=[
                 section
                 for section in row.get("sections") or []
@@ -1455,13 +1465,23 @@ def _publish_report(
     published = dict(_clone(report))
     published["published_at"] = timestamp
     published["published_by"] = publisher
+    review_history = row.get("review_history")
+    sections = row.get("sections")
+    if type(review_history) is not list or any(
+        type(event) is not dict for event in review_history
+    ):
+        raise ResearchJobStateConflictError("research review history is invalid")
+    if type(sections) is not list or any(
+        type(section) is not dict for section in sections
+    ):
+        raise ResearchJobStateConflictError("research sections are invalid")
     publication_sha256 = research_publication_sha256(
         artifact_sha256=str(report.get("sha256") or ""),
         report_version=int(row.get("report_version") or 0),
         published_at=timestamp,
         published_by=publisher,
-        review_history=row.get("review_history"),
-        sections=row.get("sections"),
+        review_history=review_history,
+        sections=sections,
     )
     published["publication_sha256"] = publication_sha256
     row["published_report"] = published
@@ -1654,15 +1674,18 @@ def _fail_section(
         return row
     control = _research_control_root(row).get("evidence")
     if lease_id is not None:
-        allowed = (
-            {
-                str(control.get("lease_id") or ""),
-                str(control.get("draining_lease_id") or ""),
-            }
-            if isinstance(control, Mapping)
-            else set()
+        allowed_lease = (
+            control.get("lease_id")
+            if row.get("status") == "running" and isinstance(control, Mapping)
+            else control.get("draining_lease_id")
+            if row.get("status") == "paused" and isinstance(control, Mapping)
+            else ""
         )
-        if lease_id not in allowed:
+        if (
+            not isinstance(control, Mapping)
+            or control.get("attempt_id") != execution_id
+            or allowed_lease != lease_id
+        ):
             return row
     target = next(
         (
@@ -1826,7 +1849,7 @@ class ResearchJobStore:
         kb_id: str | None = None,
         status: str | None = None,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> ResearchRows:
         with self._lock:
             rows = self._read_all_locked()
         if kb_id is not None:
@@ -1850,7 +1873,7 @@ class ResearchJobStore:
         limit: int = 21,
         before_updated_at: str | None = None,
         before_job_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> ResearchRows:
         """Read a stable keyset page and discard all heavy job projections."""
 
         if (before_updated_at is None) != (before_job_id is None):
@@ -1882,6 +1905,19 @@ class ResearchJobStore:
         return [
             _clone(compact_research_job_summary(row)) for row in rows[: max(0, limit)]
         ]
+
+    def list_dispatchable(
+        self, *, after_job_id: str = "", limit: int = 1000
+    ) -> ResearchRows:
+        with self._lock:
+            rows = [
+                row
+                for row in self._read_all_locked()
+                if row.get("status") in {"running", "generating"}
+                and str(row.get("job_id") or "") > after_job_id
+            ]
+        rows.sort(key=lambda row: str(row.get("job_id") or ""))
+        return _clone(rows[: max(0, limit)])
 
     def update_plan(
         self,
@@ -2261,6 +2297,54 @@ class ResearchJobStore:
 
         return self._mutate(job_id, transition, write_if_unchanged=False)
 
+    def activate_distributed_attempt(
+        self,
+        job_id: str,
+        *,
+        phase: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        """Fence an old node and make one claimed HA attempt executable.
+
+        The dispatch lease is acquired before this transition. Rotating the
+        embedded lease makes every callback from the previous owner a no-op.
+        Evidence sections claimed by a lost owner are returned to the pending
+        queue, while already completed sections remain immutable.
+        """
+
+        if phase not in {"evidence", "report"}:
+            raise ValueError("research phase is invalid")
+        if type(attempt_id) is not str or not attempt_id:
+            raise ValueError("research attempt_id is invalid")
+
+        def transition(row: dict[str, Any]) -> dict[str, Any]:
+            expected_status = "running" if phase == "evidence" else "generating"
+            current_attempt = (
+                row.get("execution_id")
+                if phase == "evidence"
+                else row.get("report_execution_id")
+            )
+            if row.get("status") != expected_status or current_attempt != attempt_id:
+                return row
+            control = _research_control_root(row).get(phase)
+            if (
+                not isinstance(control, dict)
+                or control.get("attempt_id") != attempt_id
+                or control.get("control_state") != "running"
+            ):
+                return row
+            control["draining_lease_id"] = str(control.get("lease_id") or "")
+            control["lease_id"] = uuid4().hex
+            control["heartbeat_at"] = _utc_now().isoformat()
+            if phase == "evidence":
+                for section in row.get("sections") or []:
+                    if isinstance(section, dict) and section.get("status") == "running":
+                        section["status"] = "pending"
+                        section["error"] = ""
+            return _touch(row)
+
+        return self._mutate(job_id, transition, write_if_unchanged=False)
+
     def reconcile_running_outcomes(
         self, *, terminal_reason: str = "service_restarted"
     ) -> dict[str, int]:
@@ -2297,7 +2381,7 @@ class ResearchJobStore:
             rows = [row for row in self._read_all_locked() if row.get("kb_id") != kb_id]
             self._write_all_locked(rows)
 
-    def export_records(self) -> list[dict[str, Any]]:
+    def export_records(self) -> ResearchRows:
         with self._lock:
             return _clone(self._read_all_locked())
 
@@ -2326,7 +2410,7 @@ class ResearchJobStore:
                 self._write_all_locked(rows)
         return {"imported": changed, "skipped": len(incoming) - changed}
 
-    def _read_all_locked(self) -> list[dict[str, Any]]:
+    def _read_all_locked(self) -> ResearchRows:
         if not os.path.exists(self._path):
             return []
         with open(self._path, encoding="utf-8") as handle:
@@ -2354,7 +2438,7 @@ class ResearchJobStore:
                 return _clone(updated)
         raise KeyError(job_id)
 
-    def _write_all_locked(self, rows: list[dict[str, Any]]) -> None:
+    def _write_all_locked(self, rows: ResearchRows) -> None:
         temporary_path = f"{self._path}.tmp"
         try:
             with open(temporary_path, "w", encoding="utf-8") as handle:
@@ -2368,27 +2452,50 @@ class ResearchJobStore:
 
 
 class SqliteResearchJobStore(ResearchJobStore):
-    """SQLite adapter with the same contract as ``ResearchJobStore``."""
+    """Transactional SQLite/shared-backend research state adapter.
 
-    def __init__(self, db_path: str):
+    The historical class name remains public for compatibility. Passing a
+    backend selects the HA database; every JSON transition then holds a row
+    lock until its compact summary and full record have been atomically stored.
+    """
+
+    def __init__(
+        self,
+        db_path: str | None,
+        *,
+        backend: DatabaseBackend | None = None,
+    ):
+        if (db_path is None) == (backend is None):
+            raise ValueError("exactly one of db_path or backend is required")
         self._lock = RLock()
         self._closed = False
-        self._conn = connect_sqlite(db_path)
+        self._backend = backend
+        self._commit_authority_guard: (
+            Callable[[Any, Mapping[str, Any], Mapping[str, Any]], None] | None
+        ) = None
+        self._conn = (
+            BackendDBAPIConnection(backend)
+            if backend is not None
+            else connect_sqlite(str(db_path))
+        )
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS research_jobs ("
             "job_id TEXT PRIMARY KEY, kb_id TEXT NOT NULL, status TEXT NOT NULL, "
             "updated_at TEXT NOT NULL, data TEXT NOT NULL, "
             "summary TEXT NOT NULL DEFAULT '{}')"
         )
-        columns = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(research_jobs)").fetchall()
-        }
-        if "summary" not in columns:
-            self._conn.execute(
-                "ALTER TABLE research_jobs "
-                "ADD COLUMN summary TEXT NOT NULL DEFAULT '{}'"
-            )
+        if backend is None:
+            columns = {
+                row[1]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(research_jobs)"
+                ).fetchall()
+            }
+            if "summary" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE research_jobs "
+                    "ADD COLUMN summary TEXT NOT NULL DEFAULT '{}'"
+                )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_research_jobs_queue "
             "ON research_jobs(kb_id, status, updated_at DESC)"
@@ -2416,6 +2523,29 @@ class SqliteResearchJobStore(ResearchJobStore):
                 "UPDATE research_jobs SET summary=? WHERE job_id=?",
                 (json.dumps(compact, ensure_ascii=False), job_id),
             )
+
+    @property
+    def backend(self) -> DatabaseBackend | None:
+        return self._backend
+
+    def bind_commit_authority_guard(
+        self,
+        guard: Callable[[Any, Mapping[str, Any], Mapping[str, Any]], None],
+    ) -> None:
+        if self._backend is None:
+            raise RuntimeError("research commit authority requires a shared backend")
+        if (
+            self._commit_authority_guard is not None
+            and self._commit_authority_guard is not guard
+        ):
+            raise RuntimeError("research commit authority guard is already bound")
+        self._commit_authority_guard = guard
+
+    def check(self) -> bool:
+        with self._lock:
+            self._ensure_open()
+            self._conn.execute("SELECT job_id FROM research_jobs WHERE 1=0").fetchall()
+        return True
 
     def create(
         self,
@@ -2486,7 +2616,7 @@ class SqliteResearchJobStore(ResearchJobStore):
         kb_id: str | None = None,
         status: str | None = None,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> ResearchRows:
         clauses: list[str] = []
         params: list[Any] = []
         if kb_id is not None:
@@ -2513,7 +2643,7 @@ class SqliteResearchJobStore(ResearchJobStore):
         limit: int = 21,
         before_updated_at: str | None = None,
         before_job_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> ResearchRows:
         if (before_updated_at is None) != (before_job_id is None):
             raise ValueError("research summary cursor fields must be supplied together")
         clauses: list[str] = []
@@ -2537,6 +2667,19 @@ class SqliteResearchJobStore(ResearchJobStore):
             rows = self._conn.execute(query, tuple(params)).fetchall()
         return [_clone(json.loads(row[0])) for row in rows]
 
+    def list_dispatchable(
+        self, *, after_job_id: str = "", limit: int = 1000
+    ) -> ResearchRows:
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                "SELECT data FROM research_jobs WHERE "
+                "status IN ('running','generating') AND job_id>? "
+                "ORDER BY job_id LIMIT ?",
+                (after_job_id, max(0, limit)),
+            ).fetchall()
+        return [_clone(json.loads(row[0])) for row in rows]
+
     def update_plan(
         self,
         job_id: str,
@@ -2550,8 +2693,14 @@ class SqliteResearchJobStore(ResearchJobStore):
             self._ensure_open()
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                lock = (
+                    " FOR UPDATE"
+                    if self._backend is not None and self._backend.kind == "postgres"
+                    else ""
+                )
                 row = self._conn.execute(
-                    "SELECT data FROM research_jobs WHERE job_id=?", (job_id,)
+                    "SELECT data FROM research_jobs WHERE job_id=?" + lock,
+                    (job_id,),
                 ).fetchone()
                 if row is None:
                     raise KeyError(job_id)
@@ -2846,9 +2995,21 @@ class SqliteResearchJobStore(ResearchJobStore):
     def clear_kb(self, kb_id: str) -> None:
         with self._lock:
             self._ensure_open()
-            self._conn.execute("DELETE FROM research_jobs WHERE kb_id=?", (kb_id,))
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if self._backend is not None:
+                    self._conn.execute(
+                        "DELETE FROM ha_research_dispatches WHERE research_job_id IN ("
+                        "SELECT job_id FROM research_jobs WHERE kb_id=?)",
+                        (kb_id,),
+                    )
+                self._conn.execute("DELETE FROM research_jobs WHERE kb_id=?", (kb_id,))
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
 
-    def export_records(self) -> list[dict[str, Any]]:
+    def export_records(self) -> ResearchRows:
         return self.list(limit=2**31 - 1)
 
     def import_records(self, records: Sequence[Mapping[str, Any]]) -> dict[str, int]:
@@ -2862,8 +3023,15 @@ class SqliteResearchJobStore(ResearchJobStore):
                     job_id = str(record.get("job_id") or "")
                     if not job_id:
                         raise ValueError("research job import requires job_id")
+                    lock = (
+                        " FOR UPDATE"
+                        if self._backend is not None
+                        and self._backend.kind == "postgres"
+                        else ""
+                    )
                     existing = self._conn.execute(
-                        "SELECT data FROM research_jobs WHERE job_id=?", (job_id,)
+                        "SELECT data FROM research_jobs WHERE job_id=?" + lock,
+                        (job_id,),
                     ).fetchone()
                     if existing is not None and json.loads(existing[0]) == record:
                         continue
@@ -2922,14 +3090,23 @@ class SqliteResearchJobStore(ResearchJobStore):
             self._ensure_open()
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                lock = (
+                    " FOR UPDATE"
+                    if self._backend is not None and self._backend.kind == "postgres"
+                    else ""
+                )
                 row = self._conn.execute(
-                    "SELECT data FROM research_jobs WHERE job_id=?", (job_id,)
+                    "SELECT data FROM research_jobs WHERE job_id=?" + lock,
+                    (job_id,),
                 ).fetchone()
                 if row is None:
                     raise KeyError(job_id)
                 current = dict(json.loads(row[0]))
                 updated = transition(_clone(current))
                 if updated != current:
+                    guard = self._commit_authority_guard
+                    if guard is not None:
+                        guard(self._conn, current, updated)
                     self._upsert_locked(updated)
                 self._conn.execute("COMMIT")
                 return _clone(updated)

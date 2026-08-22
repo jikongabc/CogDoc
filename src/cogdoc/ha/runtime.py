@@ -13,10 +13,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from cogdoc.ha.index_generation import GEN_PREPARED, GEN_PUBLISHED, IndexGenerationStore
+from cogdoc.ha.index_generation import (
+    GEN_PREPARED,
+    GEN_PUBLISHED,
+    IndexAuthorityGuard,
+    IndexGenerationStore,
+)
 from cogdoc.ha.index_replica import HAIndexReplica
+from cogdoc.ha.invalidation import CacheInvalidationFeed, HACacheInvalidator
 from cogdoc.ha.maintenance import HAMaintenance
-from cogdoc.ha.migration_catalog import CURRENT_SCHEMA_VERSION, MINIMUM_SCHEMA_VERSION
+from cogdoc.ha.migration_catalog import (
+    CURRENT_SCHEMA_VERSION,
+    MINIMUM_SCHEMA_VERSION,
+    REGISTERED_MIGRATIONS,
+    migrations_are_current,
+)
+from cogdoc.ha.migrations import MigrationRunner
 from cogdoc.ha.object_store import (
     LocalObjectStore,
     ObjectIndexRepository,
@@ -26,6 +38,7 @@ from cogdoc.ha.object_store import (
 from cogdoc.ha.outbox import EventHandler, OutboxDispatcher, OutboxStore
 from cogdoc.ha.postgres import PostgresBackend
 from cogdoc.ha.scheduler import DistributedScheduler, ScheduleStore
+from cogdoc.ha.source_generation import SourceGenerationStore
 from cogdoc.ha.storage import DatabaseBackend, DatabaseConnection, SQLiteBackend
 from cogdoc.ha.tasks import LeaseJobStore
 from cogdoc.ha.versioning import ApplicationVersionRegistry, VersionHeartbeat
@@ -62,6 +75,14 @@ class HAConfig:
     index_worker_count: int = 2
     index_worker_poll_seconds: float = 0.5
     index_worker_lease_seconds: float = 300.0
+    research_worker_poll_seconds: float = 0.5
+    research_worker_lease_seconds: float = 120.0
+    chat_session_lease_seconds: float = 300.0
+    chat_index_reader_lease_seconds: float = 600.0
+    chat_max_sessions_per_scope: int = 1024
+    chat_session_ttl_seconds: int = 604800
+    chat_max_display_messages: int = 2000
+    chat_max_session_bytes: int = 4 * 1024 * 1024
     release_id: str = "unknown"
     minimum_schema_version: int = MINIMUM_SCHEMA_VERSION
     maximum_schema_version: int = CURRENT_SCHEMA_VERSION
@@ -69,6 +90,15 @@ class HAConfig:
     version_heartbeat_ttl_seconds: float = 90.0
     index_reads_enabled: bool = True
     index_replica_cache_root: str = ""
+    api_multi_writer_enabled: bool = False
+    mutation_lease_seconds: float = 300.0
+    source_cache_root: str = ""
+    source_max_files: int = 100_000
+    source_max_total_bytes: int = 10 * 1024 * 1024 * 1024
+    source_artifact_max_file_bytes: int = 100 * 1024 * 1024
+    source_artifact_max_total_bytes: int = 10 * 1024 * 1024 * 1024
+    source_artifact_max_tenant_bytes: int = 512 * 1024 * 1024
+    source_artifact_max_versions: int = 10
 
     @classmethod
     def from_settings(cls, settings: Any) -> HAConfig:
@@ -123,6 +153,30 @@ class HAConfig:
             index_worker_lease_seconds=float(
                 getattr(settings, "cogdoc_ha_index_worker_lease_seconds", 300.0)
             ),
+            research_worker_poll_seconds=float(
+                getattr(settings, "cogdoc_ha_research_worker_poll_seconds", 0.5)
+            ),
+            research_worker_lease_seconds=float(
+                getattr(settings, "cogdoc_ha_research_worker_lease_seconds", 120.0)
+            ),
+            chat_session_lease_seconds=float(
+                getattr(settings, "cogdoc_ha_chat_session_lease_seconds", 300.0)
+            ),
+            chat_index_reader_lease_seconds=float(
+                getattr(settings, "cogdoc_ha_chat_index_reader_lease_seconds", 600.0)
+            ),
+            chat_max_sessions_per_scope=int(
+                getattr(settings, "cogdoc_ha_chat_max_sessions_per_scope", 1024)
+            ),
+            chat_session_ttl_seconds=int(
+                getattr(settings, "cogdoc_ha_chat_session_ttl_seconds", 604800)
+            ),
+            chat_max_display_messages=int(
+                getattr(settings, "cogdoc_ha_chat_max_display_messages", 2000)
+            ),
+            chat_max_session_bytes=int(
+                getattr(settings, "cogdoc_ha_chat_max_session_bytes", 4 * 1024 * 1024)
+            ),
             release_id=configured_release or package_release,
             minimum_schema_version=int(
                 getattr(
@@ -159,6 +213,46 @@ class HAConfig:
                 getattr(settings, "cogdoc_ha_index_replica_cache_root", "")
             ).strip()
             or str(Path(settings.cogdoc_data_dir) / "ha-index-cache"),
+            api_multi_writer_enabled=bool(
+                getattr(settings, "cogdoc_ha_api_multi_writer_enabled", False)
+            ),
+            mutation_lease_seconds=float(
+                getattr(settings, "cogdoc_ha_mutation_lease_seconds", 300.0)
+            ),
+            source_cache_root=str(
+                getattr(settings, "cogdoc_ha_source_cache_root", "")
+            ).strip()
+            or str(Path(settings.cogdoc_data_dir) / "ha-source-cache"),
+            source_max_files=int(
+                getattr(settings, "cogdoc_ha_source_max_files", 100_000)
+            ),
+            source_max_total_bytes=int(
+                getattr(
+                    settings,
+                    "cogdoc_ha_source_max_total_bytes",
+                    10 * 1024 * 1024 * 1024,
+                )
+            ),
+            source_artifact_max_file_bytes=int(
+                getattr(settings, "cogdoc_source_artifact_max_file_mb", 100)
+            )
+            * 1024
+            * 1024,
+            source_artifact_max_total_bytes=int(
+                getattr(
+                    settings,
+                    "cogdoc_ha_source_artifact_max_total_bytes",
+                    10 * 1024 * 1024 * 1024,
+                )
+            ),
+            source_artifact_max_tenant_bytes=int(
+                getattr(settings, "cogdoc_source_artifact_max_tenant_mb", 512)
+            )
+            * 1024
+            * 1024,
+            source_artifact_max_versions=int(
+                getattr(settings, "cogdoc_source_artifact_max_versions", 10)
+            ),
         )
         config.validate()
         return config
@@ -206,6 +300,35 @@ class HAConfig:
         ):
             raise HAConfigurationError("HA index worker lease is invalid")
         if (
+            not math.isfinite(self.research_worker_poll_seconds)
+            or not 0.05 <= self.research_worker_poll_seconds <= 60
+        ):
+            raise HAConfigurationError("HA research worker poll interval is invalid")
+        if (
+            not math.isfinite(self.research_worker_lease_seconds)
+            or not 5 <= self.research_worker_lease_seconds <= 3600
+        ):
+            raise HAConfigurationError("HA research worker lease is invalid")
+        if (
+            not math.isfinite(self.chat_session_lease_seconds)
+            or not 5 <= self.chat_session_lease_seconds <= 3600
+            or not math.isfinite(self.chat_index_reader_lease_seconds)
+            or not 15 <= self.chat_index_reader_lease_seconds <= 3600
+        ):
+            raise HAConfigurationError("HA chat lease configuration is invalid")
+        if (
+            type(self.chat_max_sessions_per_scope) is not int
+            or not 1 <= self.chat_max_sessions_per_scope <= 100_000
+            or type(self.chat_session_ttl_seconds) is not int
+            or not 0 <= self.chat_session_ttl_seconds <= 10 * 365 * 86400
+            or type(self.chat_max_display_messages) is not int
+            or not 2 <= self.chat_max_display_messages <= 100_000
+            or self.chat_max_display_messages % 2
+            or type(self.chat_max_session_bytes) is not int
+            or not 4096 <= self.chat_max_session_bytes <= 128 * 1024 * 1024
+        ):
+            raise HAConfigurationError("HA chat storage limits are invalid")
+        if (
             not self.release_id
             or self.release_id != self.release_id.strip()
             or len(self.release_id.encode()) > 255
@@ -230,6 +353,30 @@ class HAConfig:
             <= 3600
         ):
             raise HAConfigurationError("HA version heartbeat timing is invalid")
+        if (
+            not math.isfinite(self.mutation_lease_seconds)
+            or not 5 <= self.mutation_lease_seconds <= 3600
+        ):
+            raise HAConfigurationError("HA mutation lease is invalid")
+        if not 1 <= self.source_max_files <= 1_000_000:
+            raise HAConfigurationError("HA source file limit is invalid")
+        if self.source_max_total_bytes < 1:
+            raise HAConfigurationError("HA source byte limit is invalid")
+        if (
+            self.source_artifact_max_file_bytes < 1
+            or self.source_artifact_max_total_bytes < 1
+            or self.source_artifact_max_tenant_bytes < 1
+            or self.source_artifact_max_versions < 1
+        ):
+            raise HAConfigurationError("HA source artifact limits are invalid")
+        if self.api_multi_writer_enabled and not (
+            self.database_url.startswith(("postgresql://", "postgres://"))
+            and self.object_store == "s3"
+            and self.s3_require_versioning
+        ):
+            raise HAConfigurationError(
+                "multi-writer API requires PostgreSQL and versioned S3"
+            )
 
     @property
     def multi_instance_safe(self) -> bool:
@@ -239,6 +386,10 @@ class HAConfig:
             and self.object_store == "s3"
             and self.s3_require_versioning
         )
+
+    @property
+    def api_multi_writer_safe(self) -> bool:
+        return self.multi_instance_safe and self.api_multi_writer_enabled
 
 
 class HARuntime:
@@ -302,6 +453,42 @@ class HARuntime:
             else None
         )
         self.outbox = OutboxStore(selected_backend)
+        self.source_generations = SourceGenerationStore(
+            selected_backend,
+            object_store,
+            outbox=self.outbox,
+            max_files=config.source_max_files,
+            max_total_bytes=config.source_max_total_bytes,
+        )
+        self.connector_commits: Any | None = None
+        self.connector_reference_lock_factory: Any | None = None
+        from cogdoc.ha.source_catalog import DistributedSourceCatalog
+        from cogdoc.ha.source_artifact_store import DistributedSourceArtifactStore
+
+        self.source_catalog = DistributedSourceCatalog(selected_backend)
+        self.source_artifact_store = DistributedSourceArtifactStore(
+            selected_backend,
+            object_store,
+            owner_id=config.worker_id,
+            max_file_bytes=config.source_artifact_max_file_bytes,
+            max_total_bytes=config.source_artifact_max_total_bytes,
+            max_bytes_per_tenant=config.source_artifact_max_tenant_bytes,
+            max_versions_per_source=config.source_artifact_max_versions + 1,
+            user_max_versions_per_source=config.source_artifact_max_versions,
+            reservation_lease_seconds=max(60.0, config.mutation_lease_seconds),
+        )
+        from cogdoc.ha.recovery import HARecoveryManifest
+
+        self.recovery = HARecoveryManifest(
+            selected_backend, object_store, self.source_generations
+        )
+        # Bound by the production API only when every mutation authority is
+        # shared. Worker-only HA deployments leave these unset.
+        self.api_registry: Any | None = None
+        self.api_mutation_coordinator: Any | None = None
+        self.api_kb_deletion: Any | None = None
+        self.tenant_quota_manager: Any | None = None
+        self.cache_invalidation_feed: CacheInvalidationFeed | None = None
         self.versions = ApplicationVersionRegistry(selected_backend)
         self.version_heartbeat = VersionHeartbeat(
             self.versions,
@@ -318,6 +505,8 @@ class HARuntime:
             self.outbox,
             self.index_generations,
             self.index_repository,
+            source_generations=self.source_generations,
+            source_artifacts=self.source_artifact_store,
             interval_seconds=config.maintenance_interval_seconds,
             retention_seconds=config.retention_seconds,
             scrub_interval_seconds=config.scrub_interval_seconds,
@@ -345,10 +534,99 @@ class HARuntime:
         )
         self._started = False
         self._lock = threading.RLock()
+        # Local/CI mode is a single-process authority and can safely bootstrap
+        # through the same checksummed migration runner. Production PostgreSQL
+        # remains operator-controlled and readiness fails until `cogdoc-ha
+        # migrate` has completed under its advisory lock.
+        if selected_backend.kind == "sqlite":
+            MigrationRunner(
+                selected_backend,
+                REGISTERED_MIGRATIONS,
+                owner_id=f"{config.worker_id}-bootstrap",
+            ).run()
 
     @property
     def multi_instance_safe(self) -> bool:
         return self.config.multi_instance_safe and self.backend.kind == "postgres"
+
+    @property
+    def api_multi_writer_safe(self) -> bool:
+        return self.config.api_multi_writer_safe and self.backend.kind == "postgres"
+
+    def bind_api_cache_invalidation(self, registry: Any) -> None:
+        with self._lock:
+            if self._started:
+                raise RuntimeError("cannot bind cache invalidation after HA startup")
+            if self.cache_invalidation_feed is not None:
+                raise RuntimeError("cache invalidation is already bound")
+            self.api_registry = registry
+            self.cache_invalidation_feed = CacheInvalidationFeed(
+                self.backend,
+                HACacheInvalidator(self.index_replica, registry),
+                consumer_id=self.config.worker_id,
+                interval_seconds=self.config.index_worker_poll_seconds,
+            )
+
+    def bind_api_tenant_quota(self, policy: Any) -> Any:
+        with self._lock:
+            if self._started:
+                raise RuntimeError("cannot bind tenant quota after HA startup")
+            if self.tenant_quota_manager is not None:
+                raise RuntimeError("tenant quota is already bound")
+            from cogdoc.ha.tenant_quota import DistributedTenantQuotaManager
+
+            self.tenant_quota_manager = DistributedTenantQuotaManager(
+                self.backend,
+                self.source_generations,
+                policy,
+                owner_id=self.config.worker_id,
+                lease_seconds=self.config.mutation_lease_seconds,
+            )
+            return self.tenant_quota_manager
+
+    def bind_api_kb_deletion(self, registry: Any) -> Any:
+        with self._lock:
+            if self._started:
+                raise RuntimeError("cannot bind KB deletion after HA startup")
+            if self.api_kb_deletion is not None:
+                raise RuntimeError("KB deletion is already bound")
+            if self.api_registry is not None and self.api_registry is not registry:
+                raise ValueError("HA API registry identity does not match")
+            from cogdoc.ha.kb_deletion import DistributedKBDeletionCoordinator
+
+            self.api_registry = registry
+            coordinator = DistributedKBDeletionCoordinator(
+                self.backend,
+                registry,
+                self.index_generations,
+                self.source_generations,
+                self.source_catalog,
+                self.source_artifact_store,
+                self.outbox,
+            )
+            self.api_kb_deletion = coordinator
+            bind_create_hook = getattr(registry, "bind_create_hook", None)
+            if not callable(bind_create_hook):
+                raise ValueError(
+                    "HA API registry does not support atomic KB activation"
+                )
+            bind_create_hook(coordinator.activate_created_kb)
+            self.index_generations.bind_authority_guard(
+                cast(IndexAuthorityGuard, coordinator.assert_index_active)
+            )
+            if self.api_mutation_coordinator is not None:
+                from cogdoc.ha.connector_commit import (
+                    DistributedConnectorCommitStore,
+                )
+
+                self.connector_commits = DistributedConnectorCommitStore(
+                    self.backend,
+                    self.object_store,
+                    self.api_mutation_coordinator,
+                    max_files=self.config.source_max_files,
+                    max_total_bytes=self.config.source_max_total_bytes,
+                )
+            return coordinator
 
     def start(self) -> None:
         with self._lock:
@@ -358,7 +636,16 @@ class HARuntime:
             try:
                 if not self.check():
                     raise RuntimeError("HA runtime dependencies are not ready")
+                if self.api_kb_deletion is not None:
+                    recovered = self.api_kb_deletion.recover(limit=100)
+                    if recovered["failed"]:
+                        raise RuntimeError("HA KB deletion recovery is incomplete")
                 self.version_heartbeat.start()
+                if self.tenant_quota_manager is not None:
+                    self.tenant_quota_manager.start()
+                self.source_artifact_store.start()
+                if self.cache_invalidation_feed is not None:
+                    self.cache_invalidation_feed.start()
                 if self.config.scheduler_enabled:
                     self.scheduler.start()
                 if self.outbox_dispatcher is not None:
@@ -391,6 +678,25 @@ class HARuntime:
 
     def _stop_background(self) -> list[BaseException]:
         errors: list[BaseException] = []
+        try:
+            if not self.source_artifact_store.stop():
+                errors.append(
+                    TimeoutError("artifact reservation heartbeat did not stop")
+                )
+        except BaseException as exc:
+            errors.append(exc)
+        if self.tenant_quota_manager is not None:
+            try:
+                if not self.tenant_quota_manager.stop():
+                    errors.append(TimeoutError("tenant quota heartbeat did not stop"))
+            except BaseException as exc:
+                errors.append(exc)
+        if self.cache_invalidation_feed is not None:
+            try:
+                if not self.cache_invalidation_feed.stop():
+                    errors.append(TimeoutError("cache invalidation feed did not stop"))
+            except BaseException as exc:
+                errors.append(exc)
         if self.index_worker is not None:
             try:
                 if not self.index_worker.stop():
@@ -424,7 +730,15 @@ class HARuntime:
     def check(self) -> bool:
         try:
             dependencies = (
-                self.backend.check() is True and self.object_store.check() is True
+                self.backend.check() is True
+                and migrations_are_current(self.backend)
+                and self.object_store.check() is True
+                and self.source_catalog.check() is True
+                and self.source_artifact_store.check() is True
+                and (
+                    self.connector_commits is None
+                    or self.connector_commits.check() is True
+                )
             )
             maintenance_ready = (
                 not self._started
@@ -447,6 +761,19 @@ class HARuntime:
                 or self.outbox_dispatcher is None
                 or self.outbox_dispatcher.check()
             )
+            invalidation_ready = (
+                not self._started
+                or self.cache_invalidation_feed is None
+                or self.cache_invalidation_feed.check()
+            )
+            quota_ready = (
+                not self._started
+                or self.tenant_quota_manager is None
+                or self.tenant_quota_manager.check()
+            )
+            deletion_ready = (
+                self.api_kb_deletion is None or self.api_kb_deletion.check()
+            )
             return (
                 dependencies
                 and maintenance_ready
@@ -454,17 +781,28 @@ class HARuntime:
                 and version_ready
                 and scheduler_ready
                 and outbox_ready
+                and invalidation_ready
+                and quota_ready
+                and deletion_ready
             )
         except Exception:
             return False
 
-    def publish_generation(self, generation: Mapping[str, Any]) -> dict[str, Any]:
+    def publish_generation(
+        self,
+        generation: Mapping[str, Any],
+        *,
+        publication_hook: Callable[[DatabaseConnection, Mapping[str, Any]], Any]
+        | None = None,
+    ) -> dict[str, Any]:
         tenant_id = str(generation["tenant_id"])
         kb_id = str(generation["kb_id"])
 
         def append_event(
             connection: DatabaseConnection, generation: Mapping[str, Any]
         ) -> None:
+            if publication_hook is not None:
+                publication_hook(connection, generation)
             self.outbox.append(
                 connection,
                 tenant_id=tenant_id,
