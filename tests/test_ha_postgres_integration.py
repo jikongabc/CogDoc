@@ -150,7 +150,7 @@ def test_real_postgres_connector_control_plane_contract():
         )
         consumed = OAuthSessionStore(
             None, second_vault, backend=second_backend
-        ).consume_callback(started.state, "notion")
+        ).consume_callback(started.state, provider="notion")
         assert consumed.session_id == started.session_id
     finally:
         second_backend.close()
