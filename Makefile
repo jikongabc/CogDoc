@@ -34,7 +34,7 @@ UVICORN_GRACEFUL_SHUTDOWN_SECONDS ?= 15
 # src-layout：包源码在 src/，入口经 PYTHONPATH 注入，无需先安装即可 run/serve/test。
 export PYTHONPATH := src
 
-.PHONY: help install native check lint typecheck-security test smoke-api smoke-account-auth reliability-gate run debug backup eval eval-coverage eval-retrieval-report eval-retrieval-baseline eval-retrieval-gate eval-multi-route calibrate-multi-route eval-multi-route-gate eval-multi-route-promote eval-claim-verification eval-claim-verification-gate eval-claim-verification-promote eval-quality eval-quality-coverage eval-suite eval-suite-run-retrieval eval-suite-report eval-suite-baseline eval-suite-update-baseline serve frontend
+.PHONY: help install native check lint typecheck-security test smoke-api smoke-account-auth reliability-gate run debug backup eval eval-coverage eval-retrieval-report eval-retrieval-baseline eval-retrieval-gate eval-multi-route calibrate-multi-route eval-multi-route-gate eval-multi-route-promote eval-claim-verification eval-claim-verification-gate eval-claim-verification-promote eval-quality eval-quality-coverage eval-suite eval-suite-run-retrieval eval-suite-report eval-suite-baseline eval-suite-update-baseline serve frontend web-install web web-check web-e2e
 
 help:
 	@echo "make install - 可编辑安装含开发依赖 (pip install -e '.[dev]')"
@@ -70,6 +70,10 @@ help:
 	@echo "make debug   - 启动独立 Debug 控制台 (python -m cogdoc.debug)"
 	@echo "make serve   - 启动 FastAPI 服务 (uvicorn cogdoc.api.app:app)"
 	@echo "make frontend - 加载 .env 后启动 Streamlit 前端 (src/cogdoc/frontend/app.py)"
+	@echo "make web-install - 安装 CogDoc 2.0 Web 依赖"
+	@echo "make web     - 启动 Next.js 工作台 (http://localhost:3000)"
+	@echo "make web-check - 运行 Web lint、类型检查与生产构建"
+	@echo "make web-e2e - 运行 Web Playwright Vertical Slice 测试"
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]"
@@ -212,3 +216,25 @@ frontend:
 	else \
 		$(PYTHON) -m streamlit run src/cogdoc/frontend/app.py; \
 	fi
+
+web-install:
+	npm install --prefix web
+
+web:
+	@if [[ -f .env ]]; then \
+		$(PYTHON) -m dotenv run --no-override -- npm run dev --prefix web; \
+	else \
+		npm run dev --prefix web; \
+	fi
+
+web-check:
+	npm run lint --prefix web
+	npm run typecheck --prefix web
+	@if [[ -f .env ]]; then \
+		$(PYTHON) -m dotenv run --no-override -- npm run build --prefix web; \
+	else \
+		npm run build --prefix web; \
+	fi
+
+web-e2e:
+	npm run test:e2e --prefix web
