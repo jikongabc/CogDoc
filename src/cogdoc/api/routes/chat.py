@@ -376,6 +376,21 @@ def _sse_frame(event_name: str, data: dict) -> str:
     return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _stream_text_chunks(value: str, max_chars: int = 12) -> list[str]:
+    """Split finalized public text into paint-sized Unicode chunks.
+
+    Audited tasks cannot expose model tokens before citation finalization. Once the
+    public answer is safe to release, chunking it here preserves that boundary while
+    still giving clients a genuine incremental SSE delivery contract.
+    """
+
+    characters = list(value)
+    return [
+        "".join(characters[index : index + max_chars])
+        for index in range(0, len(characters), max_chars)
+    ]
+
+
 # 转换toSSE 帧。
 def _event_to_frame(
     event: ChatEvent, *, doc_id: str, session_id: str | None
@@ -387,7 +402,13 @@ def _event_to_frame(
             {"trace_id": event.payload.get("trace_id"), "doc_id": doc_id},
         )
     if event.type == "token":
-        return _sse_frame("token", {"content": event.payload.get("content", "")})
+        content = str(event.payload.get("content", "") or "")
+        if not content:
+            return None
+        return "".join(
+            _sse_frame("token", {"content": chunk})
+            for chunk in _stream_text_chunks(content)
+        )
     if event.type in _SSE_PROGRESS_TYPES:
         # round_answer 是 CLI 展示用的整段模型回答，不进流式帧。
         data = {k: v for k, v in event.payload.items() if k != "round_answer"}

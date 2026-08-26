@@ -13,6 +13,7 @@ from cogdoc.api.retrieval_feedback_store import RetrievalFeedbackStore
 from cogdoc.api.retrieval_eval_draft_store import RetrievalEvalDraftStore
 from cogdoc.api.research_job_store import ResearchJobStore
 from cogdoc.api.resource_access import ResourceAccessStore
+from cogdoc.api.routes import documents as documents_route
 from cogdoc.tools.chunk_identity import build_document_id
 from cogdoc.tools.eval.retrieval_eval_drafts import create_pending_draft
 
@@ -498,11 +499,19 @@ async def test_upload_triggers_job_until_succeeded(tmp_path, monkeypatch):
             )
             job_id = up.json()["job_id"]
             done = await _wait_job(client, job_id)
+            listed = await client.get("/v1/index-jobs")
+            missing_kb = await client.get(
+                "/v1/index-jobs", params={"kb_id": "does-not-exist"}
+            )
 
     assert up.status_code == 202 and up.json()["job_id"]
     assert up.json()["status"] in ("pending", "running", "succeeded")
     assert done.json()["status"] == "succeeded"
     assert done.json()["document_count"] == 1 and done.json()["chunk_count"] == 3
+    assert listed.status_code == 200
+    assert listed.json()["jobs"] == [done.json()]
+    assert missing_kb.status_code == 404
+    assert missing_kb.json()["error_code"] == "KB_NOT_FOUND"
     assert done.json()["ocr_summary"] == {
         "candidate_pages": 2,
         "attempted_pages": 2,
@@ -578,6 +587,96 @@ async def test_upload_accepts_supported_non_pdf_document(tmp_path, monkeypatch):
                 },
             )
     assert response.status_code == 202
+
+
+@pytest.mark.anyio
+async def test_embedding_profiles_hide_credentials(tmp_path, monkeypatch):
+    app, _ = _make_app(tmp_path, monkeypatch=monkeypatch)
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            response = await client.get("/v1/embedding-profiles")
+
+    assert response.status_code == 200
+    profiles = response.json()
+    assert [profile["profile_id"] for profile in profiles] == ["local", "cloud"]
+    assert profiles[0]["available"] is True
+    assert all("api_key" not in profile for profile in profiles)
+
+
+def test_kb_embedding_metadata_cache_is_invalidated_by_state_fingerprint(monkeypatch):
+    calls = []
+
+    class FakeState:
+        def __init__(self, storage_id):
+            self.storage_id = storage_id
+
+        def active(self):
+            calls.append(self.storage_id)
+            return {"embedding_model": "local"}
+
+    documents_route._cached_kb_embedding_metadata.cache_clear()
+    monkeypatch.setattr(documents_route, "KBState", FakeState)
+    try:
+        first = documents_route._cached_kb_embedding_metadata("kb", 1, 10, "")
+        repeated = documents_route._cached_kb_embedding_metadata("kb", 1, 10, "")
+        changed = documents_route._cached_kb_embedding_metadata("kb", 2, 10, "")
+    finally:
+        documents_route._cached_kb_embedding_metadata.cache_clear()
+
+    assert first == repeated == changed == ("local", "BAAI/bge-m3")
+    assert calls == ["kb", "kb"]
+
+
+@pytest.mark.anyio
+async def test_batch_upload_writes_all_files_and_indexes_once(tmp_path, monkeypatch):
+    calls = []
+
+    def ingest(kb_id, source_dir, *, embedding_profile_id=None):
+        calls.append((kb_id, embedding_profile_id))
+        return SimpleNamespace(document_count=2, chunk_count=4, ocr_summary=None)
+
+    app, source_dir_for = _make_app(
+        tmp_path, ingest_fn=ingest, monkeypatch=monkeypatch
+    )
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
+            response = await client.post(
+                "/v1/knowledge-bases/kb/documents/batch",
+                files=[
+                    ("files", ("guide.md", b"# Guide", "text/markdown")),
+                    ("files", ("notes.txt", b"notes", "text/plain")),
+                ],
+                data={"embedding_profile_id": "local"},
+            )
+            done = await _wait_job(client, response.json()["job_id"])
+
+    assert response.status_code == 202
+    assert done.json()["status"] == "succeeded"
+    assert calls == [("kb", "local")]
+    source_dir = source_dir_for("kb")
+    assert (tmp_path / "kb" / "kb" / "sources" / "guide.md").exists()
+    assert (tmp_path / "kb" / "kb" / "sources" / "notes.txt").exists()
+    assert source_dir.endswith("/kb/kb/sources")
+
+
+@pytest.mark.anyio
+async def test_batch_upload_rejects_duplicate_names(tmp_path, monkeypatch):
+    app, _ = _make_app(tmp_path, monkeypatch=monkeypatch)
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
+            response = await client.post(
+                "/v1/knowledge-bases/kb/documents/batch",
+                files=[
+                    ("files", ("same.txt", b"one", "text/plain")),
+                    ("files", ("same.txt", b"two", "text/plain")),
+                ],
+                data={"embedding_profile_id": "local"},
+            )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "BAD_REQUEST"
 
 
 # 验证 upload rejects oversize。

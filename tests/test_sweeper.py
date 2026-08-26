@@ -65,6 +65,66 @@ def test_sweep_runs_bounded_connector_maintenance(monkeypatch):
     maintenance.assert_called_once_with()
 
 
+def test_model_sweeper_compares_the_persisted_embedding_identifier(monkeypatch):
+    """A healthy local index must not be rebuilt on every sweep."""
+
+    embedder = object()
+    state = MagicMock(
+        active=lambda: {
+            "embedding_model": "BAAI/bge-m3",
+            "index_build_version": "build-v1",
+        }
+    )
+    jobs = MagicMock()
+    jobs.is_busy.return_value = False
+    monkeypatch.setattr(sweeper_mod, "KBState", lambda kb_id: state)
+    monkeypatch.setattr(
+        sweeper_mod.ingest_service, "resolve_embedder", lambda profile: embedder
+    )
+    monkeypatch.setattr(
+        sweeper_mod.ingest_service,
+        "_embedding_model_for_state",
+        lambda value: "BAAI/bge-m3",
+    )
+    monkeypatch.setattr(
+        sweeper_mod.ingest_service, "index_build_version", lambda value: "build-v1"
+    )
+
+    sweeper = sweeper_mod.BackgroundSweeper(lambda: ["kb1"], jobs)
+    sweeper._rebuild_stale_models(["kb1"])
+
+    jobs.submit.assert_not_called()
+
+
+def test_model_sweeper_rebuilds_when_the_build_contract_changed(monkeypatch):
+    embedder = object()
+    state = MagicMock(
+        active=lambda: {
+            "embedding_model": "BAAI/bge-m3",
+            "index_build_version": "old-build",
+        }
+    )
+    jobs = MagicMock()
+    jobs.is_busy.return_value = False
+    monkeypatch.setattr(sweeper_mod, "KBState", lambda kb_id: state)
+    monkeypatch.setattr(
+        sweeper_mod.ingest_service, "resolve_embedder", lambda profile: embedder
+    )
+    monkeypatch.setattr(
+        sweeper_mod.ingest_service,
+        "_embedding_model_for_state",
+        lambda value: "BAAI/bge-m3",
+    )
+    monkeypatch.setattr(
+        sweeper_mod.ingest_service, "index_build_version", lambda value: "build-v2"
+    )
+
+    sweeper = sweeper_mod.BackgroundSweeper(lambda: ["kb1"], jobs)
+    sweeper._rebuild_stale_models(["kb1"])
+
+    jobs.submit.assert_called_once_with("kb1")
+
+
 # 验证 evict idle removes idle executor。
 def test_evict_idle_removes_idle_executor():
     mgr = IndexJobManager(

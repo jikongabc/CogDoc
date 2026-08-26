@@ -1,7 +1,8 @@
 from collections.abc import Callable, Mapping
+from functools import lru_cache
 import mimetypes
 import os
-from fastapi import APIRouter, File, Query, Request, Response, UploadFile
+from fastapi import APIRouter, File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from cogdoc.api.ingest import KBExistsError
 from cogdoc.api.ha_chat_authority import (
@@ -27,9 +28,11 @@ from cogdoc.api.tenant_scope import (
 from cogdoc.api.tenancy import Permission, Principal, Role
 from cogdoc.api.schemas import (
     Document,
+    EmbeddingProfile,
     ErrorCode,
     ErrorResponse,
     IndexJob,
+    IndexJobList,
     KnowledgeBase,
     KnowledgeBaseCreate,
     SourceChunksResponse,
@@ -59,12 +62,67 @@ from cogdoc.service.kb_state import KBState
 from cogdoc.source_model import build_source_id, build_version_id
 from cogdoc.tools.manifest import load_index_manifest
 from cogdoc.tools.chunk_identity import build_document_id
+from cogdoc.tools.embedder import (
+    CloudEmbedder,
+    Embedder,
+    embedding_profile_id,
+    public_embedding_model_name,
+    public_embedding_profiles,
+    resolve_embedder,
+)
 from cogdoc.tools.source_parser import (
     CONNECTOR_MATERIALIZED_PREFIX,
     SUPPORTED_EXTENSIONS,
 )
 
 router = APIRouter(prefix="/v1", tags=["documents"])
+
+MAX_BATCH_UPLOAD_FILES = 20
+MAX_BATCH_UPLOAD_BYTES = 500 * 1024 * 1024
+
+
+@lru_cache(maxsize=1024)
+def _cached_kb_embedding_metadata(
+    storage_id: str,
+    state_mtime_ns: int,
+    state_size: int,
+    configured_cloud_model: str,
+) -> tuple[str, str]:
+    del state_mtime_ns, state_size, configured_cloud_model
+    active = KBState(storage_id).active()
+    persisted = str((active or {}).get("embedding_model") or "local")
+    profile_id = embedding_profile_id(persisted)
+    model = public_embedding_model_name(persisted) or profile_id
+    return profile_id, model
+
+
+def _kb_embedding_metadata(storage_id: str) -> dict[str, str]:
+    settings = get_settings()
+    state_path_for = getattr(settings, "kb_state_path", None)
+    if callable(state_path_for):
+        try:
+            state = os.stat(state_path_for(storage_id))
+            fingerprint = (state.st_mtime_ns, state.st_size)
+        except FileNotFoundError:
+            fingerprint = (0, 0)
+    else:
+        fingerprint = (0, 0)
+    profile_id, model = _cached_kb_embedding_metadata(
+        storage_id,
+        *fingerprint,
+        str(getattr(settings, "cloud_embedding_model", "") or "").strip(),
+    )
+    return {"embedding_profile_id": profile_id, "embedding_model": model}
+
+
+def _validate_embedding_profile(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized not in {Embedder.PROFILE_ID, CloudEmbedder.PROFILE_ID}:
+        raise ValueError("Embedding 配置只能是 local 或 cloud")
+    resolve_embedder(normalized)
+    return normalized
 
 
 # 创建 kb。
@@ -76,6 +134,7 @@ def _create_kb(
     resource_access_store=None,
     access_policy="workspace",
     owner_membership_id=None,
+    role_ids=None,
 ):
     # 与删库尾部互斥：create 与 delete 都持 kb_write_lock，杜绝"删库已删 registry、未落 tombstone" 之间并发 create 把 lifecycle 切 active、随后旧删库又写 deleted 把新 KB 标删的竞态。
     storage_id_for = getattr(registry, "storage_id_for", None)
@@ -91,11 +150,22 @@ def _create_kb(
                     access_policy,
                     owner_membership_id=owner_membership_id,
                 )
+                if role_ids is not None:
+                    resource_access_store.replace_kb_roles(
+                        tenant_id,
+                        str(record.get("storage_id") or storage_id),
+                        role_ids,
+                    )
             except Exception:
                 # A registered KB without an ACL is unusable in account mode and
                 # would also make a same-slug retry impossible. Compensate the
                 # empty create before surfacing the persistence failure.
-                registry.delete(str(record.get("storage_id") or storage_id))
+                try:
+                    resource_access_store.clear_kb(
+                        tenant_id, str(record.get("storage_id") or storage_id)
+                    )
+                finally:
+                    registry.delete(str(record.get("storage_id") or storage_id))
                 raise
         return record
 
@@ -368,6 +438,40 @@ def _allowed_sources_for_scope(request: Request, scope, sources) -> list[str]:
     return [str(source) for source in sources if allows(source)]
 
 
+def _validate_workspace_role_ids(
+    request: Request, tenant_id: str, values: list[str] | None
+) -> list[str] | None:
+    if values is None:
+        return None
+    selected: list[str] = []
+    for raw in values:
+        if not isinstance(raw, str):
+            raise ValueError("角色标识无效")
+        role_id = raw.strip()
+        if (
+            not role_id
+            or len(role_id) > 160
+            or role_id != raw
+            or any(ord(character) < 32 or ord(character) == 127 for character in role_id)
+        ):
+            raise ValueError("角色标识无效")
+        if role_id not in selected:
+            selected.append(role_id)
+    auth_store = getattr(request.app.state, "auth_store", None)
+    if auth_store is None:
+        available = {role.value for role in Role}
+    else:
+        rows = auth_store.list_workspace_roles(tenant_id)
+        available = {
+            str(row.get("role_id") or "")
+            for row in rows
+            if isinstance(row, Mapping)
+        }
+    if any(role_id not in available for role_id in selected):
+        raise ValueError("包含不存在的工作区角色")
+    return selected
+
+
 def _live_session_authorization_guard(
     request: Request,
     scope,
@@ -431,6 +535,12 @@ def _live_session_authorization_guard(
                     role=Role(str(membership.get("role") or "")),
                     key_fingerprint=key_fingerprint,
                     membership_id=live_membership_id,
+                    access_role_id=str(
+                        membership.get("role_id")
+                        or membership.get("custom_role_id")
+                        or membership.get("role")
+                        or ""
+                    ),
                 )
             else:
                 live_principal = principal
@@ -505,6 +615,12 @@ async def create_knowledge_base(body: KnowledgeBaseCreate, request: Request):
     quota = getattr(request.app.state, "tenant_quota", None)
     reservation = None
     try:
+        selected_roles = _validate_workspace_role_ids(
+            request, principal.tenant_id, body.role_ids
+        )
+    except ValueError as exc:
+        return _error(ErrorCode.BAD_REQUEST, str(exc), 422)
+    try:
         if quota is not None:
             reservation = quota.reserve_knowledge_base(principal.tenant_id)
         storage_id_for = getattr(registry, "storage_id_for", None)
@@ -525,6 +641,7 @@ async def create_knowledge_base(body: KnowledgeBaseCreate, request: Request):
             getattr(request.app.state, "resource_access_store", None),
             getattr(body, "access_policy", "workspace"),
             principal.membership_id,
+            selected_roles,
         )
     except KBExistsError:
         return _error(ErrorCode.KB_EXISTS, f"知识库已存在: {body.kb_id}", 409)
@@ -536,7 +653,15 @@ async def create_knowledge_base(body: KnowledgeBaseCreate, request: Request):
     return KnowledgeBase(
         **{key: value for key, value in record.items() if key != "storage_id"},
         document_count=0,
+        **_kb_embedding_metadata(str(record.get("storage_id") or storage_id)),
     )
+
+
+@router.get("/embedding-profiles", response_model=list[EmbeddingProfile])
+async def list_embedding_profiles():
+    """Return safe provider metadata; credentials never leave the API process."""
+
+    return [EmbeddingProfile(**profile) for profile in public_embedding_profiles()]
 
 
 # 列出 knowledge bases。
@@ -555,6 +680,7 @@ async def list_knowledge_bases(request: Request):
                 tenant_id=scope.tenant_id,
                 owner_id=scope.owner_id,
                 document_count=len(visible_sources),
+                **_kb_embedding_metadata(scope.storage_id),
             )
         )
     return result
@@ -576,6 +702,7 @@ async def get_knowledge_base(kb_id: str, request: Request):
         tenant_id=scope.tenant_id,
         owner_id=scope.owner_id,
         document_count=len(visible_sources),
+        **_kb_embedding_metadata(scope.storage_id),
     )
 
 
@@ -794,7 +921,25 @@ async def list_documents(kb_id: str, request: Request):
             request, scope, (document.name for document in documents)
         )
     )
-    return [document for document in documents if document.name in allowed]
+    access_store = getattr(request.app.state, "resource_access_store", None)
+    visible: list[Document] = []
+    for document in documents:
+        if document.name not in allowed:
+            continue
+        role_ids: list[str] = []
+        if access_store is not None:
+            try:
+                role_ids = access_store.list_document_roles(
+                    scope.tenant_id, scope.storage_id, document.document_id
+                )
+            except Exception:
+                return _error(
+                    ErrorCode.INTERNAL_ERROR,
+                    "文档权限状态不可用",
+                    503,
+                )
+        visible.append(document.model_copy(update={"role_ids": role_ids}))
+    return visible
 
 
 # 列出知识库来源文件。
@@ -857,7 +1002,13 @@ async def source_chunks(
 @router.post(
     "/knowledge-bases/{kb_id}/documents", status_code=202, responses=_ERROR_RESPONSES
 )
-async def upload_document(kb_id: str, request: Request, file: UploadFile = File(...)):
+async def upload_document(
+    kb_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    allowed_role_ids: list[str] | None = Form(default=None),
+    embedding_profile_id: str | None = Form(default=None),
+):
     registry = request.app.state.kb_registry
     scope = resolve_kb_scope(request, kb_id)
     if scope is None:
@@ -879,6 +1030,18 @@ async def upload_document(kb_id: str, request: Request, file: UploadFile = File(
         )
 
     principal = request_principal(request)
+    try:
+        selected_embedding_profile = _validate_embedding_profile(
+            embedding_profile_id
+        )
+    except (RuntimeError, ValueError) as exc:
+        return _error(ErrorCode.BAD_REQUEST, str(exc), 422)
+    try:
+        selected_roles = _validate_workspace_role_ids(
+            request, principal.tenant_id, allowed_role_ids
+        )
+    except ValueError as exc:
+        return _error(ErrorCode.BAD_REQUEST, str(exc), 422)
     access_store = getattr(request.app.state, "resource_access_store", None)
     if access_store is not None and not source_is_authorized(
         request, scope, filename, permission=Permission.WRITE
@@ -927,6 +1090,13 @@ async def upload_document(kb_id: str, request: Request, file: UploadFile = File(
                     "inherit",
                     owner_membership_id=principal.membership_id,
                 )
+            if selected_roles is not None:
+                access_store.replace_document_roles(
+                    scope.tenant_id,
+                    scope.storage_id,
+                    build_document_id(filename),
+                    selected_roles,
+                )
         except Exception:
             return _error(
                 ErrorCode.INTERNAL_ERROR,
@@ -968,10 +1138,209 @@ async def upload_document(kb_id: str, request: Request, file: UploadFile = File(
             bytes(content),
             (lambda: quota.release(reservation)) if quota is not None else None,
             authorization_guard,
+            selected_embedding_profile,
         )
     except Exception:
         if quota is not None:
             quota.release(reservation)
+        raise
+    return _public_job(job, request)
+
+
+@router.post(
+    "/knowledge-bases/{kb_id}/documents/batch",
+    status_code=202,
+    responses=_ERROR_RESPONSES,
+)
+async def upload_documents_batch(
+    kb_id: str,
+    request: Request,
+    files: list[UploadFile] = File(...),
+    allowed_role_ids: list[str] | None = Form(default=None),
+    embedding_profile_id: str | None = Form(default=None),
+):
+    registry = request.app.state.kb_registry
+    scope = resolve_kb_scope(request, kb_id)
+    if scope is None:
+        return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
+    if not files:
+        return _error(ErrorCode.BAD_REQUEST, "请至少选择一个文件", 422)
+    if len(files) > MAX_BATCH_UPLOAD_FILES:
+        return _error(
+            ErrorCode.BAD_REQUEST,
+            f"一次最多上传 {MAX_BATCH_UPLOAD_FILES} 个文件",
+            422,
+        )
+
+    principal = request_principal(request)
+    try:
+        selected_roles = _validate_workspace_role_ids(
+            request, principal.tenant_id, allowed_role_ids
+        )
+        selected_embedding_profile = _validate_embedding_profile(
+            embedding_profile_id
+        )
+    except (RuntimeError, ValueError) as exc:
+        return _error(ErrorCode.BAD_REQUEST, str(exc), 422)
+
+    settings = get_settings()
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    uploads: list[tuple[str, bytes]] = []
+    seen_names: set[str] = set()
+    total_bytes = 0
+    for upload in files:
+        filename = os.path.basename(upload.filename or "")
+        suffix = os.path.splitext(filename)[1].casefold()
+        if not filename or filename in seen_names:
+            return _error(
+                ErrorCode.BAD_REQUEST,
+                "批量上传中存在空文件名或重复文件名",
+                422,
+            )
+        seen_names.add(filename)
+        if filename.startswith(CONNECTOR_MATERIALIZED_PREFIX):
+            return _error(
+                ErrorCode.INVALID_PDF,
+                f"{filename}: 文件名使用了连接器保留命名空间",
+                400,
+            )
+        if suffix not in SUPPORTED_EXTENSIONS:
+            return _error(
+                ErrorCode.INVALID_PDF,
+                f"{filename}: 不支持该文件格式",
+                400,
+            )
+        content = bytearray()
+        while True:
+            block = await upload.read(1024 * 1024)
+            if not block:
+                break
+            content.extend(block)
+            total_bytes += len(block)
+            if len(content) > max_bytes:
+                return _error(
+                    ErrorCode.FILE_TOO_LARGE,
+                    f"{filename}: 文件超过上限 {settings.max_upload_mb}MB",
+                    413,
+                )
+            if total_bytes > MAX_BATCH_UPLOAD_BYTES:
+                return _error(
+                    ErrorCode.FILE_TOO_LARGE,
+                    "批量文件总大小超过 500MB",
+                    413,
+                )
+        if suffix != ".pdf" and content.startswith(_PDF_MAGIC):
+            return _error(
+                ErrorCode.INVALID_PDF, f"{filename}: 内容与扩展名不匹配", 400
+            )
+        if suffix == ".pdf" and not content.startswith(_PDF_MAGIC):
+            return _error(ErrorCode.INVALID_PDF, f"{filename}: 不是合法 PDF", 400)
+        uploads.append((filename, bytes(content)))
+
+    access_store = getattr(request.app.state, "resource_access_store", None)
+    if access_store is not None:
+        decision = resource_access_decision(request, scope, permission=Permission.WRITE)
+        if (
+            decision is False
+            or str(getattr(getattr(decision, "mode", None), "value", "")) != "all"
+        ):
+            return _error(ErrorCode.DOCUMENT_NOT_FOUND, "文档不存在", 404)
+        try:
+            for filename, _content in uploads:
+                document_id = build_document_id(filename)
+                if (
+                    access_store.get_document_by_source(
+                        scope.tenant_id, scope.storage_id, filename
+                    )
+                    is None
+                ):
+                    access_store.set_document_policy(
+                        scope.tenant_id,
+                        scope.storage_id,
+                        document_id,
+                        filename,
+                        principal.subject_id,
+                        "inherit",
+                        owner_membership_id=principal.membership_id,
+                    )
+                if selected_roles is not None:
+                    access_store.replace_document_roles(
+                        scope.tenant_id,
+                        scope.storage_id,
+                        document_id,
+                        selected_roles,
+                    )
+        except Exception:
+            return _error(
+                ErrorCode.INTERNAL_ERROR,
+                "文档权限状态不可用，未执行上传",
+                503,
+            )
+
+    authorization_guards = [
+        guard
+        for filename, _content in uploads
+        if (
+            guard := _live_session_authorization_guard(
+                request, scope, permission=Permission.WRITE, source=filename
+            )
+        )
+        is not None
+    ]
+
+    def revalidate_authorization() -> None:
+        for guard in authorization_guards:
+            guard()
+
+    authorization_guard = (
+        revalidate_authorization if authorization_guards else None
+    )
+
+    storage_id = scope.storage_id
+    source_dir = registry.source_dir(storage_id)
+    quota = getattr(request.app.state, "tenant_quota", None)
+    reservations = []
+    if quota is not None:
+        try:
+            for filename, content in uploads:
+                reservations.append(
+                    quota.reserve_upload(
+                        scope.tenant_id,
+                        storage_id,
+                        source_dir,
+                        filename,
+                        len(content),
+                    )
+                )
+        except (TenantQuotaExceeded, TenantMutationInProgress) as exc:
+            for reservation in reservations:
+                quota.release(reservation)
+            status = 409
+            code = (
+                ErrorCode.TENANT_QUOTA_EXCEEDED
+                if isinstance(exc, TenantQuotaExceeded)
+                else ErrorCode.BAD_REQUEST
+            )
+            return _error(code, str(exc), status)
+
+    def release_reservations() -> None:
+        if quota is not None:
+            for reservation in reservations:
+                quota.release(reservation)
+
+    try:
+        job = await run_sync(
+            request.app.state.offload_executor,
+            request.app.state.index_jobs.submit_upload_batch,
+            storage_id,
+            source_dir,
+            uploads,
+            release_reservations if quota is not None else None,
+            authorization_guard,
+            selected_embedding_profile,
+        )
+    except Exception:
+        release_reservations()
         raise
     return _public_job(job, request)
 
@@ -1042,6 +1411,30 @@ async def delete_document(kb_id: str, name: str, request: Request):
         on_retiring,
     )
     return _public_job(job, request)
+
+
+# 返回索引任务。
+@router.get("/index-jobs", response_model=IndexJobList, responses=_ERROR_RESPONSES)
+async def list_index_jobs(
+    request: Request,
+    kb_id: str | None = None,
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    if kb_id is not None:
+        scope = resolve_kb_scope(request, kb_id)
+        if scope is None:
+            return _error(ErrorCode.KB_NOT_FOUND, f"知识库不存在: {kb_id}", 404)
+        scopes = [scope]
+    else:
+        scopes = tenant_kb_scopes(request)
+    storage_ids = {scope.storage_id for scope in scopes}
+    rows = await run_sync(
+        request.app.state.offload_executor,
+        request.app.state.index_jobs.list,
+        storage_ids,
+        limit=limit,
+    )
+    return IndexJobList(jobs=[_public_job(row, request) for row in rows])
 
 
 # 返回索引任务。

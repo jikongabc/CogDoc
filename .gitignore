@@ -61,3 +61,7 @@ artifacts/reliability/eval-data/reliability/
 
 # Node / mermaid-cli 本地渲染依赖。
 node_modules/
+.next/
+playwright-report/
+test-results/
+*.tsbuildinfo

@@ -137,6 +137,7 @@ make frontend       # 终端 2：Streamlit 网页端（自动在浏览器打开�
 6. 在侧栏打开 **本地 Ollama 模式** 即可把生成切到本地模型。
 7. 打开 **调试**，只查看当前对话的请求 trace；也可以用 **检索调试** 直接调用 `/v1/retrieve`，检查命中 chunk、重排分数和 retrieval 元数据。
 8. 切到主视图里的 **派生知识**，可以新增知识、审核待处理/过期项、查看反馈分析、启用/禁用检索调权、导出审核队列，并在文档变化后扫描过期绑定。
+9. 具备 Reviewer 权限时，可从当前知识库的 **调试 → RAG 评测** 进入离线评测工具，标注检索证据或核验回答声明；这些标注仅属于当前知识库，用于评测与改进，不会直接改写当前 RAG。
 
 ### 直接调用 API
 
@@ -160,6 +161,7 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 | `GET /v1/auth/sessions`、`DELETE /v1/auth/sessions/{id}`、`POST /v1/auth/change-password` | 管理设备会话与修改密码 |
 | `GET/POST /v1/workspaces`、`POST /v1/workspaces/{id}/switch` | 列出/创建工作区，并切换当前登录会话的活动工作区 |
 | `GET /v1/workspaces/{id}/members`、`PATCH/DELETE /v1/workspaces/{id}/members/{member_id}` | 列出成员、调整角色或移除成员 |
+| `GET/POST /v1/workspaces/{id}/roles`、`DELETE /v1/workspaces/{id}/roles/{role_id}` | 列出内置/自定义角色、创建继承内置权限模板的角色并删除未使用角色 |
 | `POST/GET /v1/workspaces/{id}/invites`、`DELETE .../invites/{invite_id}`、`POST /v1/auth/invitations/accept` | 签发、查看、撤销或接受一次性工作区邀请 |
 | `GET /v1/tenant` | 查看当前工作区、主体、角色、权限与配额使用量 |
 | `GET /v1/audit-events` | 分页读取当前工作区的哈希链审计元数据（owner/admin） |
@@ -237,6 +239,8 @@ Compare 的中间模型文本可能包含内部 Evidence ID，且尚未通过终
 owner 可管理工作区本身；admin 同时拥有写入、删除、审核/发布和权限管理；editor 可读、查询和写入；reviewer 可读、查询、审核和发布；viewer 可读和查询。owner/admin 管理成员与邀请，但普通角色修改不能凭空产生另一个 owner，也不能移除最后一位 owner。切换工作区会改变该登录会话的兼容活动工作区；新版客户端还会在每个受保护请求中发送非敏感的 `X-CogDoc-Workspace` 选择器，因此两个共用同一 Bearer 的浏览器标签页也能各自固定到不同成员关系。服务端仍会验证该成员关系；选择器与 `/v1/workspaces/{id}` 路径冲突时以不透明 404 fail-closed。不带该 header 的旧客户端继续使用 session 活动工作区。同一公开 slug 的知识库按工作区使用不同物理身份；真人账号的对话会话与 Trace 还会按用户分隔。跨工作区请求统一表现为资源不存在，不泄露另一租户的资源。
 
 新知识库默认采用 `workspace`，新上传文档默认采用 `inherit`。`private` 知识库只对资源 owner、工作区 owner/admin，或得到知识库 grant 的同工作区主体可见。文档可继承知识库、单独开放给工作区，或设为 private；文档 grant 只开放对应文档。grant 角色权限与工作区角色权限取交集，因此不能借 ACL 提权。账号模式下 ACL 缺失、损坏或不可用都会拒绝访问。只有具备 `manage_access` 的 owner/admin 能修改策略与 grant。
+
+工作区同时提供 `owner/admin/editor/reviewer/viewer` 五个内置角色，其中邀请未显式指定角色时默认 `viewer`（前端显示为“普通成员”）。owner/admin 可创建拥有独立 `role_id` 的自定义角色；自定义角色继承一个非 owner 内置权限模板，但文档访问匹配使用独立角色 ID，不会把同一权限模板下的所有用户混为一组。成员始终只绑定一个有效角色。创建知识库、上传文档以及后续访问权限编辑都可提交角色 allowlist：知识库 allowlist 是父级边界，文档 allowlist 在其上继续取交集；没有 allowlist 的存量资源保持原 ACL 行为。仍被成员、知识库或文档引用的自定义角色不能删除。
 
 查询权限会固化成明确的 `ALL`、非空 `SUBSET` 或 `DENY`。当结果为子集时，Chroma 向量过滤、BM25 候选选择、已审核派生知识、Summary、Compare 与 QA 都会在 top-k/重排之前使用来源 allowlist；融合后还有第二道过滤，防止过期或自定义后端忽略过滤后把越权结果带入 Prompt、Trace 或持久证据。这也避免高分越权 chunk 在 top-k 中挤掉可见证据。后台 Research 会冻结创建者及精确来源边界，在召回前后重新检查当前成员关系和 ACL；无法执行子集过滤的后端会被拒绝，权限撤销会中止任务，后续新增授权也不会静默扩大已经运行的任务范围。
 
@@ -603,7 +607,7 @@ chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{
 - **归因反馈权重** — 正向反馈（点赞或高于中性的评分）可提升其引用/evidence chunk。点踩、纠错和低于中性的评分只有在明确标记 `feedback_type=bad_retrieval` 时才生成负检索权重；其他答案质量问题不会误罚可能正确的证据。`skip_retrieval_feedback=true` 会让该条反馈的正负调权全部跳过。
 - **生成 + 引用自愈** — `Generator`（OpenAI 兼容；云端 `deepseek-chat` 或本地 `qwen2.5:7b`，`temperature = 0.2`）把文档包装为 `<Document source=… page=… chunk_id=…>` 并强制 `[source:Pn]` 标签。`validate_citations_native`（Rust）返回结构化的 `missing_citations` / `invalid_sources` / `invalid_pages`；`citation_node` 把失败转成 critique，循环 `generate → citation` 至 `max_iteration_count`（默认 `2`）。只有通过物理引用校验的回答才会离开任务子图。
 - **父图声明核验的分阶段发布** — `CLAIM_VERIFICATION_MODE=off|shadow|enforce` 控制 QA、Summary、Compare 在物理引用校验后的行为。`CLAIM_VERIFICATION_ROLLOUT_PERCENT` 将确定性、按会话粘性的流量桶提升到配置模式：未命中的 `shadow` 流量回退 `off`，未命中的 `enforce` 流量回退 `shadow`；修改 `CLAIM_VERIFICATION_ROLLOUT_SEED` 会有意重新分桶。`off` 跳过模型校验器；`shadow` 执行同一套声明/证据审计，但绝不修复、阻断或改写实际交付答案，只记录 `would_allow`、`would_repair` 或 `would_block`，且会被拦截的候选不会进入 Agent 记忆；`enforce` 才启用有限修复与 fail-closed 拒答。`ClaimEvidenceVerifierAgent` 只依据每条声明显式引用的证据判定支持度。修订答案必须先通过确定性引用复检，再重新执行语义审计；修复次数由 `CLAIM_VERIFICATION_MAX_REPAIR_ATTEMPTS` 限定（默认 `1`）。仅当新 mode 未设置时，旧配置 `CLAIM_VERIFICATION_ENABLED=true` 才兼容映射为 `enforce`。
-- **遵守 ACL 的声明核验人工判卷工作台** — 人工抽样默认关闭；显式开启后只确定性保留声明、模型判定及该声明精确引用的有界证据快照，不保存问题、完整答案、会话、trace ID 或原始分桶身份。Reviewer 接口提供经 ACL 过滤的汇总指标、keyset 分页、按需详情、乐观并发标注和有界评测导出；每次操作都会重新检查租户、KB 与 source ACL，因此权限撤销后旧快照立即不可见。网页“证据审核”现提供完整的声明队列、状态筛选、翻页、精确证据纸、人机一致率、冲突提示与 JSONL 发布门禁下载。
+- **遵守 ACL 的声明核验人工判卷工作台** — 人工抽样默认关闭；显式开启后只确定性保留声明、模型判定及该声明精确引用的有界证据快照，不保存问题、完整答案、会话、trace ID 或原始分桶身份。Reviewer 接口提供经 ACL 过滤的汇总指标、keyset 分页、按需详情、乐观并发标注和有界评测导出；每次操作都会重新检查租户、KB 与 source ACL，因此权限撤销后旧快照立即不可见。网页“调试 → RAG 评测 → 声明核验”提供当前知识库的声明队列、精确证据、人机一致率与人工结论标注。
 
   每个最终 Chat 响应的有界 `claim_verification` 投影会公开不含身份的策略 ID、配置/实际模式、百分比、桶位与决策；trace 保存同一份安全摘要。Prometheus 在原决策计数器之外提供 `cogdoc_claim_verification_cohorts_total{task_type,configured_mode,effective_mode,selected}`。建议按 `off → shadow 5/25/100% →` 通过人工基线发布门禁 `→ enforce 5/25/100%` 上线；提升百分比期间保持 seed 不变，已有会话才会保持粘性。
 

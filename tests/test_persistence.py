@@ -1,3 +1,5 @@
+import json
+import sqlite3
 import time
 from types import SimpleNamespace
 from cogdoc.api.ingest import IndexJobManager
@@ -130,3 +132,55 @@ def test_reconcile_marks_orphaned_running_job_failed(tmp_path):
 def test_get_missing_job_returns_none(tmp_path):
     store = SqliteJobStore(str(tmp_path / "state.db"))
     assert store.get("nope") is None
+
+
+def test_job_store_migrates_legacy_scope_and_normalizes_mixed_timestamps(tmp_path):
+    db = str(tmp_path / "state.db")
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "CREATE TABLE index_jobs (job_id TEXT PRIMARY KEY, status TEXT, data TEXT)"
+    )
+    records = [
+        {
+            "job_id": "epoch-seconds",
+            "kb_id": "kb",
+            "status": "succeeded",
+            "created_at": 1_700_000_000,
+        },
+        {
+            "job_id": "iso",
+            "kb_id": "kb",
+            "status": "succeeded",
+            "created_at": "2024-01-01T00:00:00Z",
+        },
+        {
+            "job_id": "epoch-millis",
+            "kb_id": "kb",
+            "status": "succeeded",
+            "created_at": 2_000_000_000_000,
+        },
+        {
+            "job_id": "missing-time",
+            "kb_id": "kb",
+            "status": "succeeded",
+            "created_at": None,
+        },
+    ]
+    connection.executemany(
+        "INSERT INTO index_jobs (job_id,status,data) VALUES (?,?,?)",
+        [
+            (record["job_id"], record["status"], json.dumps(record))
+            for record in records
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    store = SqliteJobStore(db, reconcile_on_init=False)
+
+    assert [row["job_id"] for row in store.list({"kb"})] == [
+        "epoch-millis",
+        "iso",
+        "epoch-seconds",
+        "missing-time",
+    ]

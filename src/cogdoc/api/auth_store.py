@@ -27,12 +27,19 @@ from cogdoc.ha.dbapi_compat import BackendDBAPIConnection
 from cogdoc.ha.storage import DatabaseBackend
 
 
-AUTH_SCHEMA_VERSION = "8"
+AUTH_SCHEMA_VERSION = "9"
 MIN_PASSWORD_LENGTH = 12
 MAX_PASSWORD_LENGTH = 256
 SESSION_TOUCH_INTERVAL_SECONDS = 60.0
 _ROLES = frozenset(role.value for role in Role)
 _ASSIGNABLE_ROLES = _ROLES - {Role.OWNER.value}
+_BUILT_IN_ROLE_NAMES = {
+    Role.OWNER.value: "Workspace Owner",
+    Role.ADMIN.value: "Administrator",
+    Role.EDITOR.value: "Editor",
+    Role.REVIEWER.value: "Reviewer",
+    Role.VIEWER.value: "Member",
+}
 _SCIM_ROLE_RANK = {"viewer": 0, "reviewer": 1, "editor": 2, "admin": 3}
 MAX_OIDC_GROUP_MAPPINGS = 100
 MAX_OIDC_GROUPS_PER_CLAIM = 200
@@ -433,11 +440,30 @@ class AuthStore:
                 updated_at REAL NOT NULL,
                 FOREIGN KEY(personal_owner_user_id) REFERENCES auth_users(user_id)
             );
+            CREATE TABLE IF NOT EXISTS auth_workspace_roles (
+                role_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                base_role TEXT NOT NULL
+                    CHECK(base_role IN ('admin','editor','reviewer','viewer')),
+                revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+                created_by TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(workspace_id, name),
+                FOREIGN KEY(workspace_id) REFERENCES auth_workspaces(workspace_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(created_by) REFERENCES auth_users(user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_auth_workspace_roles_workspace
+                ON auth_workspace_roles(workspace_id, name);
             CREATE TABLE IF NOT EXISTS auth_memberships (
                 member_id TEXT PRIMARY KEY,
                 workspace_id TEXT NOT NULL,
                 user_id TEXT NOT NULL,
                 role TEXT NOT NULL CHECK(role IN ('owner','admin','editor','reviewer','viewer')),
+                custom_role_id TEXT,
                 revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
                 joined_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -675,6 +701,23 @@ class AuthStore:
                 "group_role_map_json",
                 "require_mapped_group",
             }
+            if self._backend.kind == "postgres":
+                self._conn.execute(
+                    "ALTER TABLE auth_memberships "
+                    "ADD COLUMN IF NOT EXISTS custom_role_id TEXT"
+                )
+            else:
+                membership_columns = {
+                    str(item[1])
+                    for item in self._conn.execute(
+                        "PRAGMA table_info(auth_memberships)"
+                    )
+                }
+                if "custom_role_id" not in membership_columns:
+                    self._conn.execute(
+                        "ALTER TABLE auth_memberships "
+                        "ADD COLUMN custom_role_id TEXT"
+                    )
         else:
             token_columns = {
                 str(item[1])
@@ -686,6 +729,14 @@ class AuthStore:
                     "PRAGMA table_info(auth_workspace_oidc_policies)"
                 )
             }
+            membership_columns = {
+                str(item[1])
+                for item in self._conn.execute("PRAGMA table_info(auth_memberships)")
+            }
+            if "custom_role_id" not in membership_columns:
+                self._conn.execute(
+                    "ALTER TABLE auth_memberships ADD COLUMN custom_role_id TEXT"
+                )
         if "permissions_json" not in token_columns:
             try:
                 self._conn.execute(
@@ -724,7 +775,7 @@ class AuthStore:
             row = self._conn.execute(
                 "SELECT value FROM auth_schema_meta WHERE key='schema_version'"
             ).fetchone()
-        elif row[0] in {"1", "2", "3", "4", "5", "6", "7"}:
+        elif row[0] in {"1", "2", "3", "4", "5", "6", "7", "8"}:
             self._conn.execute(
                 "UPDATE auth_schema_meta SET value=? WHERE key='schema_version' AND value=?",
                 (AUTH_SCHEMA_VERSION, row[0]),
@@ -782,7 +833,9 @@ class AuthStore:
 
     @staticmethod
     def _membership(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
-        return {
+        custom_role_id = None if len(row) < 9 or row[8] is None else str(row[8])
+        role_name = None if len(row) < 10 or row[9] is None else str(row[9])
+        result = {
             "member_id": row[0],
             "user_id": row[1],
             "email": row[2],
@@ -791,7 +844,14 @@ class AuthStore:
             "joined_at": _iso(row[5]),
             "updated_at": _iso(row[6]),
             "revision": row[7],
+            "role_id": custom_role_id or str(row[4]),
+            "base_role": str(row[4]),
+            "role_name": role_name
+            or _BUILT_IN_ROLE_NAMES.get(str(row[4]), str(row[4])),
         }
+        if custom_role_id is not None:
+            result["custom_role_id"] = custom_role_id
+        return result
 
     @staticmethod
     def _session(
@@ -1060,7 +1120,7 @@ class AuthStore:
         self, workspace_id: str, user_id: str
     ) -> tuple[Any, ...] | None:
         return self._conn.execute(
-            "SELECT member_id,role,revision FROM auth_memberships "
+            "SELECT member_id,role,revision,custom_role_id FROM auth_memberships "
             "WHERE workspace_id=? AND user_id=?",
             (workspace_id, user_id),
         ).fetchone()
@@ -1071,7 +1131,7 @@ class AuthStore:
         """Resolve route-facing membership IDs while retaining user-ID callers."""
 
         return self._conn.execute(
-            "SELECT member_id,user_id,role,revision FROM auth_memberships "
+            "SELECT member_id,user_id,role,revision,custom_role_id FROM auth_memberships "
             "WHERE workspace_id=? AND (member_id=? OR user_id=?)",
             (workspace_id, member_or_user_id, member_or_user_id),
         ).fetchone()
@@ -1521,6 +1581,9 @@ class AuthStore:
                 role=Role(membership[1]),
                 session_id=session_id,
                 membership_id=str(membership[0]),
+                access_role_id=(
+                    str(membership[3]) if membership[3] is not None else None
+                ),
             )
             return AuthContext(user, workspace, session, principal)
 
@@ -3798,6 +3861,146 @@ class AuthStore:
             )
             return True
 
+    def list_workspace_roles(
+        self, workspace_id: str, actor_user_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        workspace = _clean_id(workspace_id, field="workspace_id")
+        with self._lock:
+            self._ensure_open()
+            if actor_user_id is not None and self._membership_row(
+                workspace, _clean_id(actor_user_id, field="user_id")
+            ) is None:
+                raise AuthAuthorizationError("workspace membership required")
+            counts = {
+                str(row[0]): int(row[1])
+                for row in self._conn.execute(
+                    "SELECT COALESCE(custom_role_id,role),COUNT(*) "
+                    "FROM auth_memberships WHERE workspace_id=? "
+                    "GROUP BY COALESCE(custom_role_id,role)",
+                    (workspace,),
+                ).fetchall()
+            }
+            rows = self._conn.execute(
+                "SELECT role_id,name,description,base_role,revision,created_by,"
+                "created_at,updated_at FROM auth_workspace_roles "
+                "WHERE workspace_id=? ORDER BY name,role_id",
+                (workspace,),
+            ).fetchall()
+        built_in = [
+            {
+                "role_id": role.value,
+                "workspace_id": workspace,
+                "name": _BUILT_IN_ROLE_NAMES[role.value],
+                "description": "",
+                "base_role": role.value,
+                "system": True,
+                "member_count": counts.get(role.value, 0),
+                "revision": 0,
+                "created_by": "system",
+                "created_at": "",
+                "updated_at": "",
+            }
+            for role in Role
+        ]
+        custom = [
+            {
+                "role_id": str(row[0]),
+                "workspace_id": workspace,
+                "name": str(row[1]),
+                "description": str(row[2]),
+                "base_role": str(row[3]),
+                "system": False,
+                "member_count": counts.get(str(row[0]), 0),
+                "revision": int(row[4]),
+                "created_by": str(row[5]),
+                "created_at": _iso(float(row[6])),
+                "updated_at": _iso(float(row[7])),
+            }
+            for row in rows
+        ]
+        return built_in + custom
+
+    def create_workspace_role(
+        self,
+        workspace_id: str,
+        name: str,
+        base_role: Role | str,
+        actor_user_id: str,
+        description: str = "",
+    ) -> dict[str, Any]:
+        workspace = _clean_id(workspace_id, field="workspace_id")
+        actor = _clean_id(actor_user_id, field="user_id")
+        clean_name = _clean_text(name, field="role_name", maximum=80)
+        clean_description = (
+            ""
+            if not description
+            else _clean_text(description, field="description", maximum=300)
+        )
+        clean_base = _clean_role(base_role)
+        identifier, now = _new_id("rol"), self._now()
+        with self._lock:
+            try:
+                with self._transaction():
+                    self._require_manager(workspace, actor)
+                    duplicate = self._conn.execute(
+                        "SELECT 1 FROM auth_workspace_roles "
+                        "WHERE workspace_id=? AND lower(name)=lower(?)",
+                        (workspace, clean_name),
+                    ).fetchone()
+                    if duplicate is not None:
+                        raise AuthConflictError(
+                            "workspace role name already exists"
+                        )
+                    self._conn.execute(
+                        "INSERT INTO auth_workspace_roles "
+                        "(role_id,workspace_id,name,description,base_role,revision,"
+                        "created_by,created_at,updated_at) VALUES (?,?,?,?,?,1,?,?,?)",
+                        (
+                            identifier,
+                            workspace,
+                            clean_name,
+                            clean_description,
+                            clean_base.value,
+                            actor,
+                            now,
+                            now,
+                        ),
+                    )
+            except sqlite3.IntegrityError as exc:
+                raise AuthConflictError("workspace role name already exists") from exc
+        return next(
+            role
+            for role in self.list_workspace_roles(workspace)
+            if role["role_id"] == identifier
+        )
+
+    def delete_workspace_role(
+        self, workspace_id: str, role_id: str, actor_user_id: str
+    ) -> bool:
+        workspace = _clean_id(workspace_id, field="workspace_id")
+        identifier = _clean_id(role_id, field="role_id")
+        actor = _clean_id(actor_user_id, field="user_id")
+        if identifier in _ROLES:
+            raise AuthConflictError("built-in workspace roles cannot be deleted")
+        with self._lock, self._transaction():
+            self._require_manager(workspace, actor)
+            in_use = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM auth_memberships "
+                    "WHERE workspace_id=? AND custom_role_id=?",
+                    (workspace, identifier),
+                ).fetchone()[0]
+            )
+            if in_use:
+                raise AuthConflictError("workspace role is assigned to members")
+            deleted = self._conn.execute(
+                "DELETE FROM auth_workspace_roles WHERE workspace_id=? AND role_id=?",
+                (workspace, identifier),
+            ).rowcount
+            if not deleted:
+                raise AuthNotFoundError("workspace role not found")
+        return True
+
     def list_members(
         self, workspace_id: str, actor_user_id: str | None = None
     ) -> list[dict[str, Any]]:
@@ -3814,8 +4017,11 @@ class AuthStore:
                 raise AuthAuthorizationError("workspace membership required")
             rows = self._conn.execute(
                 "SELECT m.member_id,u.user_id,u.email,u.display_name,m.role,m.joined_at,"
-                "m.updated_at,m.revision FROM auth_memberships m JOIN auth_users u "
-                "ON u.user_id=m.user_id WHERE m.workspace_id=? "
+                "m.updated_at,m.revision,m.custom_role_id,r.name "
+                "FROM auth_memberships m JOIN auth_users u "
+                "ON u.user_id=m.user_id "
+                "LEFT JOIN auth_workspace_roles r ON r.role_id=m.custom_role_id "
+                "WHERE m.workspace_id=? "
                 "ORDER BY m.joined_at,m.member_id",
                 (workspace_id,),
             ).fetchall()
@@ -3830,8 +4036,10 @@ class AuthStore:
             self._ensure_open()
             row = self._conn.execute(
                 "SELECT m.member_id,u.user_id,u.email,u.display_name,m.role,"
-                "m.joined_at,m.updated_at,m.revision FROM auth_memberships m "
+                "m.joined_at,m.updated_at,m.revision,m.custom_role_id,r.name "
+                "FROM auth_memberships m "
                 "JOIN auth_users u ON u.user_id=m.user_id "
+                "LEFT JOIN auth_workspace_roles r ON r.role_id=m.custom_role_id "
                 "WHERE m.workspace_id=? AND m.user_id=?",
                 (workspace_id, user_id),
             ).fetchone()
@@ -3875,14 +4083,16 @@ class AuthStore:
         self,
         workspace_id: str,
         member_user_id: str,
-        role: Role | str,
+        role: Role | str | None,
         actor_user_id: str,
         expected_revision: int | None = None,
+        role_id: str | None = None,
     ) -> dict[str, Any]:
         workspace_id = _clean_id(workspace_id, field="workspace_id")
         member_user_id = _clean_id(member_user_id, field="member_id")
         actor_user_id = _clean_id(actor_user_id, field="user_id")
-        clean_role = _clean_role(role)
+        clean_role: Role
+        custom_role_id: str | None = None
         if expected_revision is not None and (
             type(expected_revision) is not int or expected_revision < 0
         ):
@@ -3890,10 +4100,31 @@ class AuthStore:
         now = self._now()
         with self._lock, self._transaction():
             actor_role = self._require_manager(workspace_id, actor_user_id)
+            if role_id is not None and role_id not in _ROLES:
+                custom_role_id = _clean_id(role_id, field="role_id")
+                role_row = self._conn.execute(
+                    "SELECT base_role FROM auth_workspace_roles "
+                    "WHERE workspace_id=? AND role_id=?",
+                    (workspace_id, custom_role_id),
+                ).fetchone()
+                if role_row is None:
+                    raise AuthNotFoundError("workspace role not found")
+                clean_role = Role(str(role_row[0]))
+            else:
+                selected = role_id if role_id is not None else role
+                if selected is None:
+                    raise AuthValidationError("workspace role is required")
+                clean_role = _clean_role(selected)
             target = self._membership_target_row(workspace_id, member_user_id)
             if target is None:
                 raise AuthNotFoundError("workspace member not found")
-            target_member_id, target_user_id, target_role, target_revision = target
+            (
+                target_member_id,
+                target_user_id,
+                target_role,
+                target_revision,
+                _target_custom_role_id,
+            ) = target
             if target_role == Role.OWNER.value:
                 raise AuthAuthorizationError("workspace owner cannot be demoted")
             if actor_role is Role.ADMIN and clean_role is Role.OWNER:
@@ -3901,9 +4132,10 @@ class AuthStore:
             if expected_revision is not None and target_revision != expected_revision:
                 raise AuthConflictError("membership revision conflict")
             self._conn.execute(
-                "UPDATE auth_memberships SET role=?,revision=revision+1,updated_at=? "
+                "UPDATE auth_memberships SET role=?,custom_role_id=?,"
+                "revision=revision+1,updated_at=? "
                 "WHERE member_id=?",
-                (clean_role.value, now, target_member_id),
+                (clean_role.value, custom_role_id, now, target_member_id),
             )
             # An explicit administrator change hands role authority back to
             # CogDoc. Future OIDC logins authenticate but do not rewrite it.
@@ -3928,7 +4160,7 @@ class AuthStore:
             target = self._membership_target_row(workspace_id, member_user_id)
             if target is None:
                 raise AuthNotFoundError("workspace member not found")
-            target_member_id, target_user_id, target_role, _ = target
+            target_member_id, target_user_id, target_role, _, _ = target
             if target_role == Role.OWNER.value:
                 raise AuthAuthorizationError("last workspace owner cannot be removed")
             if actor_role is Role.ADMIN and target_role == Role.OWNER.value:

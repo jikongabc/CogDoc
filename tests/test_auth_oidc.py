@@ -167,7 +167,7 @@ def test_auth_schema_v1_is_migrated_in_place(tmp_path):
     assert reopened.check()
     assert reopened._conn.execute(
         "SELECT value FROM auth_schema_meta WHERE key='schema_version'"
-    ).fetchone() == ("8",)
+    ).fetchone() == ("9",)
     for table in (
         "auth_oidc_identities",
         "auth_workspace_oidc_policies",
@@ -216,7 +216,7 @@ def test_auth_schema_v6_adds_group_policy_columns_with_safe_defaults(tmp_path):
     assert {"group_claim", "group_role_map_json", "require_mapped_group"} <= columns
     assert migrated._conn.execute(
         "SELECT value FROM auth_schema_meta WHERE key='schema_version'"
-    ).fetchone() == ("8",)
+    ).fetchone() == ("9",)
     migrated.close()
 
 

@@ -17,6 +17,7 @@ from cogdoc.tools.retriever.vector_retriever import (
     EmbeddingModelMismatchError,
     VectorRetriever,
 )
+from cogdoc.tools.embedder import resolve_embedder
 
 
 class RetrieverFactory:
@@ -92,17 +93,32 @@ class RetrieverFactory:
             return HybridRetriever(NullRetriever(), NullRetriever())
 
         collection_id = get_settings().kb_collection_id(kb_id, gen_id)
+        gen_state = KBState(kb_id).get(gen_id)
+        if gen_state is None:
+            return HybridRetriever(NullRetriever(), NullRetriever())
+        try:
+            embedder = resolve_embedder(str(gen_state.get("embedding_model") or "local"))
+        except RuntimeError:
+            return HybridRetriever(NullRetriever(), NullRetriever())
+        except ValueError:
+            # Pre-profile generations may contain an arbitrary local alias.
+            from cogdoc.tools.embedder import Embedder
+
+            embedder = Embedder
         try:
             engine = HybridRetriever(
-                vector_retriever=VectorRetriever(collection_id=collection_id),
+                vector_retriever=(
+                    VectorRetriever(collection_id=collection_id)
+                    if getattr(embedder, "PROFILE_ID", "local") == "local"
+                    else VectorRetriever(
+                        collection_id=collection_id, embedder=embedder
+                    )
+                ),
                 bm25_retriever=BM25Retriever(collection_id=collection_id),
             )
         except EmbeddingModelMismatchError:
             return HybridRetriever(NullRetriever(), NullRetriever())
 
-        gen_state = KBState(kb_id).get(gen_id)
-        if gen_state is None:
-            return HybridRetriever(NullRetriever(), NullRetriever())
         expected = gen_state.get("expected_count")
         actual = engine.count()
         consistent = engine.is_consistent()

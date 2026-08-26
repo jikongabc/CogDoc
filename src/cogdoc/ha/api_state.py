@@ -848,6 +848,30 @@ class DistributedIndexJobStore:
         value = json.loads(str(encoded))
         return value if isinstance(value, dict) else None
 
+    def list(self, kb_ids: set[str], *, limit: int = 200) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        if not kb_ids:
+            return []
+        marker = self.backend.sql(sqlite="?", postgres="%s")
+        ordered_ids = sorted(kb_ids)
+        placeholders = ",".join(marker for _ in ordered_ids)
+        with self.backend.transaction() as connection:
+            rows = connection.execute(
+                "SELECT record_json FROM ha_api_index_jobs "
+                f"WHERE kb_id IN ({placeholders}) "
+                "ORDER BY created_at DESC,job_id DESC "
+                f"LIMIT {marker}",
+                (*ordered_ids, limit),
+            ).fetchall()
+        jobs = []
+        for row in rows:
+            encoded = row["record_json"] if isinstance(row, Mapping) else row[0]
+            value = json.loads(str(encoded))
+            if isinstance(value, dict):
+                jobs.append(value)
+        return jobs
+
     def reconcile_orphans(self) -> int:
         now = float(self._clock())
         marker = self.backend.sql(sqlite="?", postgres="%s")

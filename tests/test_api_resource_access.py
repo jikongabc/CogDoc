@@ -129,6 +129,7 @@ async def test_kb_policy_get_update_and_response_never_exposes_storage_id(tmp_pa
             "acl_epoch": 0,
             "created_at": "",
             "updated_at": "",
+            "role_ids": [],
         }
 
         payload = await _configure_kb(client, "workspace")

@@ -465,9 +465,15 @@ class IndexJobManager:
                 "knowledge_store",
                 accepts_var_keyword=accepts_var_keyword,
             )
+            self._ingest_takes_embedding_profile = self._accepts_keyword(
+                ingest_parameters,
+                "embedding_profile_id",
+                accepts_var_keyword=accepts_var_keyword,
+            )
         except (TypeError, ValueError):
             self._ingest_takes_on_commit = False
             self._ingest_takes_knowledge_store = False
+            self._ingest_takes_embedding_profile = False
         if self._mutation_coordinator is not None and not self._ingest_takes_on_commit:
             raise ValueError(
                 "distributed KB mutations require an ingest commit-fence callback"
@@ -970,6 +976,7 @@ class IndexJobManager:
         content: bytes,
         on_finished: Callable[[], None] | None = None,
         authorization_guard: Callable[[], None] | None = None,
+        embedding_profile_id: str | None = None,
     ) -> dict:
         # 写文件与构建索引作为一个 executor command：保证每个 job 快照与其 mutation 精确对应。
         return self._enqueue(
@@ -980,6 +987,30 @@ class IndexJobManager:
             content,
             on_finished,
             authorization_guard,
+            embedding_profile_id,
+        )
+
+    def submit_upload_batch(
+        self,
+        kb_id: str,
+        source_dir: str,
+        uploads: list[tuple[str, bytes]],
+        on_finished: Callable[[], None] | None = None,
+        authorization_guard: Callable[[], None] | None = None,
+        embedding_profile_id: str | None = None,
+    ) -> dict:
+        """Commit several source mutations and one index generation as one job."""
+
+        if not uploads:
+            raise ValueError("batch upload requires at least one file")
+        return self._enqueue(
+            kb_id,
+            self._run_with_writes,
+            source_dir,
+            uploads,
+            on_finished,
+            authorization_guard,
+            embedding_profile_id,
         )
 
     # 提交删除文档。
@@ -1133,6 +1164,7 @@ class IndexJobManager:
         content: bytes,
         on_finished: Callable[[], None] | None = None,
         authorization_guard: Callable[[], None] | None = None,
+        embedding_profile_id: str | None = None,
     ) -> None:
         try:
             self._run_with_write_reserved(
@@ -1143,6 +1175,7 @@ class IndexJobManager:
                 filename,
                 content,
                 authorization_guard,
+                embedding_profile_id,
             )
         finally:
             if on_finished is not None:
@@ -1157,6 +1190,7 @@ class IndexJobManager:
         filename: str,
         content: bytes,
         authorization_guard: Callable[[], None] | None = None,
+        embedding_profile_id: str | None = None,
     ) -> None:
         if self._store.get(job_id) is None:
             return
@@ -1204,6 +1238,7 @@ class IndexJobManager:
             on_commit=lambda gid: self._prepare_authorized_commit(
                 job_id, gid, authorization_guard, kb_id, source_dir
             ),
+            embedding_profile_id=embedding_profile_id,
         )
         if ok:
             # 已提交：先打不可逆 committed 标记，再 best-effort 清备份，最后无条件清 journal。 不能因备份清理失败而保留 journal——否则后续切代/删库会让它被误判未提交而回滚已提交源文件。
@@ -1222,6 +1257,147 @@ class IndexJobManager:
                 )
         elif self._rollback_upload(job_id, kb_id, dest, backup, had_old):
             self._finish_rollback(job_id)
+
+    def _prepare_batch_authorized_commit(
+        self,
+        job_id: str,
+        journal_ids: list[str],
+        gen_id: str,
+        authorization_guard: Callable[[], None] | None,
+        kb_id: str,
+        source_dir: str,
+    ) -> None:
+        for journal_id in journal_ids:
+            self._journal.record_generation(journal_id, gen_id)
+        self._store.update(job_id, committed_generation_id=gen_id)
+        stored = self._store.get(job_id)
+        if stored is None or stored.get("committed_generation_id") != gen_id:
+            raise RuntimeError(f"job {job_id} 的 generation 提交证据未持久化")
+        if authorization_guard is not None:
+            authorization_guard()
+        if self._mutation_coordinator is not None:
+            assert_live = getattr(self._mutation_coordinator, "assert_live", None)
+            if not callable(assert_live):
+                raise RuntimeError("mutation coordinator does not support fencing")
+            assert_live()
+            if self._source_generation_store is not None:
+                current_lease = getattr(
+                    self._mutation_coordinator, "current_lease", None
+                )
+                stage = getattr(self._source_generation_store, "stage_for_commit", None)
+                lease = current_lease() if callable(current_lease) else None
+                if lease is None or not callable(stage):
+                    raise RuntimeError(
+                        "distributed source generation staging is unavailable"
+                    )
+                stage(
+                    storage_id=kb_id,
+                    source_dir=source_dir,
+                    lease=lease,
+                    build_id=gen_id,
+                )
+                assert_live()
+
+    def _run_with_writes(
+        self,
+        job_id: str,
+        kb_id: str,
+        base_epoch: int,
+        source_dir: str,
+        uploads: list[tuple[str, bytes]],
+        on_finished: Callable[[], None] | None = None,
+        authorization_guard: Callable[[], None] | None = None,
+        embedding_profile_id: str | None = None,
+    ) -> None:
+        try:
+            if self._store.get(job_id) is None:
+                return
+            if self._stale(kb_id, base_epoch):
+                self._fail_job(
+                    job_id,
+                    kb_id,
+                    RuntimeError(f"KB {kb_id} 已被删除或重建，批量上传取消"),
+                )
+                return
+            if self._reject_if_unresolved(job_id, kb_id):
+                return
+            try:
+                self._prepare_source_cache(kb_id, source_dir)
+            except Exception as exc:
+                self._fail_job(job_id, kb_id, exc)
+                return
+            if authorization_guard is not None and not self._ingest_takes_on_commit:
+                self._fail_job(
+                    job_id,
+                    kb_id,
+                    RuntimeError("索引构建器不支持提交前权限复验"),
+                )
+                return
+
+            mutations: list[tuple[str, str, str, bool]] = []
+            try:
+                os.makedirs(source_dir, exist_ok=True)
+                for index, (filename, content) in enumerate(uploads):
+                    journal_id = f"{job_id}-{index}"
+                    dest = os.path.join(source_dir, filename)
+                    backup = f"{dest}.{journal_id}{_BAK_SUFFIX}"
+                    had_old = os.path.exists(dest)
+                    self._journal.begin_upload(
+                        journal_id, kb_id, dest, backup, had_old
+                    )
+                    mutations.append((journal_id, dest, backup, had_old))
+                    if had_old:
+                        os.replace(dest, backup)
+                        self._journal.mark_source_moved(journal_id)
+                    with open(dest, "wb") as handle:
+                        handle.write(content)
+            except Exception as exc:
+                restored = True
+                for journal_id, dest, backup, had_old in reversed(mutations):
+                    if self._rollback_upload(
+                        journal_id, kb_id, dest, backup, had_old
+                    ):
+                        self._finish_rollback(journal_id)
+                    else:
+                        restored = False
+                self._fail_job(job_id, kb_id, exc)
+                if not restored:
+                    self._store.update(
+                        job_id, message="批量上传回滚失败，需恢复 mutation journal"
+                    )
+                return
+
+            journal_ids = [mutation[0] for mutation in mutations]
+            ok = self._run_ingest(
+                job_id,
+                kb_id,
+                source_dir,
+                on_commit=lambda gid: self._prepare_batch_authorized_commit(
+                    job_id,
+                    journal_ids,
+                    gid,
+                    authorization_guard,
+                    kb_id,
+                    source_dir,
+                ),
+                embedding_profile_id=embedding_profile_id,
+            )
+            if ok:
+                for journal_id, _dest, backup, had_old in mutations:
+                    committed_marked = self._journal.mark_committed(journal_id)
+                    if had_old:
+                        _silent_remove(backup)
+                    if committed_marked:
+                        self._journal.clear(journal_id)
+            else:
+                for journal_id, dest, backup, had_old in reversed(mutations):
+                    if self._rollback_upload(
+                        journal_id, kb_id, dest, backup, had_old
+                    ):
+                        self._finish_rollback(journal_id)
+        finally:
+            if on_finished is not None:
+                on_finished()
 
     # 运行with删除文档。
     def _run_with_delete_doc(
@@ -1319,6 +1495,7 @@ class IndexJobManager:
         source_dir,
         on_commit=None,
         on_succeeded: Callable[[], None] | None = None,
+        embedding_profile_id: str | None = None,
     ) -> bool:
         try:
             self._store.update(job_id, status="running")
@@ -1331,6 +1508,11 @@ class IndexJobManager:
                 ingest_kwargs["on_commit"] = on_commit
             if self._ingest_takes_knowledge_store and self._knowledge_store is not None:
                 ingest_kwargs["knowledge_store"] = self._knowledge_store
+            if (
+                self._ingest_takes_embedding_profile
+                and embedding_profile_id is not None
+            ):
+                ingest_kwargs["embedding_profile_id"] = embedding_profile_id
             # 不支持新参数的旧/测试 ingest_fn 保持原有两参数调用契约。
             result = self._ingest_fn(kb_id, source_dir, **ingest_kwargs)
         except Exception as exc:
@@ -1403,6 +1585,12 @@ class IndexJobManager:
     # 返回结果。
     def get(self, job_id: str) -> dict | None:
         return self._store.get(job_id)
+
+    def list(self, kb_ids: set[str], *, limit: int = 200) -> list[dict]:
+        list_jobs = getattr(self._store, "list", None)
+        if not callable(list_jobs):
+            raise RuntimeError("index job store does not support collection reads")
+        return list_jobs(kb_ids, limit=limit)
 
     # 协调孤儿任务。
     def reconcile_orphans(self) -> None:

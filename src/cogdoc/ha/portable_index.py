@@ -536,7 +536,10 @@ class PortableIndexInstaller:
         portable_path: str | os.PathLike[str],
     ) -> Any:
         from cogdoc.config.settings import get_settings
-        from cogdoc.tools.embedder import Embedder
+        from cogdoc.tools.embedder import (
+            embedding_contract,
+            resolve_embedder,
+        )
         from cogdoc.tools.retriever.base_retriever import NullRetriever
         from cogdoc.tools.retriever.bm25_retriever import BM25Retriever
         from cogdoc.tools.retriever.hybrid import HybridRetriever
@@ -546,9 +549,20 @@ class PortableIndexInstaller:
         generation_id = _clean_text(generation_id, "generation_id", maximum=255)
         portable_path = Path(portable_path)
         metadata, documents, embeddings = PortableIndexStore().load(portable_path)
+        try:
+            embedder = resolve_embedder(metadata.embedding_model)
+            expected_contract = embedding_contract(embedder)
+            expected_dimensions = int(
+                getattr(embedder, "EMBEDDING_DIM", 0)
+                or embedder.embedding_dim()
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise PortableIndexIntegrityError(
+                "portable index embedding contract is incompatible or unavailable"
+            ) from exc
         if (
-            metadata.embedding_model != Embedder.EMBEDDING_CONTRACT_VERSION
-            or metadata.dimensions != Embedder.EMBEDDING_DIM
+            metadata.embedding_model != expected_contract
+            or metadata.dimensions != expected_dimensions
         ):
             raise PortableIndexIntegrityError(
                 "portable index embedding contract is incompatible"
@@ -568,7 +582,7 @@ class PortableIndexInstaller:
             "portable_sha256": _file_sha256(portable_path),
         }
         with self._lock_for(collection_id), _installation_lock(lock_path):
-            vector = VectorRetriever(collection_id=collection_id)
+            vector = VectorRetriever(collection_id=collection_id, embedder=embedder)
             bm25 = BM25Retriever(collection_id=collection_id)
             if self._marker_matches(marker, expected_marker):
                 engine = HybridRetriever(vector, bm25)
@@ -653,13 +667,15 @@ def export_retrieval_generation(
     """Export one already-built local generation without activating another one."""
 
     from cogdoc.config.settings import get_settings
+    from cogdoc.tools.embedder import resolve_embedder
     from cogdoc.tools.retriever.bm25_retriever import BM25Retriever
     from cogdoc.tools.retriever.vector_retriever import VectorRetriever
 
     collection_id = get_settings().kb_collection_id(kb_id, generation_id)
     registry = BM25Retriever(collection_id=collection_id).export_registry()
+    embedder = resolve_embedder(embedding_model)
     embeddings_by_id = VectorRetriever(
-        collection_id=collection_id
+        collection_id=collection_id, embedder=embedder
     ).embeddings_by_chunk_id()
     chunk_ids = [
         str(document.get("meta", {}).get("chunk_id", "")) for document in registry

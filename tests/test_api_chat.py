@@ -97,6 +97,30 @@ def test_retrieval_retry_event_maps_to_node_sse_frame():
     assert '"retry_count": 1' in frame
 
 
+# 已完成安全校验的长回答按小块交付，避免客户端只能在末尾一次性显示全文。
+def test_finalized_token_is_split_into_incremental_sse_frames():
+    frame = _event_to_frame(
+        ChatEvent("token", {"content": "123456789012ABCDEFGHIJKL"}),
+        doc_id="kb",
+        session_id="s1",
+    )
+
+    assert frame is not None
+    assert frame.count("event: token") == 2
+    assert '"content": "123456789012"' in frame
+    assert '"content": "ABCDEFGHIJKL"' in frame
+
+
+def test_empty_token_does_not_emit_a_placeholder_sse_frame():
+    frame = _event_to_frame(
+        ChatEvent("token", {"content": ""}),
+        doc_id="kb",
+        session_id="s1",
+    )
+
+    assert frame is None
+
+
 # 验证 chat endpoint maps response and trace header 场景。
 @pytest.mark.anyio
 async def test_chat_endpoint_maps_response_and_trace_header(monkeypatch):

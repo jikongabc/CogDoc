@@ -179,6 +179,30 @@ def test_should_verify_supported_and_borderline_fact_queries():
     )
 
 
+# 阈值附近已经召回明确证据时，普通身份问题也应进入二阶段校验，避免错误拒答。
+def test_borderline_simple_query_still_triggers_evidence_verification():
+    settings = _settings(qa_evidence_verify_borderline_min_score=0.75)
+
+    assert should_verify_evidence(
+        {
+            "query": "项目负责人是谁",
+            "retrieval_first_stage_supported": False,
+            "retrieval_abstained": True,
+            "retrieval_abstain_reason": "below_threshold",
+            "retrieval_confidence": 0.9,
+        },
+        settings,
+    )
+
+    assert not should_verify_evidence(
+        {
+            "query": "项目负责人是谁",
+            "retrieval_first_stage_supported": True,
+        },
+        settings,
+    )
+
+
 # 多个原子需求即使不命中数值/日期标记，也必须逐项校验。
 def test_multiple_requirements_trigger_verification_without_fact_marker():
     assert should_verify_evidence(

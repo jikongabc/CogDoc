@@ -24,17 +24,26 @@ async def require_eval_reviewer(request: Request) -> str:
     completion notification is missed.
     """
 
-    # Explicit tenant principals are the new collaboration authority.  The
-    # middleware has already resolved the endpoint-specific REVIEW/PUBLISH
-    # permission, and the fingerprint set proves this is not the permissive
-    # local principal or a legacy shared admin key.
+    # Explicit tenant API principals and authenticated account sessions are the
+    # collaboration authority. The middleware has already validated the live
+    # session and resolved the endpoint-specific REVIEW/PUBLISH permission.
+    # Requiring a membership incarnation keeps fabricated/local principals and
+    # legacy shared admin keys on the independent reviewer-key path below.
     principal = getattr(request.state, "principal", None)
     explicit_fingerprints = set(
         getattr(request.app.state, "explicit_principal_fingerprints", set())
     )
+    is_account_session = (
+        isinstance(principal, Principal)
+        and principal.membership_id is not None
+        and principal.key_fingerprint.startswith("session:")
+    )
     if (
         isinstance(principal, Principal)
-        and principal.key_fingerprint in explicit_fingerprints
+        and (
+            principal.key_fingerprint in explicit_fingerprints
+            or is_account_session
+        )
         and (
             principal.allows(Permission.REVIEW)
             or principal.allows(Permission.PUBLISH)

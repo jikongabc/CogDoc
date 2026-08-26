@@ -13,10 +13,14 @@ from cogdoc.ha.portable_index import export_retrieval_generation
 from cogdoc.ha.runtime import HARuntime, manifest_for_directory
 from cogdoc.service.kb_lifecycle import LIFECYCLE_ACTIVE, shared_lifecycle_store
 from cogdoc.service.kb_state import KBState
-from cogdoc.tools.embedder import Embedder
+from cogdoc.tools.embedder import Embedder, embedding_contract, resolve_embedder
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class HAEmbeddingBackendUnavailable(RuntimeError):
+    """The persisted index contract cannot be served by this worker."""
 
 
 class HAIndexMirror:
@@ -103,6 +107,24 @@ class HAIndexMirror:
         active = KBState(kb_id).active()
         if active is None or active.get("id") != local_generation_id:
             raise RuntimeError("local index generation is no longer active")
+        try:
+            embedder = resolve_embedder(
+                str(active.get("embedding_model") or "local")
+            )
+        except ValueError:
+            # Older generations recorded arbitrary local model aliases. They
+            # predate provider selection and therefore use the local contract.
+            embedder = Embedder
+        except RuntimeError as exc:
+            # A persisted cloud contract must never fall back to local vectors.
+            # Surface one stable mirror-domain failure so reconciliation can
+            # mark readiness unhealthy and retry after credentials are restored.
+            raise HAEmbeddingBackendUnavailable(
+                "HA index mirror embedding backend is unavailable"
+            ) from exc
+        dimensions = int(
+            getattr(embedder, "EMBEDDING_DIM", 0) or embedder.embedding_dim()
+        )
         build_id = self._build_id(local_generation_id)
         current = self.runtime.index_generations.current(tenant_id, kb_id)
         if current is not None and current["build_id"] == build_id:
@@ -147,8 +169,8 @@ class HAIndexMirror:
                     kb_id,
                     local_generation_id,
                     directory,
-                    embedding_model=Embedder.EMBEDDING_CONTRACT_VERSION,
-                    dimensions=Embedder.EMBEDDING_DIM,
+                    embedding_model=embedding_contract(embedder),
+                    dimensions=dimensions,
                     chunk_version=str(active.get("chunk_identity_version") or ""),
                 )
                 manifest = manifest_for_directory(
@@ -280,4 +302,4 @@ class HAIndexMirror:
         return thread is not None and thread.is_alive() and self._last_error is None
 
 
-__all__ = ["HAIndexMirror"]
+__all__ = ["HAEmbeddingBackendUnavailable", "HAIndexMirror"]

@@ -289,24 +289,25 @@ def should_verify_evidence(
     settings = settings or get_settings()
     if not settings.qa_evidence_verify_enabled:
         return False
-    has_multiple_requirements = len(_requirements(state)) > 1
-    if not has_multiple_requirements and not requires_evidence_verification(
-        str(state.get("query") or "")
-    ):
-        return False
     first_stage_supported = bool(
         state.get(
             "retrieval_first_stage_supported",
             not state.get("retrieval_abstained", False),
         )
     )
-    if first_stage_supported:
-        return True
-    return (
-        state.get("retrieval_abstain_reason")
-        in {"below_threshold", "requirement_coverage_incomplete"}
-        and float(state.get("retrieval_confidence") or 0.0)
-        >= settings.qa_evidence_verify_borderline_min_score
+    if not first_stage_supported:
+        # 一阶段阈值只负责快速放行。接近阈值的候选必须交给证据校验器判断，
+        # 即使问题不是数值/日期类；否则“某人是谁”这类简单事实会在已召回
+        # 明确文本时，仅因向量距离略过校准线而被错误拒答。
+        return (
+            state.get("retrieval_abstain_reason")
+            in {"below_threshold", "requirement_coverage_incomplete"}
+            and float(state.get("retrieval_confidence") or 0.0)
+            >= settings.qa_evidence_verify_borderline_min_score
+        )
+    has_multiple_requirements = len(_requirements(state)) > 1
+    return has_multiple_requirements or requires_evidence_verification(
+        str(state.get("query") or "")
     )
 
 

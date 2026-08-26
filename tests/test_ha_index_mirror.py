@@ -7,7 +7,7 @@ import pytest
 
 import cogdoc.ha.index_mirror as mirror_module
 from cogdoc.config.settings import get_settings
-from cogdoc.ha.index_mirror import HAIndexMirror
+from cogdoc.ha.index_mirror import HAEmbeddingBackendUnavailable, HAIndexMirror
 from cogdoc.ha.api_state import (
     DistributedKnowledgeBaseRegistry,
     DistributedMutationCoordinator,
@@ -215,6 +215,29 @@ def test_reconcile_repairs_crash_window_after_local_commit(
     assert runtime.index_generations.current("tenant", "kb")["build_id"] == (
         f"local:{local_generation}"
     )
+    runtime.shutdown()
+
+
+def test_mirror_fails_closed_when_persisted_embedding_backend_is_unavailable(
+    tmp_path, monkeypatch, isolated_settings
+):
+    runtime = HARuntime(_config(tmp_path))
+    local_generation = _active_generation("kb")
+    mirror = HAIndexMirror(
+        runtime,
+        Registry({"tenant_id": "tenant", "storage_id": "kb"}),
+    )
+    monkeypatch.setattr(
+        mirror_module,
+        "resolve_embedder",
+        lambda _contract: (_ for _ in ()).throw(RuntimeError("credentials removed")),
+    )
+
+    with pytest.raises(HAEmbeddingBackendUnavailable) as captured:
+        mirror.mirror("tenant", "kb", local_generation)
+
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    assert runtime.index_generations.current("tenant", "kb") is None
     runtime.shutdown()
 
 

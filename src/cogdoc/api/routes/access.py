@@ -52,6 +52,7 @@ def _canonical_text(value: str, *, field: str, max_length: int = 160) -> str:
 class KnowledgeBasePolicyUpdateRequest(_ApiModel):
     schema_version: Literal["v1"] = "v1"
     policy: Literal["workspace", "private"]
+    role_ids: list[str] | None = Field(default=None, max_length=100)
 
 
 class KnowledgeBasePolicyResponse(_ApiModel):
@@ -63,12 +64,14 @@ class KnowledgeBasePolicyResponse(_ApiModel):
     acl_epoch: int = Field(ge=0)
     created_at: str = ""
     updated_at: str = ""
+    role_ids: list[str] = Field(default_factory=list)
 
 
 class DocumentPolicyUpdateRequest(_ApiModel):
     schema_version: Literal["v1"] = "v1"
     policy: Literal["inherit", "workspace", "private"]
     source: str | None = Field(default=None, min_length=1, max_length=1024)
+    role_ids: list[str] | None = Field(default=None, max_length=100)
 
     @field_validator("source")
     @classmethod
@@ -90,6 +93,7 @@ class DocumentPolicyResponse(_ApiModel):
     acl_epoch: int = Field(ge=0)
     created_at: str = ""
     updated_at: str = ""
+    role_ids: list[str] = Field(default_factory=list)
 
 
 class SubjectGrantRequest(_ApiModel):
@@ -243,6 +247,7 @@ def _kb_policy_response(
     principal: Principal,
     scope: KnowledgeBaseScope,
     epoch: int,
+    role_ids: Sequence[str] = (),
 ) -> KnowledgeBasePolicyResponse:
     if row is None:
         return KnowledgeBasePolicyResponse(
@@ -251,6 +256,7 @@ def _kb_policy_response(
             owner_id=scope.owner_id,
             policy=None,
             acl_epoch=epoch,
+            role_ids=list(role_ids),
         )
     _validate_record_scope(row, principal, scope)
     return KnowledgeBasePolicyResponse(
@@ -261,6 +267,7 @@ def _kb_policy_response(
         acl_epoch=int(row.get("acl_epoch", epoch)),
         created_at=str(row.get("created_at") or ""),
         updated_at=str(row.get("updated_at") or ""),
+        role_ids=list(role_ids),
     )
 
 
@@ -270,6 +277,7 @@ def _document_policy_response(
     principal: Principal,
     scope: KnowledgeBaseScope,
     document_id: str,
+    role_ids: Sequence[str] = (),
 ) -> DocumentPolicyResponse:
     _validate_record_scope(row, principal, scope, document_id=document_id)
     return DocumentPolicyResponse(
@@ -281,7 +289,25 @@ def _document_policy_response(
         acl_epoch=int(row.get("acl_epoch", 0)),
         created_at=str(row.get("created_at") or ""),
         updated_at=str(row.get("updated_at") or ""),
+        role_ids=list(role_ids),
     )
+
+
+def _validated_role_ids(request: Request, tenant_id: str, values: Sequence[str]) -> list[str]:
+    selected = list(dict.fromkeys(_canonical_text(value, field="role_id") for value in values))
+    auth_store = getattr(request.app.state, "auth_store", None)
+    if auth_store is None:
+        allowed = {role.value for role in Role}
+    else:
+        rows = auth_store.list_workspace_roles(tenant_id)
+        allowed = {
+            str(row.get("role_id") or "")
+            for row in rows
+            if isinstance(row, Mapping)
+        }
+    if any(role_id not in allowed for role_id in selected):
+        raise _RouteError(422, ErrorCode.BAD_REQUEST, "包含不存在的工作区角色")
+    return selected
 
 
 def _grant_response(
@@ -475,6 +501,9 @@ async def get_kb_access_policy(kb_id: str, request: Request):
         principal=principal,
         scope=scope,
         epoch=int(epoch),
+        role_ids=_store_call(
+            store, "list_kb_roles", principal.tenant_id, scope.storage_id
+        ),
     )
 
 
@@ -512,11 +541,28 @@ async def update_kb_access_policy(
         ),
     )
     record = _record_mapping(row)
+    if body.role_ids is not None:
+        selected_roles = _validated_role_ids(
+            request, principal.tenant_id, body.role_ids
+        )
+        roles_result = _store_call(
+            store,
+            "replace_kb_roles",
+            principal.tenant_id,
+            scope.storage_id,
+            selected_roles,
+        )
+        record["acl_epoch"] = int(
+            _record_mapping(roles_result).get("acl_epoch", record.get("acl_epoch", 0))
+        )
     return _kb_policy_response(
         record,
         principal=principal,
         scope=scope,
         epoch=int(record.get("acl_epoch", 0)),
+        role_ids=_store_call(
+            store, "list_kb_roles", principal.tenant_id, scope.storage_id
+        ),
     )
 
 
@@ -543,6 +589,13 @@ async def get_document_access_policy(kb_id: str, document_id: str, request: Requ
         principal=principal,
         scope=scope,
         document_id=document_id,
+        role_ids=_store_call(
+            store,
+            "list_document_roles",
+            principal.tenant_id,
+            scope.storage_id,
+            document_id,
+        ),
     )
 
 
@@ -603,11 +656,31 @@ async def update_document_access_policy(
         raise _RouteError(409, ErrorCode.BAD_REQUEST, "请先配置知识库访问策略") from exc
     except ResourceAccessConflictError as exc:
         raise _RouteError(409, ErrorCode.BAD_REQUEST, "source 已绑定其他文档") from exc
+    if body.role_ids is not None:
+        selected_roles = _validated_role_ids(
+            request, principal.tenant_id, body.role_ids
+        )
+        roles_result = _store_call(
+            store,
+            "replace_document_roles",
+            principal.tenant_id,
+            scope.storage_id,
+            document_id,
+            selected_roles,
+        )
+        row = {**_record_mapping(row), "acl_epoch": _record_mapping(roles_result).get("acl_epoch", 0)}
     return _document_policy_response(
         _record_mapping(row),
         principal=principal,
         scope=scope,
         document_id=document_id,
+        role_ids=_store_call(
+            store,
+            "list_document_roles",
+            principal.tenant_id,
+            scope.storage_id,
+            document_id,
+        ),
     )
 
 

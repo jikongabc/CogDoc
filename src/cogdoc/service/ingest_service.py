@@ -37,7 +37,11 @@ from cogdoc.tools.manifest import (
     stamp_chunk_identity_contract,
     stamp_source_document_contract,
 )
-from cogdoc.tools.embedder import Embedder
+from cogdoc.tools.embedder import (
+    Embedder,
+    embedding_contract,
+    resolve_embedder,
+)
 from cogdoc.tools.parser import PARSER_VERSION, smart_parse
 from cogdoc.tools.source_parser import (
     SOURCE_PARSER_VERSION,
@@ -53,12 +57,14 @@ from cogdoc.tools.tokenizer import TOKENIZER_VERSION
 
 
 # 增量复用门控：任一构建组件版本变化都使旧索引不可复用，强制全量重建。
-INDEX_BUILD_VERSION = (
+INDEX_BUILD_BASE_VERSION = (
     f"{CHUNK_IDENTITY_VERSION}"
     f"|parser={PARSER_VERSION}"
     f"|source_parser={SOURCE_PARSER_VERSION}"
     f"|tokenizer={TOKENIZER_VERSION}"
-    f"|embedder={Embedder.EMBEDDING_CONTRACT_VERSION}"
+)
+INDEX_BUILD_VERSION = (
+    f"{INDEX_BUILD_BASE_VERSION}|embedder={Embedder.EMBEDDING_CONTRACT_VERSION}"
 )
 _SOURCE_CONTRACTS_SIDECAR = ".cogdoc-source-contracts.json"
 
@@ -138,9 +144,13 @@ def _log_chunking_summary(source: str, chunks: list) -> None:
 
 
 # 写入索引构建版本。
-def stamp_index_build_version(manifest: dict) -> dict:
+def index_build_version(embedder=Embedder) -> str:
+    return f"{INDEX_BUILD_BASE_VERSION}|embedder={embedding_contract(embedder)}"
+
+
+def stamp_index_build_version(manifest: dict, embedder=Embedder) -> dict:
     # 写入当前构建版本，启动检查与入库共用同一门控。
-    manifest["index_build_version"] = INDEX_BUILD_VERSION
+    manifest["index_build_version"] = index_build_version(embedder)
     return manifest
 
 
@@ -852,12 +862,31 @@ def _schedule_generation_cleanup(kb_id: str, gen_id: str) -> None:
 
 
 # 构建暂存区检索引擎。
-def _build_staging_engine(kb_id: str, gen_id: str) -> HybridRetriever:
+def _build_staging_engine(kb_id: str, gen_id: str, embedder=Embedder) -> HybridRetriever:
     collection_id = get_settings().kb_collection_id(kb_id, gen_id)
     return HybridRetriever(
-        vector_retriever=VectorRetriever(collection_id=collection_id),
+        vector_retriever=VectorRetriever(
+            collection_id=collection_id, embedder=embedder
+        ),
         bm25_retriever=BM25Retriever(collection_id=collection_id),
     )
+
+
+def _embedding_model_for_state(embedder=Embedder) -> str:
+    return (
+        Embedder.MODEL_NAME
+        if embedder is Embedder
+        else embedding_contract(embedder)
+    )
+
+
+def _embedding_contract_changed(
+    previous_active: dict | None, embedder=Embedder
+) -> bool:
+    if previous_active is None:
+        return False
+    previous_model = str(previous_active.get("embedding_model") or "local")
+    return previous_model != _embedding_model_for_state(embedder)
 
 
 # 规划事务化增量构建。
@@ -884,13 +913,18 @@ def _fill_staging_incremental(
     gen_dir,
     source_hash_by_name,
     ocr_summary=None,
+    embedder=Embedder,
 ):
     if ocr_summary is None:
         ocr_summary = _empty_ocr_summary()
 
     # 复用上一代未变文档的分块和向量，只解析新增或改动文档。
     prev_collection_id = get_settings().kb_collection_id(kb_id, prev_active["id"])
-    prev_vector = VectorRetriever(collection_id=prev_collection_id)
+    prev_vector = (
+        VectorRetriever(collection_id=prev_collection_id)
+        if embedder is Embedder
+        else VectorRetriever(collection_id=prev_collection_id, embedder=embedder)
+    )
     prev_bm25 = BM25Retriever(collection_id=prev_collection_id)
 
     # 旧代两路分块标识集合必须相等且非空，并与提交数量吻合。
@@ -962,15 +996,22 @@ def _populate_staging(
     source_hash_by_name,
     staging,
     ocr_summary=None,
+    embedder=Embedder,
+    *,
+    force_full_rebuild: bool = False,
 ):
     if ocr_summary is None:
         ocr_summary = _empty_ocr_summary()
 
     # 决定增量复用还是全量填充暂存区。
-    plan, prev_active = _plan_transactional_incremental(state, manifest)
+    plan, prev_active = (
+        (None, None)
+        if force_full_rebuild
+        else _plan_transactional_incremental(state, manifest)
+    )
     if plan is not None:
         try:
-            return _fill_staging_incremental(
+            fill_args = (
                 kb_id,
                 staging,
                 prev_active,
@@ -978,6 +1019,11 @@ def _populate_staging(
                 gen_dir,
                 source_hash_by_name,
                 ocr_summary,
+            )
+            return (
+                _fill_staging_incremental(*fill_args)
+                if embedder is Embedder
+                else _fill_staging_incremental(*fill_args, embedder)
             )
         except Exception as exc:
             # 复用失败时清空暂存区并回退全量重建。
@@ -1006,6 +1052,7 @@ def build_kb_index_transactional(
     *,
     knowledge_store: DerivedKnowledgeStore | None = None,
     retain_previous_generation: bool = False,
+    embedding_profile_id: str | None = None,
 ) -> IngestResult:
     # 取知识库写锁串行化写操作，提交前回调失败会中止提交。
     with kb_write_lock(kb_id):
@@ -1015,6 +1062,7 @@ def build_kb_index_transactional(
             on_commit,
             knowledge_store=knowledge_store,
             retain_previous_generation=retain_previous_generation,
+            embedding_profile_id=embedding_profile_id,
         )
     _log_ocr_summary(result)
     return result
@@ -1028,10 +1076,24 @@ def _build_transactional_locked(
     *,
     knowledge_store: DerivedKnowledgeStore | None = None,
     retain_previous_generation: bool = False,
+    embedding_profile_id: str | None = None,
 ) -> IngestResult:
     state = KBState(kb_id)
-    pdf_files = list_pdf_files(source_dir)
     previous_active = state.active()
+    active_contract = (
+        str(previous_active.get("embedding_model") or "local")
+        if previous_active is not None
+        else "local"
+    )
+    try:
+        embedder = resolve_embedder(embedding_profile_id or active_contract)
+    except ValueError:
+        if embedding_profile_id is not None:
+            raise
+        # Legacy/test generations may contain an old model alias. Rebuilding
+        # them with the default local contract preserves the pre-profile path.
+        embedder = Embedder
+    pdf_files = list_pdf_files(source_dir)
     previous_documents = (
         previous_active.get("documents", []) if previous_active is not None else []
     )
@@ -1044,6 +1106,7 @@ def _build_transactional_locked(
             previous_documents,
             knowledge_store=knowledge_store,
             retain_previous_generation=retain_previous_generation,
+            embedder=embedder,
         )
 
     abs_dir = os.path.abspath(source_dir)
@@ -1056,11 +1119,15 @@ def _build_transactional_locked(
     manifest = stamp_index_build_version(
         stamp_source_document_contract(stamp_chunk_identity_contract(scanned_manifest))
     )
+    manifest["index_build_version"] = index_build_version(embedder)
     source_hash_by_name = _documents_by_name(manifest)
+    switching_embedding_contract = _embedding_contract_changed(
+        previous_active, embedder
+    )
 
     gen_id = state.begin_generation(
-        Embedder.MODEL_NAME,
-        INDEX_BUILD_VERSION,
+        _embedding_model_for_state(embedder),
+        index_build_version(embedder),
         CHUNK_IDENTITY_VERSION,
     )
     gen_dir = get_settings().kb_generation_dir(kb_id, gen_id)
@@ -1068,8 +1135,12 @@ def _build_transactional_locked(
 
     try:
         _hardlink_snapshot(source_dir, gen_dir, pdf_files)
-        staging = _build_staging_engine(kb_id, gen_id)
-        all_chunks, doc_results = _populate_staging(
+        staging = (
+            _build_staging_engine(kb_id, gen_id)
+            if embedder is Embedder
+            else _build_staging_engine(kb_id, gen_id, embedder)
+        )
+        populate_args = (
             kb_id,
             state,
             gen_dir,
@@ -1078,6 +1149,18 @@ def _build_transactional_locked(
             source_hash_by_name,
             staging,
             ocr_summary,
+        )
+        all_chunks, doc_results = (
+            _populate_staging(
+                *populate_args,
+                force_full_rebuild=switching_embedding_contract,
+            )
+            if embedder is Embedder
+            else _populate_staging(
+                *populate_args,
+                embedder,
+                force_full_rebuild=switching_embedding_contract,
+            )
         )
         if all_chunks:
             _verify_staging(staging, all_chunks)
@@ -1153,13 +1236,18 @@ def _transactional_empty(
     *,
     knowledge_store: DerivedKnowledgeStore | None = None,
     retain_previous_generation: bool = False,
+    embedder=Embedder,
 ) -> IngestResult:
     if previous_documents is None:
         active = state.active()
         previous_documents = active.get("documents", []) if active is not None else []
     gen_id = state.begin_generation(
-        Embedder.MODEL_NAME,
-        INDEX_BUILD_VERSION,
+        (
+            Embedder.MODEL_NAME
+            if embedder is Embedder
+            else embedding_contract(embedder)
+        ),
+        index_build_version(embedder),
         CHUNK_IDENTITY_VERSION,
     )
     try:

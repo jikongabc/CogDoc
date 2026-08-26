@@ -78,7 +78,6 @@ def test_register_is_atomic_normalizes_email_and_never_returns_secrets(store):
     assert PASSWORD not in row[0]
     assert store._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert store._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-
     with pytest.raises(AuthConflictError):
         register(store, "alice@example.com")
     assert store._conn.execute("SELECT COUNT(*) FROM auth_users").fetchone()[0] == 1
@@ -89,6 +88,48 @@ def test_register_is_atomic_normalizes_email_and_never_returns_secrets(store):
         store._conn.execute("SELECT COUNT(*) FROM auth_memberships").fetchone()[0] == 1
     )
 
+
+def test_custom_workspace_roles_can_be_created_assigned_and_are_usage_protected(store):
+    owner = register(store)
+    member_user = register(store, "member@example.com", "Member")["user"]
+    workspace_id = owner["workspace"]["workspace_id"]
+    owner_id = owner["user"]["user_id"]
+    member = store.add_member(workspace_id, member_user["user_id"], "viewer", owner_id)
+
+    role = store.create_workspace_role(
+        workspace_id,
+        "Finance",
+        "viewer",
+        owner_id,
+        "Finance documents",
+    )
+    assert role["system"] is False
+    assert role["base_role"] == "viewer"
+
+    assigned = store.update_member_role(
+        workspace_id,
+        member["member_id"],
+        None,
+        owner_id,
+        role_id=role["role_id"],
+    )
+    assert assigned["role"] == "viewer"
+    assert assigned["role_id"] == role["role_id"]
+    assert assigned["role_name"] == "Finance"
+
+    with pytest.raises(AuthConflictError):
+        store.delete_workspace_role(workspace_id, role["role_id"], owner_id)
+
+    restored = store.update_member_role(
+        workspace_id,
+        member["member_id"],
+        None,
+        owner_id,
+        role_id="viewer",
+    )
+    assert restored["role_id"] == "viewer"
+    assert restored["role_name"] == "Member"
+    assert store.delete_workspace_role(workspace_id, role["role_id"], owner_id)
 
 def test_password_contract_and_unknown_user_performs_dummy_verify(store, monkeypatch):
     with pytest.raises(AuthValidationError):

@@ -85,10 +85,19 @@ class BackgroundSweeper:
                 continue
             if active is None:
                 continue
+            try:
+                embedder = ingest_service.resolve_embedder(
+                    str(active.get("embedding_model") or "local")
+                )
+            except (RuntimeError, ValueError):
+                # A removed cloud credential/model must fail closed. Never
+                # rebuild a cloud KB with local vectors behind the operator's back.
+                continue
             stale = (
-                active.get("embedding_model") != ingest_service.Embedder.MODEL_NAME
+                active.get("embedding_model")
+                != ingest_service._embedding_model_for_state(embedder)
                 or active.get("index_build_version")
-                != ingest_service.INDEX_BUILD_VERSION
+                != ingest_service.index_build_version(embedder)
             )
             if stale and not self._index_jobs.is_busy(kb_id):
                 try:

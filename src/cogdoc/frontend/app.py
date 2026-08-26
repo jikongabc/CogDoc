@@ -8,6 +8,7 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 try:
     import streamlit as st
@@ -3357,27 +3358,55 @@ def _render_workspace_members(client: CogDocClient, workspace_id: str) -> None:
     if not isinstance(members, list):
         st.error("成员列表响应格式不符合预期。")
         return
+    try:
+        roles_response = client.list_workspace_roles(workspace_id)
+        roles_payload = response_payload(roles_response)
+        available_roles = (
+            roles_payload.get("roles", [])
+            if roles_response.status_code == 200
+            and isinstance(roles_payload, Mapping)
+            else []
+        )
+    except Exception:
+        available_roles = []
+    role_rows = [role for role in available_roles if isinstance(role, Mapping)]
+    assignable_role_ids = [
+        str(item.get("role_id") or "")
+        for item in role_rows
+        if str(item.get("role_id") or "") != "owner"
+    ]
+    role_labels = {
+        str(item.get("role_id") or ""): str(
+            item.get("name") or item.get("role_id") or ""
+        )
+        for item in role_rows
+    }
     for member in members:
         if not isinstance(member, Mapping):
             continue
         member_id = str(member.get("member_id") or member.get("user_id") or "")
         role = str(member.get("role") or "viewer")
+        role_id = str(member.get("role_id") or role)
         label = str(member.get("display_name") or member.get("email") or member_id)
         st.caption(f"{label} · {member.get('email') or '-'} · {role}")
         if not member_id or role == "owner":
             continue
         controls = st.columns([3, 1, 1])
-        roles = ["viewer", "reviewer", "editor", "admin"]
+        roles = assignable_role_ids or ["viewer", "reviewer", "editor", "admin"]
         selected_role = controls[0].selectbox(
             "成员角色",
             roles,
-            index=roles.index(role) if role in roles else 0,
+            index=roles.index(role_id) if role_id in roles else 0,
+            format_func=lambda value: role_labels.get(value, value),
             key=f"member-role-{workspace_id}-{member_id}",
             label_visibility="collapsed",
         )
         if controls[1].button("保存", key=f"member-save-{workspace_id}-{member_id}"):
-            response = client.update_workspace_member(
-                workspace_id, member_id, selected_role
+            response = client.assign_workspace_member_role(
+                workspace_id,
+                member_id,
+                selected_role,
+                int(member.get("revision") or 0),
             )
             if response.status_code == 200:
                 _invalidate_auth_profile()
@@ -3393,6 +3422,49 @@ def _render_workspace_members(client: CogDocClient, workspace_id: str) -> None:
                 st.rerun()
             else:
                 st.error(_response_error(response, "移除成员失败"))
+
+
+def _render_workspace_roles(client: CogDocClient, workspace_id: str) -> None:
+    try:
+        response = client.list_workspace_roles(workspace_id)
+        payload = response_payload(response)
+    except Exception as exc:
+        st.error(f"读取角色失败: {exc}")
+        return
+    if response.status_code != 200 or not isinstance(payload, Mapping):
+        st.error(_response_error(response, "读取角色失败"))
+        return
+    roles = [item for item in payload.get("roles", []) if isinstance(item, Mapping)]
+    for role in roles:
+        role_id = str(role.get("role_id") or "")
+        name = str(role.get("name") or role_id)
+        role_type = "内置" if bool(role.get("system")) else "自定义"
+        st.caption(
+            f"{name} · {role_type} · {role.get('member_count') or 0} 位用户"
+        )
+        if not bool(role.get("system")) and st.button(
+            "删除角色", key=f"delete-role-{workspace_id}-{role_id}"
+        ):
+            deleted = client.delete_workspace_role(workspace_id, role_id)
+            if deleted.status_code == 204:
+                _clear_api_cache()
+                st.rerun()
+            st.error(_response_error(deleted, "删除角色失败"))
+    with st.form(f"create-role-{workspace_id}", clear_on_submit=True):
+        name = st.text_input("角色名称")
+        base_role = st.selectbox(
+            "权限模板", ["viewer", "reviewer", "editor", "admin"]
+        )
+        description = st.text_input("说明（可选）")
+        submitted = st.form_submit_button("创建角色")
+    if submitted:
+        created = client.create_workspace_role(
+            workspace_id, name.strip(), base_role, description.strip()
+        )
+        if created.status_code == 201:
+            _clear_api_cache()
+            st.rerun()
+        st.error(_response_error(created, "创建角色失败"))
 
 
 def _render_workspace_invites(client: CogDocClient, workspace_id: str) -> None:
@@ -4220,6 +4292,8 @@ def _render_account_sidebar(client: CogDocClient) -> None:
         _render_oidc_account(client, config)
     if current_id and role in {"owner", "admin"}:
         with st.expander("成员与邀请"):
+            st.markdown("**角色**")
+            _render_workspace_roles(client, current_id)
             st.markdown("**成员**")
             _render_workspace_members(client, current_id)
             st.markdown("**邀请**")
@@ -5666,6 +5740,31 @@ def _sidebar() -> None:
             st.session_state.kb_id = None
             st.info("还没有知识库，先在下面新建一个。")
 
+        workspace_roles: list[dict[str, Any]] = []
+        current_workspace_id = _current_workspace_id()
+        if current_workspace_id:
+            try:
+                role_response = client.list_workspace_roles(current_workspace_id)
+                if role_response.status_code == 200:
+                    role_payload = role_response.json()
+                    raw_roles = (
+                        role_payload.get("roles", [])
+                        if isinstance(role_payload, Mapping)
+                        else []
+                    )
+                    workspace_roles = [
+                        dict(role)
+                        for role in raw_roles
+                        if isinstance(role, Mapping) and role.get("role_id")
+                    ]
+            except Exception:
+                workspace_roles = []
+        role_ids = [str(role["role_id"]) for role in workspace_roles]
+        role_names = {
+            str(role["role_id"]): str(role.get("name") or role["role_id"])
+            for role in workspace_roles
+        }
+
         with st.form("create_kb", clear_on_submit=True):
             new_kb = st.text_input("新建知识库 ID")
             new_kb_policy = st.selectbox(
@@ -5675,8 +5774,22 @@ def _sidebar() -> None:
                     "仅自己/授权成员" if value == "private" else "工作区成员"
                 ),
             )
+            new_kb_roles = st.multiselect(
+                "可访问角色",
+                role_ids,
+                default=role_ids,
+                format_func=lambda value: role_names.get(value, value),
+                help="只有选中的角色可以发现并检索这个知识库。",
+            )
             if st.form_submit_button("创建") and new_kb:
-                resp = client.create_knowledge_base(new_kb, access_policy=new_kb_policy)
+                if role_ids and not new_kb_roles:
+                    st.error("请至少选择一个可访问角色")
+                    st.stop()
+                resp = client.create_knowledge_base(
+                    new_kb,
+                    access_policy=new_kb_policy,
+                    role_ids=new_kb_roles if role_ids else None,
+                )
                 if resp.status_code == 201:
                     _clear_api_cache(("kbs", client.base_url))
                     st.success(f"已创建 {new_kb}")
@@ -5720,11 +5833,27 @@ def _sidebar() -> None:
             ],
             help="支持文档、演示文稿、表格、网页和图片；图片会在 OCR 可用时提取文字。",
         )
+        upload_roles = st.multiselect(
+            "文档可访问角色",
+            role_ids,
+            default=role_ids,
+            format_func=lambda value: role_names.get(value, value),
+            help="RAG 只会召回当前用户角色有权访问的文档。",
+            disabled=uploaded is None or not role_ids,
+        )
         if st.button("上传并入库", disabled=uploaded is None):
             if uploaded is None:  # disabled controls are not a static type guard
                 st.error("请先选择要上传的文件")
                 return
-            resp = client.upload_document(kb_id, uploaded.name, uploaded.getvalue())
+            if role_ids and not upload_roles:
+                st.error("请至少选择一个可访问角色")
+                return
+            resp = client.upload_document(
+                kb_id,
+                uploaded.name,
+                uploaded.getvalue(),
+                allowed_role_ids=upload_roles if role_ids else None,
+            )
             if resp.status_code != 202:
                 st.error(resp.json().get("message", resp.text))
             else:

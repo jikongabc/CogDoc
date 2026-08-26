@@ -105,6 +105,11 @@ async def save_diagnostic_label(
                 "task_kind": "qa_requirement",
                 "label": body.requirement_label or body.query,
                 "retrieval_query": body.query,
+                # A diagnostic starts from one concrete query, while the eval
+                # workflow requires both the primary and fallback queries to
+                # be reviewable. Seed a useful fallback instead of creating a
+                # draft that cannot be approved without repairing hidden data.
+                "recovery_query": f"{body.query} 补充证据",
                 "expected_status": "no_evidence" if body.no_answer else "supported",
                 "acceptable_evidence": acceptable,
                 "hard_negative_chunks": negatives,

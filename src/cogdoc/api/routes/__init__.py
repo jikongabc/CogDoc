@@ -29,6 +29,7 @@ from cogdoc.api.routes.retrieval_diagnostics import (
 )
 from cogdoc.api.routes.research import router as research_router
 from cogdoc.api.routes.source_operations import router as source_operations_router
+from cogdoc.api.routes.tasks import router as tasks_router
 from cogdoc.api.routes.traces import router as traces_router
 
 __all__ = [
@@ -55,5 +56,6 @@ __all__ = [
     "retrieval_diagnostics_router",
     "research_router",
     "source_operations_router",
+    "tasks_router",
     "traces_router",
 ]

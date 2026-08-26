@@ -373,6 +373,10 @@ async def test_connection_api_runs_local_sync_and_exposes_bounded_status(
             assert "lease_token" not in response.json()
             listed = await client.get("/v1/knowledge-bases/docs/sync-jobs")
             assert listed.json()["jobs"][0]["documents_fetched"] == 1
+            workspace_listed = await client.get("/v1/sync-jobs")
+            assert workspace_listed.status_code == 200
+            assert workspace_listed.json()["jobs"][0]["job_id"] == job_id
+            assert workspace_listed.json()["jobs"][0]["kb_id"] == "docs"
             health = await client.get(
                 f"/v1/knowledge-bases/docs/connections/{connection['connection_id']}/health"
             )
