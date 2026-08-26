@@ -7,6 +7,7 @@ from cogdoc.service.ingest_service import (
     INDEX_BUILD_VERSION,
     IncrementalPlan,
     IndexInconsistencyError,
+    _embedding_contract_changed,
     _populate_staging,
     _fill_staging_incremental,
     _review_changed_derived_knowledge,
@@ -476,6 +477,53 @@ def test_contract_change_forces_full_build(tmp_path, monkeypatch):
     fake_vec.embeddings_by_chunk_id.assert_not_called()
     staging.index.assert_called_once_with(full)
     staging.vector_retriever.add_with_embeddings.assert_not_called()
+
+
+def test_explicit_embedding_switch_skips_incremental_reuse(tmp_path, monkeypatch):
+    kb_id = "kb-explicit-switch"
+    state = _make_state(tmp_path, kb_id)
+    documents = _docs(("a.pdf", "H1"))
+    _seed_active(state, documents, [_reg_doc("a.pdf", "H1", 0, 0)])
+    full = [_reg_doc("a.pdf", "H1", 0, 0)]
+    monkeypatch.setattr(ingest_service, "_parse_and_chunk", lambda *a, **k: (full, []))
+    monkeypatch.setattr(
+        ingest_service,
+        "_plan_transactional_incremental",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("model switch must not open the incremental path")
+        ),
+    )
+    staging = MagicMock()
+
+    chunks, _ = _populate_staging(
+        kb_id,
+        state,
+        "/gen",
+        ["a.pdf"],
+        _manifest(kb_id, documents),
+        {},
+        staging,
+        force_full_rebuild=True,
+    )
+
+    assert chunks == full
+    staging.clear.assert_not_called()
+    staging.index.assert_called_once_with(full)
+
+
+def test_embedding_contract_change_is_detected_before_staging_reuse():
+    class CloudContract:
+        @classmethod
+        def contract_version(cls):
+            return "openai-compatible:model@fingerprint|dim=3|norm=True"
+
+    local_active = {"embedding_model": Embedder.MODEL_NAME}
+    cloud_active = {"embedding_model": CloudContract.contract_version()}
+
+    assert _embedding_contract_changed(local_active, Embedder) is False
+    assert _embedding_contract_changed(local_active, CloudContract) is True
+    assert _embedding_contract_changed(cloud_active, CloudContract) is False
+    assert _embedding_contract_changed(cloud_active, Embedder) is True
 
 
 # 嵌入契约版本参与构建门控。

@@ -12,12 +12,14 @@ import type {
   FeedbackResponse,
   IndexJob,
   KnowledgeBase,
+  EmbeddingProfile,
   OidcExchangeResponse,
   OidcStartResponse,
   SessionHistoryResponse,
   SessionListResponse,
   StreamEvent,
   TraceResponse,
+  WorkspaceRoleListResponse,
 } from "@/lib/api/types";
 import { streamEventDataSchemas } from "@/lib/api/schemas";
 
@@ -61,7 +63,23 @@ function requestHeaders(init?: HeadersInit, options?: RequestOptions) {
 
 async function errorBody(response: Response): Promise<ApiErrorBody> {
   try {
-    return (await response.json()) as ApiErrorBody;
+    const value = await response.json() as Record<string, unknown>;
+    const detail = typeof value.detail === "object" && value.detail !== null && !Array.isArray(value.detail)
+      ? value.detail as Record<string, unknown>
+      : null;
+    return {
+      ...value,
+      message: typeof value.message === "string"
+        ? value.message
+        : typeof value.detail === "string"
+          ? value.detail
+          : typeof detail?.message === "string"
+            ? detail.message
+          : response.statusText || "请求失败",
+      details: typeof value.details === "object" && value.details !== null && !Array.isArray(value.details)
+        ? value.details as Record<string, unknown>
+        : detail,
+    } as ApiErrorBody;
   } catch {
     return { message: response.statusText || "请求失败" };
   }
@@ -144,11 +162,14 @@ export const api = {
       method: "POST",
       headers: { "X-CogDoc-Workspace": workspaceId },
     }),
+  workspaceRoles: (workspaceId: string) =>
+    apiFetch<WorkspaceRoleListResponse>(`/workspaces/${encodeURIComponent(workspaceId)}/roles`),
   knowledgeBases: () => apiFetch<KnowledgeBase[]>("/knowledge-bases"),
-  createKnowledgeBase: (kbId: string, accessPolicy: "workspace" | "private") =>
+  embeddingProfiles: () => apiFetch<EmbeddingProfile[]>("/embedding-profiles"),
+  createKnowledgeBase: (kbId: string, accessPolicy: "workspace" | "private", roleIds: string[]) =>
     apiFetch<KnowledgeBase>("/knowledge-bases", {
       method: "POST",
-      body: JSON.stringify({ kb_id: kbId, access_policy: accessPolicy }),
+      body: JSON.stringify({ kb_id: kbId, access_policy: accessPolicy, role_ids: roleIds }),
     }),
   deleteKnowledgeBase: (kbId: string) =>
     apiFetch<void>(`/knowledge-bases/${encodeURIComponent(kbId)}`, { method: "DELETE" }),
@@ -158,11 +179,18 @@ export const api = {
     apiFetch<void>(`/knowledge-bases/${encodeURIComponent(kbId)}/documents/${encodeURIComponent(name)}`, {
       method: "DELETE",
     }),
-  uploadDocument: (kbId: string, file: File) => {
+  uploadDocuments: (
+    kbId: string,
+    files: File[],
+    allowedRoleIds: string[],
+    embeddingProfileId: "local" | "cloud",
+  ) => {
     const body = new FormData();
-    body.append("file", file, file.name);
+    files.forEach((file) => body.append("files", file, file.name));
+    allowedRoleIds.forEach((roleId) => body.append("allowed_role_ids", roleId));
+    body.append("embedding_profile_id", embeddingProfileId);
     return apiFetch<{ job_id: string }>(
-      `/knowledge-bases/${encodeURIComponent(kbId)}/documents`,
+      `/knowledge-bases/${encodeURIComponent(kbId)}/documents/batch`,
       { method: "POST", body },
     );
   },

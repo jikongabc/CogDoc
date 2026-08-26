@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { apiDownload } from "@/lib/api/client";
 import { controlApi, numberValue, records, textValue, type JsonRecord } from "@/lib/api/control-plane";
+import { formatDateTime } from "@/lib/utils";
 import { useSessionStore } from "@/stores/session-store";
 
 export default function AuditPage() {
@@ -99,7 +100,7 @@ export default function AuditPage() {
                             <td className="px-3 py-2.5 font-medium">{textValue(row.action, textValue(row.method))}</td>
                             <td className="max-w-xs truncate px-3 py-2.5 font-mono text-[10px] text-muted-foreground">{textValue(row.resource, textValue(row.path))}</td>
                             <td className="px-3 py-2.5"><StatusBadge status={numberValue(row.status, 200) < 400 ? "succeeded" : "failed"} label={textValue(row.status)} /></td>
-                            <td className="px-3 py-2.5 font-mono text-[10px] text-muted-foreground">{textValue(row.created_at, textValue(row.timestamp))}</td>
+                            <td className="px-3 py-2.5 text-[11px] tabular-nums text-muted-foreground">{formatDateTime((row.created_at ?? row.timestamp) as string | number | null | undefined)}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -122,7 +123,7 @@ export default function AuditPage() {
                         <div key={id} className="grid grid-cols-[minmax(0,1fr)_120px_160px_auto] items-center gap-3 px-4 py-3 text-[13px]">
                           <div><p className="font-medium">审计事件导出</p><p className="font-mono text-[10px] text-muted-foreground">{id}</p></div>
                           <StatusBadge status={textValue(row.status, "pending")} />
-                          <span className="font-mono text-[10px] text-muted-foreground">到期 {textValue(row.expires_at)}</span>
+                          <span className="text-[11px] tabular-nums text-muted-foreground">到期 {formatDateTime(row.expires_at as string | number | null | undefined)}</span>
                           <div className="flex gap-1">
                             {ready ? <Button variant="ghost" size="icon" loading={download.isPending && download.variables === id} onClick={() => download.mutate(id)} aria-label="下载审计导出"><Download className="size-4" /></Button> : null}
                             <Button variant="ghost" size="icon" className="text-error" onClick={() => remove.mutate(row)} aria-label="删除导出"><Trash2 className="size-4" /></Button>

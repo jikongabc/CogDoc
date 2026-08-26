@@ -2,7 +2,7 @@
 
 Status: normative
 Scope: every CogDoc 2.0 web surface
-Last updated: 2026-08-24
+Last updated: 2026-08-25
 
 This document defines the visual primitives for CogDoc 2.0. Product pages may
 compose these primitives, but must not introduce local color systems, spacing
@@ -24,12 +24,12 @@ not decoration.
 
 ## Visual design plan
 
-- Palette: Canvas `#F6F7F9`, Paper `#FFFFFF`, Ink `#172033`, Steel `#667085`,
-  Trust blue `#315D93`, and semantic green/amber/red reserved for status.
+- Palette: Canvas `#F7F7F7`, Paper `#FFFFFF`, Ink `#171717`, Stone `#676767`,
+  Evidence green `#176B5B`, and semantic green/amber/red reserved for status.
 - Type: Geist Sans for product and long-form work, the system CJK sans fallback
   for Chinese readability, and Geist Mono only for hashes, IDs, timestamps, and
   diagnostic values.
-- Layout: a quiet 288px context rail, 44px work-view header, dense central work
+- Layout: a quiet 272px context rail, 48px work-view header, dense central work
   surface, and a reusable 400px provenance inspector.
 - Signature: the provenance rail binds claims and operations to inspectable
   evidence without making users leave their work.
@@ -53,28 +53,29 @@ ledger rows, and document-like reading surfaces rather than decoration.
 
 ## Color tokens
 
-The palette is cool neutral with an ink-blue action color. The deep blue is used
-for trust-bearing actions and focus, never as a broad decorative fill.
+The palette is neutral and nearly monochrome. A low-saturation mineral green is
+reserved for evidence, primary actions, and focus; it never becomes a broad
+decorative fill.
 
 | Token | Light | Dark (reserved) | Use |
 | --- | --- | --- | --- |
-| `--background` | `#F7F8FA` | `#111318` | Application canvas |
+| `--background` | `#F7F7F7` | `#111318` | Application canvas |
 | `--surface` | `#FFFFFF` | `#181B21` | Primary working surface |
-| `--surface-subtle` | `#F1F3F5` | `#20242C` | Hover, selected rows, secondary panes |
+| `--surface-subtle` | `#F3F3F3` | `#20242C` | Hover, selected rows, secondary panes |
 | `--surface-raised` | `#FFFFFF` | `#242832` | Popovers and dialogs |
-| `--foreground` | `#172033` | `#F4F6FA` | Primary text |
-| `--muted-foreground` | `#667085` | `#A9B0BE` | Secondary text |
-| `--border` | `#DDE1E7` | `#303641` | Default dividers and inputs |
-| `--border-strong` | `#B9C0CB` | `#454D5C` | Emphasized boundaries |
-| `--primary` | `#254F8F` | `#7DA7E8` | Primary action, selected navigation, focus |
-| `--primary-hover` | `#1E4278` | `#91B5ED` | Primary action hover |
-| `--primary-subtle` | `#EAF0F8` | `#1B2A41` | Selected and evidence focus background |
-| `--success` | `#287A52` | `#69C697` | Complete, healthy, verified |
-| `--success-subtle` | `#EAF5EF` | `#173327` | Success surfaces |
-| `--warning` | `#9A6700` | `#E2B55B` | Stale, partial, waiting |
-| `--warning-subtle` | `#FFF5D6` | `#352B16` | Warning surfaces |
-| `--error` | `#B42318` | `#F38B82` | Failed, destructive, invalid |
-| `--error-subtle` | `#FDECEA` | `#3A1D1C` | Error surfaces |
+| `--foreground` | `#171717` | `#F4F6FA` | Primary text |
+| `--muted-foreground` | `#676767` | `#A9B0BE` | Secondary text |
+| `--border` | `#E6E6E6` | `#303641` | Default dividers and inputs |
+| `--border-strong` | `#D1D1D1` | `#454D5C` | Emphasized boundaries |
+| `--primary` | `#176B5B` | `#6FC7B5` | Evidence, primary action, selected navigation, focus |
+| `--primary-hover` | `#11594C` | `#84D2C2` | Primary action hover |
+| `--primary-subtle` | `#E7F1EE` | `#17312C` | Selected evidence and citation background |
+| `--success` | `#187050` | `#69C697` | Complete, healthy, verified |
+| `--success-subtle` | `#E8F3EE` | `#173327` | Success surfaces |
+| `--warning` | `#8A5A00` | `#E2B55B` | Stale, partial, waiting |
+| `--warning-subtle` | `#FFF6DC` | `#352B16` | Warning surfaces |
+| `--error` | `#B3261E` | `#F38B82` | Failed, destructive, invalid |
+| `--error-subtle` | `#FCEDEB` | `#3A1D1C` | Error surfaces |
 
 Rules:
 
@@ -122,7 +123,7 @@ All spacing is based on 4px. Allowed values:
 - Compact table row: 40px; comfortable row: 48px.
 - Main content gutter: 24px desktop, 16px tablet/mobile.
 - Reading column: 720–800px; data workspace may use the full available width.
-- Context rail: 288px expanded and 56px collapsed. It may scroll independently
+- Context rail: 272px expanded and 56px collapsed. It may scroll independently
   because it contains the original workspace, KB, conversation, and document
   controls rather than only global navigation.
 - Provenance rail: 400px desktop; full-height sheet below 1100px.
@@ -134,15 +135,15 @@ alignment.
 
 Radius tokens:
 
-- `--radius-xs: 3px` — badges and compact controls.
-- `--radius-sm: 5px` — inputs, buttons, table containers.
-- `--radius-md: 8px` — popovers, dialogs, upload zone.
+- `--radius-xs: 4px` — compact controls.
+- `--radius-sm: 6px` — buttons and table containers.
+- `--radius-md: 10px` — inputs, popovers, dialogs, and upload zones.
 - No pill shapes except status chips, avatars, and segmented selections.
 
 Shadow tokens:
 
-- `--shadow-float: 0 8px 24px rgba(23, 32, 51, 0.10)` — dialogs and popovers.
-- `--shadow-edge: 0 1px 2px rgba(23, 32, 51, 0.05)` — rare raised surfaces.
+- `--shadow-float: 0 16px 40px rgba(23, 23, 23, 0.12)` — dialogs and popovers.
+- `--shadow-edge: 0 1px 2px rgba(23, 23, 23, 0.05)` — rare raised surfaces.
 
 Primary page structure is created with borders and background changes, not
 stacks of shadows.
@@ -170,9 +171,21 @@ Respect `prefers-reduced-motion` by removing non-essential transforms.
 ### Buttons
 
 - Variants: `primary`, `secondary`, `ghost`, `destructive`.
-- Heights: 32px default, 36px form, 28px compact.
+- Heights: 36px default, 40px form, 32px compact.
 - One primary action per local action group.
-- Loading preserves width and replaces the leading icon with a spinner.
+- Loading preserves width and label, replaces the action icon with the shared
+  `Spinner`, disables repeat activation, and exposes `aria-busy`.
+
+### Loading and progress
+
+- Route and full-page boundaries use the shared `LoadingState` with a restrained
+  `Spinner` and a concrete status label.
+- Local reads use the same spinner at compact size; they do not replace the
+  surrounding application shell.
+- Upload and indexing use `Progress`. Use determinate progress only when the
+  backend reports an authoritative percentage. Otherwise use the indeterminate
+  bar with the durable stage label (`uploading`, `queued`, `indexing`).
+- Motion stops under `prefers-reduced-motion`; status text remains visible.
 
 ### Inputs
 
@@ -212,7 +225,7 @@ Respect `prefers-reduced-motion` by removing non-essential transforms.
 - The selected knowledge base and session are always visible. Creating a KB,
   starting a conversation, uploading a document, and deleting a document remain
   available without navigating to a dashboard.
-- Advanced account, task, and administration routes sit in a quiet utility footer;
+- Data ingestion, advanced account, task, and administration routes sit in a quiet utility footer;
   they do not replace the working context.
 
 ## Accessibility floor

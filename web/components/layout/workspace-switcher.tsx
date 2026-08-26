@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, ChevronsUpDown, LoaderCircle } from "lucide-react";
+import { Check, ChevronsUpDown } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { api } from "@/lib/api/client";
@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { useWorkspaceStore } from "@/stores/workspace-store";
+import { Spinner } from "@/components/ui/spinner";
 
 export function WorkspaceSwitcher({ collapsed = false }: { collapsed?: boolean }) {
   const router = useRouter();
@@ -62,7 +63,7 @@ export function WorkspaceSwitcher({ collapsed = false }: { collapsed?: boolean }
                 <span className="block truncate text-[13px] font-medium">{workspace?.name || "选择工作区"}</span>
                 <span className="block truncate text-[11px] text-muted-foreground">{workspace?.role || "workspace"}</span>
               </span>
-              {mutation.isPending ? <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" /> : <ChevronsUpDown className="size-3.5 text-muted-foreground" />}
+              {mutation.isPending ? <Spinner size="sm" className="text-muted-foreground" /> : <ChevronsUpDown className="size-3.5 text-muted-foreground" />}
             </>
           ) : null}
         </button>

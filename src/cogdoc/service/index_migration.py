@@ -16,12 +16,14 @@ from cogdoc.service.ingest_service import (
     INDEX_BUILD_VERSION,
     _cleanup_generation_storage,
     build_kb_index_transactional,
+    index_build_version,
 )
 from cogdoc.service.kb_locks import kb_write_lock
 from cogdoc.service.kb_state import KBState
 from cogdoc.service.retriever_factory import RetrieverFactory
 from cogdoc.tools.chunk_identity import CHUNK_IDENTITY_VERSION
 from cogdoc.tools.manifest import save_index_manifest
+from cogdoc.tools.embedder import resolve_embedder
 
 
 ProgressCallback = Callable[[Mapping[str, Any]], None]
@@ -73,6 +75,11 @@ class IndexMigrationStore:
 
 def inspect_index_generation(storage_id: str) -> dict[str, Any]:
     active = KBState(storage_id).active()
+    try:
+        embedder = resolve_embedder(str((active or {}).get("embedding_model") or "local"))
+        target_build = index_build_version(embedder)
+    except (RuntimeError, ValueError):
+        target_build = INDEX_BUILD_VERSION
     actual_identity = str((active or {}).get("chunk_identity_version") or "")
     actual_build = str((active or {}).get("index_build_version") or "")
     reasons = []
@@ -80,7 +87,7 @@ def inspect_index_generation(storage_id: str) -> dict[str, Any]:
         reasons.append("missing_active_generation")
     if actual_identity != CHUNK_IDENTITY_VERSION:
         reasons.append("chunk_identity_version_mismatch")
-    if actual_build != INDEX_BUILD_VERSION:
+    if actual_build != target_build:
         reasons.append("index_build_version_mismatch")
     return {
         "storage_id": storage_id,
@@ -88,7 +95,7 @@ def inspect_index_generation(storage_id: str) -> dict[str, Any]:
         "actual_chunk_identity_version": actual_identity,
         "target_chunk_identity_version": CHUNK_IDENTITY_VERSION,
         "actual_index_build_version": actual_build,
-        "target_index_build_version": INDEX_BUILD_VERSION,
+        "target_index_build_version": target_build,
         "needs_migration": bool(reasons),
         "reasons": reasons,
     }

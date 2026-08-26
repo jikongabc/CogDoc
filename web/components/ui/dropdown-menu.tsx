@@ -16,7 +16,7 @@ export function DropdownMenuContent({ className, sideOffset = 6, ...props }: Rea
     <DropdownMenuPrimitive.Portal>
       <DropdownMenuPrimitive.Content
         sideOffset={sideOffset}
-        className={cn("z-50 min-w-48 rounded-[5px] border border-border bg-surface-raised p-1 text-[13px] shadow-[var(--shadow-float)]", className)}
+        className={cn("z-50 min-w-48 rounded-[8px] border border-border bg-surface-raised p-1 text-[13px] shadow-[var(--shadow-float)]", className)}
         {...props}
       />
     </DropdownMenuPrimitive.Portal>
@@ -24,7 +24,7 @@ export function DropdownMenuContent({ className, sideOffset = 6, ...props }: Rea
 }
 
 export function DropdownMenuItem({ className, inset, ...props }: React.ComponentProps<typeof DropdownMenuPrimitive.Item> & { inset?: boolean }) {
-  return <DropdownMenuPrimitive.Item className={cn("relative flex h-8 select-none items-center gap-2 rounded-[3px] px-2 outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 data-[highlighted]:bg-surface-subtle", inset && "pl-8", className)} {...props} />;
+  return <DropdownMenuPrimitive.Item className={cn("relative flex h-8 select-none items-center gap-2 rounded-[6px] px-2 outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 data-[highlighted]:bg-surface-subtle", inset && "pl-8", className)} {...props} />;
 }
 
 export function DropdownMenuLabel({ className, ...props }: React.ComponentProps<typeof DropdownMenuPrimitive.Label>) {

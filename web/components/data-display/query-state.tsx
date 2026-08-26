@@ -1,5 +1,6 @@
-import { AlertTriangle, LoaderCircle, RotateCw } from "lucide-react";
+import { AlertTriangle, RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { LoadingState } from "@/components/ui/spinner";
 
 export function QueryState({
   pending,
@@ -15,7 +16,7 @@ export function QueryState({
   errorTitle?: string;
 }) {
   if (pending) {
-    return <div role="status" className="flex min-h-40 items-center justify-center gap-2 text-[13px] text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />{label}</div>;
+    return <LoadingState label={label} />;
   }
   if (error) {
     return (

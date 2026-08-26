@@ -144,6 +144,49 @@ async def test_review_api_is_reviewer_only_tenant_scoped_and_minimizes_list(
 
 
 @pytest.mark.anyio
+async def test_review_list_and_summary_can_be_scoped_to_current_knowledge_base(
+    monkeypatch, tmp_path,
+):
+    store = ClaimVerificationReviewStore()
+    app, tenant_a_kb, _ = _app(monkeypatch, store, tmp_path)
+    other = app.state.kb_registry.create("other", "tenant-a", "alice")
+    other_kb = str(other["storage_id"])
+    store.record_candidates(
+        "tenant-a",
+        [
+            _candidate("c" * 32, kb_id=tenant_a_kb),
+            _candidate("d" * 32, kb_id=other_kb),
+        ],
+    )
+
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            listed = await client.get(
+                "/v1/claim-verification/reviews",
+                params={"kb_id": "kb"},
+                headers={"X-API-Key": "a-reviewer"},
+            )
+            summary = await client.get(
+                "/v1/claim-verification/reviews/summary",
+                params={"kb_id": "kb"},
+                headers={"X-API-Key": "a-reviewer"},
+            )
+            missing = await client.get(
+                "/v1/claim-verification/reviews",
+                params={"kb_id": "missing"},
+                headers={"X-API-Key": "a-reviewer"},
+            )
+
+    assert listed.status_code == 200
+    assert [item["review_id"] for item in listed.json()["items"]] == ["c" * 32]
+    assert summary.status_code == 200
+    assert summary.json()["total_count"] == 1
+    assert missing.status_code == 404
+
+
+@pytest.mark.anyio
 async def test_review_api_rechecks_source_acl_across_list_detail_label_and_export(
     monkeypatch, tmp_path,
 ):

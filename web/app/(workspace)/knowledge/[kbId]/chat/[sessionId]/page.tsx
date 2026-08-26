@@ -141,7 +141,11 @@ function ChatSession({ kbId, sessionId }: { kbId: string; sessionId: string }) {
         if (generationRef.current !== generation) return;
         if (event.type === "start") setStage("正在理解问题");
         if (event.type === "node") setStage(stageLabel(event.data.stage));
-        if (event.type === "token") setLiveMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: message.content + (event.data.content || "") } : message));
+        if (event.type === "token") {
+          setStage("正在生成回答");
+          setLiveMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: message.content + (event.data.content || "") } : message));
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        }
         if (event.type === "error") throw new ApiError(500, event.data);
         if (event.type === "final") {
           finalReceived = true;

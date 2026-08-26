@@ -767,6 +767,44 @@ class Settings(BaseSettings):
         default=90.0, validation_alias="LLM_TIMEOUT_SECONDS"
     )
     llm_max_retries: int = Field(default=2, validation_alias="LLM_MAX_RETRIES")
+
+    # OpenAI-compatible cloud embedding backend. Credentials stay server-side;
+    # the frontend only receives readiness/model metadata from the profiles API.
+    cloud_embedding_base_url: str = Field(
+        default="https://api.openai.com/v1",
+        validation_alias="COGDOC_CLOUD_EMBEDDING_BASE_URL",
+    )
+    cloud_embedding_api_key: str = Field(
+        default="", validation_alias="COGDOC_CLOUD_EMBEDDING_API_KEY"
+    )
+    cloud_embedding_model: str = Field(
+        default="text-embedding-3-small",
+        validation_alias="COGDOC_CLOUD_EMBEDDING_MODEL",
+    )
+    cloud_embedding_dimensions: int = Field(
+        default=1024,
+        ge=1,
+        le=8192,
+        validation_alias="COGDOC_CLOUD_EMBEDDING_DIMENSIONS",
+    )
+    cloud_embedding_batch_size: int = Field(
+        default=64,
+        ge=1,
+        le=2048,
+        validation_alias="COGDOC_CLOUD_EMBEDDING_BATCH_SIZE",
+    )
+    cloud_embedding_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0.0,
+        le=600.0,
+        validation_alias="COGDOC_CLOUD_EMBEDDING_TIMEOUT_SECONDS",
+    )
+    cloud_embedding_max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        validation_alias="COGDOC_CLOUD_EMBEDDING_MAX_RETRIES",
+    )
     # 独立阅卷模型配置；留空时回退到云端主模型，但角色仍保持 Judge。
     llm_judge_model_name: str = Field(
         default="", validation_alias="LLM_JUDGE_MODEL_NAME"

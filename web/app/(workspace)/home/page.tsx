@@ -3,13 +3,14 @@
 import { useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { BookOpenCheck, LoaderCircle } from "lucide-react";
+import { BookOpenCheck } from "lucide-react";
 import { CreateKnowledgeBaseDialog } from "@/features/knowledge/create-kb-dialog";
 import { useKnowledgeBases } from "@/features/knowledge/queries";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { useSessionStore } from "@/stores/session-store";
 import { api } from "@/lib/api/client";
 import { queryKeys } from "@/lib/query/keys";
+import { LoadingState } from "@/components/ui/spinner";
 
 export default function WorkspaceHomePage() {
   const router = useRouter();
@@ -44,12 +45,12 @@ export default function WorkspaceHomePage() {
           <p className="mb-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">{workspace?.name || "本地工作区"}</p>
           <span className="mx-auto flex size-10 items-center justify-center rounded-[6px] border border-border bg-surface text-primary"><BookOpenCheck className="size-5" /></span>
           <h2 className="mt-4 text-xl font-semibold tracking-[-0.02em]">创建第一个知识库</h2>
-          <p className="mt-2 text-sm leading-6 text-muted-foreground">创建知识库、上传文档，然后就能沿用原来的 CogDoc 工作流进行对话、研究和证据审核。</p>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">创建知识库、上传文档，然后就能沿用 CogDoc 工作流进行对话、研究和知识治理。</p>
           <div className="mt-5 flex justify-center"><CreateKnowledgeBaseDialog /></div>
         </div>
       </div>
     );
   }
 
-  return <div className="flex min-h-full items-center justify-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin text-primary" />正在恢复知识库与对话</div>;
+  return <LoadingState className="min-h-full" label="正在恢复知识库与对话" />;
 }

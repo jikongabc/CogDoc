@@ -2,7 +2,7 @@
 
 Status: normative
 Scope: complete Next.js web workspace
-Last updated: 2026-08-24
+Last updated: 2026-08-25
 
 ## Product objective
 
@@ -32,10 +32,11 @@ capability already exists.
 `src/cogdoc/frontend/app.py` is an approximately 8,000-line Streamlit application
 and `api_client.py` is an approximately 2,300-line backend adapter. Streamlit
 combines navigation, authentication, server state, forms, background SSE work,
-and all product domains in one rerun-driven module. The current Next.js client
-implements login and the upload/chat/evidence path, but Research, Tasks, and Admin
-are placeholders and most knowledge governance, connector, review, identity, and
-operations APIs have no product surface.
+and all product domains in one rerun-driven module. The Next.js client now exposes
+the complete route map below, including Research, source/version operations,
+governance, diagnostics, identity, service accounts, sessions, and audit. Ongoing
+parity work is therefore verified workflow by workflow rather than represented by
+placeholder routes.
 
 The Next.js migration separates these responsibilities without changing the
 workflow itself.
@@ -45,7 +46,7 @@ workflow itself.
 The Streamlit workspace is the navigation contract. The React application must
 remain structurally familiar to an existing CogDoc user: one selected workspace,
 one selected knowledge base, its conversations and documents in the left rail,
-and the six original work views in the main area. React routes provide durable
+and the six stable work views in the main area. React routes provide durable
 deep links; they do not redefine the user's workflow.
 
 ```text
@@ -57,15 +58,16 @@ Workspace
 │   ├── Conversation list / create / delete
 │   ├── Document upload / index status / delete
 │   └── Resource access and destructive controls
-├── Main views (original order)
+├── Main views
 │   ├── Conversation             mode / history / streaming / evidence / feedback
 │   ├── Research                 plan / run / provenance / review / publish
-│   ├── Sources                  connectors / credentials / sync / catalog / versions
+│   ├── Documents                upload / index status / access / delete
 │   ├── Derived knowledge        author / review / conflicts / feedback loop
 │   ├── Evidence review          claim verification / retrieval evidence
 │   └── Diagnostics              trace / retrieval / migration inspection
 └── Incremental product tools
     ├── All knowledge bases
+    ├── Data ingestion           connectors / credentials / sync / catalog / versions
     ├── Background tasks
     └── Administration           identity / members / security / audit
 ```
@@ -73,8 +75,9 @@ Workspace
 The selected knowledge base is the primary working context, exactly as in the
 Streamlit client. Global list, task, and administration routes remain available
 as secondary utilities, but they must never displace, duplicate, or hide the six
-original work views. New capabilities are attached to the closest existing view
-or exposed as a secondary utility.
+work views. Data ingestion is intentionally separate from the RAG document view:
+connections operate external systems, while their materialized documents remain
+visible in the selected knowledge base.
 
 ## Route map
 
@@ -84,14 +87,15 @@ or exposed as a secondary utility.
 | `/home` | Resume the last selected KB/session, or guide first KB creation |
 | `/chat` | Compatibility picker that enters a KB conversation |
 | `/knowledge` | Find, create, and manage knowledge bases |
-| `/knowledge/[kbId]` | Overview and document operations |
-| `/knowledge/[kbId]/sources` | Connections, credentials, sync, catalog, versions |
+| `/knowledge/[kbId]` | Document list, upload, indexing state, access, and delete |
+| `/knowledge/[kbId]/sources` | Legacy deep link redirected to Data ingestion |
 | `/knowledge/[kbId]/knowledge` | Derived knowledge and feedback loop |
 | `/knowledge/[kbId]/access` | KB/document policies and grants |
-| `/knowledge/[kbId]/diagnostics` | Trace and retrieval inspection |
+| `/knowledge/[kbId]/diagnostics` | Trace, retrieval inspection, index operations, and reviewer-only RAG evaluation for the current KB |
 | `/knowledge/[kbId]/chat/[sessionId]` | Stateful streaming conversation |
 | `/research` | Research queue, plan, lifecycle, provenance, report review and publish |
-| `/reviews` | Governance queues and reviewer workflows |
+| `/reviews` | Backward-compatible redirect to the current KB's Diagnostics → RAG 评测 tab |
+| `/integrations` | Connections, credentials, sync jobs, external-source catalog and versions |
 | `/tasks` | Durable background work across domains |
 | `/admin` | Members and invitations |
 | `/admin/identity` | OIDC identities/policy and SCIM readiness |
@@ -175,15 +179,14 @@ placed in URLs, logs, server-rendered props, or analytics.
 
 - `layout`: AppShell, Sidebar, Header, WorkspaceSwitcher, PageHeader,
   ContextNavigation, Inspector.
-- `data-display`: DataGrid, Table, StatusBadge, Timeline, ActivityFeed,
-  EmptyState, QueryState.
+- `data-display`: DataGrid, Table, StatusBadge, EmptyState, QueryState.
 - `ai`: ChatWindow, Message, Composer, Citation, EvidencePanel, SourcePreview,
   VerificationState.
-- `knowledge`: KnowledgeBaseList, DocumentList, UploadZone, SourceCatalog,
-  ConnectionEditor, KnowledgeReviewTable, PermissionEditor.
-- `research`: ResearchQueue, PlanEditor, ResearchTimeline, ReportReview,
+- `knowledge`: KnowledgeBaseList, DocumentList, UploadZone, RoleSelector,
+  SourceCatalog, ConnectionEditor, KnowledgeReviewTable.
+- `research`: ResearchQueue, PlanEditor, ResearchLifecycle, ReportReview,
   ProvenanceInspector.
-- `admin`: MemberTable, InviteTable, IdentityPolicy, ServiceAccountTable,
+- `admin`: MemberManagement, InviteTable, IdentityPolicy, ServiceAccountTable,
   SessionTable, AuditTable.
 
 Pages compose shared primitives and may colocate a workflow-specific editor until

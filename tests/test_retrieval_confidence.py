@@ -15,14 +15,14 @@ def _settings(**overrides):
     return Settings(_env_file=None, **overrides)
 
 
-def _doc(*, distance=None, bm25_score=None, source_type="document"):
+def _doc(*, distance=None, bm25_score=None, source_type="document", text="evidence"):
     retrieval = {}
     if distance is not None:
         retrieval["distance"] = distance
     if bm25_score is not None:
         retrieval["bm25_score"] = bm25_score
     return {
-        "text": "evidence",
+        "text": text,
         "meta": {
             "chunk_id": "chunk:test:0",
             "source_type": source_type,
@@ -54,6 +54,43 @@ def test_support_accepts_semantic_or_lexical_signal():
 
     assert semantic.supported is True
     assert lexical.supported is True
+
+
+# 小语料中 BM25 的 IDF 可能退化；完整精确词覆盖仍应作为独立支持信号。
+def test_support_accepts_exact_query_terms_when_bm25_has_no_score():
+    result = assess_retrieval_support(
+        [_doc(distance=0.95, text="项目负责人负责发布审核。")],
+        _settings(),
+        query="项目负责人是谁",
+    )
+    partial = assess_retrieval_support(
+        [_doc(distance=0.95, text="项目已经完成发布审核。")],
+        _settings(),
+        query="项目负责人是谁",
+    )
+
+    assert result.supported is True
+    assert result.signals["query_lexical_coverage"] == 1.0
+    assert partial.supported is False
+
+
+def test_partial_query_coverage_does_not_raise_borderline_confidence():
+    query = "alpha beta gamma delta epsilon zeta eta theta iota kappa"
+    result = assess_retrieval_support(
+        [
+            _doc(
+                distance=1.6,
+                bm25_score=1.0,
+                text="alpha beta gamma delta epsilon zeta eta theta iota",
+            )
+        ],
+        _settings(),
+        query=query,
+    )
+
+    assert result.signals["query_lexical_coverage"] == 0.9
+    assert result.score < 0.75
+    assert result.supported is False
 
 
 # 缺失所有评分信号时默认拒绝，显式兼容开关可恢复旧行为。

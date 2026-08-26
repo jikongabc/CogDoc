@@ -1,11 +1,11 @@
 import * as React from "react";
 import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
-import { LoaderCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 
 const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center gap-2 rounded-[5px] text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",
+  "inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-[7px] text-[13px] font-medium transition-[color,background-color,border-color,box-shadow] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 [&[data-loading=true]>svg]:hidden",
   {
     variants: {
       variant: {
@@ -15,10 +15,10 @@ const buttonVariants = cva(
         destructive: "bg-error text-white hover:bg-[#941f16]",
       },
       size: {
-        compact: "h-7 px-2.5",
-        default: "h-8 px-3",
-        form: "h-9 px-4",
-        icon: "size-8 p-0",
+        compact: "h-8 px-2.5",
+        default: "h-9 px-3",
+        form: "h-10 px-4",
+        icon: "size-9 p-0",
       },
     },
     defaultVariants: { variant: "secondary", size: "default" },
@@ -53,9 +53,11 @@ export function Button({
     <button
       className={cn(buttonVariants({ variant, size }), className)}
       disabled={disabled || loading}
+      aria-busy={loading || undefined}
+      data-loading={loading || undefined}
       {...props}
     >
-      {loading ? <LoaderCircle className="size-4 animate-spin" aria-hidden="true" /> : null}
+      {loading ? <Spinner size="md" /> : null}
       {children}
     </button>
   );

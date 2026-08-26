@@ -7,6 +7,8 @@ const backendOrigin = (process.env.COGDOC_API_URL ?? "http://127.0.0.1:8000").re
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
+  devIndicators: false,
+  allowedDevOrigins: ["127.0.0.1"],
   turbopack: { root: process.cwd() },
   async headers() {
     return [

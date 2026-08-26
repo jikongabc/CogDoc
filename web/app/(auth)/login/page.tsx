@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useRef, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { ArrowRight, BookOpenCheck, Building2, Check, Database, LoaderCircle, LockKeyhole, ShieldCheck } from "lucide-react";
+import { ArrowRight, BookOpenCheck, Building2, Check, Database, ShieldCheck } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
@@ -16,6 +16,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { InviteAcceptanceForm, RegistrationForm } from "@/features/auth/onboarding-forms";
 import { queryKeys } from "@/lib/query/keys";
+import { LoadingState } from "@/components/ui/spinner";
 
 const loginSchema = z.object({
   email: z.email("请输入有效邮箱"),
@@ -100,25 +101,18 @@ function LoginContent() {
   };
 
   return (
-    <main className="grid min-h-dvh bg-background lg:grid-cols-[288px_minmax(0,1fr)]">
-      <section className="flex min-h-48 flex-col border-b border-border bg-surface p-6 lg:min-h-dvh lg:border-b-0 lg:border-r lg:p-8">
-        <div className="flex items-center gap-2.5"><span className="flex size-8 items-center justify-center rounded-[5px] bg-foreground text-white"><BookOpenCheck className="size-[18px]" /></span><span><span className="block text-base font-semibold">CogDoc</span><span className="block text-[10px] text-muted-foreground">知识工作台</span></span></div>
-        <div className="mt-10 hidden lg:block">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">工作方式</p>
-          <div className="mt-3 space-y-1 text-[13px]">
-            {["选择工作区与知识库", "上传并管理文档", "对话、研究与证据审核"].map((item, index) => <p key={item} className="flex items-center gap-2 rounded-[4px] px-2 py-2"><span className="font-mono text-[10px] text-muted-foreground">0{index + 1}</span>{item}</p>)}
-          </div>
-          <div className="mt-8 border-t border-border pt-5 text-xs leading-5 text-muted-foreground"><p className="flex items-center gap-2"><ShieldCheck className="size-3.5 text-success" />账号、工作区与 ACL 由后端统一校验</p><p className="mt-2 flex items-center gap-2"><Database className="size-3.5 text-primary" />登录后恢复原有知识库工作流</p></div>
-        </div>
-        <p className="mt-auto hidden text-[11px] text-muted-foreground lg:block">CogDoc 2.0 · Enterprise workspace</p>
+    <main className="grid min-h-dvh bg-surface lg:grid-cols-[280px_minmax(0,1fr)]">
+      <section className="flex h-16 flex-col border-b border-border bg-sidebar px-5 py-3 lg:h-auto lg:min-h-dvh lg:border-b-0 lg:border-r lg:p-7">
+        <div className="flex items-center gap-2.5"><span className="flex size-9 items-center justify-center rounded-[10px] bg-foreground text-white shadow-[var(--shadow-edge)]"><BookOpenCheck className="size-[18px]" /></span><span><span className="block text-base font-semibold tracking-[-0.02em]">CogDoc</span><span className="block text-[10px] text-muted-foreground">企业知识工作台</span></span></div>
+        <div className="mt-auto hidden border-t border-border pt-5 text-xs leading-5 text-muted-foreground lg:block"><p>面向组织知识的检索、研究与质量治理。</p><p className="mt-2">身份、权限和审计策略由服务端统一执行。</p></div>
       </section>
-      <section className="flex items-center justify-center p-5 sm:p-8 lg:p-12">
-        <div className="w-full max-w-[420px]">
-          <div className="mb-7"><div className="mb-3 flex size-9 items-center justify-center rounded-[5px] border border-border bg-surface"><LockKeyhole className="size-[18px] text-primary" /></div><h2 className="text-2xl font-semibold tracking-[-0.02em]">进入工作区</h2><p className="mt-1.5 text-sm text-muted-foreground">登录、创建账号或接受组织邀请。</p></div>
+      <section className="flex items-center justify-center bg-surface p-5 sm:p-8 lg:p-12">
+        <div className="w-full max-w-[400px]">
+          <div className="mb-7"><h2 className="text-2xl font-semibold tracking-[-0.03em]">进入工作区</h2><p className="mt-1.5 text-sm text-muted-foreground">使用组织账号登录，或接受工作区邀请。</p></div>
           {config.isError ? <div className="mb-4 border-l-2 border-error bg-error-subtle px-3 py-2 text-[13px] text-error"><p>无法连接身份服务。请确认 CogDoc API 正在运行后重试。</p><Button variant="ghost" size="compact" className="mt-2 text-error" onClick={() => void config.refetch()}>重新连接</Button></div> : null}
-          {oidcExchange.isPending ? <div className="flex h-36 items-center justify-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />正在完成企业登录</div> : config.isPending ? <div className="flex h-36 items-center justify-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />正在读取认证配置</div> : config.data && !config.data.account_auth_enabled ? (
-            <div className="border border-border bg-surface">
-              <div className="border-b border-border bg-surface-subtle px-4 py-3">
+          {oidcExchange.isPending ? <LoadingState className="h-36 min-h-0" label="正在完成企业登录" /> : config.isPending ? <LoadingState className="h-36 min-h-0" label="正在读取认证配置" /> : config.data && !config.data.account_auth_enabled ? (
+            <div className="overflow-hidden rounded-[8px] border border-border bg-surface">
+              <div className="border-b border-border px-4 py-3">
                 <div className="flex items-center gap-2 text-sm font-semibold"><Database className="size-4 text-primary" />本地部署模式</div>
               </div>
               <div className="p-4">
@@ -165,5 +159,5 @@ function LoginContent() {
 }
 
 export default function LoginPage() {
-  return <Suspense fallback={<main className="flex min-h-dvh items-center justify-center bg-background"><LoaderCircle className="size-5 animate-spin text-primary" /><span className="ml-2 text-sm text-muted-foreground">正在载入登录</span></main>}><LoginContent /></Suspense>;
+  return <Suspense fallback={<LoadingState page label="正在载入登录" />}><LoginContent /></Suspense>;
 }

@@ -40,6 +40,30 @@ def _app(*, api_key: str, role: str, explicit: bool, legacy_reviewer: bool = Fal
     return app
 
 
+def _session_app(*, role: str):
+    app = FastAPI()
+    app.state.eval_review_api_keys = set()
+    app.state.explicit_principal_fingerprints = set()
+    principal = Principal.for_user_session(
+        tenant_id="team-a",
+        subject_id="alice",
+        role=role,
+        session_id="session-1",
+        membership_id="membership-1",
+    )
+
+    @app.middleware("http")
+    async def attach_session_principal(request, call_next):
+        request.state.principal = principal
+        return await call_next(request)
+
+    @app.post("/v1/research-jobs/job-1/publish")
+    async def publish(actor: str = Depends(require_eval_reviewer)):
+        return {"actor": actor}
+
+    return app
+
+
 @pytest.mark.anyio
 async def test_explicit_reviewer_principal_is_the_audit_actor():
     app = _app(api_key="reviewer-key", role="reviewer", explicit=True)
@@ -53,6 +77,29 @@ async def test_explicit_reviewer_principal_is_the_audit_actor():
 
     assert response.status_code == 200
     assert response.json() == {"actor": "alice"}
+
+
+@pytest.mark.anyio
+async def test_account_reviewer_session_is_the_audit_actor_without_legacy_key():
+    app = _session_app(role="reviewer")
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.post("/v1/research-jobs/job-1/publish")
+
+    assert response.status_code == 200
+    assert response.json() == {"actor": "alice"}
+
+
+@pytest.mark.anyio
+async def test_account_viewer_session_cannot_review():
+    app = _session_app(role="viewer")
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.post("/v1/research-jobs/job-1/publish")
+
+    assert response.status_code == 403
 
 
 @pytest.mark.anyio

@@ -11,7 +11,7 @@ export function Citation({ traceId, evidenceId, index, source, location }: { tra
       <TooltipTrigger asChild>
         <button
           type="button"
-          className="mx-0.5 inline-flex h-[19px] min-w-5 translate-y-[-1px] items-center justify-center rounded-[3px] border border-primary/20 bg-primary-subtle px-1 font-mono text-[10px] font-semibold leading-none text-primary hover:border-primary/40 hover:bg-[#dfe9f6]"
+          className="mx-0.5 inline-flex h-5 min-w-5 translate-y-[-1px] items-center justify-center rounded-[5px] border border-primary/20 bg-primary-subtle px-1.5 font-mono text-[10px] font-semibold leading-none text-primary transition-colors hover:border-primary/40 hover:bg-[#dcece7]"
           onClick={(event) => openEvidence({ traceId, evidenceId }, event.currentTarget)}
           aria-label={`打开证据 ${index}: ${source || "来源"}`}
         >

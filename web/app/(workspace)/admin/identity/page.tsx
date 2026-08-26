@@ -16,7 +16,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { api } from "@/lib/api/client";
-import { controlApi, isRecord, numberValue, records, textValue } from "@/lib/api/control-plane";
+import { controlApi, isRecord, numberValue, records, textValue, type JsonRecord } from "@/lib/api/control-plane";
 import { queryKeys } from "@/lib/query/keys";
 import { useSessionStore } from "@/stores/session-store";
 
@@ -35,7 +35,8 @@ export default function IdentityPage() {
   const identities = useQuery({ queryKey: ["admin", "oidc-identities"], queryFn: controlApi.oidcIdentities, enabled: Boolean(workspaceId) && Boolean(config.data?.oidc_enabled), retry: false });
   const policy = useQuery({ queryKey: ["admin", "oidc-policy", workspaceId], queryFn: () => controlApi.oidcPolicy(workspaceId), enabled: Boolean(workspaceId) && Boolean(config.data?.oidc_enabled), retry: false });
   const scim = useQuery({ queryKey: ["admin", "scim", workspaceId], queryFn: () => controlApi.scimStatus(workspaceId), enabled: Boolean(workspaceId) && Boolean(config.data?.scim_enabled), retry: false });
-  const policyRow = isRecord(policy.data) ? policy.data : {};
+  const policyEnvelope = isRecord(policy.data) ? policy.data : {};
+  const policyRow = isRecord(policyEnvelope.policy) ? policyEnvelope.policy : policyEnvelope;
   const form = useForm<PolicyForm>({ defaultValues: { domains: "", role: "viewer", groupClaim: "groups", enabled: false, requireMappedGroup: false } });
   const role = useWatch({ control: form.control, name: "role" });
   useEffect(() => {
@@ -76,7 +77,9 @@ export default function IdentityPage() {
     } catch (error) { toast.error(error instanceof Error ? error.message : "无法绑定企业身份"); }
   };
   const identityRows = records(identities.data, ["items", "identities"]);
-  const scimRow = isRecord(scim.data) ? scim.data : {};
+  const scimEnvelope = isRecord(scim.data) ? scim.data : {};
+  const scimPayload = isRecord(scimEnvelope.status) ? scimEnvelope.status : scimEnvelope;
+  const scimRow: JsonRecord = { ...scimPayload, status: Boolean(scimPayload.enabled) ? "active" : "disabled" };
   return (
     <AdminPageFrame>
       <PageHeader eyebrow="Identity & provisioning" title="企业身份" description="配置 OIDC 准入、账号绑定和 SCIM 配置状态。" actions={config.data?.oidc_enabled && workspaceId ? <Button onClick={() => void startLink()}><Link2 className="size-4" />绑定企业身份</Button> : undefined} />

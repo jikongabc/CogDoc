@@ -14,7 +14,7 @@ export function useCreateKnowledgeBase() {
   const queryClient = useQueryClient();
   const workspaceId = useSessionStore((state) => state.selectedWorkspaceId);
   return useMutation({
-    mutationFn: ({ kbId, accessPolicy }: { kbId: string; accessPolicy: "workspace" | "private" }) => api.createKnowledgeBase(kbId, accessPolicy),
+    mutationFn: ({ kbId, accessPolicy, roleIds }: { kbId: string; accessPolicy: "workspace" | "private"; roleIds: string[] }) => api.createKnowledgeBase(kbId, accessPolicy, roleIds),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.knowledgeBases(workspaceId) });
     },

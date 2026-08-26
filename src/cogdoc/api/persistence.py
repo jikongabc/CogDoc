@@ -399,6 +399,27 @@ class SqliteSessionStore:
 _NON_TERMINAL_STATUS = ("pending", "running")
 
 
+def _job_sort_timestamp(value: Any) -> float:
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        return timestamp / 1000 if timestamp >= 100_000_000_000 else timestamp
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return 0.0
+        try:
+            numeric = float(stripped)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(stripped.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return 0.0
+        return numeric / 1000 if numeric >= 100_000_000_000 else numeric
+    return 0.0
+
+
 # 入库任务记录的落盘版：整条 record 存 JSON，status 单列出来便于孤儿协调。
 class SqliteJobStore:
     # 入库任务记录的落盘版：整条 record 存 JSON，status 单列出来便于孤儿协调。
@@ -407,7 +428,45 @@ class SqliteJobStore:
         self._conn = _connect(db_path)
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS index_jobs ("
-            "job_id TEXT PRIMARY KEY, status TEXT, data TEXT)"
+            "job_id TEXT PRIMARY KEY, status TEXT, data TEXT, "
+            "kb_id TEXT, created_at TEXT, sort_at REAL)"
+        )
+        columns = {
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(index_jobs)").fetchall()
+        }
+        for name, data_type in (
+            ("kb_id", "TEXT"),
+            ("created_at", "TEXT"),
+            ("sort_at", "REAL"),
+        ):
+            if name not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE index_jobs ADD COLUMN {name} {data_type}"
+                )
+        stale_rows = self._conn.execute(
+            "SELECT job_id,data FROM index_jobs "
+            "WHERE kb_id IS NULL OR created_at IS NULL OR sort_at IS NULL"
+        ).fetchall()
+        for job_id, encoded in stale_rows:
+            try:
+                record = json.loads(encoded)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            created_at = record.get("created_at")
+            self._conn.execute(
+                "UPDATE index_jobs SET kb_id=?,created_at=?,sort_at=? WHERE job_id=?",
+                (
+                    record.get("kb_id"),
+                    created_at if created_at is not None else "",
+                    _job_sort_timestamp(created_at),
+                    job_id,
+                ),
+            )
+        self._conn.execute("DROP INDEX IF EXISTS idx_index_jobs_scope")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_index_jobs_scope "
+            "ON index_jobs(kb_id,sort_at DESC,job_id DESC)"
         )
         self._conn.commit()
         if reconcile_on_init:
@@ -419,11 +478,20 @@ class SqliteJobStore:
             # 执行内部回调。
             def _do():
                 self._conn.execute(
-                    "INSERT INTO index_jobs (job_id, status, data) VALUES (?, ?, ?)",
+                    "INSERT INTO index_jobs "
+                    "(job_id,status,data,kb_id,created_at,sort_at) "
+                    "VALUES (?,?,?,?,?,?)",
                     (
                         record["job_id"],
                         record["status"],
                         json.dumps(record, ensure_ascii=False),
+                        record["kb_id"],
+                        (
+                            record.get("created_at")
+                            if record.get("created_at") is not None
+                            else ""
+                        ),
+                        _job_sort_timestamp(record.get("created_at")),
                     ),
                 )
                 self._conn.commit()
@@ -453,6 +521,22 @@ class SqliteJobStore:
     def get(self, job_id: str) -> dict | None:
         with self._lock:
             return self._get_locked(job_id)
+
+    def list(self, kb_ids: set[str], *, limit: int = 200) -> list[dict]:
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        if not kb_ids:
+            return []
+        placeholders = ",".join("?" for _ in kb_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT data FROM index_jobs "
+                f"WHERE kb_id IN ({placeholders}) "
+                "ORDER BY sort_at DESC,job_id DESC LIMIT ?",
+                (*sorted(kb_ids), limit),
+            ).fetchall()
+        jobs = [json.loads(row[0]) for row in rows]
+        return jobs
 
     # 返回locked。
     def _get_locked(self, job_id: str) -> dict | None:
@@ -535,6 +619,24 @@ class InMemoryJobStore:
         with self._lock:
             record = self._jobs.get(job_id)
             return dict(record) if record else None
+
+    def list(self, kb_ids: set[str], *, limit: int = 200) -> list[dict]:
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        with self._lock:
+            jobs = [
+                dict(job)
+                for job in self._jobs.values()
+                if str(job.get("kb_id") or "") in kb_ids
+            ]
+        jobs.sort(
+            key=lambda job: (
+                _job_sort_timestamp(job.get("created_at")),
+                str(job.get("job_id") or ""),
+            ),
+            reverse=True,
+        )
+        return jobs[:limit]
 
     # 协调孤儿任务。
     def reconcile_orphans(self) -> None:

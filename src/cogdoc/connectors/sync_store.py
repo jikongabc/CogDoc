@@ -867,6 +867,27 @@ class ConnectorSyncStore:
             ).fetchall()
         return [self._row(row) for row in rows]
 
+    def list_workspace_jobs(
+        self,
+        tenant_id: str,
+        kb_ids: set[str],
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if not kb_ids:
+            return []
+        placeholders = ",".join("?" for _ in kb_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_JOB_SELECT} FROM connector_sync_jobs "
+                f"WHERE tenant_id=? AND kb_id IN ({placeholders}) "
+                "ORDER BY updated_at DESC,job_sequence DESC LIMIT ?",
+                (tenant_id, *sorted(kb_ids), limit),
+            ).fetchall()
+        return [self._row(row) for row in rows]
+
     def recoverable(
         self, *, limit: int = 1000, after_sequence: int = 0
     ) -> list[dict[str, Any]]:

@@ -271,6 +271,16 @@ class ResourceAccessStore:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS resource_access_document_role_grants (
+                tenant_id TEXT NOT NULL,
+                kb_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                role_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, kb_id, document_id, role_id)
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS resource_access_acl_epochs (
                 tenant_id TEXT NOT NULL,
                 kb_id TEXT NOT NULL,
@@ -318,6 +328,11 @@ class ResourceAccessStore:
             """
             CREATE INDEX IF NOT EXISTS idx_resource_access_grants_tenant_subject
             ON resource_access_subject_grants (tenant_id, subject_id, kb_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_resource_access_document_roles
+            ON resource_access_document_role_grants
+                (tenant_id, kb_id, role_id, document_id)
             """,
         )
         with self._lock:
@@ -984,6 +999,11 @@ class ResourceAccessStore:
                 "WHERE tenant_id=? AND kb_id=? AND document_key=?",
                 (tenant_id, kb_id, document_id),
             )
+            self._conn.execute(
+                "DELETE FROM resource_access_document_role_grants "
+                "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                (tenant_id, kb_id, document_id),
+            )
             self._bump_epoch_locked(tenant_id, kb_id)
             return True
 
@@ -1187,6 +1207,16 @@ class ResourceAccessStore:
                 changed = (
                     bool(
                         self._conn.execute(
+                            "DELETE FROM resource_access_document_role_grants "
+                            "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                            (tenant, knowledge_base, document),
+                        ).rowcount
+                    )
+                    or changed
+                )
+                changed = (
+                    bool(
+                        self._conn.execute(
                             "DELETE FROM resource_access_document_policies "
                             "WHERE tenant_id=? AND kb_id=? AND document_id=?",
                             (tenant, knowledge_base, document),
@@ -1223,6 +1253,174 @@ class ResourceAccessStore:
         return tuple(str(row[0]) for row in rows)
 
     # -- Subject grant CRUD -------------------------------------------------
+
+    def replace_document_roles(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        document_id: str,
+        role_ids: Iterable[str],
+    ) -> dict[str, Any]:
+        """Replace a document's role allowlist atomically.
+
+        An empty allowlist preserves the legacy ACL behavior. Once at least one
+        role is present, non-privileged readers must match one of those roles in
+        addition to satisfying the existing knowledge-base/document policy.
+        """
+
+        tenant = _identity(tenant_id, field="tenant_id")
+        knowledge_base = _identity(kb_id, field="kb_id")
+        document = _identity(document_id, field="document_id")
+        if isinstance(role_ids, (str, bytes)):
+            raise TypeError("role_ids must be an iterable of identifiers")
+        desired = tuple(
+            sorted(
+                {
+                    _identity(role_id, field="role_id")
+                    for role_id in role_ids
+                }
+            )
+        )
+        now = _now_iso()
+        with self._write_transaction():
+            self._reject_retiring_document_locked(tenant, knowledge_base, document)
+            exists = self._conn.execute(
+                "SELECT 1 FROM resource_access_document_policies "
+                "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                (tenant, knowledge_base, document),
+            ).fetchone()
+            if exists is None:
+                raise ResourceAccessNotFoundError(
+                    f"document policy does not exist: {document}"
+                )
+            current = {
+                str(row["role_id"])
+                for row in self._conn.execute(
+                    "SELECT role_id FROM resource_access_document_role_grants "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant, knowledge_base, document),
+                ).fetchall()
+            }
+            wanted = set(desired)
+            changed = current != wanted
+            if changed:
+                self._conn.execute(
+                    "DELETE FROM resource_access_document_role_grants "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant, knowledge_base, document),
+                )
+                for role_id in desired:
+                    self._conn.execute(
+                        "INSERT INTO resource_access_document_role_grants "
+                        "(tenant_id,kb_id,document_id,role_id,created_at) "
+                        "VALUES (?,?,?,?,?)",
+                        (tenant, knowledge_base, document, role_id, now),
+                    )
+                epoch = self._bump_epoch_locked(tenant, knowledge_base)
+            else:
+                epoch = self._epoch_locked(tenant, knowledge_base)
+        return {
+            "tenant_id": tenant,
+            "kb_id": knowledge_base,
+            "document_id": document,
+            "role_ids": list(desired),
+            "acl_epoch": epoch,
+        }
+
+    def replace_kb_roles(
+        self, tenant_id: str, kb_id: str, role_ids: Iterable[str]
+    ) -> dict[str, Any]:
+        tenant = _identity(tenant_id, field="tenant_id")
+        knowledge_base = _identity(kb_id, field="kb_id")
+        if isinstance(role_ids, (str, bytes)):
+            raise TypeError("role_ids must be an iterable of identifiers")
+        desired = tuple(
+            sorted({_identity(role_id, field="role_id") for role_id in role_ids})
+        )
+        now = _now_iso()
+        with self._write_transaction():
+            exists = self._conn.execute(
+                "SELECT 1 FROM resource_access_kb_policies "
+                "WHERE tenant_id=? AND kb_id=?",
+                (tenant, knowledge_base),
+            ).fetchone()
+            if exists is None:
+                raise ResourceAccessNotFoundError(
+                    f"knowledge-base policy does not exist: {tenant}/{knowledge_base}"
+                )
+            current = {
+                str(row["role_id"])
+                for row in self._conn.execute(
+                    "SELECT role_id FROM resource_access_document_role_grants "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant, knowledge_base, _KB_GRANT_DOCUMENT_KEY),
+                ).fetchall()
+            }
+            wanted = set(desired)
+            if current != wanted:
+                self._conn.execute(
+                    "DELETE FROM resource_access_document_role_grants "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant, knowledge_base, _KB_GRANT_DOCUMENT_KEY),
+                )
+                for role_id in desired:
+                    self._conn.execute(
+                        "INSERT INTO resource_access_document_role_grants "
+                        "(tenant_id,kb_id,document_id,role_id,created_at) "
+                        "VALUES (?,?,?,?,?)",
+                        (
+                            tenant,
+                            knowledge_base,
+                            _KB_GRANT_DOCUMENT_KEY,
+                            role_id,
+                            now,
+                        ),
+                    )
+                epoch = self._bump_epoch_locked(tenant, knowledge_base)
+            else:
+                epoch = self._epoch_locked(tenant, knowledge_base)
+        return {
+            "tenant_id": tenant,
+            "kb_id": knowledge_base,
+            "role_ids": list(desired),
+            "acl_epoch": epoch,
+        }
+
+    def list_kb_roles(self, tenant_id: str, kb_id: str) -> builtins.list[str]:
+        tenant = _identity(tenant_id, field="tenant_id")
+        knowledge_base = _identity(kb_id, field="kb_id")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role_id FROM resource_access_document_role_grants "
+                "WHERE tenant_id=? AND kb_id=? AND document_id=? ORDER BY role_id",
+                (tenant, knowledge_base, _KB_GRANT_DOCUMENT_KEY),
+            ).fetchall()
+        return [str(row["role_id"]) for row in rows]
+
+    def role_usage_count(self, tenant_id: str, role_id: str) -> int:
+        tenant = _identity(tenant_id, field="tenant_id")
+        role = _identity(role_id, field="role_id")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM resource_access_document_role_grants "
+                "WHERE tenant_id=? AND role_id=?",
+                (tenant, role),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def list_document_roles(
+        self, tenant_id: str, kb_id: str, document_id: str
+    ) -> builtins.list[str]:
+        tenant = _identity(tenant_id, field="tenant_id")
+        knowledge_base = _identity(kb_id, field="kb_id")
+        document = _identity(document_id, field="document_id")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role_id FROM resource_access_document_role_grants "
+                "WHERE tenant_id=? AND kb_id=? AND document_id=? ORDER BY role_id",
+                (tenant, knowledge_base, document),
+            ).fetchall()
+        return [str(row["role_id"]) for row in rows]
 
     def grant_subject(
         self,
@@ -1647,7 +1845,7 @@ class ResourceAccessStore:
             )
 
         try:
-            kb_row, documents, grants, retirements, epoch, membership_revoked = (
+            kb_row, documents, grants, role_grants, retirements, epoch, membership_revoked = (
                 self._authorization_snapshot(
                     requested_tenant,
                     kb_id,
@@ -1699,7 +1897,11 @@ class ResourceAccessStore:
             # Tenant owner/admin roles bypass resource visibility, never their own
             # role permissions (checked above), and never a missing policy unless
             # the constructor explicitly enabled legacy workspace behavior.
-            privileged_bypass = principal.role in {Role.OWNER, Role.ADMIN}
+            privileged_bypass = (
+                principal.role in {Role.OWNER, Role.ADMIN}
+                and principal.effective_access_role_id
+                in {Role.OWNER.value, Role.ADMIN.value}
+            )
             kb_owner_bypass = self._owner_matches(
                 principal, kb_owner, kb_row["owner_membership_id"] if kb_row else None
             )
@@ -1723,6 +1925,16 @@ class ResourceAccessStore:
             grants_by_document = {
                 str(row["document_key"]): _role(row["role"]) for row in grants
             }
+            roles_by_document: dict[str, set[str]] = {}
+            for row in role_grants:
+                roles_by_document.setdefault(str(row["document_id"]), set()).add(
+                    str(row["role_id"])
+                )
+            required_kb_roles = roles_by_document.get(_KB_GRANT_DOCUMENT_KEY)
+            kb_role_allows = (
+                not required_kb_roles
+                or principal.effective_access_role_id in required_kb_roles
+            )
             kb_grant_allows = self._grant_allows(
                 grants_by_document.get(_KB_GRANT_DOCUMENT_KEY),
                 principal,
@@ -1731,8 +1943,13 @@ class ResourceAccessStore:
             kb_allows = (
                 privileged_bypass
                 or kb_owner_bypass
-                or kb_policy is AccessPolicy.WORKSPACE
-                or kb_grant_allows
+                or (
+                    kb_role_allows
+                    and (
+                        kb_policy is AccessPolicy.WORKSPACE
+                        or kb_grant_allows
+                    )
+                )
             )
 
             if not documents:
@@ -1777,6 +1994,29 @@ class ResourceAccessStore:
                     document_allows = document_grant_allows
                 else:
                     document_allows = kb_allows or document_grant_allows
+                required_roles = roles_by_document.get(document_id)
+                if (
+                    document_allows
+                    and not kb_role_allows
+                    and not privileged_bypass
+                    and not kb_owner_bypass
+                    and not self._owner_matches(
+                        principal, document_owner, row["owner_membership_id"]
+                    )
+                ):
+                    document_allows = False
+                if (
+                    document_allows
+                    and required_roles
+                    and not privileged_bypass
+                    and not kb_owner_bypass
+                    and not self._owner_matches(
+                        principal, document_owner, row["owner_membership_id"]
+                    )
+                ):
+                    document_allows = (
+                        principal.effective_access_role_id in required_roles
+                    )
                 if document_allows:
                     allowed.append((document_id, source))
 
@@ -1847,6 +2087,7 @@ class ResourceAccessStore:
             changed = False
             for table in (
                 "resource_access_subject_grants",
+                "resource_access_document_role_grants",
                 "resource_access_document_policies",
                 "resource_access_retiring_documents",
                 "resource_access_kb_policies",
@@ -1871,8 +2112,10 @@ class ResourceAccessStore:
                 "WHERE tenant_id=? "
                 "UNION SELECT kb_id FROM resource_access_subject_grants "
                 "WHERE tenant_id=? UNION SELECT kb_id FROM "
+                "resource_access_document_role_grants WHERE tenant_id=? "
+                "UNION SELECT kb_id FROM "
                 "resource_access_retiring_documents WHERE tenant_id=? ORDER BY kb_id",
-                (tenant_id, tenant_id, tenant_id, tenant_id),
+                (tenant_id, tenant_id, tenant_id, tenant_id, tenant_id),
             ).fetchall()
             kb_ids = [str(row["kb_id"]) for row in rows]
             self._conn.execute(
@@ -1887,6 +2130,7 @@ class ResourceAccessStore:
                 return 0
             for table in (
                 "resource_access_subject_grants",
+                "resource_access_document_role_grants",
                 "resource_access_document_policies",
                 "resource_access_retiring_documents",
                 "resource_access_kb_policies",
@@ -1913,6 +2157,7 @@ class ResourceAccessStore:
                     "resource_access_kb_policies",
                     "resource_access_document_policies",
                     "resource_access_subject_grants",
+                    "resource_access_document_role_grants",
                     "resource_access_acl_epochs",
                     "resource_access_membership_tombstones",
                     "resource_access_subject_locks",
@@ -1955,6 +2200,7 @@ class ResourceAccessStore:
         sqlite3.Row | None,
         Sequence[sqlite3.Row],
         Sequence[sqlite3.Row],
+        Sequence[sqlite3.Row],
         frozenset[str],
         int,
         bool,
@@ -1981,6 +2227,12 @@ class ResourceAccessStore:
                     "WHERE tenant_id=? AND kb_id=? AND subject_id=?",
                     (tenant_id, kb_id, subject_id),
                 ).fetchall()
+                role_grants = self._conn.execute(
+                    "SELECT document_id,role_id FROM "
+                    "resource_access_document_role_grants "
+                    "WHERE tenant_id=? AND kb_id=?",
+                    (tenant_id, kb_id),
+                ).fetchall()
                 retirements = frozenset(
                     str(row["document_id"])
                     for row in self._conn.execute(
@@ -2004,7 +2256,15 @@ class ResourceAccessStore:
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
-        return kb_row, documents, grants, retirements, epoch, membership_revoked
+        return (
+            kb_row,
+            documents,
+            grants,
+            role_grants,
+            retirements,
+            epoch,
+            membership_revoked,
+        )
 
     @staticmethod
     def _owner_matches(

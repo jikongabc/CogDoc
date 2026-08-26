@@ -87,6 +87,7 @@ class Principal:
     key_fingerprint: str
     membership_id: str | None = None
     permission_scope: frozenset[Permission] | None = None
+    access_role_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -119,6 +120,12 @@ class Principal:
                     "permission_scope contains an unsupported permission"
                 ) from exc
             object.__setattr__(self, "permission_scope", scope)
+        if self.access_role_id is not None:
+            object.__setattr__(
+                self,
+                "access_role_id",
+                _identity_part(self.access_role_id, name="access_role_id"),
+            )
 
     @property
     def permissions(self) -> frozenset[Permission]:
@@ -126,6 +133,12 @@ class Principal:
         if self.permission_scope is None:
             return role_permissions
         return role_permissions & self.permission_scope
+
+    @property
+    def effective_access_role_id(self) -> str:
+        """Stable role identity used by document-level role allowlists."""
+
+        return self.access_role_id or self.role.value
 
     @property
     def rate_limit_identity(self) -> str:
@@ -170,6 +183,7 @@ class Principal:
         role: Role | str,
         session_id: str,
         membership_id: str | None = None,
+        access_role_id: str | None = None,
     ) -> "Principal":
         """Build a principal without embedding a bearer secret in memory or logs."""
 
@@ -180,6 +194,7 @@ class Principal:
             role=Role(role),
             key_fingerprint=f"session:{clean_session_id}",
             membership_id=membership_id,
+            access_role_id=access_role_id,
         )
 
 

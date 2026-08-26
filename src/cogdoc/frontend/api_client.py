@@ -694,6 +694,55 @@ class CogDocClient:
             headers=self._headers_for_workspace(workspace_id),
         )
 
+    def list_workspace_roles(self, workspace_id: str) -> httpx.Response:
+        return httpx.get(
+            self._url(f"/v1/workspaces/{workspace_id}/roles"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def create_workspace_role(
+        self,
+        workspace_id: str,
+        name: str,
+        base_role: str,
+        description: str = "",
+    ) -> httpx.Response:
+        return httpx.post(
+            self._url(f"/v1/workspaces/{workspace_id}/roles"),
+            json={
+                "name": name,
+                "base_role": base_role,
+                "description": description,
+            },
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def delete_workspace_role(
+        self, workspace_id: str, role_id: str
+    ) -> httpx.Response:
+        return httpx.delete(
+            self._url(f"/v1/workspaces/{workspace_id}/roles/{role_id}"),
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
+    def assign_workspace_member_role(
+        self,
+        workspace_id: str,
+        member_id: str,
+        role_id: str,
+        expected_revision: int | None = None,
+    ) -> httpx.Response:
+        payload = {"role_id": role_id, "expected_revision": expected_revision}
+        return httpx.patch(
+            self._url(f"/v1/workspaces/{workspace_id}/members/{member_id}"),
+            json={key: value for key, value in payload.items() if value is not None},
+            timeout=self.timeout,
+            headers=self._headers_for_workspace(workspace_id),
+        )
+
     def update_workspace_member(
         self,
         workspace_id: str,
@@ -900,11 +949,21 @@ class CogDocClient:
 
     # 创建知识库。
     def create_knowledge_base(
-        self, kb_id: str, *, access_policy: str = "workspace"
+        self,
+        kb_id: str,
+        *,
+        access_policy: str = "workspace",
+        role_ids: list[str] | None = None,
     ) -> httpx.Response:
+        payload: dict[str, Any] = {
+            "kb_id": kb_id,
+            "access_policy": access_policy,
+        }
+        if role_ids is not None:
+            payload["role_ids"] = role_ids
         return httpx.post(
             self._url("/v1/knowledge-bases"),
-            json={"kb_id": kb_id, "access_policy": access_policy},
+            json=payload,
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -952,7 +1011,12 @@ class CogDocClient:
 
     # 上传文档。
     def upload_document(
-        self, kb_id: str, filename: str, content: bytes
+        self,
+        kb_id: str,
+        filename: str,
+        content: bytes,
+        *,
+        allowed_role_ids: list[str] | None = None,
     ) -> httpx.Response:
         files = {
             "file": (
@@ -964,6 +1028,11 @@ class CogDocClient:
         return httpx.post(
             self._url(f"/v1/knowledge-bases/{kb_id}/documents"),
             files=files,
+            data=(
+                [("allowed_role_ids", role_id) for role_id in allowed_role_ids]
+                if allowed_role_ids is not None
+                else None
+            ),
             timeout=self.timeout,
             headers=self._headers,
         )

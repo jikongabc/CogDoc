@@ -24,6 +24,7 @@ from cogdoc.api.schemas import (
 from cogdoc.api.tenant_scope import (
     request_principal,
     retrieval_scope_for_request,
+    resolve_kb_scope,
     scope_for_storage_id,
 )
 from cogdoc.config.settings import get_settings
@@ -148,6 +149,7 @@ async def _authorized_review_page(
     status: str | None,
     limit: int,
     cursor: str | None,
+    kb_id: str | None = None,
 ) -> dict:
     authorized: list[dict] = []
     scan_cursor = cursor
@@ -158,6 +160,7 @@ async def _authorized_review_page(
             store.list_page,
             tenant_id,
             status=status,
+            kb_id=kb_id,
             limit=200,
             cursor=scan_cursor,
         )
@@ -180,7 +183,7 @@ async def _authorized_review_page(
 
 
 async def _authorized_review_summary_buckets(
-    request: Request, store, tenant_id: str
+    request: Request, store, tenant_id: str, *, kb_id: str | None = None
 ) -> list[dict]:
     buckets = await run_sync(
         request.app.state.offload_executor,
@@ -191,6 +194,7 @@ async def _authorized_review_summary_buckets(
     return [
         bucket
         for bucket in buckets
+        if (kb_id is None or str(bucket.get("kb_id") or "") == kb_id)
         if _review_summary_is_authorized(
             request, bucket, scope_cache=scope_cache
         )
@@ -358,6 +362,7 @@ async def export_claim_verification_reviews(
 async def list_claim_verification_reviews(
     request: Request,
     status: Literal["pending", "reviewed"] | None = Query(default=None),
+    kb_id: str | None = Query(default=None, max_length=200),
     limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = Query(default=None, max_length=256),
 ):
@@ -370,12 +375,24 @@ async def list_claim_verification_reviews(
             ).model_dump(),
         )
     principal = request_principal(request)
+    storage_kb_id: str | None = None
+    if kb_id is not None:
+        scope = resolve_kb_scope(request, kb_id, allow_legacy_default=True)
+        if scope is None:
+            return JSONResponse(
+                status_code=404,
+                content=build_error_response(
+                    ErrorCode.KB_NOT_FOUND, "知识库不存在"
+                ).model_dump(),
+            )
+        storage_kb_id = scope.storage_id
     try:
         page = await _authorized_review_page(
             request,
             store,
             principal.tenant_id,
             status=status,
+            kb_id=storage_kb_id,
             limit=limit,
             cursor=cursor,
         )
@@ -407,7 +424,10 @@ async def list_claim_verification_reviews(
     "/reviews/summary",
     response_model=ClaimVerificationReviewSummaryResponse,
 )
-async def summarize_claim_verification_reviews(request: Request):
+async def summarize_claim_verification_reviews(
+    request: Request,
+    kb_id: str | None = Query(default=None, max_length=200),
+):
     store = _review_store(request)
     if store is None:
         return JSONResponse(
@@ -417,9 +437,20 @@ async def summarize_claim_verification_reviews(request: Request):
             ).model_dump(),
         )
     principal = request_principal(request)
+    storage_kb_id: str | None = None
+    if kb_id is not None:
+        scope = resolve_kb_scope(request, kb_id, allow_legacy_default=True)
+        if scope is None:
+            return JSONResponse(
+                status_code=404,
+                content=build_error_response(
+                    ErrorCode.KB_NOT_FOUND, "知识库不存在"
+                ).model_dump(),
+            )
+        storage_kb_id = scope.storage_id
     try:
         buckets = await _authorized_review_summary_buckets(
-            request, store, principal.tenant_id
+            request, store, principal.tenant_id, kb_id=storage_kb_id
         )
     except Exception:
         return JSONResponse(

@@ -1,7 +1,7 @@
 "use client";
 
-import { apiFetch } from "@/lib/api/client";
-import type { AuthSession, Workspace } from "@/lib/api/types";
+import { apiDownload, apiFetch } from "@/lib/api/client";
+import type { AuthSession, AuthSessionListResponse, Workspace } from "@/lib/api/types";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonRecord | JsonValue[];
@@ -50,22 +50,33 @@ export function numberValue(value: JsonValue | undefined, fallback = 0) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function workspaceValue(value: unknown): Workspace {
+  const row = isRecord(value) && isRecord(value.workspace) ? value.workspace : value;
+  if (!isRecord(row)) throw new Error("工作区响应格式无效");
+  return row as unknown as Workspace;
+}
+
 export const controlApi = {
-  workspaces: () => apiFetch<Workspace[]>("/workspaces"),
-  createWorkspace: (name: string) => apiFetch<Workspace>("/workspaces", json("POST", { name })),
+  createWorkspace: async (name: string) => workspaceValue(await apiFetch<unknown>("/workspaces", json("POST", { name }))),
   updateWorkspace: (workspaceId: string, name: string, expectedRevision?: number) =>
-    apiFetch<Workspace>(
+    apiFetch<unknown>(
       `/workspaces/${pathPart(workspaceId)}`,
       json("PATCH", { name, expected_revision: expectedRevision }),
-    ),
+    ).then(workspaceValue),
   deleteWorkspace: (workspaceId: string) =>
     apiFetch<void>(`/workspaces/${pathPart(workspaceId)}`, { method: "DELETE" }),
   members: (workspaceId: string) =>
     apiFetch<unknown>(`/workspaces/${pathPart(workspaceId)}/members`),
-  updateMember: (workspaceId: string, memberId: string, role: string, expectedRevision?: number) =>
+  roles: (workspaceId: string) =>
+    apiFetch<unknown>(`/workspaces/${pathPart(workspaceId)}/roles`),
+  createRole: (workspaceId: string, payload: JsonRecord) =>
+    apiFetch<unknown>(`/workspaces/${pathPart(workspaceId)}/roles`, json("POST", payload)),
+  deleteRole: (workspaceId: string, roleId: string) =>
+    apiFetch<void>(`/workspaces/${pathPart(workspaceId)}/roles/${pathPart(roleId)}`, { method: "DELETE" }),
+  updateMember: (workspaceId: string, memberId: string, roleId: string, expectedRevision?: number) =>
     apiFetch<unknown>(
       `/workspaces/${pathPart(workspaceId)}/members/${pathPart(memberId)}`,
-      json("PATCH", { role, expected_revision: expectedRevision }),
+      json("PATCH", { role_id: roleId, expected_revision: expectedRevision }),
     ),
   removeMember: (workspaceId: string, memberId: string) =>
     apiFetch<void>(
@@ -87,7 +98,7 @@ export const controlApi = {
   acceptAuthenticatedInvite: (token: string) =>
     apiFetch<AuthSession>("/auth/invitations/accept", json("POST", { token })),
 
-  authSessions: () => apiFetch<unknown>("/auth/sessions"),
+  authSessions: () => apiFetch<AuthSessionListResponse>("/auth/sessions"),
   revokeAuthSession: (sessionId: string) =>
     apiFetch<void>(`/auth/sessions/${pathPart(sessionId)}`, { method: "DELETE" }),
   changePassword: (currentPassword: string, newPassword: string) =>
@@ -147,6 +158,8 @@ export const controlApi = {
     ),
   serviceAccountPolicy: (workspaceId: string) =>
     apiFetch<unknown>(`/workspaces/${pathPart(workspaceId)}/service-account-policy`),
+  updateServiceAccountPolicy: (workspaceId: string, payload: JsonRecord) =>
+    apiFetch<unknown>(`/workspaces/${pathPart(workspaceId)}/service-account-policy`, json("PUT", payload)),
   serviceTokens: (workspaceId: string, accountId: string) =>
     apiFetch<unknown>(
       `/workspaces/${pathPart(workspaceId)}/service-accounts/${pathPart(accountId)}/tokens`,
@@ -180,7 +193,7 @@ export const controlApi = {
 
   researchJobs: (kbId: string, status?: string) =>
     apiFetch<unknown>(`/research-jobs${query({ kb_id: kbId, status, limit: 100 })}`),
-  researchSummaries: (kbId: string, status?: string) =>
+  researchSummaries: (kbId?: string, status?: string) =>
     apiFetch<unknown>(
       `/research-jobs/summaries${query({ kb_id: kbId, status, limit: 100 })}`,
     ),
@@ -201,8 +214,8 @@ export const controlApi = {
       `/research-jobs/${pathPart(jobId)}/plan`,
       json("PUT", { expected_revision: expectedRevision, sections }),
     ),
-  researchReport: (jobId: string) =>
-    apiFetch<unknown>(`/research-jobs/${pathPart(jobId)}/report`),
+  researchReport: async (jobId: string) =>
+    (await apiDownload(`/research-jobs/${pathPart(jobId)}/report`)).text(),
   researchProvenance: (jobId: string) =>
     apiFetch<unknown>(`/research-jobs/${pathPart(jobId)}/provenance`),
   reviewResearch: (jobId: string, expectedRevision: number, decisions: JsonValue[]) =>
@@ -255,6 +268,8 @@ export const controlApi = {
     ),
   reviewQueue: (kbId: string) =>
     apiFetch<unknown>(`/review-queue${query({ kb_id: kbId })}`),
+  reviewQueueExport: (kbId: string) =>
+    apiFetch<unknown>(`/review-queue/export${query({ kb_id: kbId, limit: 500 })}`),
   feedbackLoopMetrics: (kbId: string) =>
     apiFetch<unknown>(`/feedback-loop-metrics${query({ kb_id: kbId })}`),
 
@@ -271,10 +286,11 @@ export const controlApi = {
       `/retrieval-eval-drafts/${pathPart(draftId)}/review`,
       json("POST", payload),
     ),
-  claimReviewSummary: () => apiFetch<unknown>("/claim-verification/reviews/summary"),
-  claimReviews: (status?: string) =>
+  claimReviewSummary: (kbId?: string) =>
+    apiFetch<unknown>(`/claim-verification/reviews/summary${query({ kb_id: kbId })}`),
+  claimReviews: (status?: string, kbId?: string) =>
     apiFetch<unknown>(
-      `/claim-verification/reviews${query({ status, limit: 100 })}`,
+      `/claim-verification/reviews${query({ status, kb_id: kbId, limit: 100 })}`,
     ),
   claimReview: (reviewId: string) =>
     apiFetch<unknown>(`/claim-verification/reviews/${pathPart(reviewId)}`),
@@ -308,6 +324,7 @@ export const controlApi = {
     ),
   syncJobs: (kbId: string) =>
     apiFetch<unknown>(`/knowledge-bases/${pathPart(kbId)}/sync-jobs`),
+  workspaceSyncJobs: () => apiFetch<unknown>("/sync-jobs?limit=200"),
   replaySyncJob: (kbId: string, jobId: string) =>
     apiFetch<unknown>(
       `/knowledge-bases/${pathPart(kbId)}/sync-jobs/${pathPart(jobId)}/replay`,
@@ -373,10 +390,10 @@ export const controlApi = {
 
   kbAccess: (kbId: string) =>
     apiFetch<unknown>(`/knowledge-bases/${pathPart(kbId)}/access`),
-  updateKbAccess: (kbId: string, policy: string) =>
+  updateKbAccess: (kbId: string, policy: string, roleIds?: string[]) =>
     apiFetch<unknown>(
       `/knowledge-bases/${pathPart(kbId)}/access`,
-      json("PATCH", { schema_version: "v1", policy }),
+      json("PATCH", { schema_version: "v1", policy, role_ids: roleIds }),
     ),
   kbGrants: (kbId: string) =>
     apiFetch<unknown>(`/knowledge-bases/${pathPart(kbId)}/access/grants`),
@@ -394,10 +411,10 @@ export const controlApi = {
     apiFetch<unknown>(
       `/knowledge-bases/${pathPart(kbId)}/documents/${pathPart(documentId)}/access`,
     ),
-  updateDocumentAccess: (kbId: string, documentId: string, policy: string, source?: string) =>
+  updateDocumentAccess: (kbId: string, documentId: string, policy: string, source?: string, roleIds?: string[]) =>
     apiFetch<unknown>(
       `/knowledge-bases/${pathPart(kbId)}/documents/${pathPart(documentId)}/access`,
-      json("PATCH", { schema_version: "v1", policy, source }),
+      json("PATCH", { schema_version: "v1", policy, source, role_ids: roleIds }),
     ),
   documentGrants: (kbId: string, documentId: string) =>
     apiFetch<unknown>(
@@ -427,6 +444,8 @@ export const controlApi = {
         requirements: [],
       }),
     ),
+  saveRetrievalDiagnosticLabel: (payload: JsonRecord) =>
+    apiFetch<unknown>("/retrieval-diagnostics/labels", json("POST", payload)),
   scanIndexMigrations: () => apiFetch<unknown>("/index-migrations/scan"),
   startIndexMigration: (kbIds: string[]) =>
     apiFetch<unknown>("/index-migrations", json("POST", { kb_ids: kbIds })),
@@ -437,6 +456,7 @@ export const controlApi = {
   finalizeIndexMigration: (runId: string) =>
     apiFetch<unknown>(`/index-migrations/${pathPart(runId)}/finalize`, { method: "POST" }),
   haJobs: () => apiFetch<unknown>("/ha/jobs?limit=200"),
+  indexJobs: () => apiFetch<unknown>("/index-jobs?limit=200"),
   cancelHaJob: (jobId: string) =>
     apiFetch<unknown>(`/ha/jobs/${pathPart(jobId)}/cancel`, { method: "POST" }),
   replayHaJob: (jobId: string, replayKey: string) =>

@@ -8,6 +8,7 @@ import type { ChatResponse, CitationLedgerEntry } from "@/lib/api/types";
 import { Citation } from "./citation";
 import { sourceLocation } from "./source-preview";
 import { Badge } from "@/components/ui/badge";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 
 function codePointSlice(value: string, start: number, end?: number) {
@@ -58,12 +59,12 @@ export function Message({ message, footer, onEvidenceVisible }: { message: Messa
     return () => observer.disconnect();
   }, [message.evidenceStatus, message.id, onEvidenceVisible]);
   return (
-    <article ref={articleRef} className={cn("chat-message border-b border-border", message.role === "user" ? "bg-surface-subtle/55" : "bg-surface")}>
-      <div className="mx-auto flex max-w-[800px] gap-3 px-4 py-5 md:px-6">
-        <span className={cn("mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-[4px]", message.role === "assistant" ? "bg-foreground text-white" : "border border-border bg-surface text-muted-foreground")}>{message.role === "assistant" ? <Bot className="size-3.5" /> : <User className="size-3.5" />}</span>
-        <div className="min-w-0 flex-1"><div className="mb-1.5 flex items-center gap-2 text-xs font-medium"><span>{message.role === "assistant" ? "CogDoc" : "你"}</span>{response?.is_valid && !message.evidenceStatus ? <Badge variant="success">已校验</Badge> : null}{response && !response.is_valid && !message.evidenceStatus ? <Badge variant="warning">需要审核</Badge> : null}{message.evidenceStatus === "loading" ? <Badge>正在恢复证据</Badge> : null}{message.evidenceStatus === "unavailable" ? <Badge variant="warning">证据暂不可用</Badge> : null}{message.incomplete ? <Badge variant="warning">未完成</Badge> : null}</div>
-          <div className="answer-markdown max-w-none break-words text-[15px] leading-[25px] text-foreground">
-            <ReactMarkdown
+    <article ref={articleRef} className="chat-message bg-surface">
+      <div className={cn("mx-auto flex max-w-[800px] gap-3 px-4 py-5 md:px-6", message.role === "user" && "justify-end py-4")}>
+        <span className={cn("mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-[8px] bg-foreground text-white", message.role === "user" && "hidden")}>{message.role === "assistant" ? <Bot className="size-3.5" /> : <User className="size-3.5" />}</span>
+        <div className={cn("min-w-0 flex-1", message.role === "user" && "max-w-[82%] flex-none rounded-[18px] bg-surface-subtle px-4 py-2.5")}><div className={cn("mb-1.5 flex items-center gap-2 text-xs font-medium", message.role === "user" && "sr-only")}><span>{message.role === "assistant" ? "CogDoc" : "你"}</span>{response?.is_valid && !message.evidenceStatus ? <Badge variant="success">已校验</Badge> : null}{response && !response.is_valid && !message.evidenceStatus ? <Badge variant="warning">需要审核</Badge> : null}{message.evidenceStatus === "loading" ? <Badge>正在恢复证据</Badge> : null}{message.evidenceStatus === "unavailable" ? <Badge variant="warning">证据暂不可用</Badge> : null}{message.incomplete ? <Badge variant="warning">未完成</Badge> : null}</div>
+          <div className={cn("answer-markdown max-w-none break-words text-[15px] leading-[26px] text-foreground", message.role === "user" && "text-[14px] leading-6")}>
+            {!rendered && message.streaming ? <div role="status" aria-live="polite" className="flex min-h-7 items-center gap-2.5 text-[13px] text-muted-foreground"><Spinner size="sm" className="text-primary" /><span>正在检索并校验证据</span></div> : <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               components={{
                 a: ({ href, children }) => {
@@ -76,7 +77,7 @@ export function Message({ message, footer, onEvidenceVisible }: { message: Messa
                   return <a href={href} target="_blank" rel="noreferrer">{children}</a>;
                 },
               }}
-            >{rendered || (message.streaming ? "正在整理证据…" : "（无内容）")}</ReactMarkdown>
+            >{rendered || "（无内容）"}</ReactMarkdown>}
           </div>
           {message.streaming ? <span className="mt-1 inline-block h-4 w-0.5 animate-pulse bg-primary" aria-hidden="true" /> : null}
           {response && !response.is_valid && !message.evidenceStatus ? <p className="mt-2 border-l-2 border-warning bg-warning-subtle px-3 py-2 text-xs text-warning">回答未通过引用或声明校验，请在使用前核对右侧证据和原始来源。</p> : null}

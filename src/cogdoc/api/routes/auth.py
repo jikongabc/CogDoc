@@ -44,6 +44,10 @@ from cogdoc.api.schemas import (
     WorkspaceMemberListResponse,
     WorkspaceMemberResponse,
     WorkspaceMemberUpdateRequest,
+    WorkspaceRoleCreateRequest,
+    WorkspaceRoleDefinition,
+    WorkspaceRoleListResponse,
+    WorkspaceRoleResponse,
     WorkspaceResponse,
     WorkspaceSessionPolicy,
     WorkspaceSessionPolicyResponse,
@@ -721,7 +725,35 @@ def _member_model(value: Any) -> WorkspaceMember:
             default=_text(user, "display_name", "name", default=email),
         ),
         role=role,
+        role_id=_text(payload, "role_id", default=role),
+        base_role=_text(payload, "base_role", default=role),
+        role_name=_text(payload, "role_name", default=role),
+        custom_role_id=_text(payload, "custom_role_id") or None,
+        revision=_integer(payload, "revision"),
         joined_at=_text(payload, "joined_at", "created_at"),
+        updated_at=_text(payload, "updated_at"),
+    )
+
+
+def _role_model(value: Any) -> WorkspaceRoleDefinition:
+    payload = _mapping(value)
+    role_id = _text(payload, "role_id", "id")
+    workspace_id = _text(payload, "workspace_id", "tenant_id")
+    name = _text(payload, "name")
+    base_role = _text(payload, "base_role", "role")
+    if not role_id or not workspace_id or not name or not base_role:
+        raise _RouteError(503, ErrorCode.INTERNAL_ERROR, "身份服务返回了无效结果")
+    return WorkspaceRoleDefinition(
+        role_id=role_id,
+        workspace_id=workspace_id,
+        name=name,
+        description=_text(payload, "description"),
+        base_role=base_role,
+        system=bool(payload.get("system", False)),
+        member_count=_integer(payload, "member_count"),
+        revision=_integer(payload, "revision"),
+        created_by=_text(payload, "created_by"),
+        created_at=_text(payload, "created_at"),
         updated_at=_text(payload, "updated_at"),
     )
 
@@ -1331,6 +1363,113 @@ async def switch_workspace(workspace_id: str, request: Request):
 
 
 @router.get(
+    "/workspaces/{workspace_id}/roles",
+    response_model=WorkspaceRoleListResponse,
+    responses=_ERROR_RESPONSES,
+)
+@_guarded
+async def list_workspace_roles(workspace_id: str, request: Request):
+    context = await _authorize_workspace(request, workspace_id)
+    try:
+        result = await _store_call(
+            request,
+            "list_workspace_roles",
+            {"workspace_id": workspace_id, "actor_user_id": context.user_id},
+            {"workspace_id": workspace_id},
+        )
+    except Exception as exc:
+        _raise_workspace_missing(exc)
+    return WorkspaceRoleListResponse(
+        workspace_id=workspace_id,
+        roles=[_role_model(row) for row in _rows(result, "roles", "items")],
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/roles",
+    response_model=WorkspaceRoleResponse,
+    status_code=201,
+    responses=_ERROR_RESPONSES,
+)
+@_guarded
+async def create_workspace_role(
+    workspace_id: str, payload: WorkspaceRoleCreateRequest, request: Request
+):
+    context = await _authorize_workspace(
+        request, workspace_id, Permission.MANAGE_ACCESS
+    )
+    try:
+        result = await _store_call(
+            request,
+            "create_workspace_role",
+            {
+                "workspace_id": workspace_id,
+                "name": payload.name,
+                "description": payload.description,
+                "base_role": payload.base_role,
+                "actor_user_id": context.user_id,
+            },
+        )
+    except _RouteError:
+        raise
+    except Exception as exc:
+        _raise_mutation_failure(
+            exc,
+            missing_code=ErrorCode.WORKSPACE_NOT_FOUND,
+            missing_message="工作区不存在",
+        )
+    return WorkspaceRoleResponse(role=_role_model(result))
+
+
+@router.delete(
+    "/workspaces/{workspace_id}/roles/{role_id}",
+    status_code=204,
+    responses=_ERROR_RESPONSES,
+)
+@_guarded
+async def delete_workspace_role(
+    workspace_id: str, role_id: str, request: Request
+):
+    context = await _authorize_workspace(
+        request, workspace_id, Permission.MANAGE_ACCESS
+    )
+    access_store = getattr(request.app.state, "resource_access_store", None)
+    if access_store is not None:
+        try:
+            if access_store.role_usage_count(workspace_id, role_id):
+                raise _RouteError(
+                    409,
+                    ErrorCode.AUTH_CONFLICT,
+                    "该角色仍被知识库或文档使用，无法删除",
+                )
+        except _RouteError:
+            raise
+        except Exception as exc:
+            raise _RouteError(
+                503, ErrorCode.INTERNAL_ERROR, "资源访问服务暂不可用"
+            ) from exc
+    try:
+        await _store_call(
+            request,
+            "delete_workspace_role",
+            {
+                "workspace_id": workspace_id,
+                "role_id": role_id,
+                "actor_user_id": context.user_id,
+            },
+        )
+    except _RouteError:
+        raise
+    except Exception as exc:
+        _raise_mutation_failure(
+            exc,
+            missing_code=ErrorCode.BAD_REQUEST,
+            missing_message="角色不存在",
+        )
+    return Response(status_code=204)
+
+
+@router.get(
     "/workspaces/{workspace_id}/members",
     response_model=WorkspaceMemberListResponse,
     responses=_ERROR_RESPONSES,
@@ -1380,6 +1519,7 @@ async def update_member(
                 "workspace_id": workspace_id,
                 "member_user_id": member_id,
                 "role": payload.role,
+                "role_id": payload.role_id,
                 "actor_user_id": context.user_id,
                 "expected_revision": payload.expected_revision,
             },
@@ -1387,6 +1527,7 @@ async def update_member(
                 "workspace_id": workspace_id,
                 "member_id": member_id,
                 "role": payload.role,
+                "role_id": payload.role_id,
                 "expected_revision": payload.expected_revision,
                 "actor_user_id": context.user_id,
             },
@@ -1394,6 +1535,7 @@ async def update_member(
                 "workspace_id": workspace_id,
                 "user_id": member_id,
                 "role": payload.role,
+                "role_id": payload.role_id,
                 "expected_revision": payload.expected_revision,
                 "actor_user_id": context.user_id,
             },

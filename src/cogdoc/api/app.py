@@ -72,6 +72,7 @@ from cogdoc.api.routes import (
     retrieval_diagnostics_router,
     research_router,
     source_operations_router,
+    tasks_router,
     traces_router,
 )
 from cogdoc.api.schemas import ErrorCode, build_error_response
@@ -1083,8 +1084,11 @@ def create_app(
         }
         ha_control = len(parts) >= 2 and parts[:2] == ["v1", "ha"]
         index_job = (
-            method == "GET" and len(parts) == 3 and parts[:2] == ["v1", "index-jobs"]
+            method == "GET"
+            and len(parts) in {2, 3}
+            and parts[:2] == ["v1", "index-jobs"]
         )
+        global_sync_jobs = method == "GET" and parts == ["v1", "sync-jobs"]
         kb_collection = parts == ["v1", "knowledge-bases"] and method in {
             "GET",
             "POST",
@@ -1153,6 +1157,7 @@ def create_app(
             health
             or ha_control
             or index_job
+            or (app.state.ha_connector_multiwriter_mode and global_sync_jobs)
             or kb_collection
             or kb_read
             or document_surface
@@ -3280,6 +3285,7 @@ def create_app(
     app.include_router(retrieval_diagnostics_router)
     app.include_router(research_router)
     app.include_router(source_operations_router)
+    app.include_router(tasks_router)
     app.include_router(traces_router)
     return app
 

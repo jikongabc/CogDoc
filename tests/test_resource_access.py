@@ -24,6 +24,7 @@ def _principal(
     *,
     membership_id: str | None = None,
     session: bool = False,
+    access_role_id: str | None = None,
 ) -> Principal:
     return Principal(
         tenant_id=tenant_id,
@@ -35,6 +36,7 @@ def _principal(
             else f"fingerprint-{tenant_id}-{subject_id}"
         ),
         membership_id=membership_id,
+        access_role_id=access_role_id,
     )
 
 
@@ -103,6 +105,40 @@ def test_private_kb_can_expose_only_explicit_workspace_or_granted_documents(tmp_
 
     store.grant_subject("tenant-a", "kb", "alice", Role.VIEWER, document_id="private")
     assert store.authorize_query(_principal(), "kb").mode is AccessMode.ALL
+
+
+def test_kb_and_document_role_allowlists_are_enforced_as_an_intersection(tmp_path):
+    store = _store(tmp_path)
+    store.set_kb_policy("tenant-a", "kb", "owner", "workspace")
+    store.set_document_policy("tenant-a", "kb", "finance", "finance.pdf")
+    store.set_document_policy("tenant-a", "kb", "general", "general.pdf")
+    store.replace_kb_roles("tenant-a", "kb", ["rol_employee", "rol_finance"])
+    store.replace_document_roles("tenant-a", "kb", "finance", ["rol_finance"])
+
+    employee = store.authorize_query(
+        _principal(access_role_id="rol_employee"), "kb"
+    )
+    assert employee.mode is AccessMode.SUBSET
+    assert employee.allowed_sources == ("general.pdf",)
+
+    finance = store.authorize_query(
+        _principal(subject_id="bob", access_role_id="rol_finance"), "kb"
+    )
+    assert finance.mode is AccessMode.ALL
+
+    outsider = store.authorize_query(
+        _principal(subject_id="mallory", access_role_id="viewer"), "kb"
+    )
+    assert outsider.mode is AccessMode.DENY
+
+    assert store.list_kb_roles("tenant-a", "kb") == [
+        "rol_employee",
+        "rol_finance",
+    ]
+    assert store.list_document_roles("tenant-a", "kb", "finance") == [
+        "rol_finance"
+    ]
+    assert store.role_usage_count("tenant-a", "rol_finance") == 2
 
 
 def test_grant_role_is_a_cap_intersected_with_principal_role(tmp_path):

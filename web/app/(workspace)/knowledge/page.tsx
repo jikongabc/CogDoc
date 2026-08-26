@@ -6,7 +6,7 @@ import type { KnowledgeBase } from "@/lib/api/types";
 import { useKnowledgeBases } from "@/features/knowledge/queries";
 import { CreateKnowledgeBaseDialog } from "@/features/knowledge/create-kb-dialog";
 import { DataGrid, type DataGridColumn } from "@/components/data-display/data-grid";
-import { Skeleton } from "@/components/ui/skeleton";
+import { LoadingState } from "@/components/ui/spinner";
 import { formatDate } from "@/lib/utils";
 
 export default function KnowledgePage() {
@@ -20,7 +20,7 @@ export default function KnowledgePage() {
   return (
     <div className="mx-auto w-full max-w-[1180px] p-4 md:p-6">
       <div className="mb-6 flex items-start justify-between gap-4"><div><h2 className="text-2xl font-semibold tracking-[-0.02em]">知识</h2><p className="mt-1 text-sm text-muted-foreground">管理可检索的文档、来源和访问边界。</p></div><CreateKnowledgeBaseDialog /></div>
-      {query.isPending ? <div className="space-y-2 rounded-[5px] border border-border bg-surface p-3">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-11 w-full" />)}</div> : null}
+      {query.isPending ? <LoadingState label="正在读取知识库" /> : null}
       {query.isError ? <div className="border-l-2 border-error bg-error-subtle px-4 py-3 text-sm text-error"><p className="font-medium">无法读取知识库</p><p className="mt-1 text-xs">{query.error.message}</p></div> : null}
       {query.data ? <DataGrid columns={columns} rows={query.data} rowKey={(row) => row.kb_id} empty={<div className="mx-auto max-w-sm"><span className="mx-auto mb-3 flex size-9 items-center justify-center rounded-[5px] border border-border bg-surface-subtle text-muted-foreground"><LockKeyhole className="size-[18px]" /></span><p className="font-medium text-foreground">建立第一个知识库</p><p className="mt-1 text-xs text-muted-foreground">创建知识库后即可上传来源并开始带证据的对话。</p><div className="mt-4 flex justify-center"><CreateKnowledgeBaseDialog /></div></div>} /> : null}
     </div>

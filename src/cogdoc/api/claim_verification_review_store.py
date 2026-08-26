@@ -374,6 +374,7 @@ class ClaimVerificationReviewStore:
         tenant_id: str,
         *,
         status: str | None = None,
+        kb_id: str | None = None,
         limit: int = 50,
         cursor: str | None = None,
     ) -> dict[str, Any]:
@@ -391,6 +392,7 @@ class ClaimVerificationReviewStore:
                 if row["tenant_id"] == tenant_id
                 and float(row["observed_at"]) >= cutoff
                 and (status is None or row["status"] == status)
+                and (kb_id is None or row["kb_id"] == kb_id)
                 and (
                     decoded is None
                     or (float(row["observed_at"]), str(row["review_id"])) < decoded
@@ -643,6 +645,7 @@ class SqliteClaimVerificationReviewStore:
         tenant_id: str,
         *,
         status: str | None = None,
+        kb_id: str | None = None,
         limit: int = 50,
         cursor: str | None = None,
     ) -> dict[str, Any]:
@@ -656,6 +659,9 @@ class SqliteClaimVerificationReviewStore:
         if status is not None:
             clauses.append("status=?")
             params.append(status)
+        if kb_id is not None:
+            clauses.append("kb_id=?")
+            params.append(kb_id)
         if decoded is not None:
             clauses.append("(observed_at<? OR (observed_at=? AND review_id<?))")
             params.extend([decoded[0], decoded[0], decoded[1]])

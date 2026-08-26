@@ -27,6 +27,7 @@ async function installLocalApi(page: Page) {
         owner_id: "local",
       }]);
     }
+    if (path === "/knowledge-bases/company-handbook/documents") return json(route, []);
     if (path === "/sessions") return json(route, { schema_version: "v1", doc_id: "company-handbook", sessions: [{ session_id: "last-session", title: "上次对话", message_count: 4 }] });
     if (path.endsWith("/pending") || path.includes("pending-knowledge")) return json(route, { pending_count: 0, items: [] });
     return json(route, { items: [], jobs: [], summaries: [], events: [] });
@@ -41,9 +42,19 @@ test("local deployment has an explicit login gate and complete product navigatio
   await page.getByRole("button", { name: /进入本地工作区/ }).click();
   await expect(page).toHaveURL(/\/knowledge\/company-handbook\/chat\/last-session$/);
   await expect(page.getByLabel("选择知识库")).toHaveValue("company-handbook");
-  await expect(page.getByRole("navigation", { name: "知识库主视图" })).toContainText("对话研究来源派生知识证据审核调试");
+  const workbench = page.getByRole("navigation", { name: "知识库主视图" });
+  await expect(workbench).toContainText("对话研究文档派生知识调试");
+  await expect(workbench).not.toContainText("证据审核");
   await expect(page.getByRole("button", { name: "新对话" }).first()).toBeVisible();
   await expect(page.getByText("文档", { exact: true }).first()).toBeVisible();
+  await workbench.getByRole("link", { name: "文档", exact: true }).click();
+  await expect(page).toHaveURL(/\/knowledge\/company-handbook\?kb=company-handbook$/);
+  await page.getByRole("link", { name: "接入", exact: true }).click();
+  await expect(page).toHaveURL(/\/integrations\?kb=company-handbook$/);
+  await expect(page.locator("#main-content").getByRole("heading", { name: "数据接入", exact: true })).toBeVisible();
+  await expect(page.getByLabel("目标知识库")).toHaveValue("company-handbook");
+  await page.goto("/knowledge/company-handbook/sources");
+  await expect(page).toHaveURL(/\/integrations\?kb=company-handbook$/);
   await page.getByRole("link", { name: "任务", exact: true }).click();
   await expect(page.getByRole("heading", { name: "任务", exact: true }).first()).toBeVisible();
 });

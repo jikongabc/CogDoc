@@ -761,6 +761,7 @@ class JobStatus(str, Enum):
 class KnowledgeBaseCreate(ApiModel):
     kb_id: str = Field(min_length=1, max_length=56)
     access_policy: Literal["workspace", "private"] = "workspace"
+    role_ids: list[str] | None = Field(default=None, max_length=100)
 
     # 校验结果。
     @field_validator("kb_id")
@@ -784,6 +785,18 @@ class KnowledgeBase(ApiModel):
     document_count: int = 0
     tenant_id: str = "default"
     owner_id: str = "default"
+    embedding_profile_id: Literal["local", "cloud"] = "local"
+    embedding_model: str = "BAAI/bge-m3"
+
+
+class EmbeddingProfile(ApiModel):
+    profile_id: Literal["local", "cloud"]
+    kind: Literal["local", "cloud"]
+    label: str
+    model: str | None = None
+    dimensions: int = Field(ge=1)
+    available: bool
+    description: str
 
 
 class ResearchJobCreate(ApiModel):
@@ -1415,6 +1428,7 @@ class Document(ApiModel):
     media_type: str = "application/pdf"
     kind: str = "file"
     origin_uri: str | None = None
+    role_ids: list[str] = Field(default_factory=list)
 
 
 # 知识库来源文件列表响应。
@@ -1473,6 +1487,11 @@ class IndexJob(ApiModel):
     ocr_summary: OcrSummary | None = None
     error_code: ErrorCode | None = None
     message: str | None = None
+
+
+class IndexJobList(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    jobs: list[IndexJob] = Field(default_factory=list, max_length=500)
 
 
 # 反馈类型：赞 / 踩 / 纠错。
@@ -2062,13 +2081,56 @@ class WorkspaceUpdateRequest(WorkspaceCreateRequest):
 class WorkspaceMemberUpdateRequest(ApiModel):
     # Ownership transfer is intentionally not smuggled through a role edit.  A
     # dedicated transfer operation can later preserve the single-owner invariant.
-    role: AssignableWorkspaceRole
+    role: AssignableWorkspaceRole | None = None
+    role_id: str | None = Field(default=None, strict=True, min_length=1, max_length=160)
     expected_revision: int | None = Field(default=None, strict=True, ge=0)
+
+    @model_validator(mode="after")
+    def _one_role_selector(self):
+        if (self.role is None) == (self.role_id is None):
+            raise ValueError("provide exactly one of role or role_id")
+        return self
+
+
+class WorkspaceRoleCreateRequest(ApiModel):
+    name: str = Field(strict=True, min_length=1, max_length=80)
+    description: str = Field(default="", strict=True, max_length=300)
+    base_role: AssignableWorkspaceRole = "viewer"
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        return _normalized_auth_text(value, field="name", maximum=80)
+
+
+class WorkspaceRoleDefinition(ApiModel):
+    role_id: str
+    workspace_id: str
+    name: str
+    description: str = ""
+    base_role: WorkspaceRole
+    system: bool
+    member_count: int = Field(default=0, ge=0)
+    revision: int = Field(default=0, ge=0)
+    created_by: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class WorkspaceRoleResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    role: WorkspaceRoleDefinition
+
+
+class WorkspaceRoleListResponse(ApiModel):
+    schema_version: Literal["v1"] = API_SCHEMA_VERSION
+    workspace_id: str
+    roles: list[WorkspaceRoleDefinition] = Field(default_factory=list)
 
 
 class WorkspaceInviteCreateRequest(ApiModel):
     email: str = Field(strict=True, min_length=3, max_length=320)
-    role: AssignableWorkspaceRole
+    role: AssignableWorkspaceRole = "viewer"
 
     @field_validator("email")
     @classmethod
@@ -2534,6 +2596,11 @@ class WorkspaceMember(ApiModel):
     email: str
     display_name: str
     role: WorkspaceRole
+    role_id: str = "viewer"
+    base_role: WorkspaceRole = "viewer"
+    role_name: str = "Member"
+    custom_role_id: str | None = None
+    revision: int = Field(default=0, ge=0)
     joined_at: str = ""
     updated_at: str = ""
 

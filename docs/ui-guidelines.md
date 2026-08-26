@@ -2,7 +2,7 @@
 
 Status: normative
 Scope: copy, composition, interaction, and review
-Last updated: 2026-08-24
+Last updated: 2026-08-25
 
 ## Experience thesis
 
@@ -12,7 +12,7 @@ information hierarchy of Notion, the density and directness of Linear, and the
 settings discipline of Vercel without copying any product's visual skin.
 
 The defining interaction is a calm split workspace: work remains in the center;
-sources and evidence open in a contextual rail. Users retain place and context.
+citations and evidence open in a contextual rail. Users retain place and context.
 
 ## Application frame
 
@@ -20,20 +20,20 @@ Desktop:
 
 ```text
 ┌──────────────────────┬──────────────────────────────────────────────┐
-│ Account / workspace  │ Conversation Research Sources Knowledge ... │
+│ Account / workspace  │ Conversation Research Documents Knowledge . │
 │ Knowledge base       │──────────────────────────────────────────────│
 │ + New conversation   │                                              │
 │ Conversation history │ Main working surface             Evidence   │
 │──────────────────────│                                  inspector  │
 │ Upload document      │                                              │
 │ Document list        │                                              │
-│ Access / utilities   │                                              │
+│ Access / utilities   │ Data ingestion / tasks / administration     │
 └──────────────────────┴──────────────────────────────────────────────┘
 ```
 
-- Context rail is 288px expanded and 56px collapsed.
-- Work-view header is 44px and preserves the original order: 对话、研究、来源、
-  派生知识、证据审核、调试.
+- Context rail is 272px expanded and 56px collapsed.
+- Work-view header is 48px and preserves the order: 对话、研究、文档、
+  派生知识、调试.
 - Main content fills available width. Reading content gets an internal maximum
   width; tables and split workspaces do not.
 - Evidence rail is 380–440px, resizable later, and overlays only below desktop.
@@ -47,14 +47,13 @@ Mobile/tablet:
 
 ## Navigation
 
-Primary work-view order is stable and inherited from Streamlit:
+Primary work-view order is stable:
 
 1. 对话
 2. 研究
-3. 来源
+3. 文档
 4. 派生知识
-5. 证据审核
-6. 调试
+5. 调试
 
 Rules:
 
@@ -62,9 +61,12 @@ Rules:
   boundary for every route.
 - Knowledge-base, conversation, and document controls remain in the context rail,
   matching the established CogDoc workflow.
-- The active work view uses a subtle background and bottom/inner marker, not
-  a filled brand-color block.
-- Home, all-knowledge, tasks, and admin are secondary utility destinations. They
+- Retrieval labeling and claim verification are offline RAG-evaluation tools.
+  Keep them behind the reviewer-only 诊断 → RAG 评测 tab for the current KB; do not place
+  them in primary work navigation or imply that labels directly mutate RAG.
+- The active work view uses one subtle neutral background. Do not duplicate the
+  state with a second underline or a filled brand-color block.
+- Home, all-knowledge, data ingestion, tasks, and admin are secondary utility destinations. They
   may not replace or reorder the six work views.
 - Breadcrumbs identify location; they are not a second navigation menu.
 - Preserve deep links for knowledge bases and sessions.
@@ -81,6 +83,9 @@ Each route has:
 
 Avoid dashboard mosaics. If several facts describe one resource, present them in
 one header or structured row rather than separate metric cards.
+
+Page headers do not use decorative English eyebrows. Product area, breadcrumb,
+and state labels appear only when they add navigation or operational meaning.
 
 ## Workflow guidance
 
@@ -109,9 +114,9 @@ one header or structured row rather than separate metric cards.
 ### Knowledge
 
 - The list is table/row-led. A knowledge base is not a decorative card gallery.
-- `KnowledgeBaseCard` is a compact selectable resource tile reserved for empty,
-  recent, or picker contexts.
-- Creation asks only for current backend fields: ID and access policy.
+- Resource pickers reuse compact rows; do not introduce a separate card pattern.
+- Creation asks only for current backend fields: ID, accessible roles, and the
+  embedding profile. ACL enforcement remains authoritative on the backend.
 - Empty state: “Create a knowledge base to add sources and ask questions.” with
   one `Create knowledge base` action.
 
@@ -173,8 +178,8 @@ one header or structured row rather than separate metric cards.
 
 - `Table`: semantic table primitives.
 - `DataGrid`: sorting/selection wrapper for structured resources.
-- `Timeline`: ordered lifecycle events with real sequence meaning.
-- `ActivityFeed`: reverse-chronological actor/action records.
+- Lifecycle and audit records use dense semantic rows unless a real sequence or
+  dependency requires a workflow-specific visualization.
 
 ### AI
 
@@ -186,14 +191,17 @@ one header or structured row rather than separate metric cards.
 
 ### Knowledge
 
-- `KnowledgeBaseCard`: compact resource selector, not the default list layout.
 - `DocumentList`: dense document table and lifecycle state.
-- `UploadZone`: accessible file drop/select and job feedback.
+- `UploadZone`: accessible multi-file drop/select, role ACL, embedding choice,
+  and server-backed job feedback.
+- `RoleSelector`: shared role ACL input for knowledge-base and document creation.
 
 ### Admin
 
-- `MemberTable`: identity, role, state, and row actions.
-- `PermissionEditor`: explicit policy and grant editing with effective-access copy.
+- Member management keeps identity, role, state, invitations, and row actions in
+  one mutation-aware surface rather than a read-only table wrapper.
+- Access editors use the shared role selector plus effective-access explanations;
+  subject grants remain a separate advanced operation.
 
 ## Copy system
 
@@ -208,7 +216,13 @@ one header or structured row rather than separate metric cards.
 ## Loading, empty, and error states
 
 - Use skeletons only where the final geometry is known.
-- Use a compact spinner for actions with uncertain geometry.
+- Use the shared Spinner for page transitions and reads with uncertain geometry.
+- Buttons performing mutations use Button Loading: preserve the action label,
+  replace its icon with a spinner, prevent duplicate activation, and set
+  `aria-busy`.
+- Uploads show a Progress Bar plus the current server-backed stage. If the API
+  exposes no authoritative percentage, use an indeterminate bar and never invent
+  numeric progress.
 - Never replace the whole application shell for a local refresh.
 - Empty state belongs inside the region that is empty.
 - Retry only safe reads automatically; mutations require explicit user action.
@@ -222,8 +236,11 @@ one header or structured row rather than separate metric cards.
 
 - Home is a work queue, not an analytics dashboard. Show pending reviews,
   running/failed work, recent knowledge bases, and direct next actions in rows.
-- Knowledge-base pages share one local navigation for documents, sources,
-  derived knowledge, access, and diagnostics. Keep the active KB visible.
+- Knowledge-base pages share one local navigation for documents, derived
+  knowledge, access, and diagnostics. Keep the active KB visible.
+- Data ingestion is a separate utility module for connectors, credentials,
+  synchronization, external-source catalog, and versions. It always shows its
+  target knowledge base and links back to the materialized document list.
 - Research uses a master/detail workbench: queue left, plan/report center,
   lifecycle and provenance in the inspector.
 - Reviews use queue/detail composition with evidence adjacent to the decision.

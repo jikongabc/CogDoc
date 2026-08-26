@@ -5,7 +5,7 @@ from typing import Any, List, cast
 from cogdoc.config.settings import get_settings
 from cogdoc.graph.state import DocMeta, RetrievedDoc
 from cogdoc.tools.chunk_identity import build_document_id
-from cogdoc.tools.embedder import Embedder
+from cogdoc.tools.embedder import Embedder, embedding_contract
 from cogdoc.tools.retriever.base_retriever import BaseRetriever
 from cogdoc.tools.retriever.metadata import copy_optional_structure_metadata
 from cogdoc.tools.retriever.retrieval_text import retrieval_text
@@ -19,9 +19,23 @@ class EmbeddingModelMismatchError(RuntimeError):
 
 # 初始化实例状态。
 class VectorRetriever(BaseRetriever):
+    def _embedding_backend(self):
+        # Several low-level callers/tests construct a retriever with __new__ or
+        # pass a collection stub. Preserve the historical local default when
+        # no provider was installed by __init__.
+        return vars(self).get("embedder", Embedder)
+
     # 初始化实例状态。
-    def __init__(self, collection_id: str, persist_directory: str | None = None):
+    def __init__(
+        self,
+        collection_id: str,
+        persist_directory: str | None = None,
+        *,
+        embedder=None,
+    ):
         persist_directory = persist_directory or get_settings().chroma_persist_dir
+        self.embedder = embedder or Embedder
+        self.embedding_contract = embedding_contract(self.embedder)
         os.makedirs(persist_directory, exist_ok=True)
         self.client = chromadb.PersistentClient(path=persist_directory)
 
@@ -36,17 +50,23 @@ class VectorRetriever(BaseRetriever):
                 f"collection_name too long ({len(self.collection_name)} > 60): {self.collection_name!r}"
             )
         self.collection = self.client.get_or_create_collection(
-            name=self.collection_name, metadata={"embedding_model": Embedder.MODEL_NAME}
+            name=self.collection_name,
+            metadata={"embedding_model": self.embedding_contract},
         )
 
         existing_meta = self.collection.metadata
+        compatible_contracts = {self.embedding_contract}
+        if self.embedder is Embedder:
+            # Collections created before configurable providers stored only the
+            # model alias. Existing local generations remain readable.
+            compatible_contracts.add(Embedder.MODEL_NAME)
         if (
             existing_meta
-            and existing_meta.get("embedding_model") != Embedder.MODEL_NAME
+            and existing_meta.get("embedding_model") not in compatible_contracts
         ):
             raise EmbeddingModelMismatchError(
                 f"collection model={existing_meta.get('embedding_model')!r}, "
-                f"system model={Embedder.MODEL_NAME!r}"
+                f"requested contract={self.embedding_contract!r}"
             )
 
     # 检查存在性。
@@ -133,7 +153,9 @@ class VectorRetriever(BaseRetriever):
     # 增量写入分块列表。
     def _upsert_chunks(self, chunks: List[RetrievedDoc]) -> None:
         # 此路重新计算 embedding；跨代复用旧向量请走 add_with_embeddings 避免重算。
-        embeddings = Embedder.embed_documents([retrieval_text(c) for c in chunks])
+        embeddings = VectorRetriever._embedding_backend(self).embed_documents(
+            [retrieval_text(c) for c in chunks]
+        )
         ids, metadatas, texts = self._materialize(chunks)
         self.collection.upsert(
             ids=ids,
@@ -152,7 +174,7 @@ class VectorRetriever(BaseRetriever):
             raise ValueError(
                 f"chunks/embeddings length mismatch: {len(chunks)} vs {len(embeddings)}"
             )
-        Embedder.validate_embeddings(embeddings)
+        VectorRetriever._embedding_backend(self).validate_embeddings(embeddings)
         ids, metadatas, texts = self._materialize(chunks)
         self.collection.upsert(
             ids=ids,
@@ -183,7 +205,9 @@ class VectorRetriever(BaseRetriever):
         # source allowlist 下推到 Chroma query，确保目标 source 在本通道
         # top-k 之前参与竞争，不能先取全库 top-k 再过滤。
         query_options: dict[str, Any] = {
-            "query_embeddings": cast(Any, [Embedder.embed_query(query)]),
+            "query_embeddings": cast(
+                Any, [VectorRetriever._embedding_backend(self).embed_query(query)]
+            ),
             "n_results": top_k,
         }
         if scope is not None and scope.is_source_restricted:
@@ -215,7 +239,10 @@ class VectorRetriever(BaseRetriever):
 
         query_options: dict[str, Any] = {
             "query_embeddings": cast(
-                Any, Embedder.embed_queries(normalized_queries)
+                Any,
+                VectorRetriever._embedding_backend(self).embed_queries(
+                    normalized_queries
+                ),
             ),
             "n_results": top_k,
         }

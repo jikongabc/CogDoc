@@ -38,7 +38,7 @@ export function DocumentList({
     columns.push({
       id: "actions",
       header: "",
-      cell: (row) => <Button variant="ghost" size="icon" className="text-error" onClick={() => setPendingDelete(row)} aria-label={`删除文档 ${row.name}`}><Trash2 className="size-4" /></Button>,
+      cell: (row) => <Button variant="ghost" size="icon" className="text-muted-foreground hover:text-error" onClick={() => setPendingDelete(row)} aria-label={`删除文档 ${row.name}`}><Trash2 className="size-4" /></Button>,
     });
   }
   if (loading) return <div className="flex h-40 items-center justify-center rounded-[5px] border border-border bg-surface text-sm text-muted-foreground">正在读取文档…</div>;

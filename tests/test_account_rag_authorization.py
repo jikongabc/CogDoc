@@ -390,6 +390,77 @@ async def _revoke_bob_allowed(harness: _Harness) -> None:
 
 
 @pytest.mark.anyio
+async def test_custom_role_document_allowlist_filters_malicious_rag_results(
+    tmp_path, monkeypatch
+):
+    async with _provisioned_account_rag(tmp_path, monkeypatch) as harness:
+        owner_headers = _headers(harness.alice["access_token"])
+        bob_headers = _headers(harness.bob["access_token"])
+        created_role = await harness.client.post(
+            f"/v1/workspaces/{harness.workspace_id}/roles",
+            headers=owner_headers,
+            json={"name": "Finance", "base_role": "viewer"},
+        )
+        assert created_role.status_code == 201, created_role.text
+        role_id = created_role.json()["role"]["role_id"]
+
+        members = await harness.client.get(
+            f"/v1/workspaces/{harness.workspace_id}/members", headers=owner_headers
+        )
+        bob_member = next(
+            member
+            for member in members.json()["members"]
+            if member["user_id"] == harness.bob["user"]["user_id"]
+        )
+        assigned = await harness.client.patch(
+            f"/v1/workspaces/{harness.workspace_id}/members/{bob_member['member_id']}",
+            headers=owner_headers,
+            json={"role_id": role_id, "expected_revision": bob_member.get("revision")},
+        )
+        assert assigned.status_code == 200, assigned.text
+        assert assigned.json()["member"]["role_id"] == role_id
+
+        kb_policy = await harness.client.patch(
+            "/v1/knowledge-bases/shared/access",
+            headers=owner_headers,
+            json={"policy": "workspace", "role_ids": [role_id]},
+        )
+        assert kb_policy.status_code == 200, kb_policy.text
+        allowed_policy = await harness.client.patch(
+            "/v1/knowledge-bases/shared/documents/"
+            f"{build_document_id(ALLOWED_SOURCE)}/access",
+            headers=owner_headers,
+            json={
+                "policy": "workspace",
+                "source": ALLOWED_SOURCE,
+                "role_ids": [role_id],
+            },
+        )
+        secret_policy = await harness.client.patch(
+            "/v1/knowledge-bases/shared/documents/"
+            f"{build_document_id(SECRET_SOURCE)}/access",
+            headers=owner_headers,
+            json={
+                "policy": "workspace",
+                "source": SECRET_SOURCE,
+                "role_ids": ["reviewer"],
+            },
+        )
+        assert allowed_policy.status_code == secret_policy.status_code == 200
+
+        retrieved = await harness.client.post(
+            "/v1/retrieve",
+            headers=bob_headers,
+            json={"doc_id": "shared", "query": "finance evidence"},
+        )
+        assert retrieved.status_code == 200, retrieved.text
+        assert [hit["source"] for hit in retrieved.json()["hits"]] == [ALLOWED_SOURCE]
+        scope = harness.retrieve_calls[-1]["retrieval_scope"]
+        assert scope.access_mode is RetrievalAccessMode.SUBSET
+        assert scope.allowed_sources == (ALLOWED_SOURCE,)
+
+
+@pytest.mark.anyio
 async def test_real_bearer_principal_role_matrix_and_same_slug_tenant_isolation(
     tmp_path, monkeypatch
 ):

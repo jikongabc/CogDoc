@@ -782,7 +782,10 @@ def rerank_node(state: GraphState) -> dict:
         for doc in raw_verification_docs
     ]
     support = assess_retrieval_support(
-        reranked_docs, settings, requirement_ids=requirement_ids
+        reranked_docs,
+        settings,
+        query=query,
+        requirement_ids=requirement_ids,
     )
     retrieval_abstained = (
         not support.supported or evidence_pack.over_budget_hard_constraints

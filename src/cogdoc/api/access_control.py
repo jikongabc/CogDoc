@@ -51,7 +51,16 @@ _PUBLIC_AUTH_PATHS = frozenset(
 WORKSPACE_HEADER = "X-CogDoc-Workspace"
 # 仅豁免限流（仍走鉴权）：前端刷新/轮询会高频读取这些轻量状态接口。
 _RATE_LIMIT_EXEMPT_GET_PATHS = frozenset(
-    ("/v1/knowledge-bases", "/v1/sessions", "/v1/traces")
+    (
+        "/v1/knowledge-bases",
+        "/v1/index-jobs",
+        "/v1/sync-jobs",
+        "/v1/research-jobs/summaries",
+        "/v1/ha/jobs",
+        "/v1/audit-events/exports",
+        "/v1/sessions",
+        "/v1/traces",
+    )
 )
 _SCIM_PREFIX = "/scim/v2"
 _RATE_LIMIT_EXEMPT_GET_PREFIXES = (

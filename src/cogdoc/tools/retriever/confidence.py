@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cogdoc.config.settings import Settings, get_settings
+from cogdoc.tools.tokenizer import tokenize_mixed_text
 
 
 @dataclass(frozen=True)
@@ -40,10 +41,49 @@ def _distance_ratio(value: float | None, maximum: float) -> float:
     return min(max(maximum / value, 0.0), 1.0)
 
 
+def _query_lexical_coverage(
+    query: str, docs: Sequence[Mapping[str, Any]]
+) -> float | None:
+    """Measure exact meaningful query-term coverage in the retrieved evidence.
+
+    BM25 can assign an IDF of zero in very small collections when a useful entity
+    occurs in every chunk. Exact token coverage remains a trustworthy independent
+    signal in that case; single-character tokens are excluded to avoid broad
+    matches on particles and isolated numbers.
+    """
+
+    query_terms = {
+        token.strip().casefold()
+        for token in tokenize_mixed_text(query)
+        if len(token.strip()) >= 2
+    }
+    if not query_terms:
+        return None
+    evidence_terms: set[str] = set()
+    for doc in docs:
+        meta = doc.get("meta") if isinstance(doc.get("meta"), Mapping) else {}
+        searchable = "\n".join(
+            str(value or "")
+            for value in (
+                doc.get("text"),
+                meta.get("source"),
+                meta.get("section_path"),
+                meta.get("context"),
+            )
+        )
+        evidence_terms.update(
+            token.strip().casefold()
+            for token in tokenize_mixed_text(searchable)
+            if len(token.strip()) >= 2
+        )
+    return len(query_terms & evidence_terms) / len(query_terms)
+
+
 def assess_retrieval_support(
     docs: Sequence[Mapping[str, Any]],
     settings: Settings | None = None,
     *,
+    query: str = "",
     requirement_ids: Sequence[str] = (),
 ) -> RetrievalSupport:
     """Aggregate bounded candidate signals and enforce atomic-requirement coverage."""
@@ -102,6 +142,7 @@ def assess_retrieval_support(
     knowledge_lexical_score = (
         max(knowledge_lexical_scores) if knowledge_lexical_scores else None
     )
+    query_lexical_coverage = _query_lexical_coverage(query, docs) if query else None
     signals = {
         key: value
         for key, value in {
@@ -109,6 +150,9 @@ def assess_retrieval_support(
             "bm25_score": bm25_score,
             "knowledge_vector_score": knowledge_vector_score,
             "knowledge_lexical_score": knowledge_lexical_score,
+            "query_lexical_coverage": (
+                query_lexical_coverage if query_lexical_coverage else None
+            ),
             "rerank_score": max(rerank_scores) if rerank_scores else None,
             "rerank_margin": (
                 max(rerank_scores) - sorted(rerank_scores, reverse=True)[1]
@@ -141,11 +185,13 @@ def assess_retrieval_support(
         knowledge_lexical_score is not None
         and knowledge_lexical_score >= settings.qa_abstain_min_knowledge_lexical_score
     )
+    exact_query_terms_supported = query_lexical_coverage == 1.0
     supported = (
         semantic_supported
         or lexical_supported
         or knowledge_vector_supported
         or knowledge_lexical_supported
+        or exact_query_terms_supported
     )
     score = max(
         _distance_ratio(distance, settings.qa_abstain_max_vector_distance),
@@ -158,6 +204,7 @@ def assess_retrieval_support(
             knowledge_lexical_score,
             settings.qa_abstain_min_knowledge_lexical_score,
         ),
+        1.0 if exact_query_terms_supported else 0.0,
     )
     if normalized_requirements:
         coverage = len(normalized_requirements & covered_requirements) / len(

@@ -27,6 +27,26 @@ export interface Workspace {
   updated_at?: string;
 }
 
+export interface WorkspaceRoleDefinition {
+  role_id: string;
+  workspace_id: string;
+  name: string;
+  description: string;
+  base_role: WorkspaceRole;
+  system: boolean;
+  member_count: number;
+  revision: number;
+  created_by?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface WorkspaceRoleListResponse {
+  schema_version: "v1";
+  workspace_id: string;
+  roles: WorkspaceRoleDefinition[];
+}
+
 export interface AuthSession {
   schema_version: "v1";
   access_token: string;
@@ -35,6 +55,19 @@ export interface AuthSession {
   user: AuthUser;
   workspace: Workspace;
   permissions: string[];
+}
+
+export interface AuthSessionInfo {
+  session_id: string;
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string;
+  current: boolean;
+}
+
+export interface AuthSessionListResponse {
+  schema_version: "v1";
+  sessions: AuthSessionInfo[];
 }
 
 export interface AuthMe {
@@ -64,6 +97,18 @@ export interface KnowledgeBase {
   document_count: number;
   tenant_id: string;
   owner_id: string;
+  embedding_profile_id: "local" | "cloud";
+  embedding_model: string;
+}
+
+export interface EmbeddingProfile {
+  profile_id: "local" | "cloud";
+  kind: "local" | "cloud";
+  label: string;
+  model: string | null;
+  dimensions: number;
+  available: boolean;
+  description: string;
 }
 
 export interface Document {
@@ -76,6 +121,7 @@ export interface Document {
   media_type: string;
   kind: string;
   origin_uri?: string | null;
+  role_ids?: string[];
 }
 
 export type IndexJobStatus = "pending" | "running" | "succeeded" | "failed";
@@ -212,6 +258,16 @@ export interface TraceResponse {
   execution_status: string;
   duration_ms?: number | null;
   evidence_completeness?: number | null;
+  input?: Record<string, unknown>;
+  config?: Record<string, unknown>;
+  summary?: {
+    step_count: number;
+    error_count: number;
+    evidence_ref_count: number;
+    node_names: string[];
+    [key: string]: unknown;
+  };
+  error?: Record<string, unknown> | null;
   steps?: Record<string, unknown>[];
   output: Record<string, unknown>;
 }

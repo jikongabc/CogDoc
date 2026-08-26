@@ -42,6 +42,7 @@ interface ApiFixtureOptions {
   sessionsFail?: boolean;
   streamLocation?: Record<string, unknown>;
   jobAlwaysRunning?: boolean;
+  uploadDelayMs?: number;
   permissions?: string[];
   authMeFails?: boolean;
 }
@@ -63,19 +64,26 @@ async function installApi(page: Page, options: ApiFixtureOptions = {}) {
     if (path === "/auth/me") return options.authMeFails
       ? json(route, { schema_version: "v1", error_code: "INTERNAL_ERROR", message: "identity service unavailable" }, 503)
       : json(route, { schema_version: "v1", user, workspace, permissions: fixtureSession.permissions, workspaces: [workspace] });
+    if (path === "/embedding-profiles") return json(route, [
+      { profile_id: "local", kind: "local", label: "本地 · BGE-M3", model: "BAAI/bge-m3", dimensions: 1024, available: true, description: "本地模型" },
+      { profile_id: "cloud", kind: "cloud", label: "云端 · enterprise-embed", model: "enterprise-embed", dimensions: 1024, available: true, description: "云端模型" },
+    ]);
     if (path === "/knowledge-bases" && request.method() === "GET") return options.knowledgeBasesFail
       ? json(route, { schema_version: "v1", error_code: "INTERNAL_ERROR", message: "知识服务暂不可用" }, 503)
       : json(route, knowledgeBases);
     if (path === "/knowledge-bases" && request.method() === "POST") {
       const payload = request.postDataJSON() as { kb_id: string };
-      const created = { kb_id: payload.kb_id, created_at: "2026-08-23T00:00:00Z", document_count: 0, tenant_id: workspace.workspace_id, owner_id: user.user_id };
+      const created = { kb_id: payload.kb_id, created_at: "2026-08-23T00:00:00Z", document_count: 0, tenant_id: workspace.workspace_id, owner_id: user.user_id, embedding_profile_id: "local", embedding_model: "BAAI/bge-m3" };
       knowledgeBases = [created];
       return json(route, created, 201);
     }
     if (path === "/knowledge-bases/policies/documents" && request.method() === "GET") {
       return json(route, documentReady ? [{ name: "security.pdf", sha256: "abc123", document_id: "doc-security", source_id: "src-security", version_id: "ver-1", connector_type: "legacy-upload", media_type: "application/pdf", kind: "file", origin_uri: null }] : []);
     }
-    if (path === "/knowledge-bases/policies/documents" && request.method() === "POST") return json(route, { job_id: "job-1" }, 202);
+    if ((path === "/knowledge-bases/policies/documents" || path === "/knowledge-bases/policies/documents/batch") && request.method() === "POST") {
+      if (options.uploadDelayMs) await new Promise((resolve) => setTimeout(resolve, options.uploadDelayMs));
+      return json(route, { job_id: "job-1" }, 202);
+    }
     if (path === "/index-jobs/job-1") {
       jobReads += 1;
       if (options.jobAlwaysRunning || jobReads < 2) return json(route, { job_id: "job-1", kb_id: "policies", status: "running", created_at: "2026-08-23T00:00:00Z" });
@@ -190,7 +198,7 @@ test("login to evidence feedback vertical slice", async ({ page }) => {
 
   await page.getByRole("tab", { name: "上传" }).click();
   await page.locator('input[type="file"]').setInputFiles({ name: "security.pdf", mimeType: "application/pdf", buffer: Buffer.from("mock pdf") });
-  await page.getByRole("button", { name: "上传并入库" }).click();
+  await page.getByRole("button", { name: "上传 1 个文件" }).click();
   await expect(page.getByText(/入库完成/)).toBeVisible({ timeout: 10_000 });
 
   await page.getByRole("button", { name: "开始对话" }).click();
@@ -515,6 +523,7 @@ test("route params accept a backend-valid percent knowledge base id", async ({ p
   await page.getByLabel("邮箱").fill("alice@acme.example");
   await page.getByLabel("密码").fill("correct horse battery");
   await page.getByRole("button", { name: "登录", exact: true }).click();
+  await expect(page).toHaveURL(/\/home$/);
   await page.goto("/knowledge");
   await page.getByRole("button", { name: "创建知识库" }).first().click();
   await page.getByLabel("知识库 ID").fill("100%");
@@ -561,11 +570,19 @@ test("viewer affordances follow backend permissions", async ({ page }) => {
   await page.getByLabel("邮箱").fill("alice@acme.example");
   await page.getByLabel("密码").fill("correct horse battery");
   await page.getByRole("button", { name: "登录", exact: true }).click();
+  await expect(page).toHaveURL(/\/home$/);
   await page.goto("/knowledge");
   await expect(page.getByRole("button", { name: "创建知识库" }).first()).toBeDisabled();
   await expect(page.getByRole("link", { name: "管理" })).toHaveCount(0);
   await page.goto("/knowledge/policies");
   await expect(page.getByRole("tab", { name: "上传" })).toBeDisabled();
+  await expect(page.getByRole("navigation", { name: "知识库主视图" })).not.toContainText("证据审核");
+  await page.goto("/knowledge/policies/diagnostics");
+  await expect(page.getByRole("tab", { name: "RAG 评测" })).toHaveCount(0);
+  await page.goto("/reviews?kb=policies");
+  await expect(page).toHaveURL(/\/knowledge\/policies\/diagnostics$/);
+  await expect(page.getByRole("tab", { name: "RAG 评测" })).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: "Trace 调试" })).toHaveAttribute("data-state", "active");
   await page.goto("/admin");
   await expect(page.getByText("当前角色不能访问管理设置")).toBeVisible();
 });
@@ -595,7 +612,7 @@ test("temporary identity outage preserves the login session", async ({ page }) =
 });
 
 test("upload job is restored after navigation reload", async ({ page }) => {
-  await installApi(page, { jobAlwaysRunning: true });
+  await installApi(page, { jobAlwaysRunning: true, uploadDelayMs: 500 });
   await page.goto("/login");
   await page.getByLabel("邮箱").fill("alice@acme.example");
   await page.getByLabel("密码").fill("correct horse battery");
@@ -603,12 +620,15 @@ test("upload job is restored after navigation reload", async ({ page }) => {
   await page.goto("/knowledge/policies");
   await page.getByRole("tab", { name: "上传" }).click();
   await page.locator('input[type="file"]').setInputFiles({ name: "security.pdf", mimeType: "application/pdf", buffer: Buffer.from("mock pdf") });
-  await page.getByRole("button", { name: "上传并入库" }).click();
-  await expect(page.getByText("正在解析并建立索引")).toBeVisible();
+  await page.getByRole("button", { name: "上传 1 个文件" }).click();
+  await expect(page.getByRole("button", { name: "正在上传" })).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByRole("progressbar", { name: "正在上传 1 个文件" })).toBeVisible();
+  await expect(page.getByText("正在解析、切分并建立索引")).toBeVisible();
+  await expect(page.getByRole("progressbar", { name: "正在解析、切分并建立索引" })).toBeVisible();
   await page.reload();
   await page.getByRole("tab", { name: "上传" }).click();
   await expect(page.getByText("已恢复入库任务")).toBeVisible();
-  await expect(page.getByText("正在解析并建立索引")).toBeVisible();
+  await expect(page.getByText("正在解析、切分并建立索引")).toBeVisible();
 });
 
 test("mobile navigation closes after route change", async ({ page }) => {
