@@ -5,6 +5,8 @@ export interface AuthConfig {
   schema_version: "v1";
   account_auth_enabled: boolean;
   self_registration_enabled: boolean;
+  /** Absent on older servers; false means HA-only task polling must stay disabled. */
+  ha_enabled?: boolean;
   oidc_enabled: boolean;
   oidc_display_name: string;
   scim_enabled: boolean;

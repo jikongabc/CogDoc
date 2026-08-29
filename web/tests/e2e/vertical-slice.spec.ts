@@ -281,7 +281,9 @@ test("OIDC callback code is scrubbed before exchange completes", async ({ page }
   await page.route("**/api/cogdoc/v1/auth/config", (route) => json(route, { schema_version: "v1", account_auth_enabled: true, self_registration_enabled: false, oidc_enabled: true, oidc_display_name: "Acme SSO", scim_enabled: false }));
   await page.route("**/api/cogdoc/v1/auth/oidc/exchange", async (route) => {
     exchangedCode = (route.request().postDataJSON() as { code: string }).code;
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // Keep the pending state observable even when the full suite runs with
+    // multiple workers and the dev server is already warm.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
     return json(route, { schema_version: "v1", error_code: "UNAUTHORIZED", message: "企业登录失败" }, 401);
   });
   await page.goto("/login?oidc_code=one-time-secret");
@@ -304,6 +306,19 @@ test("self registration follows auth configuration", async ({ page }) => {
   await registration.getByLabel("密码").fill("correct horse battery");
   await registration.getByRole("button", { name: "创建账号", exact: true }).click();
   await expect(page).toHaveURL(/\/home$/);
+});
+
+test("self registration explains an existing account conflict", async ({ page }) => {
+  await page.route("**/api/cogdoc/v1/auth/config", (route) => json(route, { schema_version: "v1", account_auth_enabled: true, self_registration_enabled: true, oidc_enabled: false, oidc_display_name: "", scim_enabled: false }));
+  await page.route("**/api/cogdoc/v1/auth/register", (route) => json(route, { schema_version: "v1", error_code: "AUTH_CONFLICT", message: "account already exists" }, 409));
+  await page.goto("/login");
+  await page.getByRole("tab", { name: "注册" }).click();
+  const registration = page.getByRole("tabpanel", { name: "注册" });
+  await registration.getByLabel("显示名称").fill("Existing User");
+  await registration.getByLabel("邮箱").fill("existing@acme.example");
+  await registration.getByLabel("密码").fill("correct horse battery");
+  await registration.getByRole("button", { name: "创建账号", exact: true }).click();
+  await expect(registration.getByRole("alert")).toHaveText("该邮箱已注册，请切换到“登录”；如果忘记密码，请联系工作区管理员。");
 });
 
 test("closed registration remains explained and invitation acceptance is functional", async ({ page }) => {

@@ -5,7 +5,7 @@ import { ArrowRight } from "lucide-react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import type { AuthSession } from "@/lib/api/types";
-import { api } from "@/lib/api/client";
+import { api, ApiError } from "@/lib/api/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -43,7 +43,13 @@ export function RegistrationForm({ onAuthenticated }: { onAuthenticated: (sessio
       });
       onAuthenticated(session);
     } catch (error) {
-      form.setError("root", { message: error instanceof Error ? error.message : "无法创建账号" });
+      form.setError("root", {
+        message: error instanceof ApiError && error.status === 409 && error.errorCode === "AUTH_CONFLICT"
+          ? "该邮箱已注册，请切换到“登录”；如果忘记密码，请联系工作区管理员。"
+          : error instanceof Error
+            ? error.message
+            : "无法创建账号",
+      });
     }
   });
   return (

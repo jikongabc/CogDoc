@@ -190,15 +190,16 @@ test("task center aggregates ingestion and opens the exact research task", async
 });
 
 test("task center tolerates legacy aggregate routes and disabled HA", async ({ page }) => {
+  let haReads = 0;
   await page.route("**/api/cogdoc/v1/**", async (route) => {
     const path = new URL(route.request().url()).pathname.replace("/api/cogdoc/v1", "");
-    if (path === "/auth/config") return json(route, { schema_version: "v1", account_auth_enabled: true, self_registration_enabled: false, oidc_enabled: false, oidc_display_name: "", scim_enabled: false });
+    if (path === "/auth/config") return json(route, { schema_version: "v1", account_auth_enabled: true, self_registration_enabled: false, ha_enabled: false, oidc_enabled: false, oidc_display_name: "", scim_enabled: false });
     if (path === "/auth/login") return json(route, session);
     if (path === "/auth/me") return json(route, { schema_version: "v1", user, workspace, permissions: session.permissions, workspaces: [workspace] });
     if (path === "/knowledge-bases") return json(route, [{ kb_id: "policies", created_at: "2026-08-01T00:00:00Z", document_count: 8, tenant_id: workspace.workspace_id, owner_id: user.user_id }]);
     if (path === "/index-jobs" || path === "/sync-jobs") return json(route, { message: "Not Found" }, 404);
     if (path === "/knowledge-bases/policies/sync-jobs") return json(route, { jobs: [{ job_id: "sync-legacy", kb_id: "policies", connection_name: "Legacy connector", status: "succeeded", created_at: "2026-08-24T08:00:00Z" }] });
-    if (path === "/ha/jobs") return json(route, { detail: "HA 控制面未启用" }, 503);
+    if (path === "/ha/jobs") { haReads += 1; return json(route, { detail: "HA 控制面未启用" }, 503); }
     if (path === "/research-jobs/summaries") return json(route, { jobs: [] });
     if (path === "/audit-events/exports") return json(route, { exports: [] });
     return json(route, { items: [], jobs: [] });
@@ -212,6 +213,29 @@ test("task center tolerates legacy aggregate routes and disabled HA", async ({ p
 
   await expect(page.getByRole("row", { name: /Legacy connector/ })).toBeVisible();
   await expect(page.getByText("部分任务暂时无法读取")).toHaveCount(0);
+  expect(haReads).toBe(0);
+});
+
+test("single-node task center settles to an empty state without polling HA", async ({ page }) => {
+  let haReads = 0;
+  await page.route("**/api/cogdoc/v1/**", async (route) => {
+    const path = new URL(route.request().url()).pathname.replace("/api/cogdoc/v1", "");
+    if (path === "/auth/config") return json(route, { schema_version: "v1", account_auth_enabled: true, self_registration_enabled: false, ha_enabled: false, oidc_enabled: false, oidc_display_name: "", scim_enabled: false });
+    if (path === "/auth/login") return json(route, session);
+    if (path === "/auth/me") return json(route, { schema_version: "v1", user, workspace, permissions: session.permissions, workspaces: [workspace] });
+    if (path === "/ha/jobs") { haReads += 1; return json(route, { detail: "HA 控制面未启用" }, 503); }
+    return json(route, { items: [], jobs: [], exports: [] });
+  });
+
+  await page.goto("/login");
+  await page.getByLabel("邮箱").fill("reviewer@example.com");
+  await page.getByLabel("密码").fill("a-valid-password");
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  await page.goto("/tasks");
+
+  await expect(page.getByText("没有匹配的任务")).toBeVisible();
+  await expect(page.getByText("正在读取任务")).toHaveCount(0);
+  expect(haReads).toBe(0);
 });
 
 test("derived knowledge binds a document and role creation stays name-first", async ({ page }) => {

@@ -15,6 +15,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { usePermission } from "@/features/auth/permissions";
 import { ApiError, api } from "@/lib/api/client";
 import { controlApi, isRecord, records, textValue, type JsonRecord } from "@/lib/api/control-plane";
+import { queryKeys } from "@/lib/query/keys";
 import { useSessionStore } from "@/stores/session-store";
 
 type TaskKind = "all" | "index" | "sync" | "research" | "system" | "exports";
@@ -139,11 +140,13 @@ export default function TasksPage() {
   const workspaceId = useSessionStore((state) => state.selectedWorkspaceId);
   const canReadAudit = usePermission("manage_access");
   const canWrite = usePermission("write");
+  const authConfig = useQuery({ queryKey: queryKeys.authConfig, queryFn: api.authConfig });
+  const haEnabled = canReadAudit && authConfig.isSuccess && authConfig.data.ha_enabled !== false;
   const [kind, setKind] = useState<TaskKind>("all");
   const index = useQuery({ queryKey: ["tasks", workspaceId, "index"], queryFn: () => compatibleIndexJobs(workspaceId), retry: false, refetchInterval: 10_000 });
   const sync = useQuery({ queryKey: ["tasks", workspaceId, "sync"], queryFn: compatibleWorkspaceSyncJobs, retry: false, refetchInterval: 10_000 });
   const research = useQuery({ queryKey: ["tasks", workspaceId, "research"], queryFn: () => controlApi.researchSummaries(), retry: false, refetchInterval: 10_000 });
-  const ha = useQuery({ queryKey: ["tasks", workspaceId, "ha"], queryFn: optionalHaJobs, enabled: canReadAudit, retry: false, refetchInterval: (query) => isRecord(query.state.data) && query.state.data.unavailable === true ? false : 10_000 });
+  const ha = useQuery({ queryKey: ["tasks", workspaceId, "ha"], queryFn: optionalHaJobs, enabled: haEnabled, retry: false, refetchInterval: (query) => isRecord(query.state.data) && query.state.data.unavailable === true ? false : 10_000 });
   const exportsQuery = useQuery({ queryKey: ["tasks", workspaceId, "exports"], queryFn: () => controlApi.auditExports(), enabled: canReadAudit, retry: false, refetchInterval: 10_000 });
 
   const allRows = useMemo<TaskRow[]>(() => {
@@ -158,15 +161,15 @@ export default function TasksPage() {
   }, [exportsQuery.data, ha.data, index.data, research.data, sync.data]);
 
   const visible = kind === "all" ? allRows : allRows.filter((row) => row._kind === kind);
-  const haUnavailable = isRecord(ha.data) && ha.data.unavailable === true;
-  const queries = [index, sync, research, ...(canReadAudit ? [ha, exportsQuery] : [])];
+  const haUnavailable = authConfig.data?.ha_enabled === false || (isRecord(ha.data) && ha.data.unavailable === true);
+  const queries = [index, sync, research, ...(haEnabled ? [ha] : []), ...(canReadAudit ? [exportsQuery] : [])];
   const isFetching = queries.some((query) => query.isFetching);
   const pending = !allRows.length && queries.some((query) => query.isPending);
   const failureCandidates: [string, Error | null][] = [
     ["解析与索引", index.error],
     ["外部同步", sync.error],
     ["Research", research.error],
-    ...(canReadAudit ? [["系统作业", ha.error] as [string, Error | null]] : []),
+    ...(haEnabled ? [["系统作业", ha.error] as [string, Error | null]] : []),
     ...(canReadAudit ? [["审计导出", exportsQuery.error] as [string, Error | null]] : []),
   ];
   const failures = failureCandidates.flatMap(([name, error]) => error ? [[name, error] as const] : []);

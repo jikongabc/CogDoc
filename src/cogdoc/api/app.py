@@ -3298,6 +3298,7 @@ def create_app(
             "schema_version": "v1",
             "account_auth_enabled": app.state.account_auth_enabled,
             "self_registration_enabled": app.state.self_registration_enabled,
+            "ha_enabled": getattr(app.state, "ha_runtime", None) is not None,
             "oidc_enabled": oidc is not None,
             "oidc_display_name": (
                 str(getattr(oidc, "display_name", "Enterprise SSO"))
