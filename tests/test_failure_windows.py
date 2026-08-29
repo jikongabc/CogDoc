@@ -142,6 +142,68 @@ def test_purge_queue_corrupt_quarantines(tmp_path):
         q.due(now=100)
 
 
+def test_purge_queue_duplicate_merges_segment_metadata(tmp_path):
+    path = tmp_path / "pq.json"
+    queue = PurgeQueue(path=str(path))
+    segment_a = "11111111-1111-1111-1111-111111111111"
+    segment_b = "22222222-2222-2222-2222-222222222222"
+
+    queue.add("kb", "g1", not_before=20, segment_ids=(segment_a,))
+    queue.add("kb", "g1", not_before=10, segment_ids=(segment_b,))
+
+    assert queue.due(now=10) == [
+        {
+            "kb_id": "kb",
+            "gen_id": "g1",
+            "not_before": 10,
+            "segment_ids": [segment_a, segment_b],
+        }
+    ]
+
+
+def test_purge_queue_identical_empty_duplicate_does_not_rewrite(tmp_path, monkeypatch):
+    queue = PurgeQueue(path=str(tmp_path / "pq.json"))
+    save_count = 0
+    original_save = queue._save
+
+    def counting_save(items):
+        nonlocal save_count
+        save_count += 1
+        original_save(items)
+
+    monkeypatch.setattr(queue, "_save", counting_save)
+
+    queue.add("kb", "g1", not_before=10)
+    queue.add("kb", "g1", not_before=10)
+
+    assert save_count == 1
+    assert queue.due(now=10) == [
+        {"kb_id": "kb", "gen_id": "g1", "not_before": 10}
+    ]
+
+
+def test_purge_queue_duplicate_still_validates_new_segment_metadata(tmp_path):
+    queue = PurgeQueue(path=str(tmp_path / "pq.json"))
+    queue.add("kb", "g1", not_before=0)
+
+    with pytest.raises(ValueError, match="segment ids"):
+        queue.add("kb", "g1", not_before=0, segment_ids=("../outside",))
+
+
+def test_purge_queue_quarantines_unhashable_segment_metadata(tmp_path):
+    path = tmp_path / "pq.json"
+    path.write_text(
+        '[{"kb_id":"kb","gen_id":"g1","not_before":0,"segment_ids":[[]]}]',
+        encoding="utf-8",
+    )
+    queue = PurgeQueue(path=str(path))
+
+    with pytest.raises(PurgeQueueCorruptError):
+        queue.due(now=100)
+
+    assert list(tmp_path.glob("pq.json.corrupt-*"))
+
+
 # 测试切代后旧日志不误回滚。
 
 

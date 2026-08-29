@@ -96,14 +96,16 @@ from cogdoc.api.tenancy import (
     Role,
     fingerprint_api_key,
 )
-from cogdoc.api.webhooks import WebhookDispatcher
+from cogdoc.api.webhooks import WebhookDispatcher, validate_webhook_url
 from cogdoc.agents.research_planner import propose_research_plan
 import logging
 from cogdoc.config.settings import get_settings
 from cogdoc.observability.logger import configure_logging, log_event
 from cogdoc.service.chat_service import ChatResult, run_chat, run_chat_sync
+from cogdoc.service.chroma_cleanup import sweep_orphan_segment_directories
 from cogdoc.service.ingest_service import cancel_all_timers, drain_purge_queue
 from cogdoc.service.kb_locks import kb_write_lock
+from cogdoc.service.kb_readers import KBReadUnavailable
 from cogdoc.service.mutation_journal import shared_mutation_journal
 from cogdoc.service.process_lock import (
     SingleInstanceError,
@@ -236,8 +238,15 @@ def _research_acl_checker(auth_store, access_store, job: Mapping) -> bool:
 
 # 构建未捕获异常响应。
 def _unhandled_error_response(exc: Exception) -> JSONResponse:
-    # 线程池关闭竞争窗口的调度异常归为暂时不可用，其余未预期异常归为内部错误；都不漏栈。
-    if isinstance(exc, RuntimeError) and "shutdown" in str(exc):
+    # 删除屏障与线程池关闭竞争窗口都属于可重试的暂时不可用；其余未预期
+    # 异常归为内部错误。响应只暴露异常类型，不泄漏堆栈或内部消息。
+    if isinstance(exc, KBReadUnavailable):
+        code, status, message = (
+            ErrorCode.MODEL_UNAVAILABLE,
+            503,
+            "知识库正在变更，请稍后重试",
+        )
+    elif isinstance(exc, RuntimeError) and "shutdown" in str(exc):
         code, status, message = ErrorCode.MODEL_UNAVAILABLE, 503, "服务正在关闭，请重试"
     else:
         code, status, message = ErrorCode.INTERNAL_ERROR, 500, "服务内部错误"
@@ -271,6 +280,7 @@ def create_app(
     webhook_dispatcher: WebhookDispatcher | None = None,
     derived_knowledge_index_refresher: Callable | None = None,
     derived_knowledge_index_statuser: Callable | None = None,
+    derived_knowledge_index_clearer: Callable[[str], None] | None = None,
     close_state_runtime_on_shutdown: bool | None = None,
     api_keys: set[str] | None = None,
     api_principals: Mapping[str, Principal | Mapping[str, str]] | None = None,
@@ -531,6 +541,34 @@ def create_app(
                 )
             # 必须在拿到单实例锁且变更日志恢复之后对账，避免误改其他实例的任务状态。
             app.state.index_jobs.reconcile_orphans()
+            # Start no mutating workers until deletion recovery and orphan cleanup finish.
+            drain_purge_queue()
+            # 此时已持单实例锁、mutation journal 已恢复，且尚未接收请求；
+            # 只有这个生命周期窗口可以安全回收 Chroma 历史逻辑删除遗留目录。
+            try:
+                orphan_cleanup = (
+                    sweep_orphan_segment_directories(
+                        app.state.state_runtime.derived_knowledge_index_persist_directory
+                    )
+                    if not app.state.ha_document_multiwriter_mode
+                    else {"scanned": 0, "removed": 0, "bytes_reclaimed": 0}
+                )
+                if orphan_cleanup["removed"]:
+                    log_event(
+                        "startup",
+                        "chroma_orphan_segments_reclaimed",
+                        {},
+                        count=orphan_cleanup["removed"],
+                        bytes_reclaimed=orphan_cleanup["bytes_reclaimed"],
+                    )
+            except Exception as exc:
+                log_event(
+                    "startup",
+                    "chroma_orphan_segment_cleanup_failed",
+                    {},
+                    level=logging.WARNING,
+                    error_class=type(exc).__name__,
+                )
             if (
                 not app.state.ha_document_multiwriter_mode
                 or app.state.ha_connector_multiwriter_mode
@@ -544,8 +582,7 @@ def create_app(
                 if callable(start_dispatcher):
                     start_dispatcher()
                 research_manager.reconcile_orphans()
-            # 重试上次遗留的删库外部资源清理，持久队列在此兜底。
-            drain_purge_queue()
+
             # 后台清扫僵尸索引代、空闲执行器和锁表。
             maintenance_tasks: dict[str, Callable[[], object]] = {}
             research_dispatch_store = getattr(
@@ -614,13 +651,14 @@ def create_app(
             )
             sweeper.start()
             app.state.sweeper = sweeper
-            # 鉴权未配置时接口对外开放，启动时告警。
+            # 鉴权未配置时仅保留回环本地 owner 模式，仍告警提醒生产部署启用身份。
             if not app.state.auth_enabled:
                 log_event(
                     "startup",
                     "auth_disabled",
                     {},
                     level=logging.WARNING,
+                    access_scope="loopback_only",
                 )
             app.state.lifecycle_status = "ready"
             yield
@@ -1226,7 +1264,22 @@ def create_app(
     # post-202 research work share one app-local Prometheus registry.
     app.state.metrics = Metrics()
     app.state.research_observer = ResearchObserver(app.state.metrics)
-    app.state.webhook_dispatcher = webhook_dispatcher or WebhookDispatcher()
+    if webhook_dispatcher is not None:
+        app.state.webhook_dispatcher = webhook_dispatcher
+    else:
+        try:
+            app.state.webhook_dispatcher = WebhookDispatcher()
+        except ValueError as exc:
+            # Notifications are optional. A malformed destination must be
+            # observable without taking the API, login, or ingestion paths down.
+            log_event(
+                "startup",
+                "webhook_disabled_invalid_configuration",
+                {},
+                level=logging.ERROR,
+                error_class=type(exc).__name__,
+            )
+            app.state.webhook_dispatcher = WebhookDispatcher(url="")
     if (
         app.state.ha_document_multiwriter_mode
         and app.state.ha_connector_backend is not None
@@ -1989,6 +2042,7 @@ def create_app(
                 )
             ),
             quota_releaser=app.state.tenant_quota.release,
+            quota_checker=app.state.tenant_quota.assert_live,
         )
 
     def cleanup_sync_terminal(job) -> None:
@@ -2515,7 +2569,9 @@ def create_app(
                 enforce_local_access_policy=app.state.auth_enabled,
                 local_allowed_roots=app.state.connector_local_allowed_roots,
                 git_allowed_roots=app.state.connector_git_allowed_roots,
-                enforce_url_host_policy=app.state.auth_enabled,
+                enforce_url_host_policy=bool(
+                    app.state.auth_enabled or app.state.connector_url_allowed_hosts
+                ),
                 url_allowed_hosts=app.state.connector_url_allowed_hosts,
             )
 
@@ -2957,6 +3013,22 @@ def create_app(
     app.state.derived_knowledge_index_statuser = (
         derived_knowledge_index_statuser or runtime.derived_knowledge_index_status
     )
+    resolved_derived_index_clearer = derived_knowledge_index_clearer
+    if resolved_derived_index_clearer is None:
+        if app.state.ha_derived_knowledge_index is not None:
+            resolved_derived_index_clearer = (
+                app.state.ha_derived_knowledge_index.clear_kb
+            )
+        elif app.state.ha_document_multiwriter_mode:
+
+            def clear_absent_ha_derived_index(_storage_id: str) -> None:
+                """No derived index exists in this HA deployment."""
+
+            resolved_derived_index_clearer = clear_absent_ha_derived_index
+        else:
+            resolved_derived_index_clearer = runtime.clear_derived_knowledge_index
+
+    app.state.derived_knowledge_index_clearer = resolved_derived_index_clearer
     app.state.derived_knowledge_index_error_recorder = (
         runtime.record_derived_knowledge_index_error
     )
@@ -2978,12 +3050,23 @@ def create_app(
         else:
             raise TypeError("api_principals values must be Principal or mapping")
         resolved_principals[raw_key] = principal
+    # Independent review credentials authenticate as the least-privileged
+    # built-in reviewer role. They can query evidence and review/publish eval
+    # artifacts, but cannot mutate documents, delete KBs, or manage access.
+    for raw_key in resolved_review_keys:
+        fingerprint = fingerprint_api_key(raw_key)
+        resolved_principals.setdefault(
+            raw_key,
+            Principal(
+                tenant_id="default",
+                subject_id=f"eval-review:{fingerprint.removeprefix('sha256:')[:16]}",
+                role=Role.REVIEWER,
+                key_fingerprint=fingerprint,
+            ),
+        )
     app.state.explicit_principal_fingerprints = {
         principal.key_fingerprint for principal in resolved_principals.values()
     }
-    # Review keys are administrator credentials and therefore also authenticate
-    # ordinary endpoints; keeping one union avoids middleware rejecting them first.
-    resolved_keys.update(resolved_review_keys)
     resolved_limiter = rate_limiter or build_rate_limiter(
         settings.rate_limit_per_minute, settings.rate_limit_burst
     )
@@ -3146,6 +3229,17 @@ def create_app(
             if callable(clear_kb):
                 clear_kb(storage_id)
 
+        app.state.derived_knowledge_index_clearer(storage_id)
+
+        claim_reviews = app.state.claim_verification_review_store
+        clear_claim_reviews = getattr(claim_reviews, "clear_kb", None)
+        if not callable(clear_claim_reviews):
+            raise RuntimeError(
+                "claim verification review store does not support KB cleanup"
+            )
+        clear_claim_reviews(tenant_id, storage_id)
+        app.state.index_jobs.clear_kb(storage_id)
+
         app.state.external_acl_sync_store.delete_scope(tenant_id, storage_id)
         vault = app.state.connector_credential_vault
         if vault is not None:
@@ -3253,6 +3347,7 @@ def create_app(
         principals=resolved_principals,
         rate_limiter=resolved_limiter,
         auth_store=app.state.auth_store,
+        trusted_proxy_cidrs=get_settings().cogdoc_trusted_proxy_cidrs,
     )
     # 指标中间件在访问控制外层（后加=最外层），故 401/429 也被计入请求统计。
     app.add_middleware(MetricsMiddleware, metrics=app.state.metrics)
@@ -3305,15 +3400,26 @@ if _settings.cogdoc_ha_enabled:
     from cogdoc.ha.outbox import WebhookOutboxHandler
     from cogdoc.ha.runtime import HAConfig, HARuntime
 
-    _ha_outbox_handler = (
-        WebhookOutboxHandler(
-            _settings.cogdoc_webhook_url,
-            secret=_settings.cogdoc_webhook_secret,
-            timeout_seconds=_settings.cogdoc_webhook_timeout_seconds,
-        )
-        if _settings.cogdoc_webhook_url.strip()
-        else None
-    )
+    _ha_outbox_handler = None
+    if _settings.cogdoc_webhook_url.strip():
+        try:
+            validate_webhook_url(_settings.cogdoc_webhook_url)
+            _ha_outbox_handler = WebhookOutboxHandler(
+                _settings.cogdoc_webhook_url,
+                secret=_settings.cogdoc_webhook_secret,
+                timeout_seconds=_settings.cogdoc_webhook_timeout_seconds,
+                allow_private_hosts=_settings.cogdoc_webhook_allow_private_hosts,
+                max_response_bytes=_settings.cogdoc_webhook_max_response_bytes,
+                max_redirects=_settings.cogdoc_webhook_max_redirects,
+            )
+        except ValueError as exc:
+            log_event(
+                "startup",
+                "ha_webhook_disabled_invalid_configuration",
+                {},
+                level=logging.ERROR,
+                error_class=type(exc).__name__,
+            )
     _ha_runtime = HARuntime(
         HAConfig.from_settings(_settings), outbox_handler=_ha_outbox_handler
     )

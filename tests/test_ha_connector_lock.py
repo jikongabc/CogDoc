@@ -74,3 +74,22 @@ async def test_distributed_reference_lock_recovers_lost_executor_wakeup(
             async with lock:
                 assert lock._token is not None
     backend.close()
+
+
+@pytest.mark.anyio
+async def test_distributed_reference_lock_surfaces_heartbeat_failure(
+    tmp_path: Path,
+) -> None:
+    backend = SQLiteBackend(tmp_path / "shared.db")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        lock = DistributedConnectorReferenceLock(
+            backend,
+            owner_id="node-a",
+            executor_provider=lambda: executor,
+            lease_seconds=5,
+            acquire_timeout_seconds=1,
+        )
+        with pytest.raises(RuntimeError, match="heartbeat failed"):
+            async with lock:
+                lock._heartbeat_error = RuntimeError("database unavailable")
+    backend.close()

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import suppress
@@ -45,6 +46,7 @@ from cogdoc.ha.index_replica import IndexReplicaError
 from cogdoc.ha.chat_execution import ha_retrieval_scope
 from cogdoc.ha.session_store import SessionBusy, StaleSessionLease
 from cogdoc.observability.trace import delete_trace_files
+from cogdoc.observability.logger import log_event
 from cogdoc.service.chat_service import (
     ChatEvent,
     ChatResult,
@@ -91,6 +93,21 @@ def _ha_chat_error(exc: Exception) -> JSONResponse:
     raise exc
 
 
+def _epoch_unavailable_error(exc: Exception, storage_id: str) -> JSONResponse:
+    log_event(
+        "cogdoc.chat",
+        "chat_epoch_unavailable",
+        level=logging.ERROR,
+        storage_id=storage_id,
+        error_class=type(exc).__name__,
+    )
+    error = build_error_response(
+        ErrorCode.MODEL_UNAVAILABLE,
+        "知识库状态暂不可用，请稍后重试",
+    )
+    return JSONResponse(status_code=503, content=error.model_dump())
+
+
 # 完成 chat 处理。
 @router.post("/chat", response_model=ChatResponse, responses=_ERROR_RESPONSES)
 async def chat(request_body: ChatRequest, request: Request, response: Response):
@@ -107,6 +124,14 @@ async def chat(request_body: ChatRequest, request: Request, response: Response):
     session_store = request.app.state.session_store
     session_scope_id = session_store_doc_id(request, request_body.doc_id)
     ha_coordinator = getattr(request.app.state, "ha_chat_coordinator", None)
+    try:
+        expected_epoch = capture_ha_chat_epoch(
+            request.app.state.kb_registry, scope.storage_id
+        )
+    except Exception as exc:
+        # Epoch is an authorization/deletion fence. Do not continue without it,
+        # but keep state-store corruption or temporary failure on a stable API.
+        return _epoch_unavailable_error(exc, scope.storage_id)
     if ha_coordinator is not None:
         retrieval_scope = ha_retrieval_scope(
             retrieval_scope,
@@ -118,9 +143,6 @@ async def chat(request_body: ChatRequest, request: Request, response: Response):
     try:
         # 用 app 级有界线程池 offload 同步图：不阻塞事件循环、不无界起线程、不走 anyio。
         if ha_coordinator is not None:
-            expected_epoch = capture_ha_chat_epoch(
-                request.app.state.kb_registry, scope.storage_id
-            )
             authority_guard = ha_chat_authority_guard(request, scope, expected_epoch)
             result = await run_sync(
                 request.app.state.offload_executor,
@@ -141,10 +163,13 @@ async def chat(request_body: ChatRequest, request: Request, response: Response):
                     request_body.forced_task,
                     internal_session_id(request, external_chat_session_id),
                     retrieval_scope,
+                    expected_epoch,
                 ),
             )
         else:
-            chat_history = session_store.get_history(
+            chat_history = await run_sync(
+                request.app.state.offload_executor,
+                session_store.get_history,
                 session_scope_id,
                 external_chat_session_id,
                 request_body.query,
@@ -160,6 +185,7 @@ async def chat(request_body: ChatRequest, request: Request, response: Response):
                 request_body.forced_task,
                 internal_session_id(request, external_chat_session_id),
                 retrieval_scope,
+                expected_epoch,
             )
     except ChatServiceError as exc:
         error_code = classify_error_code(exc.stage, exc.error_class, exc.message)
@@ -186,7 +212,9 @@ async def chat(request_body: ChatRequest, request: Request, response: Response):
 
     # 记忆走门控后的 chat_messages；展示存「用户问题 + 实际答案」，切对话时能看到内容。
     if ha_coordinator is None:
-        session_store.record(
+        await run_sync(
+            request.app.state.offload_executor,
+            session_store.record,
             session_scope_id,
             external_chat_session_id,
             result.chat_messages,
@@ -231,8 +259,10 @@ async def list_sessions(request: Request, doc_id: str = Query(default="")):
     scope = resolve_kb_scope(request, kb_id, allow_legacy_default=True)
     if scope is None:
         return SessionListResponse(doc_id=kb_id, sessions=[])
-    sessions = request.app.state.session_store.list_sessions(
-        session_store_doc_id(request, scope.storage_id)
+    sessions = await run_sync(
+        request.app.state.offload_executor,
+        request.app.state.session_store.list_sessions,
+        session_store_doc_id(request, scope.storage_id),
     )
     return SessionListResponse(doc_id=kb_id, sessions=sessions)
 
@@ -245,13 +275,14 @@ async def session_history(
     # 前端刷新后凭 URL 里的 session_id 拉回多轮历史；会话态仍在内存（服务存活期内）。
     kb_id = doc_id or get_settings().cogdoc_default_doc_id
     scope = resolve_kb_scope(request, kb_id, allow_legacy_default=True)
-    messages = (
-        request.app.state.session_store.get_display(
-            session_store_doc_id(request, scope.storage_id), session_id
+    messages = []
+    if scope is not None:
+        messages = await run_sync(
+            request.app.state.offload_executor,
+            request.app.state.session_store.get_display,
+            session_store_doc_id(request, scope.storage_id),
+            session_id,
         )
-        if scope is not None
-        else []
-    )
     return SessionHistoryResponse(
         session_id=session_id, doc_id=kb_id, messages=messages
     )
@@ -264,13 +295,14 @@ async def session_memory(
 ):
     kb_id = doc_id or get_settings().cogdoc_default_doc_id
     scope = resolve_kb_scope(request, kb_id, allow_legacy_default=True)
-    snapshot = (
-        request.app.state.session_store.get_memory_snapshot(
-            session_store_doc_id(request, scope.storage_id), session_id
+    snapshot = {"short_term": [], "mid_term": {}, "long_term": []}
+    if scope is not None:
+        snapshot = await run_sync(
+            request.app.state.offload_executor,
+            request.app.state.session_store.get_memory_snapshot,
+            session_store_doc_id(request, scope.storage_id),
+            session_id,
         )
-        if scope is not None
-        else {"short_term": [], "mid_term": {}, "long_term": []}
-    )
     return MemorySnapshotResponse(
         session_id=session_id,
         doc_id=kb_id,
@@ -297,14 +329,20 @@ async def delete_long_term_memory(request: Request, doc_id: str = Query(default=
                     permission=Permission.DELETE,
                 )
                 authority_guard()
-                request.app.state.session_store.clear_long_term(
+                await run_sync(
+                    request.app.state.offload_executor,
+                    request.app.state.session_store.clear_long_term,
                     session_scope_id,
                     authority=getattr(authority_guard, "evidence", None),
                 )
             except (HAChatAuthorityChanged, StaleSessionLease) as exc:
                 return _ha_chat_error(exc)
         else:
-            request.app.state.session_store.clear_long_term(session_scope_id)
+            await run_sync(
+                request.app.state.offload_executor,
+                request.app.state.session_store.clear_long_term,
+                session_scope_id,
+            )
     return Response(status_code=204)
 
 
@@ -331,7 +369,9 @@ async def delete_session(
                 permission=Permission.DELETE,
             )
             authority_guard()
-            request.app.state.session_store.clear(
+            await run_sync(
+                request.app.state.offload_executor,
+                request.app.state.session_store.clear,
                 session_scope_id,
                 session_id,
                 authority=getattr(authority_guard, "evidence", None),
@@ -339,7 +379,12 @@ async def delete_session(
         except (HAChatAuthorityChanged, StaleSessionLease) as exc:
             return _ha_chat_error(exc)
     else:
-        request.app.state.session_store.clear(session_scope_id, session_id)
+        await run_sync(
+            request.app.state.offload_executor,
+            request.app.state.session_store.clear,
+            session_scope_id,
+            session_id,
+        )
         await run_sync(
             request.app.state.offload_executor,
             delete_trace_files,
@@ -475,11 +520,14 @@ async def chat_stream(request_body: ChatRequest, request: Request):
                 getattr(request.app.state, "ha_auxiliary_retrieval_enabled", False)
             ),
         )
-    expected_epoch = (
-        capture_ha_chat_epoch(request.app.state.kb_registry, scope.storage_id)
-        if ha_coordinator is not None
-        else capture_kb_epoch(scope.storage_id)
-    )
+    try:
+        expected_epoch = (
+            capture_ha_chat_epoch(request.app.state.kb_registry, scope.storage_id)
+            if ha_coordinator is not None
+            else capture_kb_epoch(scope.storage_id)
+        )
+    except Exception as exc:
+        return _epoch_unavailable_error(exc, scope.storage_id)
     try:
         authority_guard = (
             ha_chat_authority_guard(request, scope, expected_epoch)
@@ -488,11 +536,15 @@ async def chat_stream(request_body: ChatRequest, request: Request):
         )
     except (HAChatAuthorityChanged, StaleSessionLease) as exc:
         return _ha_chat_error(exc)
-    chat_history = (
-        []
-        if ha_coordinator is not None
-        else session_store.get_history(session_scope_id, session_id, request_body.query)
-    )
+    chat_history = []
+    if ha_coordinator is None:
+        chat_history = await run_sync(
+            request.app.state.offload_executor,
+            session_store.get_history,
+            session_scope_id,
+            session_id,
+            request_body.query,
+        )
 
     idle_timeout_seconds = get_settings().cogdoc_chat_stream_idle_timeout_seconds
     stop_event = threading.Event()
@@ -507,6 +559,7 @@ async def chat_stream(request_body: ChatRequest, request: Request):
             request_body.forced_task,
             internal_session_id(request, session_id),
             retrieval_scope,
+            expected_epoch,
         )
 
     events = iter(
@@ -611,7 +664,7 @@ async def chat_stream(request_body: ChatRequest, request: Request):
         current_acknowledgement: threading.Event | None = None
 
         # 记录最终结果。
-        def record_final(result: ChatResult) -> None:
+        async def record_final(result: ChatResult) -> None:
             nonlocal recorded
             if recorded:
                 return
@@ -631,7 +684,9 @@ async def chat_stream(request_body: ChatRequest, request: Request):
                 result.task_type, result.raw_output
             )
             if ha_coordinator is None:
-                session_store.record(
+                await run_sync(
+                    request.app.state.offload_executor,
+                    session_store.record,
                     session_scope_id,
                     session_id,
                     result.chat_messages,
@@ -728,7 +783,7 @@ async def chat_stream(request_body: ChatRequest, request: Request):
                         break
                 if event.type == "final":
                     final_result = event.payload["result"]
-                    record_final(final_result)
+                    await record_final(final_result)
                 frame = _event_to_frame(
                     event, doc_id=external_doc_id, session_id=session_id
                 )
@@ -738,7 +793,7 @@ async def chat_stream(request_body: ChatRequest, request: Request):
                 current_acknowledgement = None
             # 兜底：理论上 final 事件已即时记录；保留防止未来事件处理顺序变化。
             if final_result is not None:
-                record_final(final_result)
+                await record_final(final_result)
         finally:
             stop_event.set()
             if current_acknowledgement is not None:

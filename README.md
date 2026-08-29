@@ -95,26 +95,23 @@ Dependencies live in [pyproject.toml](pyproject.toml): runtime in `[project.depe
 
 Copy `.env.example` to `.env` and set at least your cloud `LLM_API_KEY` (or run `/local` with Ollama). Put supported documents in the inbox `your_documents/` (or set `COGDOC_DOC_DIR`). `make native` must be re-run after any change under `rust_core/src/` — the `.so` is not auto-rebuilt and not committed.
 
-Persistent accounts default to off for a no-surprise upgrade. For an individual or team deployment, set `COGDOC_ACCOUNT_AUTH_ENABLED=true`, start the API, register the first owner, and use its returned Bearer token. An enterprise can then configure [OIDC SSO](docs/OIDC_zh-CN.md), optionally provision users and groups through [SCIM 2.0](docs/SCIM_zh-CN.md), and set `COGDOC_SELF_REGISTRATION_ENABLED=false`.
+Persistent accounts default to off for a no-surprise upgrade. For an individual or team bootstrap, temporarily set both `COGDOC_ACCOUNT_AUTH_ENABLED=true` and `COGDOC_SELF_REGISTRATION_ENABLED=true`, register the first owner, then disable self-registration and use invitations or SSO. An enterprise can configure [OIDC SSO](docs/OIDC_zh-CN.md) and optionally provision users and groups through [SCIM 2.0](docs/SCIM_zh-CN.md).
 
 ## How to Use
 
-The CLI and web app share the same KB → ingest → ask flow. Set up once (see [Quick Start](#quick-start)): install deps, build the native extension (`make native && make check`), configure `.env`, and drop PDFs into `your_documents/`.
+The CLI and web app use the same versioned API, account, workspace, ACL, and job state. Set up once (see [Quick Start](#quick-start)): install dependencies, build the native extension (`make native && make check`), configure `.env`, and start the API.
 
 ### CLI console
 
 ```bash
-make run            # python -m cogdoc.cli
+make serve                         # FastAPI, required by Web and product CLI
+cogdoc login owner@example.com     # stores only the opaque session token (mode 0600)
+cogdoc                              # interactive API console
 ```
 
-Then drive everything with slash commands inside the console:
+Use `cogdoc --help` for automation-friendly commands covering workspaces, roles, KB/document ACL, batch upload, streaming chat, sessions, derived knowledge, Research, integrations, jobs, traces, evaluation, and index migrations. Inside the interactive console, the same commands may start with `/`; plain text starts a streaming chat against the selected KB.
 
-1. `/kb new <name>` — create a knowledge base, `/kb` to list / switch.
-2. `/add <filename>` — ingest a supported inbox document from `your_documents/` into the active KB (synchronous rebuild).
-3. `/new` — start a conversation; `/chats` and `/open` browse persisted history.
-4. Ask directly to run **QA**; "summarize `<file>`" runs **Summary**; "compare `<a>` and `<b>`" runs **Compare**.
-5. `/cloud` uses the cloud LLM, `/local` uses Ollama; `/help` lists commands; `exit` quits.
-6. Use `/dk` or `/knowledge` for derived knowledge, `/feedback` for feedback records and analyses, `/tuning` for retrieval-weight controls, and `/review` for queue summaries, metrics, and export.
+The old direct-storage inbox console is retained only for offline recovery as `cogdoc --local-storage` or `cogdoc-local`. It uses the legacy `default` tenant and is intentionally not the normal multi-tenant product path. See [CLI/Web parity](docs/cli-web-parity.md).
 
 `make debug` opens the standalone Debug console for one KB. Ask questions there to get normal answers plus trace summaries, use `/trace`, `/steps`, `/rewrite`, `/evidence`, and `/config` to inspect the latest request, or run `/retrieve <query>` to inspect retrieval and rerank output without calling the LLM. To debug a specific KB directly, run `python -m cogdoc.debug --kb <kb_id>`.
 
@@ -223,7 +220,7 @@ Every connector sync updates durable health, low-cardinality Prometheus metrics,
 
 ### Accounts, workspaces, and RAG authorization
 
-`COGDOC_ACCOUNT_AUTH_ENABLED=false` is the backward-compatible default. Set it to `true` for persistent human identities: registration atomically creates a user, an owner membership, a personal workspace, and a login session. Passwords must contain at least 12 characters and are stored as versioned, salted scrypt hashes. Session and invitation values are opaque bearer secrets returned only at issuance; only SHA-256 digests are persisted, and invitations are single-use. Sessions expire, can be listed/revoked individually or globally, and password changes revoke the other active sessions. Repeated bad logins trigger a configurable temporary lock. Send the returned token as `Authorization: Bearer <token>`; it is not a cookie and must never be put in URLs or logs.
+`COGDOC_ACCOUNT_AUTH_ENABLED=false` is the backward-compatible local-development default. Credential-free owner access is accepted only from a loopback peer; non-loopback clients receive 401. Set account auth to `true` for persistent human identities: registration atomically creates a user, an owner membership, a personal workspace, and a login session. Passwords must contain at least 12 characters and are stored as versioned, salted scrypt hashes. Session and invitation values are opaque bearer secrets returned only at issuance; only SHA-256 digests are persisted, and invitations are single-use. Sessions expire, can be listed/revoked individually or globally, and password changes revoke the other active sessions. Repeated bad logins trigger a configurable temporary lock. Send the returned token as `Authorization: Bearer <token>`; it is not a cookie and must never be put in URLs or logs.
 
 Owners can manage the workspace itself; admins combine write, delete, review/publish, and access-management permissions; editors read/query/write; reviewers read/query/review/publish; viewers read/query. Owners/admins manage members and invitations, but a normal role edit cannot manufacture another owner or remove the last owner. Switching workspaces changes the legacy active workspace of that login session. Current clients additionally send the non-secret `X-CogDoc-Workspace` selector on every protected request, so two browser tabs sharing one Bearer can stay pinned to different memberships; the server still validates that membership, and a selector conflicting with a `/v1/workspaces/{id}` path fails closed as an opaque 404. Omitting the header preserves compatibility with clients that rely on the session's active workspace. Knowledge bases with the same public slug are physically isolated by workspace, while account users' conversation sessions and traces are additionally namespaced by user. Cross-workspace list, detail, and mutation requests appear absent rather than revealing another tenant's resource.
 
@@ -231,7 +228,7 @@ New knowledge bases default to `workspace`; uploaded documents default to `inher
 
 Query authorization is materialized as an explicit `ALL`, non-empty `SUBSET`, or `DENY` scope. For a subset, Chroma vector filtering, BM25 candidate selection, approved-derived-knowledge lookup, Summary, Compare, and QA all apply the source allowlist before top-k/reranking; a second post-fusion guard removes any result returned by a stale or custom backend that ignored the filter. This avoids unauthorized high-scoring chunks crowding authorized evidence out of top-k and prevents forbidden text from entering prompts, traces, or persisted evidence. Background Research freezes its creator and exact source boundary, rechecks current workspace membership and ACLs before/after retrieval, refuses a backend that cannot enforce a subset, and stops if access has been revoked; later grants do not silently broaden an already-running job.
 
-Static service principals remain available for automation and staged upgrades. `COGDOC_API_PRINCIPALS` maps each key to a `tenant_id`, `subject_id`, and role; legacy `COGDOC_API_KEYS` and `COGDOC_EVAL_REVIEW_API_KEYS` remain `default`-workspace admins. When account auth is enabled, configured service keys and human sessions coexist. With account auth disabled, authentication is open only when all three static credential settings are empty. Bearer takes precedence over `X-API-Key` if both are sent. Explicit reviewer/admin/owner principals can use evidence-eval and Research review routes; persisted actors always come from the authenticated identity. Hard quotas cover KB count, committed plus in-flight PDF count, and PDF bytes. `/v1/tenant` reports `limits`, `usage`, and `reserved`; quota failures return HTTP 409 with `TENANT_QUOTA_EXCEEDED`.
+Static service principals remain available for automation and staged upgrades. `COGDOC_API_PRINCIPALS` maps each key to a `tenant_id`, `subject_id`, and role; legacy `COGDOC_API_KEYS` remain `default`-workspace admins, while `COGDOC_EVAL_REVIEW_API_KEYS` are least-privileged `default`-workspace reviewers. When account auth is enabled, configured service keys and human sessions coexist. With account auth disabled and no static credentials, only effective loopback clients receive the local owner identity. A reverse proxy deployment must list only its proxy networks in `COGDOC_TRUSTED_PROXY_CIDRS` and overwrite either `Forwarded` or `X-Forwarded-For`; requests from a configured proxy without a valid chain fail closed, so its loopback TCP address cannot grant owner access to an external client. Bearer takes precedence over `X-API-Key` if both are sent. Explicit reviewer/admin/owner principals can use evidence-eval and Research review routes; persisted actors always come from the authenticated identity. Hard quotas cover KB count, committed plus in-flight PDF count, and PDF bytes. `/v1/tenant` reports `limits`, `usage`, and `reserved`; quota failures return HTTP 409 with `TENANT_QUOTA_EXCEEDED`.
 
 `COGDOC_API_KEY` (singular) is an outbound credential consumed by the Streamlit/CLI client, not a server credential allowlist. If it is present in the Streamlit process and the browser has no human session token, the UI deliberately enters service-key mode and skips the account login screen. Leave it empty on every shared or multi-user frontend; configure accepted service identities on the API with `COGDOC_API_KEYS` / `COGDOC_API_PRINCIPALS`, and let human users sign in normally. A singular key is appropriate only for a trusted single-user console or dedicated automation frontend.
 
@@ -420,7 +417,7 @@ flowchart TD
     class LLM,RUST,EMB native
 ```
 
-CLI and Debug bypass the FastAPI HTTP adapter; they call the same Python services in-process. The Streamlit UI is the built-in entry point that talks to FastAPI over HTTP/SSE. CLI, Debug, and FastAPI all acquire the single-instance process lock at startup, then recover the mutation journal before serving KB mutations.
+The product CLI and Web UI both use FastAPI over HTTP/SSE, so they share authentication, workspace selection, ACL enforcement, and asynchronous job state. `cogdoc-debug` and the explicit `cogdoc-local` offline-maintenance console still call Python services in-process; those maintenance tools acquire the single-instance lock and must not run beside the API over the same data directory.
 
 The next diagram expands ingestion, retrieval, and local persistence boundaries: source PDFs and approved derived knowledge are indexed separately, then joined into one candidate pool at query time; feedback does not rewrite indexes directly, but is persisted as reviewable records or rollbackable retrieval tuning.
 
@@ -692,7 +689,8 @@ CogDoc/
 
 | Path | Responsibility |
 | --- | --- |
-| `src/cogdoc/cli.py` | Multi-KB, multi-conversation CLI entry point (`python -m cogdoc.cli` / `cogdoc`) |
+| `src/cogdoc/api_cli.py` | Lightweight API product CLI (`python -m cogdoc.api_cli` / `cogdoc`) |
+| `src/cogdoc/cli.py` | Explicit offline/direct-storage maintenance console (`cogdoc-local`) |
 | `src/cogdoc/debug.py` | Standalone Trace Debug console (`python -m cogdoc.debug` / `cogdoc-debug`) |
 | `src/cogdoc/agents/` | Routing, query rewrite, generation, citation validation, feedback understanding, and Summary / Compare agent primitives |
 | `src/cogdoc/api/` | FastAPI app, routes, schemas, persistence, access control, metrics, feedback / knowledge stores, webhooks |
@@ -714,6 +712,9 @@ CogDoc/
 | `COGDOC_WEBHOOK_URL` | unset | Optional endpoint for pending-knowledge and connector-sync lifecycle events |
 | `COGDOC_WEBHOOK_SECRET` | unset | Optional shared secret sent with webhook requests |
 | `COGDOC_WEBHOOK_TIMEOUT_SECONDS` | `3` | Timeout for webhook delivery attempts |
+| `COGDOC_WEBHOOK_ALLOW_PRIVATE_HOSTS` | `false` | Explicitly allow private-address HTTPS webhook targets; public HTTPS with DNS pinning is the secure default |
+| `COGDOC_WEBHOOK_MAX_REDIRECTS` | `2` | Bounded same-origin HTTPS redirects accepted during webhook delivery |
+| `COGDOC_WEBHOOK_MAX_RESPONSE_BYTES` | `1048576` | Maximum webhook response body read before delivery is rejected |
 | `COGDOC_CREDENTIAL_MASTER_KEYS` | unset | JSON keyring of key ID to base64url 32-byte AES key; unset disables vault/OAuth endpoints while environment-reference connections remain compatible |
 | `COGDOC_CREDENTIAL_ACTIVE_KEY_VERSION` | `v1` | Key ID used for new/rotated credential envelopes; the ID must exist in the keyring |
 | `COGDOC_CONNECTOR_OAUTH_PUBLIC_BASE_URL` | unset | Public API origin used to build exact provider callbacks; production requires HTTPS |
@@ -735,16 +736,17 @@ CogDoc/
 | `COGDOC_FEEDBACK_STORE` | `jsonl` | Feedback storage backend; set `sqlite` to use SQLite with JSONL export |
 | `COGDOC_DERIVED_KNOWLEDGE_INDEX_AUTO_REFRESH` | `false` | Rebuild approved derived-knowledge vectors in the background after review changes |
 | `COGDOC_ACCOUNT_AUTH_ENABLED` | `false` | Enable persistent human accounts, login sessions, workspaces, invitations, and resource ACL enforcement; opt-in for compatibility |
-| `COGDOC_SELF_REGISTRATION_ENABLED` | `true` | Permit public account registration while account auth is enabled; disable after enterprise bootstrap to use invitations only |
+| `COGDOC_SELF_REGISTRATION_ENABLED` | `false` | Temporarily permit public account bootstrap; disable immediately after the first owner and use invitations or SSO |
 | `COGDOC_AUTH_SESSION_TTL_SECONDS` | `2592000` | Login-session lifetime (30 days) |
 | `COGDOC_AUTH_INVITE_TTL_SECONDS` | `604800` | One-time workspace-invitation lifetime (7 days) |
 | `COGDOC_AUTH_MAX_FAILED_LOGINS` | `5` | Consecutive bad password attempts before temporary lockout |
 | `COGDOC_AUTH_LOCKOUT_SECONDS` | `900` | Account lockout duration after the failed-login limit is reached |
 | `COGDOC_API_KEYS` | unset | Comma-separated legacy default/admin API keys; auth is open only when this, principals, and review keys are all empty |
+| `COGDOC_TRUSTED_PROXY_CIDRS` | unset | Proxies allowed to supply validated client-address forwarding headers; configuring a proxy makes the header mandatory for requests from that network |
 | `COGDOC_API_PRINCIPALS` | unset | One-line JSON map from API keys to `tenant_id`, `subject_id`, and RBAC `role`; preferred for team workspaces |
-| `COGDOC_EVAL_REVIEW_API_KEYS` | unset | Legacy evidence-eval/Research review keys; each also authenticates ordinary routes as default/admin |
-| `RATE_LIMIT_PER_MINUTE` | `120` | Token-bucket refill rate for protected API routes |
-| `RATE_LIMIT_BURST` | `120` | Token-bucket burst capacity; `<=0` disables rate limiting |
+| `COGDOC_EVAL_REVIEW_API_KEYS` | unset | Legacy evidence-eval/Research review keys; each authenticates as a least-privileged `default`-workspace reviewer |
+| `COGDOC_RATE_LIMIT_PER_MINUTE` | `120` | Token-bucket refill rate for protected API routes; legacy `RATE_LIMIT_PER_MINUTE` remains accepted |
+| `COGDOC_RATE_LIMIT_BURST` | `120` | Token-bucket burst capacity; `<=0` disables rate limiting; legacy `RATE_LIMIT_BURST` remains accepted |
 | `COGDOC_TENANT_MAX_KNOWLEDGE_BASES` | `0` | Hard KB limit per workspace; `0` is unlimited |
 | `COGDOC_TENANT_MAX_DOCUMENTS` | `0` | Hard committed + in-flight PDF limit per workspace; `0` is unlimited |
 | `COGDOC_TENANT_MAX_STORAGE_MB` | `0` | Hard committed + in-flight PDF-byte limit per workspace in MiB; `0` is unlimited |

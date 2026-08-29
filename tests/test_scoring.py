@@ -1,9 +1,11 @@
 from cogdoc.tools.eval.scoring import (
     LLMJudge,
+    _normalize_score,
     aggregate_case,
     aggregate_run,
     evaluate_trial,
 )
+import pytest
 
 
 def test_deterministic_quality_and_fatal_gate_are_independent():
@@ -31,6 +33,16 @@ def test_deterministic_quality_and_fatal_gate_are_independent():
     assert report["decision"] == "FAIL"
 
 
+@pytest.mark.parametrize(
+    ("judge_score", "normalized"),
+    [(1.0, 0.0), (2.0, 0.25), (3.0, 0.5), (4.0, 0.75), (5.0, 1.0)],
+)
+def test_judge_score_normalization_preserves_one_to_five_order(
+    judge_score, normalized
+):
+    assert _normalize_score(judge_score) == normalized
+
+
 def test_trace_incomplete_can_score_but_never_passes():
     report = evaluate_trial(
         {
@@ -43,6 +55,105 @@ def test_trace_incomplete_can_score_but_never_passes():
     )
     assert report["quality_score"] == 1.0
     assert report["decision"] == "NEEDS_REVIEW"
+
+
+@pytest.mark.parametrize(
+    "execution_status",
+    ("PROTOCOL_ERROR", "CONFIG_ERROR", "TIMEOUT", "TARGET_ERROR"),
+)
+def test_failed_execution_can_score_but_never_passes(execution_status):
+    report = evaluate_trial(
+        {
+            "trial_id": "failed",
+            "execution_status": execution_status,
+            "agent_output": "ok",
+            "expected": "ok",
+        },
+        [{"type": "exact_match", "requires": ["agent_output", "expected"]}],
+    )
+
+    assert report["quality_score"] == 1.0
+    assert report["decision"] == "FAIL"
+
+
+def test_unknown_execution_status_requires_review():
+    report = evaluate_trial(
+        {
+            "execution_status": "FUTURE_STATUS",
+            "agent_output": "ok",
+            "expected": "ok",
+        },
+        [{"type": "exact_match", "requires": ["agent_output", "expected"]}],
+    )
+
+    assert report["decision"] == "NEEDS_REVIEW"
+
+
+def test_missing_execution_status_is_not_assumed_successful():
+    report = evaluate_trial(
+        {"agent_output": "ok", "expected": "ok"},
+        [{"type": "exact_match", "requires": ["agent_output", "expected"]}],
+    )
+
+    assert report["execution_status"] == "UNKNOWN"
+    assert report["decision"] == "NEEDS_REVIEW"
+
+
+def test_required_unobservable_gate_forces_review():
+    report = evaluate_trial(
+        {
+            "execution_status": "SUCCESS",
+            "agent_output": "ok",
+            "expected": "ok",
+        },
+        [
+            {"type": "exact_match", "requires": ["agent_output", "expected"]},
+            {
+                "type": "safety_assertion",
+                "role": "GATE",
+                "requires": ["tool_trace"],
+                "gate_policy": {"level": "CRITICAL", "required": True},
+            },
+        ],
+    )
+
+    assert report["gate_decision"] == "GATE_REVIEW"
+    assert report["decision"] == "NEEDS_REVIEW"
+
+
+def test_warning_gate_does_not_override_quality_decision():
+    report = evaluate_trial(
+        {
+            "execution_status": "SUCCESS",
+            "agent_output": "ok forbidden",
+            "expected": "ok forbidden",
+        },
+        [
+            {"type": "exact_match", "requires": ["agent_output", "expected"]},
+            {
+                "type": "safety_assertion",
+                "role": "GATE",
+                "requires": ["agent_output"],
+                "gate_policy": {"level": "WARNING"},
+                "config": {"forbidden_patterns": ["forbidden"]},
+            },
+        ],
+    )
+
+    assert report["gate_decision"] == "PASS_WITH_WARNING"
+    assert report["decision"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"pass_threshold": float("nan")}, "pass_threshold"),
+        ({"margin": -0.1}, "margin"),
+    ],
+)
+def test_invalid_trial_thresholds_are_rejected(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        evaluate_trial({"execution_status": "SUCCESS"}, [], **kwargs)
 
 
 def test_missing_required_evidence_is_not_observable():
@@ -211,6 +322,17 @@ def test_run_decision_and_stable_case_rate():
     )
     assert report["stable_case_rate"] == 0.5
     assert report["decision"] == "NEEDS_REVIEW"
+
+
+def test_aggregates_reject_non_finite_scores_and_invalid_thresholds():
+    with pytest.raises(ValueError, match="quality_score"):
+        aggregate_case(
+            [{"execution_status": "SUCCESS", "quality_score": float("nan")}]
+        )
+    with pytest.raises(ValueError, match="min_success_rate"):
+        aggregate_case([], min_success_rate=2.0)
+    with pytest.raises(ValueError, match="quality_score"):
+        aggregate_run([{"quality_score": float("inf")}])
 
 
 def test_llm_judge_uses_common_output_schema(monkeypatch):

@@ -43,6 +43,14 @@ class HybridRetriever(BaseRetriever):
         self.vector_retriever.clear()  # 清空向量索引
         self.bm25_retriever.clear()  # 清空BM25索引
 
+    def close(self) -> None:
+        """Release retriever-owned resources when an engine leaves the cache."""
+
+        for retriever in (self.vector_retriever, self.bm25_retriever):
+            close = getattr(retriever, "close", None)
+            if callable(close):
+                close()
+
     # 写入索引。
     def index(self, chunks: List[RetrievedDoc]) -> None:
         if not chunks:

@@ -345,6 +345,49 @@ def test_database_finalize_failure_keeps_durable_orphan_intent_for_gc(
     assert objects.head(uploaded[0].key) is None
 
 
+def test_expired_upload_lease_cannot_commit_without_capacity_reservation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class Clock:
+        value = 100.0
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    objects = LocalObjectStore(tmp_path / "objects")
+    store = DistributedSourceArtifactStore(
+        SQLiteBackend(tmp_path / "shared.db"),
+        objects,
+        owner_id="node-a",
+        max_file_bytes=1024,
+        max_total_bytes=4,
+        max_bytes_per_tenant=4,
+        reservation_lease_seconds=60,
+        clock=clock,
+    )
+    original_put = objects.put_bytes
+
+    def delayed_put(*args, **kwargs):
+        result = original_put(*args, **kwargs)
+        clock.value += 61
+        return result
+
+    monkeypatch.setattr(objects, "put_bytes", delayed_put)
+    with pytest.raises(ArtifactConflictError, match="authority expired"):
+        _put(store, b"1234")
+
+    with store.backend.transaction() as connection:
+        artifact_count = connection.execute(
+            "SELECT COUNT(*) FROM ha_source_artifacts"
+        ).fetchone()[0]
+        reserved = connection.execute(
+            "SELECT reserved_bytes FROM ha_source_artifact_uploads"
+        ).fetchone()[0]
+    assert artifact_count == 0
+    assert reserved == 0
+
+
 def test_limits_include_trash_and_outstanding_cluster_reservations(
     tmp_path: Path,
 ) -> None:

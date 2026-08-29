@@ -256,6 +256,24 @@ def test_pending_job_is_not_failed_before_worker_claims_it(tmp_path: Path) -> No
     assert store.get("job-1")["status"] == "pending"  # type: ignore[index]
 
 
+def test_distributed_index_job_store_clear_kb_removes_only_scope(
+    tmp_path: Path,
+) -> None:
+    backend = SQLiteBackend(tmp_path / "shared.db")
+    store = DistributedIndexJobStore(
+        backend, owner_id="worker-a", lease_seconds=30
+    )
+    store.create({"job_id": "old-kb", "kb_id": "kb-a", "status": "succeeded"})
+    store.create(
+        {"job_id": "other-kb", "kb_id": "kb-b", "status": "succeeded"}
+    )
+
+    store.clear_kb("kb-a")
+
+    assert store.get("old-kb") is None
+    assert [row["job_id"] for row in store.list({"kb-b"})] == ["other-kb"]
+
+
 def test_executor_submit_failure_claims_before_terminal_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

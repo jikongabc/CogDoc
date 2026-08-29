@@ -10,6 +10,7 @@ from cogdoc.ha.index_generation import IndexConflict
 from cogdoc.ha.object_store import LocalObjectStore
 from cogdoc.ha.storage import SQLiteBackend
 from cogdoc.tools.embedder import Embedder
+from cogdoc.service.kb_lifecycle import LIFECYCLE_DELETING
 
 
 class _FakeEngine:
@@ -432,3 +433,45 @@ def test_refresh_claim_is_renewed_during_a_slow_build(tmp_path, monkeypatch):
 
     assert index.refresh_pending(storage_id) is True
     assert store.pending_refreshes() == []
+
+
+def test_clear_kb_detaches_only_fenced_incarnation_head(tmp_path, monkeypatch):
+    backend = SQLiteBackend(tmp_path / "clear-derived-head.db")
+    registry = DistributedKnowledgeBaseRegistry(backend, tmp_path / "source-cache")
+    record = registry.create("docs", "tenant", "owner")
+    storage_id = str(record["storage_id"])
+    store = DistributedDerivedKnowledgeStore(backend)
+    row, _ = store.create({"kb_id": storage_id, "text": "Approved"})
+    store.set_status(row["knowledge_id"], "approved", actor="owner")
+    monkeypatch.setattr(Embedder, "EMBEDDING_DIM", 3)
+    monkeypatch.setattr(
+        Embedder,
+        "embed_documents",
+        lambda texts: [[1.0, 0.0, 0.0] for _ in texts],
+    )
+    index = HADerivedKnowledgeIndex(
+        backend,
+        LocalObjectStore(tmp_path / "objects"),
+        store,
+        registry,
+        worker_id="worker",
+        cache_root=tmp_path / "cache",
+    )
+    index.rebuild(storage_id)
+    scope = _scope_id(storage_id, int(record["epoch"]))
+    assert index.generations.current("tenant", scope) is not None
+    index._engines[storage_id] = (1, "old", object())
+    index._last_error[storage_id] = "old-error"
+
+    with pytest.raises(RuntimeError, match="fenced"):
+        index.clear_kb(storage_id)
+
+    registry.set(storage_id, LIFECYCLE_DELETING)
+    registry.bump(storage_id)
+    index.clear_kb(storage_id)
+
+    assert index.generations.current("tenant", scope) is None
+    assert storage_id not in index._engines
+    assert storage_id not in index._last_error
+
+    index.clear_kb(storage_id)

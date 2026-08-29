@@ -51,6 +51,22 @@ class Settings(BaseSettings):
     cogdoc_webhook_timeout_seconds: float = Field(
         default=3.0, validation_alias="COGDOC_WEBHOOK_TIMEOUT_SECONDS"
     )
+    cogdoc_webhook_allow_private_hosts: bool = Field(
+        default=False,
+        validation_alias="COGDOC_WEBHOOK_ALLOW_PRIVATE_HOSTS",
+    )
+    cogdoc_webhook_max_redirects: int = Field(
+        default=2,
+        ge=0,
+        le=3,
+        validation_alias="COGDOC_WEBHOOK_MAX_REDIRECTS",
+    )
+    cogdoc_webhook_max_response_bytes: int = Field(
+        default=1024 * 1024,
+        ge=1024,
+        le=10 * 1024 * 1024,
+        validation_alias="COGDOC_WEBHOOK_MAX_RESPONSE_BYTES",
+    )
     # Connector vault keys are a JSON object of key-id -> URL-safe base64
     # encoded 32-byte AES keys. Empty keeps vault/OAuth endpoints fail-closed
     # while preserving legacy environment-reference connections.
@@ -407,6 +423,13 @@ class Settings(BaseSettings):
 
     # 访问控制：旧密钥逗号分隔；只有全部三类凭据均为空才关闭鉴权。
     cogdoc_api_keys: str = Field(default="", validation_alias="COGDOC_API_KEYS")
+    # Forwarded client addresses are accepted only from these immediate proxy
+    # networks. Empty is the safe direct-server default. Configuring a proxy
+    # network also makes a forwarding header mandatory for requests from it.
+    cogdoc_trusted_proxy_cidrs: str = Field(
+        default="",
+        validation_alias="COGDOC_TRUSTED_PROXY_CIDRS",
+    )
     # 团队工作区身份映射。JSON 对象的 key 是 API key，value 包含
     # tenant_id / subject_id / role。与旧 COGDOC_API_KEYS 可并存；旧 key
     # 为了无损升级仍映射到 default 租户的 admin。
@@ -424,7 +447,7 @@ class Settings(BaseSettings):
         default=False, validation_alias="COGDOC_ACCOUNT_AUTH_ENABLED"
     )
     cogdoc_self_registration_enabled: bool = Field(
-        default=True, validation_alias="COGDOC_SELF_REGISTRATION_ENABLED"
+        default=False, validation_alias="COGDOC_SELF_REGISTRATION_ENABLED"
     )
     cogdoc_auth_session_ttl_seconds: float = Field(
         default=30 * 24 * 60 * 60,
@@ -532,9 +555,15 @@ class Settings(BaseSettings):
     )
     # 限流令牌桶：每分钟补充速率 + 突发容量；容量<=0 关闭限流。
     rate_limit_per_minute: int = Field(
-        default=120, validation_alias="RATE_LIMIT_PER_MINUTE"
+        default=120,
+        validation_alias=AliasChoices(
+            "COGDOC_RATE_LIMIT_PER_MINUTE", "RATE_LIMIT_PER_MINUTE"
+        ),
     )
-    rate_limit_burst: int = Field(default=120, validation_alias="RATE_LIMIT_BURST")
+    rate_limit_burst: int = Field(
+        default=120,
+        validation_alias=AliasChoices("COGDOC_RATE_LIMIT_BURST", "RATE_LIMIT_BURST"),
+    )
     # 0 表示不设限。配额只以服务端解析出的 tenant_id 为信任边界。
     cogdoc_tenant_max_knowledge_bases: int = Field(
         default=0,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 import pytest
 from types import SimpleNamespace
@@ -8,7 +8,8 @@ from types import SimpleNamespace
 from cogdoc.api.access_control import AccessControlMiddleware, TokenBucketRateLimiter
 from cogdoc.api.auth_store import AuthNotFoundError, AuthStore, AuthStoreError
 from cogdoc.api.resource_access import AccessMode, ResourceAccessStore
-from cogdoc.api.routes.auth import router as auth_router
+from cogdoc.api.routes.auth import _enforce_public_rate_limit, router as auth_router
+from cogdoc.api.tenant_scope import request_principal
 from cogdoc.api.routes.documents import _live_session_authorization_guard
 from cogdoc.api.tenant_scope import KnowledgeBaseScope
 from cogdoc.api.tenancy import Permission, Principal, Role
@@ -26,6 +27,15 @@ class _AllowAll:
 class _DenyAll:
     def allow(self, _identity: str) -> bool:
         return False
+
+
+class _CaptureAll:
+    def __init__(self) -> None:
+        self.identities: list[str] = []
+
+    def allow(self, identity: str) -> bool:
+        self.identities.append(identity)
+        return True
 
 
 @pytest.fixture
@@ -57,6 +67,41 @@ def _access_token(payload: dict) -> str:
 
 def _client(app: FastAPI) -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver")
+
+
+def _request(app: FastAPI, *, effective_host: str | None = None) -> Request:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/auth/login",
+            "raw_path": b"/v1/auth/login",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+            "app": app,
+        }
+    )
+    if effective_host is not None:
+        request.state.effective_client_host = effective_host
+    return request
+
+
+def test_tenant_scope_requires_an_explicit_authenticated_principal() -> None:
+    app = FastAPI()
+    with pytest.raises(RuntimeError, match="principal is unavailable"):
+        request_principal(_request(app))
+
+
+def test_public_auth_limiter_uses_proxy_aware_client_identity() -> None:
+    app = FastAPI()
+    limiter = _CaptureAll()
+    app.state.auth_public_rate_limiter = limiter
+    _enforce_public_rate_limit(_request(app, effective_host="198.51.100.10"), "login")
+    _enforce_public_rate_limit(_request(app, effective_host="198.51.100.11"), "login")
+    assert len(set(limiter.identities)) == 2
 
 
 class _CountingAuthStore(AuthStore):

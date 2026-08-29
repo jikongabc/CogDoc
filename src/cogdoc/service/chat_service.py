@@ -7,6 +7,7 @@ from cogdoc.agents.router import FORCED_TASK_TYPES
 from cogdoc.observability.logger import configure_logging, log_event, new_trace_id
 from cogdoc.observability.trace import build_trace_step, export_trace, monotonic_ms
 from cogdoc.service.index_provenance import current_index_provenance
+from cogdoc.service.kb_epoch import shared_epoch_store
 from cogdoc.service.claim_verification_rollout import (
     build_claim_verification_rollout,
     ensure_claim_verification_rollout,
@@ -271,13 +272,14 @@ def _trace_config(
     settings: Any,
     session_id: str | None = None,
     claim_verification_policy: ClaimVerificationPolicy | None = None,
+    kb_epoch: int | None = None,
 ) -> dict[str, Any]:
     verification_policy = (
         claim_verification_policy.to_state()
         if claim_verification_policy is not None
         else {}
     )
-    return {
+    config = {
         "doc_id": doc_id,
         **current_index_provenance(doc_id),
         "session_id": session_id or "",
@@ -355,6 +357,9 @@ def _trace_config(
         ),
         "model": settings.ollama_model_name if is_local else settings.llm_model_name,
     }
+    if type(kb_epoch) is int and kb_epoch >= 1:
+        config["kb_epoch"] = kb_epoch
+    return config
 
 
 # 构建跟踪错误摘要。
@@ -377,6 +382,7 @@ def run_chat(
     *,
     state_runtime=None,
     retrieval_scope=None,
+    kb_epoch: int | None = None,
 ) -> Iterator[ChatEvent]:
     global app
     if app is None:
@@ -390,6 +396,12 @@ def run_chat(
         from cogdoc.state_runtime import default_state_runtime
 
         state_runtime = default_state_runtime()
+    if kb_epoch is None:
+        try:
+            kb_epoch = shared_epoch_store().current(doc_id)
+        except Exception:
+            # Trace metadata must never make an otherwise valid chat fail.
+            kb_epoch = None
     trace_id = new_trace_id()
     claim_verification_policy = resolve_claim_verification_policy(
         settings,
@@ -408,6 +420,7 @@ def run_chat(
         settings,
         session_id=session_id,
         claim_verification_policy=claim_verification_policy,
+        kb_epoch=kb_epoch,
     )
     stream_error: dict[str, Any] | None = None
     initial_state = {

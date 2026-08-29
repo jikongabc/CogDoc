@@ -872,6 +872,14 @@ class DistributedIndexJobStore:
                 jobs.append(value)
         return jobs
 
+    def clear_kb(self, kb_id: str) -> None:
+        marker = self.backend.sql(sqlite="?", postgres="%s")
+        with self.backend.transaction(write=True) as connection:
+            connection.execute(
+                f"DELETE FROM ha_api_index_jobs WHERE kb_id={marker}",
+                (kb_id,),
+            )
+
     def reconcile_orphans(self) -> int:
         now = float(self._clock())
         marker = self.backend.sql(sqlite="?", postgres="%s")

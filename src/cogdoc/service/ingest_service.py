@@ -11,6 +11,10 @@ from cogdoc.api.derived_knowledge_store import (
     DerivedKnowledgeStore,
 )
 from cogdoc.config.settings import get_settings
+from cogdoc.service.chroma_cleanup import (
+    collection_segment_ids,
+    delete_collection_and_segments,
+)
 from cogdoc.service.retriever_factory import RetrieverFactory
 from cogdoc.observability.logger import log_event
 from cogdoc.service.kb_epoch import shared_epoch_store
@@ -458,7 +462,9 @@ def delete_kb_index(kb_id: str) -> None:
 
 
 # 清理索引代外部资源。
-def _purge_generation_external(kb_id: str, gen_id: str) -> None:
+def _purge_generation_external(
+    kb_id: str, gen_id: str, segment_ids: list[str] | tuple[str, ...] = ()
+) -> None:
     # 删库专用，只清理知识库目录外的向量集合和关键词索引文件。
     if has_readers(kb_id):
         raise KBCleanupError(f"KB {kb_id} 仍有在途读者，延后清理 generation {gen_id}")
@@ -468,11 +474,13 @@ def _purge_generation_external(kb_id: str, gen_id: str) -> None:
     try:
         import chromadb
 
-        chromadb.PersistentClient(path=settings.chroma_persist_dir).delete_collection(
-            f"col-{collection_id}"
+        client = chromadb.PersistentClient(path=settings.chroma_persist_dir)
+        delete_collection_and_segments(
+            client,
+            settings.chroma_persist_dir,
+            f"col-{collection_id}",
+            retained_segment_ids=segment_ids,
         )
-    except ValueError:
-        pass
     except Exception:
         ok = False
     bm25_path = os.path.join(settings.bm25_persist_dir, f"bm25_{collection_id}.pkl")
@@ -534,7 +542,11 @@ def drain_purge_queue(now: float | None = None) -> int:
     done = 0
     for item in queue.due(now):
         try:
-            _purge_generation_external(item["kb_id"], item["gen_id"])
+            _purge_generation_external(
+                item["kb_id"],
+                item["gen_id"],
+                item.get("segment_ids", ()),
+            )
             queue.remove(item["kb_id"], item["gen_id"])
             done += 1
         except Exception:
@@ -546,8 +558,21 @@ def drain_purge_queue(now: float | None = None) -> int:
 def _schedule_kb_purge(kb_id: str, gen_ids: list) -> None:
     # 物理清理先入持久队列，并启动定时器促其尽快执行。
     not_before = time.time() + GENERATION_CLEANUP_DELAY_SECONDS
+    settings = get_settings()
     for gen_id in gen_ids:
-        shared_purge_queue().add(kb_id, gen_id, not_before)
+        collection_id = settings.kb_collection_id(kb_id, gen_id)
+        try:
+            segment_ids = collection_segment_ids(
+                settings.chroma_persist_dir, f"col-{collection_id}"
+            )
+        except Exception:
+            segment_ids = ()
+        shared_purge_queue().add(
+            kb_id,
+            gen_id,
+            not_before,
+            segment_ids=segment_ids,
+        )
     try:
         _start_tracked_timer(GENERATION_CLEANUP_DELAY_SECONDS, drain_purge_queue)
     except Exception as exc:
@@ -800,6 +825,12 @@ def _cleanup_generation_storage(kb_id: str, gen_id: str) -> None:
             raise KBCleanupError(
                 f"KB {kb_id} 仍有在途读者，延后清理 generation {gen_id}"
             )
+        state = KBState(kb_id)
+        active = state.active()
+        if active is not None and str(active.get("id") or "") == gen_id:
+            raise KBCleanupError(
+                f"refusing to clean active generation {gen_id} for KB {kb_id}"
+            )
         settings = get_settings()
         collection_id = settings.kb_collection_id(kb_id, gen_id)
         all_ok = True
@@ -807,11 +838,12 @@ def _cleanup_generation_storage(kb_id: str, gen_id: str) -> None:
         try:
             import chromadb
 
-            chromadb.PersistentClient(
-                path=settings.chroma_persist_dir
-            ).delete_collection(f"col-{collection_id}")
-        except ValueError:
-            pass  # Chroma 对 not-found 抛 ValueError：集合已清，视为成功
+            client = chromadb.PersistentClient(path=settings.chroma_persist_dir)
+            delete_collection_and_segments(
+                client,
+                settings.chroma_persist_dir,
+                f"col-{collection_id}",
+            )
         except Exception:
             all_ok = False
 
@@ -833,7 +865,7 @@ def _cleanup_generation_storage(kb_id: str, gen_id: str) -> None:
         if all_ok:
             # 全部资源清理成功后才移除状态记录。
             try:
-                KBState(kb_id).remove_generation(gen_id)
+                state.remove_generation(gen_id)
             except Exception:
                 all_ok = False
 
@@ -1172,7 +1204,10 @@ def _build_transactional_locked(
         # 提交前记录索引代，写失败则在切换活跃代前中止。
         if on_commit is not None:
             on_commit(gen_id)
-        old_gen = state.switch_active(gen_id)  # 提交点：持有 kb_write_lock 保证原子性
+        old_gen = state.switch_active(
+            gen_id,
+            retain_previous_generation=retain_previous_generation,
+        )  # 提交点：持有 kb_write_lock 保证原子性
     except Exception:
         # 各步独立容错，保证原始异常不被次级异常覆盖。
         try:
@@ -1254,7 +1289,10 @@ def _transactional_empty(
         state.mark_ready(gen_id, expected_count=0, documents=[])
         if on_commit is not None:
             on_commit(gen_id)  # 提交前记录 gen_id，写失败则中止提交
-        old_gen = state.switch_active(gen_id)  # 提交点
+        old_gen = state.switch_active(
+            gen_id,
+            retain_previous_generation=retain_previous_generation,
+        )  # 提交点
     except Exception:
         try:
             state.mark_failed(gen_id)

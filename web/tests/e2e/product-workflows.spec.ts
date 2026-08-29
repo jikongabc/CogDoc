@@ -470,3 +470,40 @@ test("derived knowledge revision and retrieval feedback controls preserve govern
   await page.getByRole("button", { name: "停用" }).click();
   await expect.poll(() => retrievalAction).toBe("/retrieval-feedback/rf-1/disable");
 });
+
+test("batch knowledge review confirms scope and reports partial success", async ({ page }) => {
+  let batchPayload: Record<string, unknown> | undefined;
+  await page.route("**/api/cogdoc/v1/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname.replace("/api/cogdoc/v1", "");
+    if (path === "/auth/config") return json(route, { schema_version: "v1", account_auth_enabled: true, self_registration_enabled: false, oidc_enabled: false, oidc_display_name: "", scim_enabled: false });
+    if (path === "/auth/login") return json(route, session);
+    if (path === "/auth/me") return json(route, { schema_version: "v1", user, workspace, permissions: session.permissions, workspaces: [workspace] });
+    if (path === "/knowledge-bases") return json(route, [{ kb_id: "policies", created_at: "2026-08-01T00:00:00Z", document_count: 1, tenant_id: workspace.workspace_id, owner_id: user.user_id }]);
+    if (path === "/knowledge" && request.method() === "GET") return json(route, { knowledge: [{ knowledge_id: "kn-raced", kb_id: "policies", text: "待审核策略。", status: "pending", certainty: "medium" }] });
+    if (path === "/knowledge/batch-approve" && request.method() === "POST") {
+      batchPayload = request.postDataJSON() as Record<string, unknown>;
+      return json(route, { updated: [], missing_ids: ["kn-raced"] });
+    }
+    if (path === "/knowledge/pending-count") return json(route, { kb_id: "policies", pending: 1, stale: 0, total: 1 });
+    if (path === "/knowledge/index-status") return json(route, { kb_id: "policies", state: "ready", approved_count: 0, indexed_count: 0 });
+    if (path === "/feedback-loop-metrics") return json(route, { counts: { approved_knowledge_total: 0, feedback_total: 0 } });
+    if (path === "/feedback" || path === "/feedback-analysis" || path === "/retrieval-feedback") return json(route, { items: [] });
+    if (path === "/knowledge-bases/policies/documents") return json(route, []);
+    return json(route, { items: [] });
+  });
+
+  await page.goto("/login");
+  await page.getByLabel("邮箱").fill("reviewer@example.com");
+  await page.getByLabel("密码").fill("a-valid-password");
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  await page.goto("/knowledge/policies/knowledge");
+  await page.getByRole("combobox").first().click();
+  await page.getByRole("option", { name: "pending" }).click();
+  await page.getByRole("button", { name: "批量通过当前列表" }).click();
+  await expect(page.getByRole("heading", { name: "批量通过派生知识" })).toBeVisible();
+  await page.getByRole("button", { name: "确认处理 1 条" }).click();
+
+  await expect.poll(() => batchPayload).toMatchObject({ knowledge_ids: ["kn-raced"] });
+  await expect(page.getByText("已通过 0 条，另有 1 条因列表变化未处理")).toBeVisible();
+});

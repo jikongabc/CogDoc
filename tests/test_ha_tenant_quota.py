@@ -9,6 +9,7 @@ from cogdoc.api.tenant_quota import (
     TenantMutationInProgress,
     TenantQuotaExceeded,
     TenantQuotaPolicy,
+    TenantQuotaReservationLost,
 )
 from cogdoc.ha.api_state import (
     DistributedKnowledgeBaseRegistry,
@@ -128,6 +129,30 @@ def test_heartbeat_keeps_live_reservation_and_release_is_owner_scoped(
     first.release(token)
 
 
+def test_expired_reservation_cannot_publish_or_heartbeat(tmp_path: Path) -> None:
+    clock, record, registry, _sources, first, _second = _cluster(
+        tmp_path, TenantQuotaPolicy(max_documents=1)
+    )
+    storage_id = str(record["storage_id"])
+    token = first.reserve_upload(
+        "tenant-a", storage_id, registry.source_dir(storage_id), "a.md", 1
+    )
+    clock.value += 6
+
+    with pytest.raises(TenantQuotaReservationLost, match="stale or expired"):
+        first.assert_live(token)
+
+    # Once ownership is lost the heartbeat must report it, rather than claim
+    # that the asynchronous mutation is still protected by quota.
+    second_token = first.reserve_upload(
+        "tenant-a", storage_id, registry.source_dir(storage_id), "b.md", 1
+    )
+    clock.value += 6
+    with pytest.raises(TenantQuotaReservationLost, match="expired"):
+        first.heartbeat()
+    first.release(second_token)
+
+
 def test_published_source_usage_and_overwrite_delta_are_cluster_authoritative(
     tmp_path: Path,
 ) -> None:
@@ -196,3 +221,53 @@ def test_concurrent_kb_reservations_are_serialized_per_tenant(tmp_path: Path) ->
         thread.join(timeout=5)
 
     assert sorted(outcomes) == ["rejected", "reserved"]
+
+
+def test_distributed_connector_snapshot_reserves_cluster_growth(tmp_path: Path) -> None:
+    _clock, record, registry, sources, first, second = _cluster(
+        tmp_path, TenantQuotaPolicy(max_documents=2, max_storage_bytes=10)
+    )
+    storage_id = str(record["storage_id"])
+    source_dir = Path(registry.source_dir(storage_id))
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "existing.md").write_bytes(b"1234")
+    coordinator = DistributedMutationCoordinator(
+        registry.backend, registry, owner_id="writer", lease_seconds=30
+    )
+    lease = coordinator.acquire(storage_id)
+    candidate = sources.stage_directory(
+        tenant_id="tenant-a",
+        storage_id=storage_id,
+        source_dir=source_dir,
+        lease=lease,
+    )
+    sources.publish(str(candidate["generation_id"]), lease)
+
+    baseline = tmp_path / "baseline"
+    proposed = tmp_path / "proposed"
+    baseline.mkdir()
+    proposed.mkdir()
+    (proposed / "connector.md").write_bytes(b"12345")
+    token = first.reserve_connector_snapshot(
+        "tenant-a",
+        storage_id,
+        str(source_dir),
+        str(baseline),
+        str(proposed),
+        "sync-1",
+    )
+    assert second.snapshot("tenant-a")["reserved"] == {
+        "knowledge_bases": 0,
+        "documents": 1,
+        "storage_bytes": 5,
+    }
+    with pytest.raises(TenantQuotaExceeded):
+        second.reserve_connector_snapshot(
+            "tenant-a",
+            storage_id,
+            str(source_dir),
+            str(baseline),
+            str(proposed),
+            "sync-2",
+        )
+    first.release(token)

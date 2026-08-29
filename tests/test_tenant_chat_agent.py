@@ -9,6 +9,7 @@ from cogdoc.api.tenant_scope import (
     PhysicalIdentityProjectionError,
     externalize_kb_fields,
 )
+from cogdoc.api.tenancy import Principal
 from cogdoc.service.chat_service import ChatResult
 
 
@@ -55,7 +56,16 @@ async def test_chat_sessions_and_agent_calls_use_physical_tenant_scope(
 
     def retrieve_runner(body):
         retrieve_calls.append(body.doc_id)
-        return []
+        return [
+            {
+                "text": f"hit-{index}",
+                "metadata": {
+                    "source": "source.pdf",
+                    "chunk_id": f"chunk-{index}",
+                },
+            }
+            for index in range(5)
+        ]
 
     app = create_app(
         kb_registry=registry,
@@ -98,7 +108,7 @@ async def test_chat_sessions_and_agent_calls_use_physical_tenant_scope(
             )
             retrieve_b = await client.post(
                 "/v1/retrieve",
-                json={"query": "find", "doc_id": "shared"},
+                json={"query": "find", "doc_id": "shared", "top_k": 2},
                 headers=headers_b,
             )
             sessions_a = await client.get(
@@ -117,6 +127,8 @@ async def test_chat_sessions_and_agent_calls_use_physical_tenant_scope(
     assert summary_a.status_code == retrieve_b.status_code == 200
     assert chat_a.json()["doc_id"] == chat_b.json()["doc_id"] == "shared"
     assert summary_a.json()["doc_id"] == retrieve_b.json()["doc_id"] == "shared"
+    assert retrieve_b.json()["top_k"] == 2
+    assert [row["rank"] for row in retrieve_b.json()["hits"]] == [1, 2]
     assert [call[0] for call in runner_calls] == [
         tenant_a["storage_id"],
         tenant_b["storage_id"],
@@ -140,5 +152,6 @@ def test_unresolved_physical_id_projection_fails_closed(tmp_path):
     from starlette.requests import Request
 
     request = Request({"type": "http", "app": app, "headers": []})
+    request.state.principal = Principal.local_owner()
     with pytest.raises(PhysicalIdentityProjectionError):
         externalize_kb_fields({"doc_id": "t-" + "a" * 64}, request)

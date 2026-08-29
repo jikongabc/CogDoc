@@ -62,6 +62,24 @@ def _close_app(app):
     app.state.state_runtime.close()
 
 
+@pytest.mark.anyio
+async def test_independent_review_key_cannot_delete_knowledge_bases(tmp_path):
+    app, _store = _make_app(tmp_path)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.delete(
+                "/v1/knowledge-bases/any-kb",
+                headers={"X-API-Key": "review-key"},
+            )
+
+        assert response.status_code == 403
+        assert response.json()["error_code"] == "FORBIDDEN"
+    finally:
+        _close_app(app)
+
+
 def _snapshot(generation="gen-1"):
     return {
         "index_generation": generation,

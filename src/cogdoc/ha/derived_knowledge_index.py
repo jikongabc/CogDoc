@@ -667,5 +667,46 @@ class HADerivedKnowledgeIndex:
         with self._lock:
             self._last_error[storage_id] = str(error_class)
 
+    def clear_kb(self, storage_id: str) -> None:
+        """Detach every derived-index generation from a fenced KB incarnation."""
+
+        marker = self.backend.sql(sqlite="?", postgres="%s")
+        lock = self.backend.sql(sqlite="", postgres=" FOR UPDATE")
+        with self.backend.transaction(write=True) as connection:
+            record = connection.execute(
+                "SELECT tenant_id,epoch,lifecycle FROM ha_api_knowledge_bases "
+                f"WHERE storage_id={marker}{lock}",
+                (storage_id,),
+            ).fetchone()
+            if record is None:
+                with self._lock:
+                    self._engines.pop(storage_id, None)
+                    self._last_error.pop(storage_id, None)
+                return
+            row = dict(record)
+            if str(row.get("lifecycle") or "") == "active":
+                raise RuntimeError("derived index cleanup requires a fenced KB")
+            tenant_id = str(row["tenant_id"])
+            epoch = int(row["epoch"])
+            scopes = [_scope_id(storage_id, epoch)]
+            # Deletion fences bump the KB epoch before physical cleanup. The
+            # active derived head therefore belongs to the immediately prior
+            # incarnation, while a partially retried cleanup may also have
+            # created a head for the fenced epoch. Detach both deterministically.
+            if epoch > 1:
+                scopes.append(_scope_id(storage_id, epoch - 1))
+            placeholders = ",".join(marker for _ in scopes)
+            connection.execute(
+                "DELETE FROM ha_index_heads WHERE tenant_id="
+                f"{marker} AND kb_id IN ({placeholders})",
+                (tenant_id, *scopes),
+            )
+        # Generations and object blobs are intentionally left headless for the
+        # existing lease-aware HA retention sweeper. The epoch-scoped head is
+        # gone immediately, so a same-slug recreation cannot resolve them.
+        with self._lock:
+            self._engines.pop(storage_id, None)
+            self._last_error.pop(storage_id, None)
+
 
 __all__ = ["DERIVED_KNOWLEDGE_CHUNK_VERSION", "HADerivedKnowledgeIndex"]

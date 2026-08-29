@@ -1,3 +1,6 @@
+import base64
+import json
+import pickle
 import types
 import pytest
 from cogdoc.service import ingest_service
@@ -372,6 +375,39 @@ def test_bm25_upsert_to_empty_clears_index(tmp_path):
     inc.upsert_documents([], removed_sources={"a.pdf"})
     assert inc.count() == 0
     assert inc.exists() is False
+
+
+def test_bm25_migrates_legacy_data_only_pickle_to_json(tmp_path):
+    persist = str(tmp_path / "bm25")
+    original = BM25Retriever("kb", persist_directory=persist)
+    original.index([_chunk("a.pdf", "aaa", 0, "alpha")])
+    with open(original.db_path, encoding="utf-8") as handle:
+        safe_payload = json.load(handle)
+    legacy_payload = {
+        "format": "bm25_index_bytes_v1",
+        "doc_registry": safe_payload["doc_registry"],
+        "index_bytes": base64.b64decode(safe_payload["index_base64"]),
+    }
+    with open(original.db_path, "wb") as handle:
+        pickle.dump(legacy_payload, handle)
+
+    restored = BM25Retriever("kb", persist_directory=persist)
+
+    assert restored.count() == 1
+    with open(restored.db_path, encoding="utf-8") as handle:
+        migrated = json.load(handle)
+    assert migrated["format"] == "bm25_index_json_v2"
+
+
+def test_bm25_restricted_legacy_loader_rejects_pickle_globals(tmp_path):
+    persist = tmp_path / "bm25"
+    persist.mkdir()
+    path = persist / "bm25_kb.pkl"
+    path.write_bytes(pickle.dumps(__import__("os").system))
+
+    restored = BM25Retriever("kb", persist_directory=str(persist))
+
+    assert restored.exists() is False
 
 
 # 校验向量索引增量等价。

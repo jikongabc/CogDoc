@@ -1,4 +1,5 @@
 import json
+import stat
 from langchain_core.messages import AIMessage
 
 from cogdoc.config.settings import Settings
@@ -635,6 +636,7 @@ def test_export_trace_writes_json_file(tmp_path):
     assert payload["summary"]["error_count"] == 0
     assert payload["error"]["error_class"] == "TimeoutError"
     assert payload["steps"][0]["node_name"] == "intent_router"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 # 验证 trace 导出能处理 LangChain Message 等非原生 JSON 对象。

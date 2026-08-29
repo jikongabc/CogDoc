@@ -141,6 +141,36 @@ def test_same_aggregate_is_delivered_in_revision_order(outbox):
     assert second["event_id"] == later["event_id"]
 
 
+def test_dead_letter_blocks_later_revision_of_same_aggregate(outbox):
+    _backend, store, _clock = outbox
+    earlier = _event(
+        store,
+        aggregate_revision=1,
+        payload={"revision": 1},
+        idempotency_key="dead-revision-1",
+        max_attempts=1,
+    )
+    later = _event(
+        store,
+        aggregate_revision=2,
+        payload={"revision": 2},
+        idempotency_key="dead-revision-2",
+    )
+
+    claimed = store.claim("worker", lease_seconds=5)
+    assert claimed["event_id"] == earlier["event_id"]
+    store.failed(
+        claimed["event_id"],
+        claimed["lease_token"],
+        "PERMANENT",
+        retry_delay_seconds=0,
+    )
+
+    assert store.get(earlier["event_id"])["status"] == OUTBOX_DEAD_LETTER
+    assert store.get(later["event_id"])["status"] == OUTBOX_PENDING
+    assert store.claim("worker") is None
+
+
 def test_concurrent_claim_has_one_owner(tmp_path):
     database = tmp_path / "outbox.db"
     backend_a = SQLiteBackend(database)
@@ -194,8 +224,21 @@ def test_dispatcher_passes_stable_id_and_prunes_delivered(outbox):
     clock.value += 1
     assert store.prune_delivered(before=clock.value) == 1
     assert store.get(event["event_id"]) is None
-    with pytest.raises(OutboxConflict, match="compacted"):
-        _event(store)
+    replayed = _event(store)
+    assert replayed["event_id"] != event["event_id"]
+    assert replayed["status"] == OUTBOX_PENDING
+
+
+def test_legacy_orphan_idempotency_key_is_reclaimed(outbox):
+    backend, store, _clock = outbox
+    original = _event(store)
+    with backend.transaction(write=True) as connection:
+        connection.execute(
+            "DELETE FROM ha_outbox WHERE event_id=?", (original["event_id"],)
+        )
+
+    replayed = _event(store)
+    assert replayed["event_id"] != original["event_id"]
 
 
 def test_webhook_handler_signs_stable_id_without_redirects():
@@ -219,3 +262,38 @@ def test_webhook_handler_signs_stable_id_without_redirects():
     assert request["headers"]["Idempotency-Key"] == "evt-1"
     assert request["headers"]["X-CogDoc-Signature"].startswith("sha256=")
     assert b'"event_id":"evt-1"' in request["content"]
+
+
+def test_webhook_handler_uses_bounded_transport():
+    requests = []
+
+    class Transport:
+        def request(self, method, url, *, headers, body):
+            requests.append((method, url, headers, body))
+
+    handler = WebhookOutboxHandler(
+        "https://hooks.example/cogdoc",
+        secret="secret",
+        transport=Transport(),
+    )
+    handler("index.published", {"generation": "g1"}, {}, "evt-1")
+
+    method, url, headers, body = requests[0]
+    assert method == "POST"
+    assert url == "https://hooks.example/cogdoc"
+    assert headers["Idempotency-Key"] == "evt-1"
+    assert headers["X-CogDoc-Signature"].startswith("sha256=")
+    assert b'"event_id":"evt-1"' in body
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://hooks.example/cogdoc",
+        "https://user:pass@hooks.example/cogdoc",
+        "https://hooks.example:8443/cogdoc",
+    ),
+)
+def test_webhook_handler_rejects_unsafe_origins(url):
+    with pytest.raises(ValueError, match="credential-free HTTPS"):
+        WebhookOutboxHandler(url)

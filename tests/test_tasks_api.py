@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from cogdoc.api.routes import tasks as tasks_route
+from cogdoc.api.tenancy import Principal
 
 
 @pytest.fixture
@@ -24,6 +25,7 @@ async def test_workspace_task_list_ignores_stale_unknown_kb(monkeypatch):
         ],
     )
     request = SimpleNamespace(
+        state=SimpleNamespace(principal=Principal.local_owner()),
         app=SimpleNamespace(
             state=SimpleNamespace(
                 offload_executor=None,

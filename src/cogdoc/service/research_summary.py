@@ -421,6 +421,11 @@ def _validate_cursor_timestamp(value: Any) -> str:
     return value
 
 
+def _timestamp_sort_key(value: Any) -> datetime:
+    validated = _validate_cursor_timestamp(value)
+    return datetime.fromisoformat(validated.replace("Z", "+00:00"))
+
+
 def _validate_cursor_job_id(value: Any) -> str:
     if type(value) is not str or not _JOB_ID_RE.fullmatch(value):
         raise ResearchSummaryCursorError("research summary cursor job_id is invalid")
@@ -517,28 +522,35 @@ def paginate_research_job_summaries(
     ):
         raise TypeError("research summaries must be a sequence")
     normalized: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[datetime, str]] = set()
     for raw in summaries:
         if not isinstance(raw, Mapping):
             raise TypeError("research summaries must contain mappings")
         job_id = _validate_cursor_job_id(raw.get("job_id"))
         updated_at = _validate_cursor_timestamp(raw.get("updated_at"))
-        identity = (updated_at, job_id)
+        identity = (_timestamp_sort_key(updated_at), job_id)
         if identity in seen:
             raise ValueError("research summaries contain a duplicate sort key")
         seen.add(identity)
         normalized.append(dict(raw))
     normalized.sort(
-        key=lambda item: (str(item["updated_at"]), str(item["job_id"])),
+        key=lambda item: (
+            _timestamp_sort_key(item["updated_at"]),
+            str(item["job_id"]),
+        ),
         reverse=True,
     )
     if cursor is not None:
         decoded = decode_research_summary_cursor(cursor)
-        cursor_key = (decoded.updated_at, decoded.job_id)
+        cursor_key = (_timestamp_sort_key(decoded.updated_at), decoded.job_id)
         normalized = [
             item
             for item in normalized
-            if (str(item["updated_at"]), str(item["job_id"])) < cursor_key
+            if (
+                _timestamp_sort_key(item["updated_at"]),
+                str(item["job_id"]),
+            )
+            < cursor_key
         ]
     has_more = len(normalized) > limit
     jobs = normalized[:limit]

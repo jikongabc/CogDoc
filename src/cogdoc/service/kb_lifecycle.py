@@ -5,6 +5,7 @@ import time
 from threading import Lock
 from typing import Any
 from cogdoc.config.settings import get_settings
+from cogdoc.service.durable_io import atomic_write_json, atomic_write_text
 from cogdoc.observability.logger import log_event
 
 
@@ -47,11 +48,7 @@ class LifecycleStore:
 
     # 保存。
     def _save(self, data: dict) -> None:
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        tmp_path = f"{self._path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, self._path)
+        atomic_write_json(self._path, data, indent=2)
 
     # 完成 降级状态 处理。
     def _degraded(self) -> bool:
@@ -92,8 +89,7 @@ class LifecycleStore:
     # 标记降级状态。
     def _mark_degraded(self) -> None:
         try:
-            with open(self._degraded_path, "w", encoding="utf-8") as f:
-                f.write(str(int(time.time())))
+            atomic_write_text(self._degraded_path, str(int(time.time())))
         except OSError:
             pass
 

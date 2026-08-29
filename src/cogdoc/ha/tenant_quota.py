@@ -11,7 +11,9 @@ from typing import Any
 from cogdoc.api.tenant_quota import (
     TenantMutationInProgress,
     TenantQuotaExceeded,
+    TenantQuotaManager,
     TenantQuotaPolicy,
+    TenantQuotaReservationLost,
 )
 from cogdoc.ha.source_generation import SourceGenerationStore
 from cogdoc.ha.storage import DatabaseBackend, DatabaseConnection
@@ -316,6 +318,105 @@ class DistributedTenantQuotaManager:
             return self._track(token)
         raise TenantMutationInProgress("source head changed during quota admission")
 
+    def reserve_connector_snapshot(
+        self,
+        tenant_id: str,
+        storage_id: str,
+        _source_dir: str,
+        baseline_dir: str,
+        proposed_dir: str,
+        reservation_key: str,
+    ) -> str | None:
+        """Reserve connector snapshot growth against the authoritative HA head."""
+
+        if not (self.policy.max_documents or self.policy.max_storage_bytes):
+            return None
+        tenant = str(tenant_id or "").strip()
+        storage = str(storage_id or "").strip()
+        key = str(reservation_key or "").strip()
+        if not tenant or not storage or not key or len(key) > 256:
+            raise ValueError("connector quota scope is invalid")
+        baseline = TenantQuotaManager._document_entries(baseline_dir)
+        proposed = TenantQuotaManager._document_entries(proposed_dir)
+        affected_names = baseline.keys() | proposed.keys()
+        marker = self.backend.sql(sqlite="?", postgres="%s")
+
+        for _attempt in range(4):
+            generation = self.source_generations.current(storage)
+            expected_head = (
+                None if generation is None else str(generation["generation_id"])
+            )
+            manifest = self.source_generations.current_manifest(storage)
+            published = {
+                str(item["path"]): int(item["byte_size"])
+                for item in (manifest or {}).get("files", [])
+                if isinstance(item, Mapping)
+            }
+            published_affected = {
+                name: published[name]
+                for name in affected_names
+                if name in published
+            }
+            document_delta = max(0, len(proposed) - len(published_affected))
+            byte_delta = max(
+                0, sum(proposed.values()) - sum(published_affected.values())
+            )
+            now = float(self._clock())
+            with self.backend.transaction(write=True) as connection:
+                self._tenant_lock(connection, tenant)
+                live = connection.execute(
+                    f"SELECT generation_id FROM ha_source_heads WHERE storage_id={marker}",
+                    (storage,),
+                ).fetchone()
+                live_head = (
+                    None if live is None else str(self._mapping(live)["generation_id"])
+                )
+                if live_head != expected_head:
+                    continue
+                kb = connection.execute(
+                    "SELECT 1 AS value FROM ha_api_knowledge_bases WHERE storage_id="
+                    f"{marker} AND tenant_id={marker} AND lifecycle<>{marker}",
+                    (storage, tenant, LIFECYCLE_DELETED),
+                ).fetchone()
+                if kb is None:
+                    raise ValueError("quota knowledge base scope is unavailable")
+                self._expire_locked(connection, tenant, now)
+                duplicate = connection.execute(
+                    "SELECT 1 AS value FROM ha_tenant_quota_reservations WHERE tenant_id="
+                    f"{marker} AND kind='connector' AND storage_id={marker} "
+                    f"AND filename={marker}",
+                    (tenant, storage, key),
+                ).fetchone()
+                if duplicate is not None:
+                    raise TenantMutationInProgress(
+                        f"connector snapshot already pending: {key}"
+                    )
+                usage = self._usage_locked(connection, tenant)
+                reserved = self._reserved_locked(connection, tenant)
+                self._enforce(
+                    "documents",
+                    usage["documents"],
+                    reserved["documents"],
+                    document_delta,
+                )
+                self._enforce(
+                    "storage_bytes",
+                    usage["storage_bytes"],
+                    reserved["storage_bytes"],
+                    byte_delta,
+                )
+                token = self._insert_locked(
+                    connection,
+                    tenant_id=tenant,
+                    kind="connector",
+                    storage_id=storage,
+                    filename=key,
+                    document_delta=document_delta,
+                    byte_delta=byte_delta,
+                )
+            return self._track(token)
+        raise TenantMutationInProgress("source head changed during quota admission")
+
     def snapshot(self, tenant_id: str) -> dict[str, Any]:
         tenant = str(tenant_id or "").strip()
         now = float(self._clock())
@@ -333,33 +434,66 @@ class DistributedTenantQuotaManager:
         if not token:
             return
         marker = self.backend.sql(sqlite="?", postgres="%s")
-        with self.backend.transaction(write=True) as connection:
-            connection.execute(
-                f"DELETE FROM ha_tenant_quota_reservations WHERE token={marker} "
-                f"AND lease_owner={marker}",
-                (token, self.owner_id),
-            )
         with self._lock:
+            with self.backend.transaction(write=True) as connection:
+                connection.execute(
+                    f"DELETE FROM ha_tenant_quota_reservations WHERE token={marker} "
+                    f"AND lease_owner={marker}",
+                    (token, self.owner_id),
+                )
             self._owned_tokens.discard(token)
 
-    def heartbeat(self) -> int:
-        with self._lock:
-            tokens = tuple(self._owned_tokens)
-        if not tokens:
-            return 0
+    def assert_live(self, token: str | None) -> None:
+        """Renew and validate the reservation immediately before publication."""
+
+        if not token:
+            raise TenantQuotaReservationLost("tenant quota reservation is unavailable")
         now = float(self._clock())
         marker = self.backend.sql(sqlite="?", postgres="%s")
-        updated = 0
-        with self.backend.transaction(write=True) as connection:
-            for token in tokens:
+        with self._lock:
+            if token not in self._owned_tokens:
+                raise TenantQuotaReservationLost(
+                    "tenant quota reservation is no longer owned"
+                )
+            with self.backend.transaction(write=True) as connection:
                 changed = connection.execute(
                     "UPDATE ha_tenant_quota_reservations SET lease_expires_at="
                     f"{marker} WHERE token={marker} AND lease_owner={marker} "
                     f"AND lease_expires_at>{marker}",
                     (now + self.lease_seconds, token, self.owner_id, now),
                 )
-                updated += changed.rowcount
-        return updated
+            if changed.rowcount != 1:
+                self._owned_tokens.discard(token)
+                raise TenantQuotaReservationLost(
+                    "tenant quota reservation is stale or expired"
+                )
+
+    def heartbeat(self) -> int:
+        with self._lock:
+            tokens = tuple(self._owned_tokens)
+            if not tokens:
+                return 0
+            now = float(self._clock())
+            marker = self.backend.sql(sqlite="?", postgres="%s")
+            updated = 0
+            lost: list[str] = []
+            with self.backend.transaction(write=True) as connection:
+                for token in tokens:
+                    changed = connection.execute(
+                        "UPDATE ha_tenant_quota_reservations SET lease_expires_at="
+                        f"{marker} WHERE token={marker} AND lease_owner={marker} "
+                        f"AND lease_expires_at>{marker}",
+                        (now + self.lease_seconds, token, self.owner_id, now),
+                    )
+                    updated += changed.rowcount
+                    if changed.rowcount != 1:
+                        lost.append(token)
+            if lost:
+                self._owned_tokens.difference_update(lost)
+                raise TenantQuotaReservationLost(
+                    "one or more tenant quota reservations expired"
+                )
+            return updated
 
     def start(self) -> None:
         with self._lock:

@@ -9,6 +9,7 @@ from cogdoc.service.claim_verification_policy import (
     claim_verification_policy_projection,
 )
 from cogdoc.service.claim_verification_rollout import ROLLOUT_DECISIONS
+from cogdoc.service.durable_io import atomic_write_text
 from cogdoc.tools.retriever.metadata import safe_retrieval_metadata
 
 
@@ -753,5 +754,9 @@ def export_trace(
         output_payload=output_payload,
         execution_status=execution_status,
     )
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(
+        str(path),
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        mode=0o600,
+    )
     return path

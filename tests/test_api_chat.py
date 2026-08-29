@@ -10,6 +10,7 @@ from cogdoc.api.persistence import SqliteSessionStore
 from cogdoc.api.routes.chat import _event_to_frame, chat_stream
 from cogdoc.api.schemas import ChatRequest
 from cogdoc.api.session_store import SessionStore
+from cogdoc.api.tenancy import Principal
 from cogdoc.memory.manager import MemoryPolicy
 from cogdoc.service.chat_service import ChatEvent, ChatResult, ChatServiceError
 
@@ -519,7 +520,7 @@ async def test_ha_stream_rechecks_authority_at_network_release(monkeypatch):
                 "query_string": b"",
                 "headers": [],
                 "app": app,
-                "state": {},
+                "state": {"principal": Principal.local_owner()},
             }
         )
         response = await chat_stream(
@@ -559,7 +560,7 @@ async def test_stream_disconnect_does_not_advance_or_record_provider(monkeypatch
                 "query_string": b"",
                 "headers": [],
                 "app": app,
-                "state": {},
+                "state": {"principal": Principal.local_owner()},
             }
         )
         response = await chat_stream(
@@ -799,6 +800,57 @@ async def test_chat_endpoint_maps_runtime_error_to_stable_error_code(monkeypatch
     # 失败不写会话，不漏栈。
     assert store.get_history("kb", "s1") == []
     assert "Traceback" not in payload["message"]
+
+
+@pytest.mark.anyio
+async def test_chat_endpoint_maps_epoch_failure_to_stable_503(monkeypatch):
+    import cogdoc.api.app as app_module
+    import cogdoc.api.routes.chat as chat_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+
+    def corrupt_epoch(*_args):
+        raise RuntimeError("epochs.json corrupt")
+
+    monkeypatch.setattr(chat_module, "capture_ha_chat_epoch", corrupt_epoch)
+    app = create_app(session_store=SessionStore())
+
+    response = await _post_chat(
+        app, {"query": "问题", "doc_id": "kb", "session_id": "s1"}
+    )
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["error_code"] == "MODEL_UNAVAILABLE"
+    assert payload["message"] == "知识库状态暂不可用，请稍后重试"
+    assert payload["trace_id"] is None
+
+
+@pytest.mark.anyio
+async def test_chat_stream_maps_epoch_failure_to_stable_503(monkeypatch):
+    import cogdoc.api.app as app_module
+    import cogdoc.api.routes.chat as chat_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+
+    def corrupt_epoch(_kb_id):
+        raise RuntimeError("epochs.json corrupt")
+
+    monkeypatch.setattr(chat_module, "capture_kb_epoch", corrupt_epoch)
+    app = create_app(session_store=SessionStore())
+
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/stream",
+                json={"query": "问题", "doc_id": "kb", "session_id": "s1"},
+            )
+
+    assert response.status_code == 503
+    assert response.json()["error_code"] == "MODEL_UNAVAILABLE"
 
 
 # 验证 chat endpoint maps stream stage to interrupted 场景。

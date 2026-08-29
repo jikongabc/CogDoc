@@ -124,7 +124,11 @@ class BackendDBAPIConnection:
     @staticmethod
     def _write(statement: str) -> bool:
         command = statement.lstrip().split(None, 1)[0].upper()
-        return command not in {"SELECT", "WITH", "EXPLAIN"}
+        # WITH may terminate in INSERT/UPDATE/DELETE.  Treating every CTE as a
+        # read can run a writable CTE in a read-only pooled transaction.  A
+        # read-only CTE taking the write path is harmless and preserves the
+        # fail-safe classification without embedding a SQL parser here.
+        return command not in {"SELECT", "EXPLAIN"}
 
     @staticmethod
     def _buffer(cursor: Any) -> CompatCursor:

@@ -1,9 +1,10 @@
 import hashlib
+import ipaddress
 import inspect
 import sqlite3
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from threading import Lock
 
 from fastapi import Request
@@ -18,7 +19,13 @@ from cogdoc.api.auth_store import (
 from cogdoc.api.error_mapping import status_for_code
 from cogdoc.api.offload import run_sync
 from cogdoc.api.schemas import ErrorCode, build_error_response
-from cogdoc.api.tenancy import Principal, Role, fingerprint_api_key, required_permission
+from cogdoc.api.tenancy import (
+    PUBLIC_AUTH_PATHS,
+    Principal,
+    Role,
+    fingerprint_api_key,
+    required_permission,
+)
 
 
 # 探针与文档路径永远放行：鉴权/限流不能挡住存活就绪检查与 OpenAPI。
@@ -34,20 +41,99 @@ _EXEMPT_PATHS = frozenset(
         "/openapi.json",
     }
 )
-_PUBLIC_AUTH_PATHS = frozenset(
-    {
-        "/v1/auth/config",
-        "/v1/auth/register",
-        "/v1/auth/login",
-        "/v1/auth/oidc/authorize",
-        "/v1/auth/oidc/callback",
-        "/v1/auth/oidc/exchange",
-        "/v1/auth/invitations/accept",
-        "/v1/auth/connector-oauth/callback/notion",
-        "/v1/auth/connector-oauth/callback/atlassian",
-        "/v1/auth/connector-oauth/callback/microsoft",
-    }
-)
+
+
+def _trusted_proxy_networks(
+    values: str | Sequence[str] | None,
+) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    raw_values = values.split(",") if isinstance(values, str) else values or ()
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for raw in raw_values:
+        value = str(raw).strip()
+        if not value:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError as exc:
+            raise ValueError(f"invalid trusted proxy CIDR: {value}") from exc
+    return tuple(networks)
+
+
+def _forwarded_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    candidate = value.strip().strip('"')
+    if candidate.startswith("["):
+        closing = candidate.find("]")
+        if closing < 0:
+            raise ValueError("invalid Forwarded client address")
+        candidate = candidate[1:closing]
+    elif candidate.count(":") == 1:
+        host, port = candidate.rsplit(":", 1)
+        if port.isdigit():
+            candidate = host
+    if not candidate or candidate.casefold() == "unknown" or candidate.startswith("_"):
+        raise ValueError("invalid Forwarded client address")
+    return ipaddress.ip_address(candidate)
+
+
+def _forwarded_chain(request: Request) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    forwarded = request.headers.get("forwarded")
+    x_forwarded_for = request.headers.get("x-forwarded-for")
+    chains: list[list[ipaddress.IPv4Address | ipaddress.IPv6Address]] = []
+    if forwarded is not None:
+        values: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+        for element in forwarded.split(","):
+            parameters = [part.strip() for part in element.split(";")]
+            raw_for = next(
+                (part.split("=", 1)[1] for part in parameters if part.casefold().startswith("for=")),
+                None,
+            )
+            if raw_for is None:
+                raise ValueError("Forwarded header is missing a client address")
+            values.append(_forwarded_ip(raw_for))
+        chains.append(values)
+    if x_forwarded_for is not None:
+        chains.append([_forwarded_ip(value) for value in x_forwarded_for.split(",")])
+    if not chains:
+        return []
+    if any(not chain for chain in chains):
+        raise ValueError("forwarded client chain is empty")
+    if len(chains) > 1 and chains[0] != chains[1]:
+        raise ValueError("forwarding headers disagree")
+    return chains[0]
+
+
+def _effective_client_host(
+    request: Request,
+    trusted_proxies: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+) -> str | None:
+    raw_peer = request.client.host if request.client is not None else ""
+    try:
+        peer = ipaddress.ip_address(raw_peer)
+    except ValueError:
+        return None
+    has_forwarding = "forwarded" in request.headers or "x-forwarded-for" in request.headers
+    if not has_forwarding:
+        if any(peer in network for network in trusted_proxies):
+            # Once an address is declared to be a proxy, a request arriving
+            # from it without an overwritten forwarding chain has no safe
+            # client identity. In particular, it must not inherit loopback
+            # owner access from the proxy's TCP address.
+            return None
+        return str(peer)
+    if not any(peer in network for network in trusted_proxies):
+        # Never fall back to a loopback owner identity when an untrusted peer
+        # supplies forwarding metadata.
+        return None
+    try:
+        chain = _forwarded_chain(request)
+    except ValueError:
+        return None
+    current = peer
+    for hop in reversed(chain):
+        if not any(current in network for network in trusted_proxies):
+            break
+        current = hop
+    return str(current)
 WORKSPACE_HEADER = "X-CogDoc-Workspace"
 # 仅豁免限流（仍走鉴权）：前端刷新/轮询会高频读取这些轻量状态接口。
 _RATE_LIMIT_EXEMPT_GET_PATHS = frozenset(
@@ -420,6 +506,7 @@ class AccessControlMiddleware:
         rate_limiter: TokenBucketRateLimiter,
         principals: Mapping[str, Principal] | None = None,
         auth_store=None,
+        trusted_proxy_cidrs: str | Sequence[str] | None = None,
     ):
         self.app = app
         self._principals = _principal_registry(set(api_keys), principals)
@@ -427,6 +514,7 @@ class AccessControlMiddleware:
         self._local_principal = Principal.local_owner()
         self._limiter = rate_limiter
         self._auth_store = auth_store
+        self._trusted_proxies = _trusted_proxy_networks(trusted_proxy_cidrs)
 
     async def _authenticate(
         self,
@@ -434,9 +522,18 @@ class AccessControlMiddleware:
         app_state: object,
         *,
         workspace_id: str | None = None,
+        client_host: str | None = None,
     ) -> tuple[Principal | None, object | None, bool]:
         if not self.auth_enabled:
-            return self._local_principal, None, True
+            try:
+                is_loopback = ipaddress.ip_address(str(client_host or "")).is_loopback
+            except ValueError:
+                is_loopback = False
+            return (
+                (self._local_principal, None, True)
+                if is_loopback
+                else (None, None, False)
+            )
         if api_key is None:
             return None, None, False
         principal = self._principals.get(fingerprint_api_key(api_key))
@@ -513,6 +610,11 @@ class AccessControlMiddleware:
 
         request = Request(scope)
         path = request.url.path
+        effective_client = _effective_client_host(request, self._trusted_proxies)
+        # Downstream public-auth handlers must use the same proxy-aware client
+        # identity as the middleware.  Reading request.client again would
+        # collapse every caller behind a reverse proxy onto the proxy address.
+        request.state.effective_client_host = effective_client
         request.state.auth_context = None
         if path in _EXEMPT_PATHS:
             # Public probes intentionally have no tenant authority.  Keeping the
@@ -524,7 +626,7 @@ class AccessControlMiddleware:
         if path == _SCIM_PREFIX or path.startswith(f"{_SCIM_PREFIX}/"):
             app_state = getattr(scope.get("app"), "state", None)
             registry = getattr(app_state, "scim_access_registry", {})
-            client = request.client.host if request.client is not None else "unknown"
+            client = effective_client or "unknown"
             key = _extract_api_key(request)
             access = None
             fingerprint = None
@@ -601,9 +703,9 @@ class AccessControlMiddleware:
             )
             return
 
-        if path in _PUBLIC_AUTH_PATHS:
+        if path in PUBLIC_AUTH_PATHS:
             request.state.principal = None
-            client = request.client.host if request.client is not None else "unknown"
+            client = effective_client or "unknown"
             identity = f"public-auth\x1f{client}"
             if not self._limiter.allow(identity):
                 response = _reject(
@@ -644,6 +746,7 @@ class AccessControlMiddleware:
                 key,
                 getattr(scope.get("app"), "state", None),
                 workspace_id=requested_workspace_id,
+                client_host=effective_client,
             )
         except _AuthenticationBackendUnavailable:
             request.state.principal = None

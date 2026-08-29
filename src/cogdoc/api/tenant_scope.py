@@ -29,10 +29,12 @@ def request_principal(request: Request) -> Principal:
         principal = request.state.principal
     except (AttributeError, KeyError, TypeError):
         principal = None
-    # Direct route unit tests and internal ASGI harnesses may bypass middleware.
-    # They retain the historical local single-user authority; production HTTP
-    # requests always receive an explicit value from AccessControlMiddleware.
-    return principal if isinstance(principal, Principal) else Principal.local_owner()
+    if not isinstance(principal, Principal):
+        # Tenant projection is an authorization boundary.  Tests and internal
+        # callers must install an explicit principal instead of silently
+        # inheriting owner authority when middleware was skipped or failed.
+        raise RuntimeError("authenticated request principal is unavailable")
+    return principal
 
 
 def is_user_session_principal(principal: Principal) -> bool:

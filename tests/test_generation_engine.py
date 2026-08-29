@@ -523,6 +523,8 @@ def test_invalidate_clears_all_entries_for_kb():
     assert (kb_id, "g001") not in keys
     assert (kb_id, "g002") not in keys
     assert ("other-kb", "g003") in keys  # 其他 kb 不受影响
+    sentinel_a.close.assert_called_once_with()
+    sentinel_b.close.assert_called_once_with()
 
 
 # 验证竞态下旧引擎不写入缓存。
@@ -542,16 +544,25 @@ def test_race_stale_engine_not_cached(tmp_path):
         return old_gen if call_count[0] == 1 else new_gen
 
     old_engine = MagicMock(spec=HybridRetriever)
+    new_engine = MagicMock(spec=HybridRetriever)
     with (
         patch.object(
             RetrieverFactory, "_resolve_gen_id", side_effect=resolve_side_effect
         ),
-        patch.object(RetrieverFactory, "_build_engine", return_value=old_engine),
+        patch.object(
+            RetrieverFactory,
+            "_build_engine",
+            side_effect=lambda _kb, generation: {
+                old_gen: old_engine,
+                new_gen: new_engine,
+            }[generation],
+        ),
     ):
         result = RetrieverFactory.get_engine(kb_id)
 
-    # 旧引擎被返回（这次请求），但没有写入缓存。
-    assert result is old_engine
+    # 构造期间切代后必须重建并返回新代，旧引擎不得逃逸。
+    assert result is new_engine
+    old_engine.close.assert_called_once_with()
     with RetrieverFactory._lock:
         assert (kb_id, old_gen) not in RetrieverFactory._engines
-        assert (kb_id, new_gen) not in RetrieverFactory._engines
+        assert RetrieverFactory._engines[(kb_id, new_gen)] is new_engine

@@ -854,9 +854,16 @@ class DistributedSourceArtifactStore:
                 Path(temporary_name).unlink(missing_ok=True)
         if info.byte_size != len(content) or info.sha256 != metadata["content_sha256"]:
             raise ArtifactIntegrityError("uploaded artifact metadata does not match")
+        # Commit expiry cleanup independently.  If the upload authority has
+        # elapsed, the following transaction will reject publication; keeping
+        # this cleanup committed prevents the failed transaction from rolling
+        # reserved_bytes back to its pre-expiry value.
         with self.backend.transaction(write=True) as connection:
             self._global_lock(connection)
             self._expire_locked(connection, float(self._clock()))
+        with self.backend.transaction(write=True) as connection:
+            self._global_lock(connection)
+            commit_now = float(self._clock())
             self._scope_writable_locked(connection, tenant, kb)
             existing = self._mapping(
                 connection.execute(
@@ -892,6 +899,7 @@ class DistributedSourceArtifactStore:
                 or str(upload["metadata_json"]) != encoded
                 or str(upload["lease_owner"]) != self.owner_id
                 or (upload.get("reservation_token") or None) != token
+                or float(upload["lease_expires_at"]) <= commit_now
             ):
                 raise ArtifactConflictError("artifact upload authority expired")
             if token is not None:

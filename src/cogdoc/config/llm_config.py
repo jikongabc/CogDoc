@@ -1,9 +1,21 @@
-import os
 from pathlib import Path
 
 from cogdoc.config.settings import PROJECT_ROOT, get_settings
+from cogdoc.service.durable_io import atomic_write_text
 
 ENV_PATH = PROJECT_ROOT / ".env"
+
+
+def _encode_env_value(value: str) -> str:
+    """Encode one literal dotenv value without comments or whitespace loss."""
+
+    if not isinstance(value, str) or any(char in value for char in ("\x00", "\r", "\n")):
+        raise ValueError("environment value must be one line")
+    # python-dotenv expands ${NAME} even inside quotes. Reject it rather than
+    # silently persisting a different credential from the one the user entered.
+    if "${" in value:
+        raise ValueError("environment value cannot contain variable expansion")
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
 # 增量写入环境变量值。
@@ -18,14 +30,12 @@ def upsert_env_values(updates: dict[str, str], env_path: Path | None = None) -> 
         if stripped and not stripped.startswith("#") and "=" in line:
             key = line.split("=", 1)[0].strip()
             if key in remaining:
-                out.append(f"{key}={remaining.pop(key)}")
+                out.append(f"{key}={_encode_env_value(remaining.pop(key))}")
                 continue
         out.append(line)
-    out.extend(f"{key}={value}" for key, value in remaining.items())
+    out.extend(f"{key}={_encode_env_value(value)}" for key, value in remaining.items())
     content = "\n".join(out) + "\n"
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_text(str(path), content, mode=0o600)
 
 
 # 应用LLM配置。
@@ -42,8 +52,8 @@ def apply_llm_config(
     if not updates:
         return
     upsert_env_values(updates)
-    # os.environ 优先级高于 .env 且本进程当场可见，保证即时生效。
-    os.environ.update(updates)
+    # Settings reloads the atomically replaced .env. Avoid copying the secret
+    # into the process environment, where child processes could inherit it.
     # 清两处缓存：settings 的 lru_cache，与按 base_url+model 缓存的 LLM 客户端（键不含 key，只改 key 必须清）。
     get_settings.cache_clear()
     from cogdoc.agents.qa_generator import Generator

@@ -575,18 +575,30 @@ def _allocate_global_budget(
 
     for group_results in groups.values():
         required = [result for result in group_results if result.unit.policy.required]
-        reservation: dict[str, list[RetrievedDoc]] = {
-            result.unit.unit_id: list(
-                result.selected_docs[: budget.min_docs_per_required_unit]
-            )
-            for result in required
-        }
+        reservation: dict[str, list[RetrievedDoc]] = {}
+        for result in required:
+            docs: list[RetrievedDoc] = []
+            chars = 0
+            for doc in result.selected_docs:
+                if (
+                    len(docs) >= budget.min_docs_per_required_unit
+                    and chars >= budget.min_chars_per_required_unit
+                ):
+                    break
+                docs.append(doc)
+                chars += _document_cost(doc)
+            reservation[result.unit.unit_id] = docs
         reservation_docs = sum(len(docs) for docs in reservation.values())
         reservation_chars = sum(
             _document_cost(doc) for docs in reservation.values() for doc in docs
         )
         if (
-            any(not docs for docs in reservation.values())
+            any(
+                len(docs) < budget.min_docs_per_required_unit
+                or sum(_document_cost(doc) for doc in docs)
+                < budget.min_chars_per_required_unit
+                for docs in reservation.values()
+            )
             or used_docs + reservation_docs > budget.max_total_docs
             or used_chars + reservation_chars > budget.max_total_chars
         ):

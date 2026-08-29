@@ -148,7 +148,14 @@ def test_rollback_restores_manifest_contract_and_reverts_on_manifest_failure(
         def __init__(self, storage_id):
             assert storage_id == "storage"
 
-        def rollback_active(self, generation_id):
+        def rollback_active(
+            self,
+            generation_id,
+            *,
+            expected_current_id=None,
+            protect_replaced=False,
+        ):
+            assert active_id["value"] == expected_current_id
             replaced = active_id["value"]
             active_id["value"] = generation_id
             return replaced
@@ -166,6 +173,7 @@ def test_rollback_restores_manifest_contract_and_reverts_on_manifest_failure(
             {
                 "storage_id": "storage",
                 "status": "succeeded",
+                "generation_id": "new",
                 "previous_generation_id": "old",
             }
         ],

@@ -58,6 +58,38 @@ async def test_trace_endpoint_returns_exported_trace(tmp_path, monkeypatch):
     assert body["steps"][0]["node_name"] == "intent_router"
 
 
+@pytest.mark.anyio
+async def test_trace_endpoint_hides_previous_kb_incarnation(tmp_path, monkeypatch):
+    import cogdoc.api.app as app_module
+    import cogdoc.api.routes.traces as traces_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(
+        traces_module, "trace_path", lambda trace_id: tmp_path / f"{trace_id}.json"
+    )
+    monkeypatch.setattr(
+        traces_module,
+        "shared_epoch_store",
+        lambda: type("Epoch", (), {"current": lambda self, _storage_id: 2})(),
+    )
+    payload = build_trace_payload(
+        "trace-old-incarnation",
+        "req-old-incarnation",
+        "qa",
+        [],
+        config={"doc_id": "kb", "kb_epoch": 1},
+    )
+    (tmp_path / "trace-old-incarnation.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    app = create_app()
+
+    response = await _get_trace(app, "trace-old-incarnation")
+
+    assert response.status_code == 404
+    assert response.json()["error_code"] == "TRACE_NOT_FOUND"
+
+
 # 验证接口返回最近跟踪文件列表。
 @pytest.mark.anyio
 async def test_trace_endpoint_lists_recent_traces(tmp_path, monkeypatch):

@@ -4,6 +4,7 @@ import time
 from typing import Any
 from threading import Lock
 from cogdoc.config.settings import get_settings
+from cogdoc.service.durable_io import atomic_write_json, atomic_write_text
 
 
 # epoch/tombstone 损坏：归零会令 incarnation 防护失效（旧任务被重新合法化），故 fail-closed 抛错。
@@ -55,18 +56,13 @@ class EpochStore:
         except OSError:
             pass
         try:
-            with open(self._degraded_path, "w", encoding="utf-8") as f:
-                f.write(str(int(time.time())))
+            atomic_write_text(self._degraded_path, str(int(time.time())))
         except OSError:
             pass
 
     # 保存。
     def _save(self, data: dict) -> None:
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        tmp_path = f"{self._path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, self._path)
+        atomic_write_json(self._path, data, indent=2)
 
     # 返回当前。
     def current(self, kb_id: str) -> int:

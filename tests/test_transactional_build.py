@@ -119,6 +119,21 @@ def test_cleanup_tolerates_missing_resources(tmp_path):
         _cleanup_generation_storage("kb", "g001")  # 不应抛错
 
 
+def test_cleanup_refuses_to_delete_active_generation(tmp_path):
+    state = _make_state(tmp_path, "kb-active")
+    generation_id = state.begin_generation("m", "v")
+    state.mark_ready(generation_id, 0, [])
+    state.switch_active(generation_id)
+
+    with (
+        patch("cogdoc.service.ingest_service.KBState", return_value=state),
+        pytest.raises(ingest_service.KBCleanupError, match="active generation"),
+    ):
+        _cleanup_generation_storage("kb-active", generation_id)
+
+    assert state.active()["id"] == generation_id
+
+
 # 事务化构建正常路径。
 
 
@@ -303,7 +318,7 @@ def test_transactional_build_stale_cleans_and_reraises(tmp_path, monkeypatch):
     state, staging = _patch_transactional(monkeypatch, tmp_path, kb_id, [])
 
     # 构造或驱动 staleswitch 测试场景。
-    def stale_switch(gid):
+    def stale_switch(gid, **_kwargs):
         raise StaleGenerationError("epoch mismatch")
 
     monkeypatch.setattr(state, "switch_active", stale_switch)
@@ -376,7 +391,7 @@ def test_transactional_empty_stale_marks_failed(tmp_path, monkeypatch):
     state = _make_state(tmp_path, kb_id)
 
     # 构造或驱动 staleswitch 测试场景。
-    def stale_switch(gid):
+    def stale_switch(gid, **_kwargs):
         raise StaleGenerationError("epoch mismatch")
 
     monkeypatch.setattr(state, "switch_active", stale_switch)

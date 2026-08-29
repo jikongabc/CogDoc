@@ -4,12 +4,17 @@ import json
 import logging
 import os
 from collections.abc import Sequence
+from threading import RLock, get_ident
 from typing import Any, Callable
 
 from cogdoc.api.derived_knowledge_store import DerivedKnowledgeStore
 from cogdoc.config.settings import get_settings
 from cogdoc.graph.state import RetrievedDoc
 from cogdoc.observability.logger import log_event
+from cogdoc.service.chroma_cleanup import (
+    collection_segment_ids,
+    delete_collection_and_segments,
+)
 from cogdoc.tools.retriever.retrieval_text import retrieval_text
 from cogdoc.tools.retriever.scope import RetrievalScope
 from cogdoc.tools.tokenizer import tokenize_mixed_text
@@ -164,6 +169,94 @@ def _row_from_stored(text: str, meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _read_index_state(path: str) -> dict[str, Any]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_index_state(path: str, data: dict[str, Any]) -> None:
+    temporary = f"{path}.{os.getpid()}.{get_ident()}.tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def clear_derived_knowledge_index_storage(
+    kb_id: str,
+    *,
+    persist_directory: str,
+    state_directory: str,
+    client: Any | None = None,
+    reader_timeout_seconds: float = 30.0,
+    mutation_lock: Any | None = None,
+) -> None:
+    """Delete a derived index without importing or resolving an embedder."""
+
+    from contextlib import nullcontext
+
+    from cogdoc.service.kb_readers import drain_kb_readers
+
+    with drain_kb_readers(kb_id, reader_timeout_seconds):
+        with mutation_lock if mutation_lock is not None else nullcontext():
+            _clear_derived_knowledge_index_storage_unlocked(
+                kb_id,
+                persist_directory=persist_directory,
+                state_directory=state_directory,
+                client=client,
+            )
+
+
+def _clear_derived_knowledge_index_storage_unlocked(
+    kb_id: str,
+    *,
+    persist_directory: str,
+    state_directory: str,
+    client: Any | None = None,
+) -> None:
+    os.makedirs(persist_directory, exist_ok=True)
+    os.makedirs(state_directory, exist_ok=True)
+    state_path = os.path.join(state_directory, _state_name(kb_id))
+    state = _read_index_state(state_path)
+    retained = state.get("deleting_segment_ids")
+    retained_ids = (
+        [str(value) for value in retained] if isinstance(retained, list) else []
+    )
+    segment_ids = sorted(
+        set(retained_ids)
+        | set(
+            collection_segment_ids(
+                persist_directory,
+                _collection_name(kb_id),
+            )
+        )
+    )
+    if segment_ids:
+        state["deleting_segment_ids"] = segment_ids
+        _write_index_state(state_path, state)
+    if client is None:
+        import chromadb
+
+        client = chromadb.PersistentClient(path=persist_directory)
+    delete_collection_and_segments(
+        client,
+        persist_directory,
+        _collection_name(kb_id),
+        retained_segment_ids=segment_ids,
+    )
+    try:
+        os.remove(state_path)
+    except FileNotFoundError:
+        pass
+
+
 class DerivedKnowledgeIndex:
     def __init__(
         self,
@@ -184,54 +277,74 @@ class DerivedKnowledgeIndex:
 
         self.client = chromadb.PersistentClient(path=self.persist_directory)
         self.embedder = _embedder()
+        self._lock = RLock()
 
     def ensure_fresh(self, kb_id: str) -> None:
-        token = self.store.revision_token()
-        state = self._read_state(kb_id)
-        if (
-            state.get("revision_token") == token
-            and state.get("embedding_contract")
-            == self.embedder.EMBEDDING_CONTRACT_VERSION
-        ):
-            expected_count = _int_or_zero(state.get("count"))
-            if expected_count <= 0 or self._collection(kb_id).count() > 0:
-                return
-        self.rebuild(kb_id, revision_token=token)
+        with self._lock:
+            token = self.store.revision_token()
+            state = self._read_state(kb_id)
+            if (
+                state.get("revision_token") == token
+                and state.get("embedding_contract")
+                == self.embedder.EMBEDDING_CONTRACT_VERSION
+            ):
+                expected_count = _int_or_zero(state.get("count"))
+                if expected_count <= 0 or self._collection(kb_id).count() > 0:
+                    return
+            self.rebuild(kb_id, revision_token=token)
 
     def rebuild(self, kb_id: str, *, revision_token: str | None = None) -> None:
-        revision_token = revision_token or self.store.revision_token()
-        rows = self.store.list(kb_id=kb_id, status="approved")
-        collection = self._reset_collection(kb_id)
-        if rows:
-            docs = [
-                _knowledge_doc(
-                    row,
-                    score=0.0,
-                    rank=index,
-                    explanation={},
-                    search_channel="derived_knowledge_embedding",
+        with self._lock:
+            revision_token = revision_token or self.store.revision_token()
+            rows = self.store.list(kb_id=kb_id, status="approved")
+            collection = self._reset_collection(kb_id)
+            if rows:
+                docs = [
+                    _knowledge_doc(
+                        row,
+                        score=0.0,
+                        rank=index,
+                        explanation={},
+                        search_channel="derived_knowledge_embedding",
+                    )
+                    for index, row in enumerate(rows)
+                ]
+                texts = [str(doc.get("text") or "") for doc in docs]
+                vector_texts = [retrieval_text(doc) for doc in docs]
+                embeddings = self.embedder.embed_documents(vector_texts)
+                collection.upsert(
+                    ids=[str(row["knowledge_id"]) for row in rows],
+                    embeddings=embeddings,
+                    documents=texts,
+                    metadatas=[
+                        _stored_meta(row, index) for index, row in enumerate(rows)
+                    ],
                 )
-                for index, row in enumerate(rows)
-            ]
-            texts = [str(doc.get("text") or "") for doc in docs]
-            vector_texts = [retrieval_text(doc) for doc in docs]
-            embeddings = self.embedder.embed_documents(vector_texts)
-            collection.upsert(
-                ids=[str(row["knowledge_id"]) for row in rows],
-                embeddings=embeddings,
-                documents=texts,
-                metadatas=[_stored_meta(row, index) for index, row in enumerate(rows)],
+            self._write_state(
+                kb_id,
+                {
+                    "revision_token": revision_token,
+                    "embedding_contract": self.embedder.EMBEDDING_CONTRACT_VERSION,
+                    "count": len(rows),
+                },
             )
-        self._write_state(
+
+    def clear_kb(self, kb_id: str) -> None:
+        """Remove the deterministic collection and its retry state."""
+
+        clear_derived_knowledge_index_storage(
             kb_id,
-            {
-                "revision_token": revision_token,
-                "embedding_contract": self.embedder.EMBEDDING_CONTRACT_VERSION,
-                "count": len(rows),
-            },
+            persist_directory=self.persist_directory,
+            state_directory=self.state_directory,
+            client=self.client,
+            mutation_lock=self._lock,
         )
 
     def status(self, kb_id: str) -> dict[str, Any]:
+        with self._lock:
+            return self._status_unlocked(kb_id)
+
+    def _status_unlocked(self, kb_id: str) -> dict[str, Any]:
         state = self._read_state(kb_id)
         current_token = self.store.revision_token()
         current_contract = self.embedder.EMBEDDING_CONTRACT_VERSION
@@ -268,9 +381,10 @@ class DerivedKnowledgeIndex:
         }
 
     def record_error(self, kb_id: str, error_class: str) -> None:
-        state = self._read_state(kb_id)
-        state["last_error"] = error_class
-        self._write_state(kb_id, state)
+        with self._lock:
+            state = self._read_state(kb_id)
+            state["last_error"] = error_class
+            self._write_state(kb_id, state)
 
     def search(
         self,
@@ -288,6 +402,20 @@ class DerivedKnowledgeIndex:
         return rows[0] if rows else []
 
     def search_many(
+        self,
+        kb_id: str,
+        queries: Sequence[str],
+        top_k: int,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> list[list[RetrievedDoc]]:
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return self._search_many_unlocked(kb_id, queries, top_k, scope=scope)
+        with lock:
+            return self._search_many_unlocked(kb_id, queries, top_k, scope=scope)
+
+    def _search_many_unlocked(
         self,
         kb_id: str,
         queries: Sequence[str],
@@ -376,14 +504,7 @@ class DerivedKnowledgeIndex:
 
     def _reset_collection(self, kb_id: str):
         name = _collection_name(kb_id)
-        try:
-            self.client.delete_collection(name)
-        except Exception:
-            collection = self._collection(kb_id)
-            ids = collection.get(include=[]).get("ids") or []
-            if ids:
-                collection.delete(ids=ids)
-            return collection
+        delete_collection_and_segments(self.client, self.persist_directory, name)
         return self._collection(kb_id)
 
     def _collection_count(self, kb_id: str) -> tuple[int, str | None]:
@@ -403,19 +524,10 @@ class DerivedKnowledgeIndex:
         return os.path.join(self.state_directory, _state_name(kb_id))
 
     def _read_state(self, kb_id: str) -> dict[str, Any]:
-        path = self._state_path(kb_id)
-        if not os.path.exists(path):
-            return {}
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return data if isinstance(data, dict) else {}
+        return _read_index_state(self._state_path(kb_id))
 
     def _write_state(self, kb_id: str, data: dict[str, Any]) -> None:
-        with open(self._state_path(kb_id), "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, sort_keys=True)
+        _write_index_state(self._state_path(kb_id), data)
 
 
 # 派生知识召回器，只读取已审核知识，不触碰原始文档索引。

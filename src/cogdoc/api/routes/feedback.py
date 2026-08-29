@@ -107,6 +107,14 @@ def _feedback_record(request: Request, feedback_id: str) -> Mapping | None:
     )
 
 
+def _feedback_records_by_id(request: Request) -> dict[str, Mapping]:
+    return {
+        str(row.get("feedback_id") or ""): row
+        for row in request.app.state.feedback_store.export_records()
+        if str(row.get("feedback_id") or "")
+    }
+
+
 def _row_allowed(request: Request, row: Mapping | None) -> bool:
     if not isinstance(row, Mapping):
         return False
@@ -539,21 +547,19 @@ async def submit_feedback(body: FeedbackRequest, request: Request):
                 authority,
             )
         )
-    if result.get("deduplicated"):
-        return FeedbackResponse(
-            feedback_id=result["feedback_id"],
-            status="duplicate_ignored",
-            is_bad_case=result["is_bad_case"],
-            retrieval_eval_draft_id=retrieval_eval_draft_id,
-            retrieval_eval_draft_status=retrieval_eval_draft_status,
-        )
     if not body.skip_retrieval_feedback:
         retrieval_store = request.app.state.retrieval_feedback_store
         record_retrieval_authorized = getattr(
             retrieval_store, "record_from_feedback_authorized", None
         )
+        already_projected = result.get("deduplicated") and any(
+            str(row.get("feedback_id") or "") == str(result["feedback_id"])
+            for row in retrieval_store.export_records()
+        )
         try:
-            if authority is not None and callable(record_retrieval_authorized):
+            if already_projected:
+                pass
+            elif authority is not None and callable(record_retrieval_authorized):
                 record_retrieval_authorized(
                     result["feedback_id"],
                     payload,
@@ -562,8 +568,20 @@ async def submit_feedback(body: FeedbackRequest, request: Request):
                 )
             else:
                 retrieval_store.record_from_feedback(result["feedback_id"], payload)
-        except (HAChatAuthorityChanged, StaleAuxiliaryWrite):
-            pass
+        except (HAChatAuthorityChanged, StaleAuxiliaryWrite) as exc:
+            # The primary feedback row may already be durable.  Surface a
+            # retryable conflict instead of reporting complete success; the
+            # retry follows the deduplicated path and repairs the idempotent
+            # retrieval-feedback projection.
+            raise HTTPException(status_code=409, detail="知识库代际已变化") from exc
+    if result.get("deduplicated"):
+        return FeedbackResponse(
+            feedback_id=result["feedback_id"],
+            status="duplicate_ignored",
+            is_bad_case=result["is_bad_case"],
+            retrieval_eval_draft_id=retrieval_eval_draft_id,
+            retrieval_eval_draft_status=retrieval_eval_draft_status,
+        )
     analysis = _analyze_feedback_quiet(result["feedback_id"], payload)
     analysis_row = None
     if analysis is not None:
@@ -669,12 +687,13 @@ async def list_feedback_analysis(
         min_confidence=min_confidence,
         limit=limit,
     )
+    feedback_by_id = _feedback_records_by_id(request)
     rows = [
         row
         for row in rows
         if _row_allowed(
             request,
-            _feedback_record(request, str(row.get("feedback_id") or "")) or row,
+            feedback_by_id.get(str(row.get("feedback_id") or "")) or row,
         )
     ]
     return {"feedback_analysis": externalize_kb_fields(rows, request)}
@@ -692,12 +711,13 @@ async def list_retrieval_feedback(
     rows = request.app.state.retrieval_feedback_store.list(
         kb_id=storage_id, enabled=enabled, limit=limit
     )
+    feedback_by_id = _feedback_records_by_id(request)
     rows = [
         row
         for row in rows
         if _row_allowed(
             request,
-            _feedback_record(request, str(row.get("feedback_id") or "")) or row,
+            feedback_by_id.get(str(row.get("feedback_id") or "")) or row,
         )
     ]
     return {"retrieval_feedback": externalize_kb_fields(rows, request)}

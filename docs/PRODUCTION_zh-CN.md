@@ -108,7 +108,7 @@ docker run --rm --user 0 \
 
 ## 账号鉴权与 ACL 上线
 
-`COGDOC_ACCOUNT_AUTH_ENABLED=false` 会有意保持旧版本地/API key 行为；个人或团队生产部署应显式开启。模块级服务随后会在 `COGDOC_DATA_DIR/state.db` 中创建身份与资源 ACL 表，已配置的静态 API 主体仍可用于服务自动化。真人登录 token 和邀请 token 只返回给调用者，数据库仅保存 SHA-256 摘要；密码使用带随机盐和版本的 scrypt 哈希，最少 12 个字符，并带有界失败锁定以及可配置的登录会话/邀请 TTL。
+`COGDOC_ACCOUNT_AUTH_ENABLED=false` 仅用于兼容本地开发，且无凭据 owner 访问只接受有效客户端地址为回环地址的请求；个人或团队生产部署必须显式开启账号认证或配置静态主体。反代部署还必须把反代网段写入 `COGDOC_TRUSTED_PROXY_CIDRS`，并让反代覆盖写入 `Forwarded` 或 `X-Forwarded-For`。来自已配置反代但缺少有效来源链的请求会 fail-closed，不会继承反代进程的回环 owner 权限。模块级服务随后会在 `COGDOC_DATA_DIR/state.db` 中创建身份与资源 ACL 表，已配置的静态 API 主体仍可用于服务自动化。真人登录 token 和邀请 token 只返回给调用者，数据库仅保存 SHA-256 摘要；密码使用带随机盐和版本的 scrypt 哈希，最少 12 个字符，并带有界失败锁定以及可配置的登录会话/邀请 TTL。
 
 全新部署按以下顺序上线：
 
@@ -218,7 +218,7 @@ SQLite 启动失败或迁移后检查失败时，按以下步骤回滚：
 
 可重试错误默认最多尝试 5 次并指数退避，耗尽后进入 `dead_letter`、停止该连接周期调度；非重试错误进入 `failed`。修复根因后，`POST .../sync-jobs/{job_id}/replay` 从最近成功 checkpoint 创建新任务，并以 `replay_of` 保留原死信关联；原任务不可变，且有活动任务或连接被禁用时拒绝重放。
 
-告警应组合 `/connection-health` 的 `health_status`、`consecutive_failures`、`last_error_code`、`backlog` 与以下 Prometheus 指标：`cogdoc_connector_sync_events_total`、`cogdoc_connector_sync_duration_seconds`、`cogdoc_connector_sync_backlog`、`cogdoc_connector_sync_documents_total`。label 仅含闭集 connector type/outcome，不包含 tenant、KB、connection、job 等高基数 ID。配置 `COGDOC_WEBHOOK_URL` 后，retry/succeeded/failed/dead_letter 会异步发送 `connector.sync.<outcome>`；`COGDOC_WEBHOOK_SECRET` 是 `X-CogDoc-Webhook-Secret` 共享值而非签名，接收端必须使用 HTTPS、恒定时间比较、event ID 幂等和自己的重试/告警。投递失败只记日志，不回滚同步终态。
+告警应组合 `/connection-health` 的 `health_status`、`consecutive_failures`、`last_error_code`、`backlog` 与以下 Prometheus 指标：`cogdoc_connector_sync_events_total`、`cogdoc_connector_sync_duration_seconds`、`cogdoc_connector_sync_backlog`、`cogdoc_connector_sync_documents_total`。label 仅含闭集 connector type/outcome，不包含 tenant、KB、connection、job 等高基数 ID。配置 `COGDOC_WEBHOOK_URL` 后，retry/succeeded/failed/dead_letter 会异步发送 `connector.sync.<outcome>`；目标必须是 HTTPS，默认拒绝私网地址并对 DNS 结果进行固定校验，只允许有限次同源 HTTPS 跳转。仅在明确需要内部回调时设置 `COGDOC_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`。无效的 Webhook URL 会禁用投递并记录启动错误，不会阻止 API 启动。`COGDOC_WEBHOOK_SECRET` 是 `X-CogDoc-Webhook-Secret` 共享值而非签名，接收端必须恒定时间比较、按 event ID 幂等并配置自己的重试/告警。投递失败只记日志，不回滚同步终态。
 
 本地目录与 Git 连接可读取服务主机文件，必须把允许的根目录纳入部署审计。根目录 allowlist 是全实例共享能力，任一租户的 KB 管理员都能选择其中任一根或子目录；禁止把各租户私有目录的共同父目录列入，隔离要求更高时应拆分实例。URL 与云连接使用 HTTPS、服务端主机 allowlist、单次解析并固定公网 IP；重定向逐跳重验且跨 origin 剥离凭据，并受响应大小限制。网络层仍应拒绝到 loopback、RFC1918、link-local 和云 metadata 网段的出站流量，作为 DNS 与代理配置错误的纵深防御。
 

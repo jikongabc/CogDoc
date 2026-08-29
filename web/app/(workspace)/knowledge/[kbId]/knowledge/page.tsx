@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { BookMarked, Download, MessageSquareWarning, Pencil, Plus, RefreshCw, ScanSearch, ShieldCheck, Trash2 } from "lucide-react";
+import { Archive, BookMarked, Download, MessageSquareWarning, Pencil, Plus, RefreshCw, ScanSearch, ShieldCheck, Trash2 } from "lucide-react";
 import { useParams } from "next/navigation";
 import { useForm, useWatch } from "react-hook-form";
 import { toast } from "sonner";
@@ -150,6 +150,57 @@ function ReviewKnowledgeDialog({ row }: { row: JsonRecord }) {
   );
 }
 
+function BatchReviewDialog({
+  action,
+  count,
+  loading,
+  onConfirm,
+}: {
+  action: "batch-approve" | "batch-reject";
+  count: number;
+  loading: boolean;
+  onConfirm: () => Promise<unknown>;
+}) {
+  const [open, setOpen] = useState(false);
+  const approving = action === "batch-approve";
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button variant={approving ? "primary" : "secondary"} size="compact">
+          {approving ? "批量通过当前列表" : "批量拒绝当前列表"}
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{approving ? "批量通过派生知识" : "批量拒绝派生知识"}</DialogTitle>
+          <DialogDescription>
+            将处理当前筛选结果中的 {count} 条记录。审核决定会写入审计记录，列表变化导致未处理的记录会单独提示。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button type="button" variant="ghost" onClick={() => setOpen(false)}>取消</Button>
+          <Button
+            type="button"
+            variant={approving ? "primary" : "secondary"}
+            loading={loading}
+            onClick={async () => {
+              try {
+                await onConfirm();
+                setOpen(false);
+              } catch {
+                // The mutation owns the user-facing error toast; keep the
+                // confirmation open so the reviewer can retry deliberately.
+              }
+            }}
+          >
+            确认处理 {count} 条
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export default function DerivedKnowledgePage() {
   const params = useParams<{ kbId: string }>();
   const kbId = decodeRouteParam(params.kbId);
@@ -168,6 +219,22 @@ export default function DerivedKnowledgePage() {
   const analysisRows = records(analysis.data, ["items", "analysis"]);
   const retrievalRows = records(retrieval.data, ["items", "retrieval_feedback", "feedback"]);
   const remove = useMutation({ mutationFn: (row: JsonRecord) => controlApi.deleteKnowledge(textValue(row.knowledge_id, textValue(row.id, ""))), onSuccess: async () => { toast.success("派生知识已删除"); await queryClient.invalidateQueries({ queryKey: ["derived"] }); }, onError: (error) => toast.error(error.message) });
+  const archive = useMutation({ mutationFn: (row: JsonRecord) => controlApi.reviewKnowledge(textValue(row.knowledge_id, textValue(row.id, "")), "archive", "从派生知识列表归档"), onSuccess: async () => { toast.success("派生知识已归档"); await queryClient.invalidateQueries({ queryKey: ["derived"] }); }, onError: (error) => toast.error(error.message) });
+  const batchReview = useMutation({
+    mutationFn: (action: "batch-approve" | "batch-reject") => controlApi.batchReviewKnowledge(knowledgeRows.map((row) => textValue(row.knowledge_id, textValue(row.id, ""))).filter(Boolean), action, "批量审核当前筛选结果"),
+    onSuccess: async (value, action) => {
+      const payload = isRecord(value) ? value : {};
+      const missing = Array.isArray(payload.missing_ids) ? payload.missing_ids.length : 0;
+      const updated = records(payload, ["updated"]).length;
+      if (missing) {
+        toast.warning(`已${action === "batch-approve" ? "通过" : "拒绝"} ${updated} 条，另有 ${missing} 条因列表变化未处理`);
+      } else {
+        toast.success(`已${action === "batch-approve" ? "通过" : "拒绝"} ${updated} 条派生知识`);
+      }
+      await queryClient.invalidateQueries({ queryKey: ["derived"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
   const scan = useMutation({ mutationFn: () => controlApi.scanStaleKnowledge(kbId), onSuccess: async () => { toast.success("过期扫描已完成"); await queryClient.invalidateQueries({ queryKey: ["derived"] }); }, onError: (error) => toast.error(error.message) });
   const exportQueue = useMutation({
     mutationFn: () => controlApi.reviewQueueExport(kbId),
@@ -189,7 +256,7 @@ export default function DerivedKnowledgePage() {
   const indexRow = isRecord(indexStatus.data) ? indexStatus.data : {};
   const metricRow: JsonRecord = { pending_count: pendingRow.pending, approved_count: metricCounts.approved_knowledge_total ?? indexRow.approved_count, stale_count: pendingRow.stale, feedback_count: metricCounts.feedback_total };
   return <div className="min-h-full"><PageHeader eyebrow="Knowledge governance" title="派生知识" description="创建、修订并审核派生知识，同时管理反馈纠错、过期检测和检索调权。" actions={<>{canReview ? <Button onClick={() => exportQueue.mutate()} loading={exportQueue.isPending}><Download className="size-4" />导出审核队列</Button> : null}<Button onClick={() => scan.mutate()} loading={scan.isPending}><ScanSearch className="size-4" />扫描过期</Button><CreateKnowledgeDialog kbId={kbId} /></>} /><div className="p-4 md:p-6"><div className="mb-5 grid gap-px overflow-hidden border border-border bg-border sm:grid-cols-4">{[["待审核", textValue(metricRow.pending_count, "—")], ["已通过", textValue(metricRow.approved_count, "—")], ["需更新", textValue(metricRow.stale_count, "—")], ["反馈总数", textValue(metricRow.feedback_count, String(feedbackRows.length))]].map(([label, value]) => <div key={label} className="bg-surface px-4 py-3"><p className="text-[11px] text-muted-foreground">{label}</p><p className="mt-1 text-lg font-semibold">{value}</p></div>)}</div><Tabs defaultValue="knowledge"><TabsList className="mb-4"><TabsTrigger value="knowledge">知识与审核 <Badge className="ml-1">{knowledgeRows.length}</Badge></TabsTrigger><TabsTrigger value="feedback">用户反馈 <Badge className="ml-1">{feedbackRows.length}</Badge></TabsTrigger><TabsTrigger value="analysis">反馈理解 <Badge className="ml-1">{analysisRows.length}</Badge></TabsTrigger><TabsTrigger value="retrieval">检索调权 <Badge className="ml-1">{retrievalRows.length}</Badge></TabsTrigger></TabsList>
-    <TabsContent value="knowledge"><section className="overflow-hidden border border-border bg-surface"><div className="flex h-11 items-center gap-3 border-b border-border px-4"><Label>状态</Label><Select value={status} onValueChange={setStatus}><SelectTrigger className="w-36"><SelectValue /></SelectTrigger><SelectContent>{["all", "pending", "approved", "rejected", "stale"].map((value) => <SelectItem key={value} value={value}>{value === "all" ? "全部" : value}</SelectItem>)}</SelectContent></Select><Button variant="ghost" size="icon" className="ml-auto" onClick={() => void knowledge.refetch()}><RefreshCw className="size-4" /></Button></div><QueryState pending={knowledge.isPending} error={knowledge.error} onRetry={() => void knowledge.refetch()} />{knowledge.data && !knowledgeRows.length ? <EmptyState icon={BookMarked} compact title="没有派生知识" description="新增人工知识，或从反馈纠错中保存内容。" action={<CreateKnowledgeDialog kbId={kbId} />} /> : <div className="divide-y divide-border">{knowledgeRows.map((row) => { const id = textValue(row.knowledge_id, textValue(row.id)); const rowStatus = textValue(row.status, "pending"); const relatedSource = textValue(row.related_source, textValue(row.related_document_id, "")); return <div key={id} className="grid gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_100px_110px_auto] sm:items-start sm:gap-4"><div className="min-w-0"><p className="whitespace-pre-wrap text-[13px] leading-5">{textValue(row.text)}</p><p className="mt-1 truncate font-mono text-[10px] text-muted-foreground">{id} · {textValue(row.origin, "manual")}{relatedSource ? ` · ${relatedSource}` : ""}</p></div><StatusBadge status={rowStatus} /><Badge className="w-fit">{textValue(row.certainty, "medium")}</Badge><div className="flex flex-wrap justify-end gap-1"><ReviseKnowledgeDialog kbId={kbId} row={row} />{canReview && ["pending", "stale"].includes(rowStatus) ? <ReviewKnowledgeDialog row={row} /> : null}<Button variant="ghost" size="icon" className="text-error" onClick={() => remove.mutate(row)} aria-label="删除"><Trash2 className="size-4" /></Button></div></div>; })}</div>}</section></TabsContent>
+    <TabsContent value="knowledge"><section className="overflow-hidden border border-border bg-surface"><div className="flex min-h-11 flex-wrap items-center gap-3 border-b border-border px-4 py-2"><Label>状态</Label><Select value={status} onValueChange={setStatus}><SelectTrigger className="w-36"><SelectValue /></SelectTrigger><SelectContent>{["all", "pending", "approved", "rejected", "stale", "archived"].map((value) => <SelectItem key={value} value={value}>{value === "all" ? "全部" : value}</SelectItem>)}</SelectContent></Select>{canReview && knowledgeRows.length && ["pending", "stale"].includes(status) ? <><BatchReviewDialog action="batch-reject" count={knowledgeRows.length} loading={batchReview.isPending} onConfirm={() => batchReview.mutateAsync("batch-reject")} /><BatchReviewDialog action="batch-approve" count={knowledgeRows.length} loading={batchReview.isPending} onConfirm={() => batchReview.mutateAsync("batch-approve")} /></> : null}<Button variant="ghost" size="icon" className="ml-auto" onClick={() => void knowledge.refetch()}><RefreshCw className="size-4" /></Button></div><QueryState pending={knowledge.isPending} error={knowledge.error} onRetry={() => void knowledge.refetch()} />{knowledge.data && !knowledgeRows.length ? <EmptyState icon={BookMarked} compact title="没有派生知识" description="新增人工知识，或从反馈纠错中保存内容。" action={<CreateKnowledgeDialog kbId={kbId} />} /> : <div className="divide-y divide-border">{knowledgeRows.map((row) => { const id = textValue(row.knowledge_id, textValue(row.id)); const rowStatus = textValue(row.status, "pending"); const relatedSource = textValue(row.related_source, textValue(row.related_document_id, "")); return <div key={id} className="grid gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_100px_110px_auto] sm:items-start sm:gap-4"><div className="min-w-0"><p className="whitespace-pre-wrap text-[13px] leading-5">{textValue(row.text)}</p><p className="mt-1 truncate font-mono text-[10px] text-muted-foreground">{id} · {textValue(row.origin, "manual")}{relatedSource ? ` · ${relatedSource}` : ""}</p></div><StatusBadge status={rowStatus} /><Badge className="w-fit">{textValue(row.certainty, "medium")}</Badge><div className="flex flex-wrap justify-end gap-1"><ReviseKnowledgeDialog kbId={kbId} row={row} />{canReview && ["pending", "stale"].includes(rowStatus) ? <ReviewKnowledgeDialog row={row} /> : null}{canReview && rowStatus === "approved" ? <Button variant="ghost" size="icon" loading={archive.isPending} onClick={() => archive.mutate(row)} aria-label="归档"><Archive className="size-4" /></Button> : null}<Button variant="ghost" size="icon" className="text-error" onClick={() => remove.mutate(row)} aria-label="删除"><Trash2 className="size-4" /></Button></div></div>; })}</div>}</section></TabsContent>
     <TabsContent value="feedback"><section className="overflow-hidden border border-border bg-surface">{feedbackRows.length ? <div className="divide-y divide-border">{feedbackRows.map((row, index) => <div key={textValue(row.feedback_id, String(index))} className="grid grid-cols-[100px_minmax(0,1fr)_160px] gap-4 px-4 py-3 text-[13px]"><StatusBadge status={textValue(row.feedback, "pending")} label={textValue(row.feedback, "反馈")} /><div><p className="font-medium">{textValue(row.feedback_type, "一般反馈")}</p><p className="mt-1 text-xs leading-5 text-muted-foreground">{textValue(row.comment, textValue(row.feedback_text, "未提供说明"))}</p></div><span className="font-mono text-[10px] text-muted-foreground">{textValue(row.created_at)}</span></div>)}</div> : <EmptyState icon={MessageSquareWarning} compact title="没有用户反馈" description="对话中的好评、差评和纠错会出现在这里。" />}</section></TabsContent>
     <TabsContent value="analysis"><section className="overflow-hidden border border-border bg-surface">{analysisRows.length ? <div className="divide-y divide-border">{analysisRows.map((row, index) => <div key={textValue(row.feedback_id, String(index))} className="grid grid-cols-[minmax(0,1fr)_160px_100px] gap-4 px-4 py-3 text-[13px]"><div><p className="font-medium">{textValue(row.recommended_action, "待分析")}</p><p className="mt-1 text-xs text-muted-foreground">{textValue(row.reason, textValue(row.summary))}</p></div><span>{textValue(row.feedback_type)}</span><StatusBadge status={Boolean(row.needs_review) ? "needs_review" : "completed"} /></div>)}</div> : <EmptyState icon={MessageSquareWarning} compact title="没有反馈分析" description="后端完成反馈理解后会显示建议动作和审核状态。" />}</section></TabsContent>
     <TabsContent value="retrieval"><section className="overflow-hidden border border-border bg-surface">{retrievalRows.length ? <div className="divide-y divide-border">{retrievalRows.map((row, index) => <div key={textValue(row.retrieval_feedback_id, textValue(row.feedback_id, String(index)))} className="grid grid-cols-[minmax(0,1fr)_120px_120px_auto] items-center gap-4 px-4 py-3 text-[13px]"><div><p className="font-medium">{textValue(row.query, "检索反馈")}</p><p className="mt-1 text-xs text-muted-foreground">{textValue(row.reason, textValue(row.comment))}</p></div><Badge>{textValue(row.feedback_type, "weight")}</Badge><StatusBadge status={Boolean(row.enabled ?? true) ? "active" : "disabled"} /><Button variant="ghost" size="compact" loading={toggleRetrieval.isPending} onClick={() => toggleRetrieval.mutate(row)}>{Boolean(row.enabled ?? true) ? "停用" : "启用"}</Button></div>)}</div> : <EmptyState icon={ScanSearch} compact title="没有检索调权反馈" description="需要调权的坏案例会沿用后端反馈流程进入这里。" />}</section></TabsContent>

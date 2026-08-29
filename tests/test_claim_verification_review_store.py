@@ -90,6 +90,31 @@ def test_review_summary_buckets_exclude_evidence_text(tmp_path, store_factory):
     assert "reason" not in buckets[0]
 
 
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        lambda path: ClaimVerificationReviewStore(),
+        lambda path: SqliteClaimVerificationReviewStore(path),
+    ],
+)
+def test_review_store_clear_kb_is_tenant_and_kb_scoped(tmp_path, store_factory):
+    store = store_factory(str(tmp_path / "state.db"))
+    other_kb = {**_candidate("2" * 32), "kb_id": "kb-b"}
+    store.record_candidates("tenant-a", [_candidate("1" * 32), other_kb])
+    store.record_candidates("tenant-b", [_candidate("1" * 32)])
+
+    try:
+        store.clear_kb("tenant-a", "kb-a")
+
+        assert store.list_page("tenant-a", kb_id="kb-a")["items"] == []
+        assert len(store.list_page("tenant-a", kb_id="kb-b")["items"]) == 1
+        assert len(store.list_page("tenant-b", kb_id="kb-a")["items"]) == 1
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+
 def test_sqlite_review_store_backfills_compact_authorization_sources(tmp_path):
     path = str(tmp_path / "state.db")
     first = SqliteClaimVerificationReviewStore(path)
@@ -250,3 +275,39 @@ def test_sqlite_review_store_survives_restart_and_enforces_cap_and_retention(tmp
         assert second.list_page("tenant-a")["items"] == []
     finally:
         second.close()
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        lambda path: ClaimVerificationReviewStore(),
+        lambda path: SqliteClaimVerificationReviewStore(path),
+    ],
+)
+def test_review_store_clear_document_is_source_and_scope_bound(tmp_path, store_factory):
+    store = store_factory(str(tmp_path / "state.db"))
+    target = _candidate("a" * 32)
+    other_source = {
+        **_candidate("b" * 32),
+        "evidence": [
+            {
+                "chunk_id": "chunk-2",
+                "source": "other.pdf",
+                "text": "其他证据",
+            }
+        ],
+    }
+    store.record_candidates("tenant-a", [target, other_source])
+    store.record_candidates("tenant-b", [target])
+
+    try:
+        assert store.clear_document("tenant-a", "kb-a", "guide.pdf") == 1
+        remaining = store.list_page("tenant-a", kb_id="kb-a")["items"]
+        other_tenant = store.list_page("tenant-b", kb_id="kb-a")["items"]
+
+        assert [row["review_id"] for row in remaining] == ["b" * 32]
+        assert [row["review_id"] for row in other_tenant] == ["a" * 32]
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()

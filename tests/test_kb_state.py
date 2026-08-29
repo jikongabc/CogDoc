@@ -190,6 +190,39 @@ def test_rollback_active_reactivates_retained_superseded_generation(tmp_path):
     assert st.get(g2)["status"] == "superseded"
 
 
+def test_retained_superseded_generation_is_hidden_from_sweeper_until_release(
+    tmp_path,
+):
+    st = _state(tmp_path)
+    old = st.begin_generation("embed", "build-v1", "chunk-v6")
+    st.mark_ready(old, 1, [])
+    st.switch_active(old)
+    new = st.begin_generation("embed", "build-v2", "chunk-v7")
+    st.mark_ready(new, 1, [])
+    st.switch_active(new, retain_previous_generation=True)
+
+    assert st.get(old)["gc_protected"] is True
+    assert old not in st.stale_generation_ids()
+
+    st.release_generation_retention(old)
+    assert old in st.stale_generation_ids()
+
+
+def test_rollback_active_rejects_a_newer_active_generation(tmp_path):
+    st = _state(tmp_path)
+    generations = []
+    for build in ("build-v1", "build-v2", "build-v3"):
+        generation = st.begin_generation("embed", build, "chunk-v7")
+        st.mark_ready(generation, 1, [])
+        st.switch_active(generation)
+        generations.append(generation)
+
+    with pytest.raises(StaleGenerationError, match="active generation changed"):
+        st.rollback_active(generations[0], expected_current_id=generations[1])
+
+    assert st.active()["id"] == generations[2]
+
+
 # 验证 mark ready rejects negative count。
 def test_mark_ready_rejects_negative_count(tmp_path):
     st = _state(tmp_path)

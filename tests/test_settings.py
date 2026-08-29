@@ -542,3 +542,16 @@ def test_scim_settings_are_explicit_and_role_bounded():
     assert settings.cogdoc_scim_default_role == "reviewer"
     with pytest.raises(ValueError):
         Settings(_env_file=None, cogdoc_scim_default_role="owner")
+
+
+def test_rate_limit_settings_prefer_prefixed_names_and_accept_legacy(monkeypatch):
+    monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", "41")
+    monkeypatch.setenv("RATE_LIMIT_BURST", "42")
+    assert Settings(_env_file=None).rate_limit_per_minute == 41
+    assert Settings(_env_file=None).rate_limit_burst == 42
+
+    monkeypatch.setenv("COGDOC_RATE_LIMIT_PER_MINUTE", "51")
+    monkeypatch.setenv("COGDOC_RATE_LIMIT_BURST", "52")
+    settings = Settings(_env_file=None)
+    assert settings.rate_limit_per_minute == 51
+    assert settings.rate_limit_burst == 52

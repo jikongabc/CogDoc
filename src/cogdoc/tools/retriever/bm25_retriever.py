@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 import pickle
 import copy
@@ -5,6 +7,7 @@ from threading import RLock
 from typing import Any, List, cast
 from cogdoc.config.settings import get_settings
 from cogdoc.graph.state import DocMeta, RetrievedDoc
+from cogdoc.service.durable_io import atomic_write_bytes
 from cogdoc.tools.chunk_identity import build_document_id
 from cogdoc.tools.document_loader import list_sources, load_source_chunks
 from cogdoc.tools.tokenizer import tokenize_mixed_text, tokenize_corpus
@@ -19,7 +22,18 @@ from cogdoc.tools.retriever.scope import RetrievalScope
 _rust_core = ensure_rust_core("Bm25Index")
 
 # 落盘载荷格式标记；BM25 持久化结构变化时 bump，旧格式按无索引处理触发重建。
-_PERSIST_FORMAT = "bm25_index_bytes_v1"
+_PERSIST_FORMAT = "bm25_index_json_v2"
+_LEGACY_PERSIST_FORMAT = "bm25_index_bytes_v1"
+
+
+class _DataOnlyUnpickler(pickle.Unpickler):
+    """Read the former primitive-only payload without permitting globals."""
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError("pickle globals are disabled")
+
+    def persistent_load(self, pid):
+        raise pickle.UnpicklingError("pickle persistent ids are disabled")
 
 
 # 初始化实例状态。
@@ -41,16 +55,34 @@ class BM25Retriever(BaseRetriever):
 
         if os.path.exists(self.db_path):
             try:
-                with open(self.db_path, "rb") as f:
-                    state = pickle.load(f)
+                legacy = False
+                try:
+                    with open(self.db_path, encoding="utf-8") as f:
+                        state = json.load(f)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    with open(self.db_path, "rb") as f:
+                        state = _DataOnlyUnpickler(f).load()
+                    legacy = True
+                if not isinstance(state, dict):
+                    raise ValueError("invalid bm25 persist payload")
                 # 旧格式或缺索引字节按无索引处理：上层据空索引/版本不符触发重建。
-                if state.get("format") != _PERSIST_FORMAT:
+                expected_format = (
+                    _LEGACY_PERSIST_FORMAT if legacy else _PERSIST_FORMAT
+                )
+                if state.get("format") != expected_format:
                     raise ValueError("unsupported bm25 persist format")
                 registry = state.get("doc_registry", [])
-                index_bytes = state.get("index_bytes")
-                if registry and index_bytes:
+                encoded_index = state.get("index_base64")
+                index_bytes = state.get("index_bytes") if legacy else None
+                if not legacy and isinstance(encoded_index, str) and encoded_index:
+                    index_bytes = base64.b64decode(encoded_index, validate=True)
+                if registry and isinstance(index_bytes, bytes) and index_bytes:
                     self.bm25 = _rust_core.Bm25Index.from_bytes(index_bytes)
                     self.doc_registry = registry
+                    if legacy:
+                        # Migrate immediately; future starts never interpret
+                        # even the restricted legacy pickle envelope.
+                        self._persist(self.doc_registry, self.bm25)
             except Exception:
                 self.bm25, self.doc_registry = None, []
 
@@ -125,18 +157,19 @@ class BM25Retriever(BaseRetriever):
 
     # 持久化结果。
     def _persist(self, registry, index) -> None:
-        # 原子写：先写临时 pickle 再 os.replace，进程中断不会留下半截文件。 索引以 Rust 序列化字节存储，规避对 List[List[str]] 语料的 pickle 大列表开销。
-        tmp_path = f"{self.db_path}.tmp"
-        with open(tmp_path, "wb") as f:
-            pickle.dump(
-                {
-                    "format": _PERSIST_FORMAT,
-                    "doc_registry": registry,
-                    "index_bytes": index.to_bytes(),
-                },
-                f,
-            )
-        os.replace(tmp_path, self.db_path)
+        # JSON + base64 is data-only and cannot execute constructors while
+        # loading. Existing pickle generations fail closed as an empty index
+        # and are rebuilt by the normal generation consistency path.
+        payload = json.dumps(
+            {
+                "format": _PERSIST_FORMAT,
+                "doc_registry": registry,
+                "index_base64": base64.b64encode(index.to_bytes()).decode("ascii"),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        atomic_write_bytes(self.db_path, payload)
 
     # 切换in。
     def _swap_in(self, registry, index) -> None:

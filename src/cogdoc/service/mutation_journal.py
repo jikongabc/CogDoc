@@ -2,6 +2,7 @@ import json
 import os
 from threading import Lock
 from cogdoc.config.settings import get_settings
+from cogdoc.service.durable_io import atomic_write_json, atomic_write_text, durable_remove
 
 OP_UPLOAD = "upload"
 OP_DELETE_DOC = "delete_doc"
@@ -28,12 +29,7 @@ class MutationJournal:
 
     # 写入结果。
     def _write(self, job_id: str, entry: dict) -> None:
-        os.makedirs(self._dir, exist_ok=True)
-        path = self._path(job_id)
-        tmp_path = f"{path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(entry, f, ensure_ascii=False)
-        os.replace(tmp_path, path)
+        atomic_write_json(self._path(job_id), entry)
 
     # 完成 begin上传 处理。
     def begin_upload(
@@ -124,12 +120,60 @@ class MutationJournal:
     def clear(self, job_id: str) -> bool:
         with self._lock:
             try:
-                os.remove(self._path(job_id))
+                durable_remove(self._path(job_id))
                 return True
             except FileNotFoundError:
                 return True
             except OSError:
                 return False
+
+    def clear_kb(self, kb_id: str) -> int:
+        """Discard every recovery capability for a permanently deleted KB.
+
+        The caller must already have fenced the KB against writes. A malformed
+        journal cannot be safely attributed to another KB, so fail closed
+        instead of letting a same-name incarnation inherit a global blocker.
+        """
+
+        with self._lock:
+            if os.path.exists(self._degraded_path):
+                raise MutationJournalError(
+                    f"mutation journal 处于 degraded 状态，需人工恢复: {self._dir}"
+                )
+            try:
+                names = os.listdir(self._dir)
+            except FileNotFoundError:
+                return 0
+            matched: list[str] = []
+            for name in names:
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(self._dir, name)
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        entry = json.load(f)
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise MutationJournalError(
+                        f"mutation journal 无法安全清理: {name}"
+                    ) from exc
+                if not _valid_entry(entry):
+                    raise MutationJournalError(
+                        f"mutation journal 记录非法，无法安全清理: {name}"
+                    )
+                if entry.get("kb_id") == kb_id:
+                    matched.append(path)
+            removed = 0
+            for path in matched:
+                try:
+                    durable_remove(path)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise MutationJournalError(
+                        f"mutation journal 无法删除: {os.path.basename(path)}"
+                    ) from exc
+                removed += 1
+            return removed
 
     # 判断是否存在 entries。
     def has_entries(self, kb_id: str) -> bool:
@@ -263,9 +307,7 @@ def _quarantine(path: str) -> None:
 # 标记降级状态。
 def _mark_degraded(path: str) -> None:
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("1")
+        atomic_write_text(path, "1")
     except OSError:
         pass
 
@@ -279,18 +321,14 @@ def _is_committed(entry: dict) -> bool:
     if not gen_id:
         return False
     try:
-        from cogdoc.service.kb_state import KBState
-        from cogdoc.service.kb_state import GENERATION_SUPERSEDED
+        from cogdoc.service.kb_state import KBState, KBStateCorruptError
 
-        state = KBState(entry["kb_id"])
-        active = state.active()
-        if active is not None and active.get("id") == gen_id:
+        if KBState(entry["kb_id"]).generation_is_committed(gen_id):
             return True
-        generation = state.get(gen_id)
-        if generation is not None and generation.get("status") == GENERATION_SUPERSEDED:
-            return True
-    except Exception:
-        pass
+    except KBStateCorruptError as exc:
+        raise MutationJournalError(
+            "KB generation state is unreadable; mutation recovery is paused"
+        ) from exc
     # KB 已进入删除流程时绝不能因 state 目录已移除而恢复源文件，否则会复活已删除内容。
     try:
         from cogdoc.service.kb_lifecycle import LIFECYCLE_ACTIVE, shared_lifecycle_store

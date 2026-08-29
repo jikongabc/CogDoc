@@ -35,6 +35,10 @@ class TenantMutationInProgress(RuntimeError):
     """Reject duplicate file mutations while their quota is still reserved."""
 
 
+class TenantQuotaReservationLost(RuntimeError):
+    """Raised when an asynchronous mutation no longer owns its quota slot."""
+
+
 @dataclass(frozen=True)
 class TenantQuotaPolicy:
     max_knowledge_bases: int = 0
@@ -374,10 +378,22 @@ class TenantQuotaManager:
         with self._lock:
             self._reservations.pop(token, None)
 
+    def assert_live(self, token: str | None) -> None:
+        """Fence an asynchronous commit on its admission reservation."""
+
+        if not token:
+            raise TenantQuotaReservationLost("tenant quota reservation is unavailable")
+        with self._lock:
+            if token not in self._reservations:
+                raise TenantQuotaReservationLost(
+                    "tenant quota reservation was released before commit"
+                )
+
 
 __all__ = [
     "TenantMutationInProgress",
     "TenantQuotaExceeded",
+    "TenantQuotaReservationLost",
     "TenantQuotaManager",
     "TenantQuotaPolicy",
 ]

@@ -489,6 +489,9 @@ async def test_ha_http_delete_purges_connector_chat_and_acl_capabilities(
         master_keys={"v1": b"k" * 32},
         active_key_version="v1",
     )
+    index_job_store = DistributedIndexJobStore(
+        runtime.backend, owner_id="api-delete", lease_seconds=30
+    )
     jobs = IndexJobManager(
         ingest_fn=lambda *_args, **_kwargs: type(
             "Result",
@@ -496,9 +499,7 @@ async def test_ha_http_delete_purges_connector_chat_and_acl_capabilities(
             {"document_count": 0, "chunk_count": 0, "ocr_summary": {}},
         )(),
         source_dir_for=registry.source_dir,
-        job_store=DistributedIndexJobStore(
-            runtime.backend, owner_id="api-delete", lease_seconds=30
-        ),
+        job_store=index_job_store,
         epoch_reader=registry.current,
         lifecycle_reader=registry.status,
         mutation_coordinator=mutations,
@@ -549,6 +550,42 @@ async def test_ha_http_delete_purges_connector_chat_and_acl_capabilities(
     research = app.state.research_job_store.create(
         kb_id=storage,
         objective="old private research",
+    )
+    index_job_store.create(
+        {
+            "job_id": "old-index-job",
+            "kb_id": storage,
+            "status": "succeeded",
+        }
+    )
+    app.state.claim_verification_review_store.record_candidates(
+        "tenant",
+        [
+            {
+                "review_id": "a" * 32,
+                "kb_id": storage,
+                "task_type": "qa",
+                "policy_id": "b" * 16,
+                "effective_mode": "shadow",
+                "decision": "would_allow",
+                "claim_id": "claim-1",
+                "claim": "old private claim",
+                "actual_verdict": "supported",
+                "reason": "test",
+                "confidence": 0.9,
+                "duration_ms": 1.0,
+                "cited_chunk_ids": ["chunk-1"],
+                "supporting_chunk_ids": ["chunk-1"],
+                "evidence": [
+                    {
+                        "chunk_id": "chunk-1",
+                        "source": "old.pdf",
+                        "text": "old private evidence",
+                    }
+                ],
+                "evidence_complete": True,
+            }
+        ],
     )
     dispatch = app.state.ha_research_dispatch_store.enqueue(
         research["job_id"], "evidence", "attempt-old"
@@ -613,6 +650,10 @@ async def test_ha_http_delete_purges_connector_chat_and_acl_capabilities(
         is None
     )
     assert app.state.research_job_store.get(research["job_id"]) is None
+    assert index_job_store.list({storage}) == []
+    assert app.state.claim_verification_review_store.list_page(
+        "tenant", kb_id=storage
+    )["items"] == []
     assert app.state.ha_research_dispatch_store.get(dispatch["dispatch_id"]) is None
     assert (
         oauth_sessions.cancel(
@@ -629,6 +670,10 @@ async def test_ha_http_delete_purges_connector_chat_and_acl_capabilities(
     assert recreated["storage_id"] == storage
     assert app.state.connection_store.list_entries("tenant", storage) == []
     assert app.state.session_store.list_sessions(storage) == []
+    assert index_job_store.list({storage}) == []
+    assert app.state.claim_verification_review_store.list_page(
+        "tenant", kb_id=storage
+    )["items"] == []
 
     app.state.sync_manager.shutdown(wait=True)
     jobs.shutdown(wait=True)

@@ -19,6 +19,7 @@ from cogdoc.service.ingest_service import (
     index_build_version,
 )
 from cogdoc.service.kb_locks import kb_write_lock
+from cogdoc.service.durable_io import atomic_write_json
 from cogdoc.service.kb_state import KBState
 from cogdoc.service.retriever_factory import RetrieverFactory
 from cogdoc.tools.chunk_identity import CHUNK_IDENTITY_VERSION
@@ -55,12 +56,7 @@ class IndexMigrationStore:
         if not run_id or any(char not in "0123456789abcdef" for char in run_id):
             raise ValueError("invalid migration run_id")
         target = self.directory / f"{run_id}.json"
-        temporary = self.directory / f".{run_id}.tmp"
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(run, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        atomic_write_json(str(target), dict(run), ensure_ascii=False, indent=2)
 
     def load(self, run_id: str) -> dict[str, Any]:
         if not run_id or any(char not in "0123456789abcdef" for char in run_id):
@@ -249,6 +245,7 @@ class IndexMigrationRunner:
             for item in run.get("items", [])
             if isinstance(item, dict)
             and item.get("status") in {"succeeded", "succeeded_with_refresh_failure"}
+            and item.get("generation_id")
             and item.get("previous_generation_id")
             and (not selected or item.get("storage_id") in selected)
         ]
@@ -258,7 +255,8 @@ class IndexMigrationRunner:
                 with kb_write_lock(storage_id):
                     state = KBState(storage_id)
                     replaced = state.rollback_active(
-                        str(item["previous_generation_id"])
+                        str(item["previous_generation_id"]),
+                        expected_current_id=str(item["generation_id"]),
                     )
                     active = state.active()
                     if active is None:
@@ -279,7 +277,11 @@ class IndexMigrationRunner:
                     except Exception:
                         # Keep state and manifest on the migrated generation when
                         # restoring the previous manifest cannot be committed.
-                        state.rollback_active(replaced)
+                        state.rollback_active(
+                            replaced,
+                            expected_current_id=str(item["previous_generation_id"]),
+                            protect_replaced=True,
+                        )
                         raise
                     RetrieverFactory.invalidate(storage_id)
                 item.update(
@@ -309,6 +311,8 @@ class IndexMigrationRunner:
             if not previous or item.get("retained_generation_cleaned_at"):
                 continue
             try:
+                state = KBState(str(item["storage_id"]))
+                state.release_generation_retention(previous)
                 _cleanup_generation_storage(str(item["storage_id"]), previous)
                 item["retained_generation_cleaned_at"] = _now_iso()
             except Exception as exc:

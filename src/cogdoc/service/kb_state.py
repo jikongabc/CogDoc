@@ -1,11 +1,13 @@
 import copy
 import json
 import math
-import os
 import time
 import uuid
 from threading import RLock
+from typing import Any
+
 from cogdoc.config.settings import get_settings
+from cogdoc.service.durable_io import atomic_write_json
 from cogdoc.service.kb_epoch import EpochStore, shared_epoch_store
 
 
@@ -30,6 +32,10 @@ class StaleGenerationError(Exception):
     pass
 
 
+class KBStateCorruptError(RuntimeError):
+    pass
+
+
 # 新建索引代id。
 def new_generation_id() -> str:
     # 短 id，进 chroma collection 名（col-{kb_id}-{gen} 有 60 字符上限）。
@@ -51,15 +57,25 @@ class KBState:
         self._lock = RLock()
 
     # 加载。
-    def _load(self) -> dict:
+    def _load(self, *, strict: bool = False) -> dict:
         # 语法损坏退回初始态；合法但结构/不变量损坏的也清洗： 未知 status 的 generation 丢弃，active 必须指向一个 ready generation 否则置空。
         try:
             with open(self._path, encoding="utf-8") as f:
                 raw = json.load(f)
             if not isinstance(raw, dict):
+                if strict:
+                    raise KBStateCorruptError("KB generation state is not an object")
                 raw = {}
-        except (FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError:
             raw = {}
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            if strict:
+                raise KBStateCorruptError("KB generation state is unreadable") from exc
+            raw = {}
+        except OSError as exc:
+            if strict:
+                raise KBStateCorruptError("KB generation state is unreadable") from exc
+            raise
 
         raw_gens = raw.get("generations")
         gens = {}
@@ -68,20 +84,36 @@ class KBState:
                 # 必填字段缺失、status 非法、或 id 与 key 不一致的条目一律丢弃。
                 if _valid_generation(gid, gen):
                     gens[gid] = gen
+                elif strict:
+                    raise KBStateCorruptError("KB generation entry is invalid")
+        elif raw_gens is not None and strict:
+            raise KBStateCorruptError("KB generations state is invalid")
 
         active = raw.get("active_generation")
         if active not in gens or gens.get(active, {}).get("status") != GENERATION_READY:
+            if strict and active is not None:
+                raise KBStateCorruptError("KB active generation pointer is invalid")
             active = None
 
         return {"kb_id": self.kb_id, "active_generation": active, "generations": gens}
 
+    def generation_is_committed(self, gen_id: str) -> bool:
+        """Read commit evidence without treating damaged state as empty state."""
+
+        with self._lock:
+            data = self._load(strict=True)
+            generation = data["generations"].get(gen_id)
+            return bool(
+                data.get("active_generation") == gen_id
+                or (
+                    generation is not None
+                    and generation.get("status") == GENERATION_SUPERSEDED
+                )
+            )
+
     # 保存。
     def _save(self, data: dict) -> None:
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        tmp_path = f"{self._path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, self._path)
+        atomic_write_json(self._path, data, indent=2)
 
     # 维护纪元和删除标记。
 
@@ -115,7 +147,7 @@ class KBState:
             data = self._load()
             gen_id = new_generation_id()
             # 记录构建起点的 epoch；切换时比对，期间被删库则拒绝提交。
-            generation = {
+            generation: dict[str, Any] = {
                 "id": gen_id,
                 "status": GENERATION_BUILDING,
                 "embedding_model": embedding_model,
@@ -178,7 +210,9 @@ class KBState:
             self._save(data)
 
     # 切换活跃代。
-    def switch_active(self, gen_id: str) -> str | None:
+    def switch_active(
+        self, gen_id: str, *, retain_previous_generation: bool = False
+    ) -> str | None:
         # 仅允许基准纪元仍匹配的就绪代切换为活跃代。
         with self._lock:
             data = self._load()
@@ -196,11 +230,21 @@ class KBState:
                 old = data["generations"].get(previous)
                 if old is not None:
                     old["status"] = GENERATION_SUPERSEDED
+                    if retain_previous_generation:
+                        old["gc_protected"] = True
+                    else:
+                        old.pop("gc_protected", None)
             data["active_generation"] = gen_id
             self._save(data)
             return previous if previous != gen_id else None
 
-    def rollback_active(self, gen_id: str) -> str:
+    def rollback_active(
+        self,
+        gen_id: str,
+        *,
+        expected_current_id: str | None = None,
+        protect_replaced: bool = False,
+    ) -> str:
         """Atomically reactivate one retained superseded generation.
 
         Rollback deliberately accepts only a superseded generation.  Building,
@@ -219,14 +263,36 @@ class KBState:
             current_id = data["active_generation"]
             if current_id is None:
                 raise ValueError("cannot roll back without an active generation")
+            if expected_current_id is not None and current_id != expected_current_id:
+                raise StaleGenerationError(
+                    "active generation changed after the migration; rollback refused"
+                )
             current = data["generations"].get(current_id)
             if current is None or current["status"] != GENERATION_READY:
                 raise ValueError("active generation state is invalid")
             current["status"] = GENERATION_SUPERSEDED
+            if protect_replaced:
+                current["gc_protected"] = True
+            else:
+                current.pop("gc_protected", None)
             target["status"] = GENERATION_READY
+            target.pop("gc_protected", None)
             data["active_generation"] = gen_id
             self._save(data)
             return current_id
+
+    def release_generation_retention(self, gen_id: str) -> None:
+        """Make one retained superseded generation eligible for GC."""
+
+        with self._lock:
+            data = self._load()
+            generation = data["generations"].get(gen_id)
+            if generation is None:
+                raise KeyError(gen_id)
+            if generation["status"] != GENERATION_SUPERSEDED:
+                raise ValueError("only a superseded generation can release retention")
+            generation.pop("gc_protected", None)
+            self._save(data)
 
     # 查询和回收。
 
@@ -272,7 +338,9 @@ class KBState:
                 if gid == active:
                     continue
                 status = gen["status"]
-                if status in (GENERATION_FAILED, GENERATION_SUPERSEDED):
+                if status == GENERATION_FAILED:
+                    stale.append(gid)
+                elif status == GENERATION_SUPERSEDED and not gen.get("gc_protected"):
                     stale.append(gid)
                 elif status in (GENERATION_BUILDING, GENERATION_READY):
                     created = gen.get("created_at", 0)

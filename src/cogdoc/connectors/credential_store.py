@@ -1497,3 +1497,50 @@ class CredentialVault:
                 occurred_at,
             ),
         )
+
+
+def delete_sqlite_connector_secret_scope(
+    database_path: str,
+    tenant_id: str,
+    kb_id: str,
+) -> dict[str, int]:
+    """Erase connector secrets without requiring the encryption keys.
+
+    Deletion never decrypts a capability. This is used by offline cleanup
+    tooling when a deployment has removed or rotated away its vault keys.
+    """
+
+    tenant, kb, _ = _scope_values(tenant_id, kb_id, None)
+    connection = connect_sqlite(database_path)
+    counts: dict[str, int] = {}
+    tables = (
+        "connector_oauth_sessions",
+        "connector_credential_pending_bindings",
+        "connector_credential_events",
+        "connector_credentials",
+    )
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        for table in tables:
+            if table not in existing:
+                counts[table] = 0
+                continue
+            removed = connection.execute(
+                f"DELETE FROM {table} WHERE tenant_id=? AND kb_id=?",
+                (tenant, kb),
+            ).rowcount
+            counts[table] = int(removed)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    return counts

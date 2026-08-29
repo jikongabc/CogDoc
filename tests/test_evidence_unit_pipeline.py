@@ -3,6 +3,7 @@ from __future__ import annotations
 from cogdoc.service.evidence_unit_pipeline import (
     EvidenceUnitExecutionStatus,
     EvidenceUnitPipelinePolicy,
+    _document_cost,
     retrieve_evidence_units,
 )
 from cogdoc.service.evidence_units import (
@@ -319,6 +320,36 @@ def test_compare_admission_group_fails_atomically_when_batch_chars_are_tight(
         EvidenceUnitExecutionStatus.BUDGET_EXHAUSTED,
     ]
     assert batch.evidence_ledger == ()
+
+
+def test_required_unit_enforces_minimum_character_reservation(monkeypatch):
+    monkeypatch.setattr(BGEReranker, "default_device", lambda: "cpu")
+    doc = _doc("a.pdf", "short", "短")
+    units = build_summary_evidence_units(
+        "总结 a.pdf",
+        "a.pdf",
+        [{"section_id": "summary", "title": "摘要", "instruction": "概括"}],
+    )
+    minimum = _document_cost(doc) + 1
+    budget = EvidenceUnitBudget(
+        max_total_docs=1,
+        max_total_chars=minimum,
+        max_docs_per_unit=1,
+        max_chars_per_unit=minimum,
+        min_chars_per_required_unit=minimum,
+    )
+    batch = retrieve_evidence_units(
+        units,
+        kb_id="kb",
+        original_query="总结 a.pdf",
+        engine=_Engine([doc]),
+        derived_knowledge_retriever=_NoDerived(),
+        retrieval_feedback_store=_NoFeedback(),
+        budget=budget,
+        policy=_policy(),
+        rrf_k=60.0,
+    )
+    assert batch.results[0].status is EvidenceUnitExecutionStatus.BUDGET_EXHAUSTED
 
 
 def test_same_chunk_different_unit_spans_receive_different_eids(monkeypatch):

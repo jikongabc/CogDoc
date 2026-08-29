@@ -8,7 +8,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 from xml.etree import ElementTree as ET
 
 from cogdoc.connectors.base import (
@@ -928,11 +928,28 @@ class S3Connector:
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         day = now.strftime("%Y%m%d")
         parts = urlsplit(url)
-        canonical_query = urlencode(
-            sorted(parse_qsl(parts.query, keep_blank_values=True)), quote_via=quote
+        encoded_query = sorted(
+            (
+                quote(name, safe="-_.~"),
+                quote(value, safe="-_.~"),
+            )
+            for name, value in parse_qsl(parts.query, keep_blank_values=True)
         )
+        canonical_query = "&".join(
+            f"{name}={value}" for name, value in encoded_query
+        )
+        # URL construction already escapes keys.  Decode once and apply the
+        # SigV4 encoding contract once so spaces, Unicode and literal percent
+        # sequences are signed exactly as they are sent.
+        canonical_uri = quote(unquote(parts.path or "/"), safe="/-_.~")
         payload_hash = hashlib.sha256(payload).hexdigest()
-        canonical_headers = f"host:{parts.netloc}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+        # Match HttpTransport._host_header: DNS names are case-insensitive and
+        # emitted lowercase, while an explicitly configured port remains part
+        # of the authority covered by the signature.
+        canonical_host = str(parts.hostname or "").casefold()
+        if parts.port is not None:
+            canonical_host = f"{canonical_host}:{parts.port}"
+        canonical_headers = f"host:{canonical_host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
         signed_headers = "host;x-amz-content-sha256;x-amz-date"
         if self.session_token:
             canonical_headers += f"x-amz-security-token:{self.session_token}\n"
@@ -940,7 +957,7 @@ class S3Connector:
         canonical = "\n".join(
             [
                 method,
-                parts.path or "/",
+                canonical_uri,
                 canonical_query,
                 canonical_headers,
                 signed_headers,

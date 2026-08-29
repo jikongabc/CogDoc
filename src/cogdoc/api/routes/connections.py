@@ -190,7 +190,10 @@ async def create_connection(kb_id: str, body: ConnectionCreate, request: Request
         validate_url_connector_host_policy(
             body.connector_type,
             body.config,
-            enforce=request.app.state.auth_enabled,
+            enforce=bool(
+                request.app.state.auth_enabled
+                or request.app.state.connector_url_allowed_hosts
+            ),
             allowed_hosts=request.app.state.connector_url_allowed_hosts,
         )
     except ValueError as exc:

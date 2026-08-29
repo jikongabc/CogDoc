@@ -1418,3 +1418,42 @@ def test_service_account_policy_client_is_workspace_scoped(monkeypatch):
         "expected_revision": 2,
     }
     assert calls[1][2]["headers"]["X-CogDoc-Workspace"] == "ws/one"
+
+
+def test_opaque_route_identifiers_are_encoded_as_single_segments(monkeypatch):
+    calls = []
+
+    def record(method):
+        def fake(url, **kwargs):
+            calls.append((method, url, kwargs))
+            return httpx.Response(200, json={"ok": True})
+
+        return fake
+
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.get", record("GET"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.post", record("POST"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.patch", record("PATCH"))
+    monkeypatch.setattr("cogdoc.frontend.api_client.httpx.delete", record("DELETE"))
+    client = CogDocClient("http://api", api_key="secret")
+
+    client.get_workspace("ws/one?#")
+    client.get_document_access_policy("kb/one", "doc name/?.pdf")
+    client.delete_document("kb/one", "doc name/?.pdf")
+    client.set_connection_enabled("kb/one", "connection/one", True)
+    client.start_connection_sync("kb/one", "connection/one")
+    client.get_job("job/one?#")
+    client.get_trace("trace/one?#")
+    client.get_session_history("session/one?#", "kb/one")
+    client.get_research_job("research/one?#")
+
+    assert [call[1] for call in calls] == [
+        "http://api/v1/workspaces/ws%2Fone%3F%23",
+        "http://api/v1/knowledge-bases/kb%2Fone/documents/doc%20name%2F%3F.pdf/access",
+        "http://api/v1/knowledge-bases/kb%2Fone/documents/doc%20name%2F%3F.pdf",
+        "http://api/v1/knowledge-bases/kb%2Fone/connections/connection%2Fone",
+        "http://api/v1/knowledge-bases/kb%2Fone/connections/connection%2Fone/sync",
+        "http://api/v1/index-jobs/job%2Fone%3F%23",
+        "http://api/v1/traces/trace%2Fone%3F%23",
+        "http://api/v1/sessions/session%2Fone%3F%23/history",
+        "http://api/v1/research-jobs/research%2Fone%3F%23",
+    ]

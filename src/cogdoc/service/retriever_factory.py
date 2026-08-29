@@ -4,6 +4,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
+import logging
 from threading import RLock
 from typing import Any
 
@@ -18,6 +19,9 @@ from cogdoc.tools.retriever.vector_retriever import (
     VectorRetriever,
 )
 from cogdoc.tools.embedder import resolve_embedder
+
+
+logger = logging.getLogger(__name__)
 
 
 class RetrieverFactory:
@@ -37,6 +41,20 @@ class RetrieverFactory:
         "cogdoc_retriever_provider", default=None
     )
 
+    @staticmethod
+    def _close_engine(engine: Any) -> None:
+        close = getattr(engine, "close", None)
+        if callable(close):
+            close()
+
+    @classmethod
+    def _close_engines(cls, engines: list[Any]) -> None:
+        for engine in engines:
+            try:
+                cls._close_engine(engine)
+            except Exception:
+                logger.exception("failed to close an evicted retrieval engine")
+
     @classmethod
     def get_engine(cls, kb_id: str) -> HybridRetriever:
         if shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE:
@@ -52,33 +70,67 @@ class RetrieverFactory:
                 return HybridRetriever(NullRetriever(), NullRetriever())
             return engine
 
-        gen_id = cls._resolve_gen_id(kb_id)
-        cache_key = (kb_id, gen_id)
+        # A generation can advance while an engine is being constructed.  A
+        # stale engine must never escape merely because it finished building
+        # first. Retry a bounded number of times and fail closed under churn.
+        for _attempt in range(3):
+            gen_id = cls._resolve_gen_id(kb_id)
+            cache_key = (kb_id, gen_id)
 
-        with cls._lock:
-            engine = cls._engines.get(cache_key)
+            with cls._lock:
+                engine = cls._engines.get(cache_key)
+                if engine is not None:
+                    cls._engines.move_to_end(cache_key)
             if engine is not None:
-                if shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE:
-                    return HybridRetriever(NullRetriever(), NullRetriever())
-                cls._engines.move_to_end(cache_key)
+                if (
+                    shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE
+                    or cls._resolve_gen_id(kb_id) != gen_id
+                ):
+                    with cls._lock:
+                        stale = (
+                            cls._engines.pop(cache_key, None)
+                            if cls._engines.get(cache_key) is engine
+                            else None
+                        )
+                    if stale is not None:
+                        cls._close_engines([stale])
+                    continue
                 return engine
 
-        built = cls._build_engine(kb_id, gen_id)
+            built = cls._build_engine(kb_id, gen_id)
+            if (
+                shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE
+                or cls._resolve_gen_id(kb_id) != gen_id
+            ):
+                cls._close_engines([built])
+                continue
 
-        with cls._lock:
-            if shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE:
-                return HybridRetriever(NullRetriever(), NullRetriever())
-            current_gen_id = cls._resolve_gen_id(kb_id)
-            if current_gen_id != gen_id:
-                return built
-            engine = cls._engines.get(cache_key)
-            if engine is None:
-                cls._engines[cache_key] = built
-                engine = built
-                while len(cls._engines) > cls._max_engines:
-                    cls._engines.popitem(last=False)
-            cls._engines.move_to_end(cache_key)
+            evicted: list[Any] = []
+            with cls._lock:
+                engine = cls._engines.get(cache_key)
+                if engine is None:
+                    cls._engines[cache_key] = built
+                    engine = built
+                    while len(cls._engines) > cls._max_engines:
+                        _, stale = cls._engines.popitem(last=False)
+                        evicted.append(stale)
+                elif built is not engine:
+                    evicted.append(built)
+                cls._engines.move_to_end(cache_key)
+            cls._close_engines(evicted)
+            # Close the remaining publish window before exposing the cached
+            # engine. invalidate() removes the stale entry when the head moved.
+            if (
+                shared_lifecycle_store().status(kb_id) != LIFECYCLE_ACTIVE
+                or cls._resolve_gen_id(kb_id) != gen_id
+            ):
+                with cls._lock:
+                    stale = cls._engines.pop(cache_key, None)
+                if stale is not None:
+                    cls._close_engines([stale])
+                continue
             return engine
+        return HybridRetriever(NullRetriever(), NullRetriever())
 
     @classmethod
     def _resolve_gen_id(cls, kb_id: str) -> str | None:
@@ -123,6 +175,7 @@ class RetrieverFactory:
         actual = engine.count()
         consistent = engine.is_consistent()
         if actual != expected or not consistent:
+            cls._close_engines([engine])
             raise IndexCorruptError(
                 f"generation {gen_id}: expected_count={expected}, actual={actual}, "
                 f"consistent={consistent}; rebuild required"
@@ -133,8 +186,8 @@ class RetrieverFactory:
     def invalidate(cls, kb_id: str) -> None:
         with cls._lock:
             stale_keys = [key for key in cls._engines if key[0] == kb_id]
-            for key in stale_keys:
-                del cls._engines[key]
+            stale = [cls._engines.pop(key) for key in stale_keys]
+        cls._close_engines(stale)
 
     @classmethod
     def bind_external_provider(cls, provider: Callable[[str], Any]) -> None:
@@ -147,7 +200,9 @@ class RetrieverFactory:
             ):
                 raise RuntimeError("retrieval engine provider is already bound")
             cls._external_provider = provider
+            stale = list(cls._engines.values())
             cls._engines.clear()
+        cls._close_engines(stale)
 
     @classmethod
     @contextmanager
@@ -165,6 +220,9 @@ class RetrieverFactory:
     @classmethod
     def unbind_external_provider(cls, provider: Callable[[str], Any]) -> None:
         with cls._lock:
+            stale: list[Any] = []
             if cls._external_provider is provider:
                 cls._external_provider = None
+                stale = list(cls._engines.values())
                 cls._engines.clear()
+        cls._close_engines(stale)

@@ -1,5 +1,9 @@
 from unittest.mock import MagicMock, patch
-from cogdoc.service.mutation_journal import MutationJournal
+import pytest
+from cogdoc.service.mutation_journal import (
+    MutationJournal,
+    MutationJournalError,
+)
 
 
 # 构造测试变更日志。
@@ -9,9 +13,9 @@ def _journal(tmp_path):
 
 # 构造测试用活跃代。
 def _active(gen_id):
-    # 让 recovery 内 KBState(kb).active() 返回指定 active gen，用于模拟"已提交"。
+    # 让 recovery 的严格提交证据读取返回指定 active gen。
     state = MagicMock()
-    state.active.return_value = {"id": gen_id} if gen_id else None
+    state.generation_is_committed.side_effect = lambda candidate: candidate == gen_id
     return patch("cogdoc.service.kb_state.KBState", return_value=state)
 
 
@@ -88,6 +92,62 @@ def test_recover_upload_gen_recorded_but_not_active_rolls_back(tmp_path):
         j.recover_all()
 
     assert dest.read_bytes() == b"OLD"
+
+
+def test_recovery_pauses_when_generation_state_is_corrupt(tmp_path, monkeypatch):
+    import cogdoc.service.kb_state as kb_state_module
+
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(
+        kb_state_module,
+        "get_settings",
+        lambda: MagicMock(kb_state_path=lambda _kb_id: str(state_path)),
+    )
+    src = tmp_path / "src"
+    src.mkdir()
+    dest = src / "a.pdf"
+    backup = src / "a.pdf.job1.cogdoc-bak"
+    dest.write_bytes(b"NEW")
+    backup.write_bytes(b"OLD")
+    journal = _journal(tmp_path)
+    journal.begin_upload("job1", "kb", str(dest), str(backup), had_old=True)
+    journal.record_generation("job1", "gNEW")
+
+    with pytest.raises(MutationJournalError, match="recovery is paused"):
+        journal.recover_all()
+
+    assert dest.read_bytes() == b"NEW"
+    assert backup.read_bytes() == b"OLD"
+    assert (tmp_path / "journal" / "job1.json").exists()
+
+
+def test_recovery_pauses_when_generation_state_is_not_utf8(tmp_path, monkeypatch):
+    import cogdoc.service.kb_state as kb_state_module
+
+    state_path = tmp_path / "state.json"
+    state_path.write_bytes(b"\xff\xfe\x00")
+    monkeypatch.setattr(
+        kb_state_module,
+        "get_settings",
+        lambda: MagicMock(kb_state_path=lambda _kb_id: str(state_path)),
+    )
+    src = tmp_path / "src"
+    src.mkdir()
+    dest = src / "a.pdf"
+    backup = src / "a.pdf.job1.cogdoc-bak"
+    dest.write_bytes(b"NEW")
+    backup.write_bytes(b"OLD")
+    journal = _journal(tmp_path)
+    journal.begin_upload("job1", "kb", str(dest), str(backup), had_old=True)
+    journal.record_generation("job1", "gNEW")
+
+    with pytest.raises(MutationJournalError, match="recovery is paused"):
+        journal.recover_all()
+
+    assert dest.read_bytes() == b"NEW"
+    assert backup.read_bytes() == b"OLD"
+    assert (tmp_path / "journal" / "job1.json").exists()
 
 
 # 验证 recover delete staged restores。
@@ -167,3 +227,35 @@ def test_clear_removes_entry(tmp_path):
     j.clear("job1")
     with _active(None):
         assert j.recover_all() == []
+
+
+def test_clear_kb_removes_only_matching_recovery_entries(tmp_path):
+    journal = _journal(tmp_path)
+    journal.begin_upload(
+        "job-kb",
+        "kb",
+        str(tmp_path / "kb" / "source.pdf"),
+        str(tmp_path / "kb" / "backup.pdf"),
+        had_old=True,
+    )
+    journal.begin_upload(
+        "job-other",
+        "other",
+        str(tmp_path / "other" / "source.pdf"),
+        str(tmp_path / "other" / "backup.pdf"),
+        had_old=True,
+    )
+
+    assert journal.clear_kb("kb") == 1
+    assert journal.has_entries("kb") is False
+    assert journal.has_entries("other") is True
+
+
+def test_clear_kb_fails_closed_on_unattributable_journal(tmp_path):
+    journal = _journal(tmp_path)
+    journal_dir = tmp_path / "journal"
+    journal_dir.mkdir()
+    (journal_dir / "broken.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(MutationJournalError):
+        journal.clear_kb("kb")

@@ -236,6 +236,16 @@ def _decode_authorization_sources(value: object) -> list[str] | None:
     return decoded
 
 
+def _contains_authorization_source(value: object, source: str) -> bool:
+    sources = (
+        _authorization_sources(value)
+        if isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes, bytearray))
+        else _decode_authorization_sources(value)
+    )
+    return isinstance(sources, list) and source in sources
+
+
 def _summary_projection(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "kb_id": str(row.get("kb_id") or ""),
@@ -482,6 +492,27 @@ class ClaimVerificationReviewStore:
                     and float(row["observed_at"]) >= cutoff
                 )
             )
+
+    def clear_kb(self, tenant_id: str, kb_id: str) -> None:
+        with self._lock:
+            self._rows = {
+                key: row
+                for key, row in self._rows.items()
+                if not (row["tenant_id"] == tenant_id and row["kb_id"] == kb_id)
+            }
+
+    def clear_document(self, tenant_id: str, kb_id: str, source: str) -> int:
+        with self._lock:
+            keys = [
+                key
+                for key, row in self._rows.items()
+                if row["tenant_id"] == tenant_id
+                and row["kb_id"] == kb_id
+                and _contains_authorization_source(row.get("evidence"), source)
+            ]
+            for key in keys:
+                self._rows.pop(key, None)
+            return len(keys)
 
     def _purge_locked(self, now: float) -> None:
         cutoff = now - self.retention_seconds
@@ -818,6 +849,34 @@ class SqliteClaimVerificationReviewStore:
             }
             for row in rows
         ]
+
+    def clear_kb(self, tenant_id: str, kb_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM claim_verification_reviews "
+                "WHERE tenant_id=? AND kb_id=?",
+                (tenant_id, kb_id),
+            )
+
+    def clear_document(self, tenant_id: str, kb_id: str, source: str) -> int:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT review_id,authorization_sources "
+                "FROM claim_verification_reviews WHERE tenant_id=? AND kb_id=?",
+                (tenant_id, kb_id),
+            ).fetchall()
+            review_ids = [
+                str(row[0])
+                for row in rows
+                if _contains_authorization_source(row[1], source)
+            ]
+            if review_ids:
+                self._conn.executemany(
+                    "DELETE FROM claim_verification_reviews "
+                    "WHERE tenant_id=? AND review_id=?",
+                    ((tenant_id, review_id) for review_id in review_ids),
+                )
+            return len(review_ids)
 
     def close(self) -> None:
         with self._lock:

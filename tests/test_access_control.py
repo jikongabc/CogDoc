@@ -70,6 +70,7 @@ def _policy_app(
     api_keys: set[str] | None = None,
     principals: dict[str, Principal] | None = None,
     rate_limiter: TokenBucketRateLimiter | None = None,
+    trusted_proxy_cidrs: str | None = None,
 ):
     app = FastAPI()
 
@@ -94,6 +95,7 @@ def _policy_app(
         principals=principals,
         rate_limiter=rate_limiter
         or TokenBucketRateLimiter(capacity=0, refill_per_second=0.0),
+        trusted_proxy_cidrs=trusted_proxy_cidrs,
     )
     return app
 
@@ -598,6 +600,91 @@ async def test_auth_disabled_injects_default_local_owner():
         "role": "owner",
         "key_fingerprint": "auth-disabled",
     }
+
+
+@pytest.mark.anyio
+async def test_auth_disabled_rejects_non_loopback_clients():
+    app = _policy_app()
+    transport = ASGITransport(app=app, client=("203.0.113.10", 41000))
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/v1/knowledge-bases")
+
+    assert response.status_code == 401
+    assert response.json()["error_code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "headers",
+    (
+        {"X-Forwarded-For": "203.0.113.10"},
+        {"Forwarded": "for=203.0.113.10;proto=https"},
+    ),
+)
+async def test_auth_disabled_rejects_external_client_behind_trusted_proxy(headers):
+    app = _policy_app(trusted_proxy_cidrs="127.0.0.1/32,::1/128")
+    transport = ASGITransport(app=app, client=("127.0.0.1", 41000))
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/v1/knowledge-bases", headers=headers)
+
+    assert response.status_code == 401
+    assert response.json()["error_code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.anyio
+async def test_untrusted_peer_cannot_spoof_forwarded_loopback_client():
+    app = _policy_app()
+    transport = ASGITransport(app=app, client=("203.0.113.10", 41000))
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            "/v1/knowledge-bases",
+            headers={"X-Forwarded-For": "127.0.0.1"},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error_code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.anyio
+async def test_disagreeing_forwarding_headers_fail_closed():
+    app = _policy_app(trusted_proxy_cidrs="127.0.0.1/32,::1/128")
+    transport = ASGITransport(app=app, client=("127.0.0.1", 41000))
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            "/v1/knowledge-bases",
+            headers={
+                "Forwarded": "for=127.0.0.1",
+                "X-Forwarded-For": "203.0.113.10",
+            },
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error_code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.anyio
+async def test_trusted_proxy_without_forwarding_header_cannot_inherit_local_owner():
+    app = _policy_app(trusted_proxy_cidrs="127.0.0.1/32,::1/128")
+    transport = ASGITransport(app=app, client=("127.0.0.1", 41000))
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/v1/knowledge-bases")
+
+    assert response.status_code == 401
+    assert response.json()["error_code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.anyio
+async def test_trusted_proxy_can_forward_an_actual_loopback_client():
+    app = _policy_app(trusted_proxy_cidrs="127.0.0.1/32,::1/128")
+    transport = ASGITransport(app=app, client=("127.0.0.1", 41000))
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            "/v1/knowledge-bases",
+            headers={"X-Forwarded-For": "127.0.0.1"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["role"] == "owner"
 
 
 @pytest.mark.anyio

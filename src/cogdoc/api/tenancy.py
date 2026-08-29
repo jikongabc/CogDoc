@@ -209,7 +209,7 @@ _QUERY_PATHS = frozenset(
         "/v1/retrieve",
     }
 )
-_PUBLIC_AUTH_PATHS = frozenset(
+PUBLIC_AUTH_PATHS = frozenset(
     {
         "/v1/auth/config",
         "/v1/auth/register",
@@ -274,7 +274,7 @@ def required_permission(method: str, path: str) -> Permission:
     # These routes authenticate/authorize inside their own handler.  This
     # branch is useful to policy consumers even though the HTTP middleware
     # exempts them from principal-based RBAC.
-    if normalized_path in _PUBLIC_AUTH_PATHS and normalized_method == "POST":
+    if normalized_path in PUBLIC_AUTH_PATHS and normalized_method == "POST":
         return Permission.READ
 
     # Credential/session lifecycle is self-service. A viewer must be able to
@@ -334,6 +334,10 @@ def required_permission(method: str, path: str) -> Permission:
     if normalized_path.startswith("/v1/claim-verification/observations"):
         return Permission.REVIEW
     if normalized_path.startswith("/v1/claim-verification/reviews"):
+        return Permission.REVIEW
+    if normalized_path == "/v1/index-migrations" or normalized_path.startswith(
+        "/v1/index-migrations/"
+    ):
         return Permission.REVIEW
 
     research_permission = _is_research_review(normalized_path, normalized_method)

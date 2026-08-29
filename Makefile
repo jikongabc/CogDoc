@@ -66,7 +66,7 @@ help:
 	@echo "make eval-suite-report - 执行真实检索发布门禁并写入 eval/eval_suite_report.json"
 	@echo "make eval-suite-baseline - 执行真实检索并对比 eval/eval_suite_baseline.json"
 	@echo "make eval-suite-update-baseline - 执行真实检索并更新 eval/eval_suite_baseline.json"
-	@echo "make run     - 启动多库多对话控制台 (python -m cogdoc.cli)"
+	@echo "make run     - 启动 API 产品控制台 (python -m cogdoc.api_cli)"
 	@echo "make debug   - 启动独立 Debug 控制台 (python -m cogdoc.debug)"
 	@echo "make serve   - 启动 FastAPI 服务 (uvicorn cogdoc.api.app:app)"
 	@echo "make frontend - 加载 .env 后启动 Streamlit 前端 (src/cogdoc/frontend/app.py)"
@@ -201,7 +201,7 @@ eval-suite-update-baseline:
 	$(PYTHON) scripts/eval_suite.py $(EVAL_SUITE_RELEASE_ARGS) --update-baseline eval/eval_suite_baseline.json
 
 run:
-	$(PYTHON) -m cogdoc.cli
+	$(PYTHON) -m cogdoc.api_cli
 
 debug:
 	$(PYTHON) -m cogdoc.debug

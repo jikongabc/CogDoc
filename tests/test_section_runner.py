@@ -1,5 +1,8 @@
 import threading
 import time
+from types import SimpleNamespace
+
+import cogdoc.agents.summary_generator as summary_generator
 from cogdoc.agents.summary_generator import resolve_section_workers, run_section_cells
 
 
@@ -15,6 +18,16 @@ def test_resolve_workers_caps_at_task_count_and_pool_limit():
     # 任务数小于上限时按任务数；超过上限时被 CLOUD_SECTION_MAX_WORKERS 钳制。
     assert resolve_section_workers(is_local=False, task_count=3) == 3
     assert resolve_section_workers(is_local=False, task_count=100) == 6
+
+
+def test_resolve_workers_reads_current_settings(monkeypatch):
+    monkeypatch.setattr(
+        summary_generator,
+        "get_settings",
+        lambda: SimpleNamespace(cloud_section_max_workers=2),
+    )
+
+    assert resolve_section_workers(is_local=False, task_count=100) == 2
 
 
 # 验证 run section cells preserves input order under jitter 场景。

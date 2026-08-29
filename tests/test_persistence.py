@@ -1,9 +1,12 @@
 import json
 import sqlite3
 import time
+from threading import Event
 from types import SimpleNamespace
+import pytest
 from cogdoc.api.ingest import IndexJobManager
-from cogdoc.api.persistence import SqliteJobStore, SqliteSessionStore
+from cogdoc.api.persistence import InMemoryJobStore, SqliteJobStore, SqliteSessionStore
+from cogdoc.service.kb_locks import kb_write_lock
 
 
 # 验证 session survives new store instance 场景。
@@ -46,6 +49,30 @@ def test_session_record_appends_across_turns(tmp_path):
         [{"role": "user", "content": "b"}],
     )
     assert len(store.get_history("kb", "s1")) == 2
+
+
+def test_session_record_rolls_back_session_and_long_memory_together(
+    tmp_path, monkeypatch
+):
+    store = SqliteSessionStore(str(tmp_path / "state.db"))
+
+    def fail_long_memory(*_args, **_kwargs):
+        raise RuntimeError("injected long-memory failure")
+
+    monkeypatch.setattr(store, "_upsert_long_memories_locked", fail_long_memory)
+
+    with pytest.raises(RuntimeError, match="long-memory failure"):
+        store.record(
+            "kb",
+            "s1",
+            [{"role": "user", "content": "must be atomic"}],
+            [{"role": "user", "content": "must be atomic"}],
+        )
+
+    row = store._conn.execute(
+        "SELECT 1 FROM sessions WHERE doc_id=? AND session_id=?", ("kb", "s1")
+    ).fetchone()
+    assert row is None
 
 
 # 验证 session doc id isolates and clear 场景。
@@ -112,6 +139,28 @@ def test_job_record_survives_new_manager(tmp_path):
     assert reopened.get(job_id)["status"] == "succeeded"
 
 
+def test_index_worker_linearizes_with_external_kb_write_lock(tmp_path):
+    entered = Event()
+
+    def ingest(_kb_id, _source_dir):
+        entered.set()
+        return SimpleNamespace(document_count=0, chunk_count=0)
+
+    manager = IndexJobManager(
+        ingest_fn=ingest,
+        source_dir_for=lambda kb_id: str(tmp_path / kb_id),
+    )
+    try:
+        with kb_write_lock("kb"):
+            job = manager.submit("kb")
+            assert entered.wait(timeout=0.05) is False
+
+        assert entered.wait(timeout=1.0) is True
+        assert _wait(manager, job["job_id"])["status"] == "succeeded"
+    finally:
+        manager.shutdown()
+
+
 # 验证 reconcile marks orphaned running job failed 场景。
 def test_reconcile_marks_orphaned_running_job_failed(tmp_path):
     db = str(tmp_path / "state.db")
@@ -132,6 +181,25 @@ def test_reconcile_marks_orphaned_running_job_failed(tmp_path):
 def test_get_missing_job_returns_none(tmp_path):
     store = SqliteJobStore(str(tmp_path / "state.db"))
     assert store.get("nope") is None
+
+
+def test_job_store_clear_kb_removes_only_target_scope(tmp_path):
+    stores = (
+        InMemoryJobStore(),
+        SqliteJobStore(str(tmp_path / "state.db"), reconcile_on_init=False),
+    )
+    for store in stores:
+        store.create(
+            {"job_id": "old-kb", "kb_id": "kb-a", "status": "succeeded"}
+        )
+        store.create(
+            {"job_id": "other-kb", "kb_id": "kb-b", "status": "succeeded"}
+        )
+
+        store.clear_kb("kb-a")
+
+        assert store.get("old-kb") is None
+        assert [row["job_id"] for row in store.list({"kb-b"})] == ["other-kb"]
 
 
 def test_job_store_migrates_legacy_scope_and_normalizes_mixed_timestamps(tmp_path):

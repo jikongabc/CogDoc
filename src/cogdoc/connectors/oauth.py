@@ -1076,12 +1076,20 @@ class AtlassianOAuthAdapter(OAuthProviderAdapter):
         clean_scopes = _scopes(scopes)
         if not clean_scopes:
             raise ValueError("Atlassian OAuth requires at least one scope")
+        # Atlassian's token and resource-discovery calls deliberately use two
+        # fixed hosts.  A default transport restricted to only the token host
+        # made every real (non-injected) flow fail at accessible-resources.
+        resolved_transport = transport or HttpTransport(
+            allowed_hosts={"auth.atlassian.com", "api.atlassian.com"},
+            timeout_seconds=OAUTH_TIMEOUT_SECONDS,
+            max_response_bytes=MAX_OAUTH_RESPONSE_BYTES,
+        )
         super().__init__(
             client_id=client_id,
             client_secret=client_secret,
             redirect_uri=redirect_uri,
             scopes=clean_scopes,
-            transport=transport,
+            transport=resolved_transport,
             allowed_host="auth.atlassian.com",
         )
 

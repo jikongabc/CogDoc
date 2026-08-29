@@ -13,6 +13,7 @@ from cogdoc.connectors.credential_store import (
     CredentialIntegrityError,
     CredentialRevisionConflict,
     CredentialVault,
+    delete_sqlite_connector_secret_scope,
 )
 
 
@@ -90,9 +91,12 @@ def test_legacy_vault_schema_migrates_credentials_to_active_lifecycle(tmp_path):
         connection.execute("ALTER TABLE connector_credentials DROP COLUMN lifecycle")
 
     reopened = _vault(tmp_path)
-    assert reopened.get_metadata(
-        metadata["credential_id"], tenant_id="tenant-a", kb_id="kb-a"
-    ) is not None
+    assert (
+        reopened.get_metadata(
+            metadata["credential_id"], tenant_id="tenant-a", kb_id="kb-a"
+        )
+        is not None
+    )
     assert reopened.get_for_use(
         metadata["credential_id"],
         tenant_id="tenant-a",
@@ -301,9 +305,7 @@ def test_pending_oauth_credential_is_hidden_until_activation_and_pruned_when_qua
     )
     credential_id = str(pending["credential_id"])
 
-    assert vault.get_metadata(
-        credential_id, tenant_id="tenant-a", kb_id="kb-a"
-    ) is None
+    assert vault.get_metadata(credential_id, tenant_id="tenant-a", kb_id="kb-a") is None
     assert credential_id not in {
         row["credential_id"] for row in vault.list_metadata("tenant-a", "kb-a")
     }
@@ -349,12 +351,15 @@ def test_pending_oauth_credential_is_hidden_until_activation_and_pruned_when_qua
     )
     now[0] = 2_000.0
     assert vault.prune_inactive_credentials(older_than=1_500.0) == 1
-    assert vault.get_metadata(
-        abandoned["credential_id"],
-        tenant_id="tenant-a",
-        kb_id="kb-a",
-        include_inactive=True,
-    ) is None
+    assert (
+        vault.get_metadata(
+            abandoned["credential_id"],
+            tenant_id="tenant-a",
+            kb_id="kb-a",
+            include_inactive=True,
+        )
+        is None
+    )
     vault.close()
 
 
@@ -522,3 +527,48 @@ def test_invalid_secret_payloads_are_rejected_without_persistence(tmp_path, valu
         _create(vault, secret_values=values)
     assert vault.list_metadata("tenant-a", "kb-a") == []
     vault.close()
+
+
+def test_scope_can_be_erased_without_vault_keys(tmp_path):
+    database = tmp_path / "state.db"
+    vault = _vault(tmp_path)
+    _create(vault)
+    _create(
+        vault,
+        kb_id="kb-b",
+        connection_id="conn-b",
+        secret_values={"token": "keep"},
+    )
+    vault.close()
+
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TABLE connector_oauth_sessions "
+        "(session_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, kb_id TEXT NOT NULL)"
+    )
+    connection.executemany(
+        "INSERT INTO connector_oauth_sessions(session_id,tenant_id,kb_id) "
+        "VALUES(?,?,?)",
+        (
+            ("session-a", "tenant-a", "kb-a"),
+            ("session-b", "tenant-a", "kb-b"),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    removed = delete_sqlite_connector_secret_scope(
+        str(database),
+        "tenant-a",
+        "kb-a",
+    )
+
+    assert removed["connector_credentials"] == 1
+    connection = sqlite3.connect(database)
+    assert connection.execute(
+        "SELECT kb_id FROM connector_credentials ORDER BY kb_id"
+    ).fetchall() == [("kb-b",)]
+    assert connection.execute(
+        "SELECT kb_id FROM connector_oauth_sessions ORDER BY kb_id"
+    ).fetchall() == [("kb-b",)]
+    connection.close()

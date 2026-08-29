@@ -34,8 +34,11 @@ dependencies = [
 ]
 
 [project.scripts]
-# 安装后可直接 `cogdoc` 启动多库多对话控制台（等价 python -m cogdoc.cli）。
-cogdoc = "cogdoc.cli:main"
+# Product commands stay lightweight and only talk to the HTTP API.
+cogdoc = "cogdoc.api_cli:main"
+# Explicit offline/direct-storage maintenance console. Product automation should
+# use `cogdoc`, which shares the Web API authentication and tenant boundary.
+cogdoc-local = "cogdoc.cli:local_main"
 # `cogdoc-debug` 启动独立 Debug 控制台（等价 python -m cogdoc.debug）。
 cogdoc-debug = "cogdoc.debug:main"
 cogdoc-ha = "cogdoc.ha.cli:main"

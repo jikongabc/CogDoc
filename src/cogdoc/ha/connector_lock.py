@@ -69,6 +69,7 @@ class DistributedConnectorReferenceLock:
         self._token: str | None = None
         self._stop: threading.Event | None = None
         self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_error: BaseException | None = None
         with backend.transaction(write=True) as connection:
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS ha_connector_reference_locks (
@@ -132,8 +133,12 @@ class DistributedConnectorReferenceLock:
                         ),
                     )
                 if changed.rowcount != 1:
+                    self._heartbeat_error = RuntimeError(
+                        "connector reference lock lease ownership was lost"
+                    )
                     return
-            except Exception:
+            except Exception as exc:
+                self._heartbeat_error = exc
                 return
 
     def _release(self, token: str) -> None:
@@ -173,6 +178,7 @@ class DistributedConnectorReferenceLock:
             self._token = token
             self._stop = stop
             self._heartbeat_thread = thread
+            self._heartbeat_error = None
             thread.start()
             return self
         except BaseException:
@@ -180,7 +186,7 @@ class DistributedConnectorReferenceLock:
             raise
 
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        del exc_type, exc, traceback
+        del exc, traceback
         token = self._token
         stop = self._stop
         thread = self._heartbeat_thread
@@ -191,13 +197,21 @@ class DistributedConnectorReferenceLock:
             stop.set()
         if thread is not None:
             thread.join(min(10.0, self.lease_seconds))
+        heartbeat_error = self._heartbeat_error
+        self._heartbeat_error = None
         try:
             if token is not None:
                 await _run_executor(self.executor_provider(), self._release, token)
         finally:
             self._local_lock.release()
+        if heartbeat_error is not None and exc_type is None:
+            raise RuntimeError(
+                "connector reference lock heartbeat failed; mutation outcome is uncertain"
+            ) from heartbeat_error
 
     def check(self) -> bool:
+        if self._heartbeat_error is not None:
+            return False
         with self.backend.transaction() as connection:
             connection.execute(
                 "SELECT 1 FROM ha_connector_reference_locks LIMIT 1"

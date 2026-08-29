@@ -668,6 +668,18 @@ def test_atlassian_adapter_matches_current_3lo_and_rotating_refresh_flow():
     ]
 
 
+def test_atlassian_default_transport_allows_token_and_resource_hosts():
+    adapter = AtlassianOAuthAdapter(
+        client_id="atl-client",
+        client_secret="atl-secret",
+        redirect_uri="https://cogdoc.example/oauth/callback",
+        scopes=["read:page:confluence"],
+    )
+    assert adapter.transport.allowed_hosts == frozenset(
+        {"auth.atlassian.com", "api.atlassian.com"}
+    )
+
+
 def test_atlassian_coordinator_binds_cloud_resource_to_connection_site(tmp_path):
     vault = _vault(tmp_path)
     sessions = OAuthSessionStore(

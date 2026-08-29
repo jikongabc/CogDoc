@@ -95,6 +95,74 @@ def test_state_runtime_close_is_idempotent_and_closes_unique_stores():
         _ = runtime.derived_knowledge_retriever
 
 
+def test_clear_derived_index_does_not_initialize_embedder(tmp_path, monkeypatch):
+    import cogdoc.tools.retriever.derived_knowledge as derived_module
+
+    settings = Settings(
+        _env_file=None,
+        cogdoc_data_dir=str(tmp_path),
+        cogdoc_state_backend="jsonl",
+        cogdoc_feedback_store="jsonl",
+    )
+    runtime = StateRuntime.from_settings(settings)
+    calls = []
+
+    def clear_storage(kb_id, **options):
+        lock_available = runtime._index_lock.acquire(blocking=False)
+        if lock_available:
+            runtime._index_lock.release()
+        calls.append((kb_id, options, lock_available))
+
+    monkeypatch.setattr(
+        derived_module,
+        "clear_derived_knowledge_index_storage",
+        clear_storage,
+    )
+
+    runtime.clear_derived_knowledge_index("kb")
+
+    assert runtime._derived_knowledge_index is None
+    assert calls == [
+        (
+            "kb",
+            {
+                "persist_directory": settings.chroma_persist_dir,
+                "state_directory": str(
+                    settings.data_dir / "knowledge" / "derived_index_state"
+                ),
+            },
+            True,
+        )
+    ]
+    runtime.close()
+
+
+def test_clear_materialized_derived_index_releases_runtime_construction_lock(tmp_path):
+    runtime = StateRuntime.from_settings(
+        Settings(
+            _env_file=None,
+            cogdoc_data_dir=str(tmp_path),
+            cogdoc_state_backend="jsonl",
+            cogdoc_feedback_store="jsonl",
+        )
+    )
+    observed = []
+
+    class Index:
+        def clear_kb(self, kb_id):
+            lock_available = runtime._index_lock.acquire(blocking=False)
+            if lock_available:
+                runtime._index_lock.release()
+            observed.append((kb_id, lock_available))
+
+    runtime._derived_knowledge_index = Index()
+
+    runtime.clear_derived_knowledge_index("kb")
+
+    assert observed == [("kb", True)]
+    runtime.close()
+
+
 # 验证 direct-call singleton 随显式 Settings 边界切换，不继续写入旧路径。
 def test_default_state_runtime_rebuilds_after_settings_change(tmp_path, monkeypatch):
     import cogdoc.state_runtime as runtime_module
@@ -118,10 +186,63 @@ def test_default_state_runtime_rebuilds_after_settings_change(tmp_path, monkeypa
         runtime_b = runtime_module.default_state_runtime()
 
         assert runtime_b is not runtime_a
-        assert runtime_a.closed is True
+        assert runtime_a.closed is False
         assert runtime_b.knowledge_store._path == settings.derived_knowledge_path
     finally:
         runtime_module.reset_default_state_runtime()
+    assert runtime_a.closed is True
+    assert runtime_b.closed is True
+
+
+def test_retired_default_runtime_is_not_kept_alive(tmp_path, monkeypatch):
+    import cogdoc.state_runtime as runtime_module
+
+    settings = Settings(
+        _env_file=None,
+        cogdoc_data_dir=str(tmp_path / "a"),
+        cogdoc_state_backend="jsonl",
+        cogdoc_feedback_store="jsonl",
+    )
+    monkeypatch.setattr(runtime_module, "get_settings", lambda: settings)
+    runtime_module.reset_default_state_runtime()
+    try:
+        retired = runtime_module.default_state_runtime()
+        retired_ref = weakref.ref(retired)
+        settings = Settings(
+            _env_file=None,
+            cogdoc_data_dir=str(tmp_path / "b"),
+            cogdoc_state_backend="jsonl",
+            cogdoc_feedback_store="jsonl",
+        )
+        active = runtime_module.default_state_runtime()
+        assert active is not retired
+
+        del retired
+        gc.collect()
+
+        assert retired_ref() is None
+    finally:
+        runtime_module.reset_default_state_runtime()
+
+
+def test_materialized_retriever_does_not_retain_runtime(tmp_path):
+    runtime = StateRuntime.from_settings(
+        Settings(
+            _env_file=None,
+            cogdoc_data_dir=str(tmp_path),
+            cogdoc_state_backend="jsonl",
+            cogdoc_feedback_store="jsonl",
+        )
+    )
+    retriever = runtime.derived_knowledge_retriever
+    runtime_ref = weakref.ref(runtime)
+
+    del runtime
+    gc.collect()
+
+    assert runtime_ref() is None
+    with pytest.raises(RuntimeError, match="unavailable"):
+        retriever._index_factory()
 
 
 # 验证 API 只在显式获得 runtime 所有权时于 lifespan 尾部关闭它。

@@ -122,26 +122,32 @@ class SqliteSessionStore:
 
             # 执行内部回调。
             def _do():
-                self._conn.execute(
-                    "INSERT INTO sessions "
-                    "(doc_id, session_id, memory, display, mid_memory, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(doc_id, session_id) DO UPDATE SET "
-                    "memory=excluded.memory, display=excluded.display, "
-                    "mid_memory=excluded.mid_memory, "
-                    "updated_at=excluded.updated_at",
-                    (
-                        doc_id,
-                        session_id,
-                        json.dumps(memory, ensure_ascii=False),
-                        json.dumps(display, ensure_ascii=False),
-                        json.dumps(mid_memory, ensure_ascii=False),
-                        time.time(),
-                    ),
-                )
-                self._upsert_long_memories_locked(doc_id, facts)
-                self._evict_overflow_locked()
-                self._conn.commit()
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._conn.execute(
+                        "INSERT INTO sessions "
+                        "(doc_id, session_id, memory, display, mid_memory, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(doc_id, session_id) DO UPDATE SET "
+                        "memory=excluded.memory, display=excluded.display, "
+                        "mid_memory=excluded.mid_memory, "
+                        "updated_at=excluded.updated_at",
+                        (
+                            doc_id,
+                            session_id,
+                            json.dumps(memory, ensure_ascii=False),
+                            json.dumps(display, ensure_ascii=False),
+                            json.dumps(mid_memory, ensure_ascii=False),
+                            time.time(),
+                        ),
+                    )
+                    self._upsert_long_memories_locked(doc_id, facts)
+                    self._evict_overflow_locked()
+                    self._conn.execute("COMMIT")
+                except BaseException:
+                    if self._conn.in_transaction:
+                        self._conn.execute("ROLLBACK")
+                    raise
 
             _execute_write_with_retry(_do)
 
@@ -538,6 +544,16 @@ class SqliteJobStore:
         jobs = [json.loads(row[0]) for row in rows]
         return jobs
 
+    def clear_kb(self, kb_id: str) -> None:
+        """Delete every persisted job belonging to one KB incarnation."""
+
+        with self._lock:
+            def _do():
+                self._conn.execute("DELETE FROM index_jobs WHERE kb_id=?", (kb_id,))
+                self._conn.commit()
+
+            _execute_write_with_retry(_do)
+
     # 返回locked。
     def _get_locked(self, job_id: str) -> dict | None:
         row = self._conn.execute(
@@ -637,6 +653,14 @@ class InMemoryJobStore:
             reverse=True,
         )
         return jobs[:limit]
+
+    def clear_kb(self, kb_id: str) -> None:
+        with self._lock:
+            self._jobs = {
+                job_id: job
+                for job_id, job in self._jobs.items()
+                if str(job.get("kb_id") or "") != kb_id
+            }
 
     # 协调孤儿任务。
     def reconcile_orphans(self) -> None:

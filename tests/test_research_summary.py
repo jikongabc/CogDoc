@@ -216,6 +216,15 @@ def test_research_summary_keyset_pagination_is_stable_for_timestamp_ties():
     }
 
 
+def test_research_summary_orders_iso_offsets_by_instant_not_text() -> None:
+    rows = [
+        {"job_id": "rj_early", "updated_at": "2026-08-10T09:30:00+08:00"},
+        {"job_id": "rj_late", "updated_at": "2026-08-10T02:00:00+00:00"},
+    ]
+    page = paginate_research_job_summaries(rows, limit=2)
+    assert [row["job_id"] for row in page["jobs"]] == ["rj_late", "rj_early"]
+
+
 def test_research_summary_etag_is_deterministic_and_supports_weak_get_matching():
     page = {"jobs": [{"job_id": "rj_1", "revision": 2}], "next_cursor": None}
     etag = research_summary_page_etag(page)

@@ -1,4 +1,5 @@
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ from cogdoc.connectors.oauth import OAuthCoordinator, OAuthSessionStore
 from cogdoc.connectors.sync_store import ConnectorSyncStore
 from cogdoc.service.source_artifact_store import SourceArtifactStore
 from cogdoc.service.source_catalog import SourceCatalog
+from cogdoc.service.kb_readers import KBReadUnavailable
 
 
 # 声明异步测试使用的后端。
@@ -80,6 +82,28 @@ async def test_healthz_is_ok(monkeypatch):
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+@pytest.mark.anyio
+async def test_metrics_render_is_offloaded_from_event_loop(monkeypatch):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    app = create_app(session_store=SessionStore())
+    event_loop_thread = threading.get_ident()
+    render_threads = []
+
+    def render():
+        render_threads.append(threading.get_ident())
+        return b"cogdoc_test_metric 1\n"
+
+    app.state.metrics.render = render
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            response = await client.get("/metrics")
+
+    assert response.status_code == 200
+    assert render_threads and render_threads[0] != event_loop_thread
 
 
 # 验证 readyz reports native dependency 场景。
@@ -564,6 +588,35 @@ def test_unhandled_error_response_maps_shutdown_to_503():
     assert resp.status_code == 503
     assert payload["error_code"] == "MODEL_UNAVAILABLE"
     assert payload["details"]["error_class"] == "RuntimeError"
+
+
+def test_unhandled_error_response_maps_kb_reader_drain_to_retryable_503():
+    resp = _unhandled_error_response(KBReadUnavailable("reader admission closed"))
+    payload = json.loads(resp.body)
+
+    assert resp.status_code == 503
+    assert payload["error_code"] == "MODEL_UNAVAILABLE"
+    assert payload["message"] == "知识库正在变更，请稍后重试"
+    assert payload["details"]["error_class"] == "KBReadUnavailable"
+
+
+@pytest.mark.anyio
+async def test_global_handler_maps_direct_kb_reader_drain_to_503(monkeypatch):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    app = create_app(session_store=SessionStore())
+
+    @app.get("/v1/test-reader-drain")
+    async def reader_drain():
+        raise KBReadUnavailable("reader admission closed")
+
+    async with app.router.lifespan_context(app):
+        async with await _client(app, raise_app_exceptions=False) as client:
+            response = await client.get("/v1/test-reader-drain")
+
+    assert response.status_code == 503
+    assert response.json()["error_code"] == "MODEL_UNAVAILABLE"
 
 
 # 验证 unhandled error response maps generic to 500 without stack 场景。

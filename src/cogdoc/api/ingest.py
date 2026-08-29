@@ -15,9 +15,11 @@ from uuid import uuid4
 from cogdoc.api.persistence import InMemoryJobStore
 from cogdoc.config.settings import get_settings
 from cogdoc.observability.logger import log_event
+from cogdoc.service.durable_io import fsync_directory
 from cogdoc.service.ingest_service import KBCleanupError, build_kb_index_transactional
 from cogdoc.service.kb_epoch import shared_epoch_store
 from cogdoc.service.kb_lifecycle import LIFECYCLE_ACTIVE, shared_lifecycle_store
+from cogdoc.service.kb_locks import kb_write_lock
 from cogdoc.service.mutation_journal import MutationJournal, shared_mutation_journal
 
 
@@ -612,6 +614,7 @@ class IndexJobManager:
         # 回滚恢复源文件，成功返回 True。失败不外逃但返回 False：调用方据此保留 journal 供恢复重试。
         try:
             os.replace(src, dst)
+            fsync_directory(os.path.dirname(dst))
             return True
         except OSError as exc:
             try:
@@ -842,7 +845,12 @@ class IndexJobManager:
             with claim_context:
                 try:
                     with mutation_context:
-                        result = fn(job_id, kb_id, base_epoch, *args)
+                        # The per-KB executor already orders API jobs. The
+                        # shared write lock additionally linearizes these file
+                        # and generation mutations with CLI/control-plane
+                        # deletion paths that do not enter that executor.
+                        with kb_write_lock(kb_id):
+                            result = fn(job_id, kb_id, base_epoch, *args)
                     stopped.set()
                     if keeper is not None:
                         keeper.join(
@@ -1021,6 +1029,7 @@ class IndexJobManager:
         on_succeeded: Callable[[], None] | None = None,
         authorization_guard: Callable[[], None] | None = None,
         on_retiring: Callable[[], None] | None = None,
+        finalize_missing: bool = False,
     ) -> dict:
         # 存在性检查在 executor command 内进行，保证与上传队列有序：upload 排在前则文件已落盘。
         return self._enqueue(
@@ -1030,6 +1039,7 @@ class IndexJobManager:
             on_succeeded,
             authorization_guard,
             on_retiring,
+            finalize_missing,
         )
 
     # 运行blocking。
@@ -1222,9 +1232,13 @@ class IndexJobManager:
             self._journal.begin_upload(job_id, kb_id, dest, backup, had_old)
             if had_old:
                 os.replace(dest, backup)  # 覆盖前备份旧文件，构建失败可回滚
+                fsync_directory(source_dir)
                 self._journal.mark_source_moved(job_id)
             with open(dest, "wb") as f:
                 f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            fsync_directory(source_dir)
         except Exception as exc:
             # 写入中途失败：恢复到上传前状态，仅当磁盘一致才清 journal，否则保留供启动恢复。
             if self._rollback_upload(job_id, kb_id, dest, backup, had_old):
@@ -1342,21 +1356,21 @@ class IndexJobManager:
                     dest = os.path.join(source_dir, filename)
                     backup = f"{dest}.{journal_id}{_BAK_SUFFIX}"
                     had_old = os.path.exists(dest)
-                    self._journal.begin_upload(
-                        journal_id, kb_id, dest, backup, had_old
-                    )
+                    self._journal.begin_upload(journal_id, kb_id, dest, backup, had_old)
                     mutations.append((journal_id, dest, backup, had_old))
                     if had_old:
                         os.replace(dest, backup)
+                        fsync_directory(source_dir)
                         self._journal.mark_source_moved(journal_id)
                     with open(dest, "wb") as handle:
                         handle.write(content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    fsync_directory(source_dir)
             except Exception as exc:
                 restored = True
                 for journal_id, dest, backup, had_old in reversed(mutations):
-                    if self._rollback_upload(
-                        journal_id, kb_id, dest, backup, had_old
-                    ):
+                    if self._rollback_upload(journal_id, kb_id, dest, backup, had_old):
                         self._finish_rollback(journal_id)
                     else:
                         restored = False
@@ -1391,9 +1405,7 @@ class IndexJobManager:
                         self._journal.clear(journal_id)
             else:
                 for journal_id, dest, backup, had_old in reversed(mutations):
-                    if self._rollback_upload(
-                        journal_id, kb_id, dest, backup, had_old
-                    ):
+                    if self._rollback_upload(journal_id, kb_id, dest, backup, had_old):
                         self._finish_rollback(journal_id)
         finally:
             if on_finished is not None:
@@ -1409,6 +1421,7 @@ class IndexJobManager:
         on_succeeded: Callable[[], None] | None = None,
         authorization_guard: Callable[[], None] | None = None,
         on_retiring: Callable[[], None] | None = None,
+        finalize_missing: bool = False,
     ) -> None:
         if self._store.get(job_id) is None:
             return
@@ -1419,17 +1432,38 @@ class IndexJobManager:
             return
         if self._reject_if_unresolved(job_id, kb_id):
             return
-        try:
-            self._prepare_source_cache(kb_id, os.path.dirname(path))
-        except Exception as exc:
-            self._fail_job(job_id, kb_id, exc)
-            return
         if authorization_guard is not None and not self._ingest_takes_on_commit:
             self._fail_job(
                 job_id,
                 kb_id,
                 RuntimeError("索引构建器不支持提交前权限复验"),
             )
+            return
+        if not os.path.exists(path) and finalize_missing and on_succeeded is not None:
+            try:
+                if authorization_guard is not None:
+                    authorization_guard()
+                on_succeeded()
+                self._store.update(
+                    job_id,
+                    status="succeeded",
+                    document_count=0,
+                    chunk_count=0,
+                    finished_at=_now_iso(),
+                )
+                log_event(
+                    "ingest",
+                    "document_delete_finalized",
+                    {"trace_id": job_id},
+                    kb_id=kb_id,
+                )
+            except Exception as exc:
+                self._fail_job(job_id, kb_id, exc)
+            return
+        try:
+            self._prepare_source_cache(kb_id, os.path.dirname(path))
+        except Exception as exc:
+            self._fail_job(job_id, kb_id, exc)
             return
         if not os.path.exists(path):
             self._fail_job(
@@ -1452,6 +1486,7 @@ class IndexJobManager:
         try:
             self._journal.begin_delete(job_id, kb_id, path, quarantine)
             os.replace(path, quarantine)  # 移入隔离区而非直接删除，构建失败可恢复
+            fsync_directory(os.path.dirname(path))
             self._journal.mark_source_moved(job_id)
         except Exception as exc:
             if os.path.exists(quarantine):
@@ -1591,6 +1626,16 @@ class IndexJobManager:
         if not callable(list_jobs):
             raise RuntimeError("index job store does not support collection reads")
         return list_jobs(kb_ids, limit=limit)
+
+    def clear_kb(self, kb_id: str) -> None:
+        clear_jobs = getattr(self._store, "clear_kb", None)
+        if not callable(clear_jobs):
+            raise RuntimeError("index job store does not support KB cleanup")
+        clear_jobs(kb_id)
+        # Journal files live outside the per-KB source tree. They are recovery
+        # capabilities, not audit history, and must not fence a future
+        # incarnation that reuses the deterministic storage id.
+        self._journal.clear_kb(kb_id)
 
     # 协调孤儿任务。
     def reconcile_orphans(self) -> None:

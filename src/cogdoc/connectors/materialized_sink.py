@@ -41,6 +41,19 @@ def _safe_component(value: str, field: str) -> str:
     return text
 
 
+def _validate_manifest_filename(value: Any) -> str:
+    """Validate a persisted flat filename without imposing an identity limit."""
+
+    if (
+        type(value) is not str
+        or not value
+        or value in {".", ".."}
+        or any(char in "/\\\x00" or ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise ValueError("connection materialization manifest filename is invalid")
+    return value
+
+
 def _materialized_name(document: SourceDocument) -> str:
     display = Path(document.display_name).name
     suffix = Path(display).suffix.casefold()
@@ -74,6 +87,7 @@ class MaterializedSyncSink:
             Callable[[str, str, str, str, str, str], str | None] | None
         ) = None,
         quota_releaser: Callable[[str | None], None] | None = None,
+        quota_checker: Callable[[str | None], None] | None = None,
         index_timeout_seconds: float = 30.0,
         commit_store: Any | None = None,
     ) -> None:
@@ -96,6 +110,7 @@ class MaterializedSyncSink:
         self.artifact_versions_to_keep = artifact_versions_to_keep
         self.quota_reserver = quota_reserver
         self.quota_releaser = quota_releaser
+        self.quota_checker = quota_checker
         self.index_timeout_seconds = float(index_timeout_seconds)
         self.commit_store = commit_store
         self.job_id = ""
@@ -330,6 +345,7 @@ class MaterializedSyncSink:
         try:
             heartbeat()
             with kb_write_lock(self.kb_id):
+                self._assert_quota_live()
                 if backup.exists():
                     shutil.rmtree(backup)
                 if current.exists():
@@ -340,6 +356,7 @@ class MaterializedSyncSink:
                 self._write_journal("swapped")
                 self._apply_side_effects(heartbeat)
                 self._write_journal("materialized")
+            self._assert_quota_live()
             self._build_index(heartbeat)
             self._finish_stale_acl_retirements()
             self._write_journal("indexed")
@@ -375,6 +392,7 @@ class MaterializedSyncSink:
             self._reserve_artifacts(self.current)
         with kb_write_lock(self.kb_id):
             if phase == "prepared" and self.staging.exists():
+                self._assert_quota_live()
                 if self.current.exists() and self.backup:
                     if self.backup.exists():
                         shutil.rmtree(self.backup)
@@ -389,6 +407,7 @@ class MaterializedSyncSink:
                 self._write_journal("materialized")
                 phase = "materialized"
         if phase == "materialized":
+            self._assert_quota_live()
             self._build_index(heartbeat)
             self._finish_stale_acl_retirements()
             self._write_journal("indexed")
@@ -977,6 +996,13 @@ class MaterializedSyncSink:
         if token is not None and self.quota_releaser is not None:
             self.quota_releaser(token)
 
+    def _assert_quota_live(self) -> None:
+        if self._quota_token is None:
+            return
+        if self.quota_checker is None:
+            raise RuntimeError("sync quota reservation cannot be fenced")
+        self.quota_checker(self._quota_token)
+
     def _reserve_artifacts(self, proposed: Path | None) -> None:
         if self._artifact_reservation_token is not None or self.artifact_store is None:
             return
@@ -1442,9 +1468,16 @@ class MaterializedSyncSink:
                 "connection materialization manifest is not a regular file"
             )
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("connection materialization manifest is invalid")
         rows = payload.get("sources")
         if payload.get("schema_version") != 1 or not isinstance(rows, dict):
             raise ValueError("connection materialization manifest is invalid")
         if any(not isinstance(value, dict) for value in rows.values()):
             raise ValueError("connection materialization manifest is invalid")
-        return {str(key): dict(value) for key, value in rows.items()}
+        validated: dict[str, dict[str, Any]] = {}
+        for key, value in rows.items():
+            row = dict(value)
+            row["filename"] = _validate_manifest_filename(row.get("filename"))
+            validated[str(key)] = row
+        return validated

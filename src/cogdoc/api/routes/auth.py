@@ -443,7 +443,7 @@ def _enforce_public_rate_limit(request: Request, operation: str) -> None:
     limiter = getattr(
         request.app.state, "auth_public_rate_limiter", _DEFAULT_PUBLIC_LIMITER
     )
-    client_host = request.client.host if request.client is not None else "unknown"
+    client_host = getattr(request.state, "effective_client_host", None) or "unknown"
     identity = hashlib.sha256(
         f"auth-public-v1\0{id(request.app)}\0{operation}\0{client_host}".encode()
     ).hexdigest()

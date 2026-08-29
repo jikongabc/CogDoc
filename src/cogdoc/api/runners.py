@@ -25,6 +25,7 @@ def run_with_optional_session(
     forced_task: str | None,
     session_id: str | None,
     retrieval_scope: object | None = None,
+    kb_epoch: int | None = None,
 ) -> Any:
     args = (doc_id, query, is_local, chat_history, forced_task)
     try:
@@ -42,6 +43,8 @@ def run_with_optional_session(
         kwargs["session_id"] = session_id
     if "retrieval_scope" in parameters or accepts_kwargs:
         kwargs["retrieval_scope"] = retrieval_scope
+    if kb_epoch is not None and ("kb_epoch" in parameters or accepts_kwargs):
+        kwargs["kb_epoch"] = kb_epoch
     if kwargs:
         return runner(*args, **kwargs)
     return runner(*args)

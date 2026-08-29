@@ -38,6 +38,8 @@ def _isolate_epoch_store(tmp_path, monkeypatch):
     import cogdoc.service.kb_lifecycle as kl
     import cogdoc.service.mutation_journal as mj
     import cogdoc.service.purge_queue as pq
+    from cogdoc.config.settings import get_settings
+    import cogdoc.api.app as app_module
 
     monkeypatch.setattr(
         ke, "_shared", ke.EpochStore(path=str(tmp_path / "epochs.json"))
@@ -51,9 +53,23 @@ def _isolate_epoch_store(tmp_path, monkeypatch):
     monkeypatch.setattr(
         pq, "_shared", pq.PurgeQueue(path=str(tmp_path / "purge_queue.json"))
     )
+    # App lifespans must never scan a developer's real Chroma directory. The
+    # filesystem sweeper has dedicated temp-directory tests.
+    monkeypatch.setattr(
+        app_module,
+        "sweep_orphan_segment_directories",
+        lambda _path: {"scanned": 0, "removed": 0, "bytes_reclaimed": 0},
+    )
+    # Developer .env credentials must not turn disabled-vault test apps into
+    # credential-bearing production apps.
+    monkeypatch.setenv("COGDOC_CREDENTIAL_MASTER_KEYS", "")
+    monkeypatch.setenv("COGDOC_CONNECTOR_VAULT_KEYS", "")
+
     # 测试在同一进程内反复拉起应用生命周期，关闭严格单实例避免进程锁争用误杀。
     monkeypatch.setenv("COGDOC_ALLOW_MULTI", "1")
+    get_settings.cache_clear()
     yield
+    get_settings.cache_clear()
     # 取消测试中残留的后台定时器，避免后台线程跨测试触发真实清理。
     import cogdoc.service.ingest_service as isvc
 

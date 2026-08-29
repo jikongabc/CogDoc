@@ -1,5 +1,6 @@
 import json
 import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from json import JSONDecodeError
 from pathlib import Path
@@ -15,6 +16,7 @@ from cogdoc.api.schemas import (
     build_error_response,
 )
 from cogdoc.observability.trace import build_trace_payload, trace_dir, trace_path
+from cogdoc.service.kb_epoch import shared_epoch_store
 from cogdoc.api.tenant_scope import (
     externalize_kb_fields,
     internal_session_id,
@@ -91,6 +93,9 @@ def _trace_list_item(
             acl_store = getattr(request.app.state, "resource_access_store", None)
             if (
                 external_doc_id is None
+                or not _trace_incarnation_is_current(
+                    request, trace_doc_id, trace.config
+                )
                 or not session_id_is_authorized(request, trace_session_id)
                 or (
                     acl_store is not None
@@ -161,6 +166,30 @@ def _external_trace_doc_id(request: Request, storage_id: str) -> str | None:
     return scope.external_id if scope is not None else None
 
 
+def _trace_incarnation_is_current(
+    request: Request, storage_id: str, config: Mapping[str, object]
+) -> bool:
+    """Reject traces from an earlier same-slug KB incarnation."""
+
+    registry = request.app.state.kb_registry
+    current = getattr(registry, "current", None)
+    try:
+        current_epoch = (
+            int(current(storage_id))
+            if callable(current)
+            else shared_epoch_store().current(storage_id)
+        )
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        return False
+    trace_epoch = config.get("kb_epoch")
+    if trace_epoch is None:
+        # Legacy epochs zero and one predate incarnation-aware traces and cannot
+        # contain data from an earlier incarnation. Once the epoch advances,
+        # ambiguity is resolved fail-closed instead of exposing an old trace.
+        return current_epoch <= 1
+    return type(trace_epoch) is int and trace_epoch == current_epoch
+
+
 # 列出最近跟踪文件。
 @router.get("/traces", response_model=TraceListResponse)
 async def list_traces(
@@ -222,11 +251,16 @@ async def get_trace(trace_id: str, request: Request):
     config = normalized.get("config")
     storage_id = str(config.get("doc_id") or "") if isinstance(config, dict) else ""
     external_doc_id = _external_trace_doc_id(request, storage_id)
-    trace_session_id = str(config.get("session_id") or "") if isinstance(config, dict) else ""
+    trace_session_id = (
+        str(config.get("session_id") or "") if isinstance(config, dict) else ""
+    )
     scope = scope_for_storage_id(request, storage_id) if storage_id else None
     acl_store = getattr(request.app.state, "resource_access_store", None)
     if (
         external_doc_id is None
+        or not _trace_incarnation_is_current(
+            request, storage_id, config if isinstance(config, dict) else {}
+        )
         or not session_id_is_authorized(request, trace_session_id)
         or (
             acl_store is not None

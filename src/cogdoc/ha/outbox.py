@@ -11,9 +11,9 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from typing import Any, Final, Protocol
+from urllib.parse import urlsplit
 
-import httpx
-
+from cogdoc.connectors.http_transport import HttpTransport
 from cogdoc.ha.storage import DatabaseBackend, DatabaseConnection, execute_script
 
 
@@ -56,17 +56,48 @@ class WebhookOutboxHandler:
         secret: str = "",
         timeout_seconds: float = 10,
         client: Any | None = None,
+        transport: Any | None = None,
+        allow_private_hosts: bool = False,
+        max_response_bytes: int = _MAX_JSON_BYTES,
+        max_redirects: int = 2,
     ) -> None:
-        if not isinstance(url, str) or not url.startswith("https://"):
+        if not isinstance(url, str):
             raise ValueError("outbox webhook URL must use HTTPS")
+        parts = urlsplit(url)
+        try:
+            port = parts.port
+        except ValueError as exc:
+            raise ValueError("outbox webhook URL is invalid") from exc
+        host = str(parts.hostname or "").casefold()
+        if (
+            parts.scheme != "https"
+            or not host
+            or port not in {None, 443}
+            or parts.username is not None
+            or parts.password is not None
+        ):
+            raise ValueError(
+                "outbox webhook URL must be a credential-free HTTPS URL"
+            )
         if not math.isfinite(timeout_seconds) or not 0.1 <= timeout_seconds <= 60:
             raise ValueError(
                 "outbox webhook timeout must be between 0.1 and 60 seconds"
             )
+        if client is not None and transport is not None:
+            raise ValueError("outbox webhook client and transport are mutually exclusive")
         self.url = url
         self._secret = secret.encode()
         self.timeout_seconds = timeout_seconds
         self._client = client
+        self._transport = transport
+        if self._client is None and self._transport is None:
+            self._transport = HttpTransport(
+                allowed_hosts={host},
+                timeout_seconds=timeout_seconds,
+                max_response_bytes=max_response_bytes,
+                max_redirects=max_redirects,
+                allow_private_hosts=allow_private_hosts,
+            )
 
     def __call__(
         self,
@@ -100,15 +131,15 @@ class WebhookOutboxHandler:
                 headers=request_headers,
                 timeout=self.timeout_seconds,
             )
+            response.raise_for_status()
         else:
-            response = httpx.post(
+            assert self._transport is not None
+            self._transport.request(
+                "POST",
                 self.url,
-                content=body,
                 headers=request_headers,
-                timeout=self.timeout_seconds,
-                follow_redirects=False,
+                body=body,
             )
-        response.raise_for_status()
 
 
 def _clean(value: str, field: str, maximum: int = 255) -> str:
@@ -255,12 +286,25 @@ class OutboxStore:
                     (prior_event_id,),
                 ).fetchone()
                 if existing is None:
-                    raise OutboxConflict(
-                        "outbox event was already delivered and compacted"
+                    # The retention window ended and the delivered row was
+                    # compacted. Remove the matching tombstone atomically so
+                    # this key may begin a new idempotency window.
+                    connection.execute(
+                        f"DELETE FROM ha_outbox_keys WHERE tenant_id={marker} "
+                        f"AND topic={marker} AND idempotency_key={marker} "
+                        f"AND event_id={marker} AND fingerprint={marker}",
+                        (
+                            tenant_id,
+                            topic,
+                            idempotency_key,
+                            prior_event_id,
+                            fingerprint,
+                        ),
                     )
-                current = self._row(existing)
-                assert current is not None
-                return current
+                else:
+                    current = self._row(existing)
+                    assert current is not None
+                    return current
         event_id = f"evt-{uuid.uuid4().hex}"
         insert = self.backend.sql(sqlite="INSERT OR IGNORE", postgres="INSERT")
         suffix = self.backend.sql(
@@ -406,7 +450,7 @@ class OutboxStore:
                     "WHERE prior.tenant_id=events.tenant_id AND prior.topic=events.topic "
                     "AND prior.aggregate_type=events.aggregate_type "
                     "AND prior.aggregate_id=events.aggregate_id "
-                    "AND prior.status IN ('pending','delivering') AND ("
+                    "AND prior.status IN ('pending','delivering','dead_letter') AND ("
                     "prior.aggregate_revision<events.aggregate_revision OR "
                     "(prior.aggregate_revision=events.aggregate_revision AND "
                     "(prior.created_at<events.created_at OR (prior.created_at=events.created_at "
@@ -427,7 +471,7 @@ class OutboxStore:
                     "prior.tenant_id=events.tenant_id AND prior.topic=events.topic "
                     "AND prior.aggregate_type=events.aggregate_type "
                     "AND prior.aggregate_id=events.aggregate_id "
-                    "AND prior.status IN ('pending','delivering') AND ("
+                    "AND prior.status IN ('pending','delivering','dead_letter') AND ("
                     "prior.aggregate_revision<events.aggregate_revision OR "
                     "(prior.aggregate_revision=events.aggregate_revision AND "
                     "(prior.created_at<events.created_at OR (prior.created_at=events.created_at "
@@ -569,6 +613,10 @@ class OutboxStore:
             ).fetchall()
             for row in rows:
                 event_id = row["event_id"] if isinstance(row, Mapping) else row[0]
+                connection.execute(
+                    f"DELETE FROM ha_outbox_keys WHERE event_id={marker}",
+                    (event_id,),
+                )
                 connection.execute(
                     f"DELETE FROM ha_outbox WHERE event_id={marker} "
                     f"AND status='{OUTBOX_DELIVERED}' AND delivered_at<={marker}",

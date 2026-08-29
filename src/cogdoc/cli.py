@@ -1,5 +1,6 @@
 import argparse
 import atexit
+import getpass
 import json
 import os
 import shlex
@@ -15,14 +16,31 @@ except ImportError:
 
 from cogdoc.agents.conversation_memory import extract_final_answer
 from cogdoc.agents.feedback_understanding import analyze_feedback
+from cogdoc.api.claim_verification_review_store import (
+    SqliteClaimVerificationReviewStore,
+)
 from cogdoc.api.ingest import KBExistsError, KnowledgeBaseRegistry
-from cogdoc.api.persistence import SqliteSessionStore
+from cogdoc.api.persistence import SqliteJobStore, SqliteSessionStore
+from cogdoc.api.resource_access import ResourceAccessStore
 from cogdoc.api.time_utils import now_iso
+from cogdoc.connectors.connection_store import ConnectionStore
+from cogdoc.connectors.credential_store import (
+    ACTIVE_KEY_VERSION_ENV,
+    MASTER_KEYS_ENV,
+    CredentialVault,
+    delete_sqlite_connector_secret_scope,
+)
+from cogdoc.connectors.oauth import OAuthSessionStore
+from cogdoc.connectors.sync_store import ConnectorSyncStore
 from cogdoc.command_modes import parse_forced_mode
 from cogdoc.config.settings import get_settings
+from cogdoc.service.external_acl import ExternalAclSyncStore
 from cogdoc.service.retriever_factory import RetrieverFactory
+from cogdoc.service.source_artifact_store import SourceArtifactStore
+from cogdoc.service.source_catalog import SourceCatalog
 from cogdoc.graph.workflow import UNKNOWN_RESPONSE
 from cogdoc.observability.logger import configure_logging
+from cogdoc.observability.trace import delete_trace_files
 from cogdoc.service.chat_service import run_chat
 from cogdoc.service.ingest_service import (
     KBCleanupError,
@@ -228,6 +246,59 @@ class Console:
         self.feedback_analysis_store = self.state_runtime.feedback_analysis_store
         self.retrieval_feedback_store = self.state_runtime.retrieval_feedback_store
         self.retrieval_eval_draft_store = self.state_runtime.retrieval_eval_draft_store
+        self.research_job_store = self.state_runtime.research_job_store
+        self.claim_verification_review_store = SqliteClaimVerificationReviewStore(
+            settings.state_db_path,
+            retention_days=settings.claim_verification_review_retention_days,
+            max_per_tenant=settings.claim_verification_review_max_per_tenant,
+        )
+        self.resource_access_store = ResourceAccessStore(
+            settings.state_db_path, legacy_workspace_default=True
+        )
+        self.index_job_store = SqliteJobStore(
+            settings.state_db_path, reconcile_on_init=False
+        )
+        self.connector_db_path = settings.state_db_path
+        self.connection_store = ConnectionStore(
+            self.connector_db_path,
+            max_connections_global=settings.cogdoc_connector_max_connections_global,
+            max_connections_per_tenant=(
+                settings.cogdoc_connector_max_connections_per_tenant
+            ),
+            max_connections_per_kb=settings.cogdoc_connector_max_connections_per_kb,
+        )
+        self.connector_sync_store = ConnectorSyncStore(self.connector_db_path)
+        self.source_catalog = SourceCatalog(self.connector_db_path)
+        self.source_artifact_store = SourceArtifactStore(
+            settings.source_artifact_dir,
+            max_file_bytes=settings.cogdoc_source_artifact_max_file_mb * 1024 * 1024,
+            max_bytes_per_tenant=(
+                settings.cogdoc_source_artifact_max_tenant_mb * 1024 * 1024
+            ),
+            max_versions_per_source=(settings.cogdoc_source_artifact_max_versions + 1),
+            user_max_versions_per_source=(settings.cogdoc_source_artifact_max_versions),
+        )
+        self.external_acl_sync_store = ExternalAclSyncStore(self.connector_db_path)
+        vault_keys = settings.cogdoc_connector_vault_keys.strip()
+        self.connector_credential_vault: CredentialVault | None
+        self.connector_oauth_session_store: OAuthSessionStore | None
+        if vault_keys:
+            self.connector_credential_vault = CredentialVault(
+                self.connector_db_path,
+                env={
+                    MASTER_KEYS_ENV: vault_keys,
+                    ACTIVE_KEY_VERSION_ENV: (
+                        settings.cogdoc_connector_vault_active_key_id
+                    ),
+                },
+            )
+            self.connector_oauth_session_store = OAuthSessionStore(
+                self.connector_db_path,
+                self.connector_credential_vault,
+            )
+        else:
+            self.connector_credential_vault = None
+            self.connector_oauth_session_store = None
         # 用绝对路径，提示与列表里一眼看清 PDF 该放哪。
         self.inbox_dir = os.path.abspath(settings.cogdoc_doc_dir)
         self.active_kb: str | None = None
@@ -237,6 +308,20 @@ class Console:
         os.makedirs(self.inbox_dir, exist_ok=True)
 
     def close(self) -> None:
+        for store in (
+            getattr(self, "claim_verification_review_store", None),
+            getattr(self, "resource_access_store", None),
+            getattr(self, "index_job_store", None),
+            getattr(self, "connector_oauth_session_store", None),
+            getattr(self, "connector_credential_vault", None),
+            getattr(self, "external_acl_sync_store", None),
+            getattr(self, "source_catalog", None),
+            getattr(self, "connector_sync_store", None),
+            getattr(self, "connection_store", None),
+        ):
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
         if self._owns_state_runtime:
             self.state_runtime.close()
 
@@ -314,6 +399,38 @@ class Console:
         _warm_kb(name)
         print(f"📚 已切换到知识库: {name}（/new 开始新对话，/chats 查看历史）")
 
+    def _clear_connector_kb_state(self, kb_id: str) -> None:
+        tenant_id = "default"
+        oauth_store = getattr(self, "connector_oauth_session_store", None)
+        if oauth_store is not None:
+            oauth_store.delete_scope(tenant_id, kb_id)
+        connector_sync_store = getattr(self, "connector_sync_store", None)
+        if connector_sync_store is not None:
+            connector_sync_store.delete_scope(tenant_id, kb_id)
+        source_artifact_store = getattr(self, "source_artifact_store", None)
+        if source_artifact_store is not None:
+            source_artifact_store.delete_scope(tenant_id, kb_id)
+        source_catalog = getattr(self, "source_catalog", None)
+        if source_catalog is not None:
+            source_catalog.delete_scope(tenant_id, kb_id)
+        external_acl_store = getattr(self, "external_acl_sync_store", None)
+        if external_acl_store is not None:
+            external_acl_store.delete_scope(tenant_id, kb_id)
+        connection_store = getattr(self, "connection_store", None)
+        if connection_store is not None:
+            connection_store.delete_scope(tenant_id, kb_id)
+        credential_vault = getattr(self, "connector_credential_vault", None)
+        if credential_vault is not None:
+            credential_vault.delete_scope(tenant_id, kb_id)
+        else:
+            connector_db_path = getattr(self, "connector_db_path", None)
+            if connector_db_path is not None:
+                delete_sqlite_connector_secret_scope(
+                    connector_db_path,
+                    tenant_id,
+                    kb_id,
+                )
+
     # 删除 kb。
     def _delete_kb(self, kb_id: str) -> None:
         # 写锁内先事务清理索引并落 tombstone，再撤 registry，避免半删除态。
@@ -327,18 +444,53 @@ class Console:
                     self.feedback_analysis_store,
                     self.retrieval_feedback_store,
                     getattr(self, "retrieval_eval_draft_store", None),
+                    getattr(self, "research_job_store", None),
                 ):
                     clear_kb = getattr(store, "clear_kb", None)
                     if callable(clear_kb):
                         clear_kb(kb_id)
             except Exception as exc:
                 raise KBCleanupError(f"KB 派生/反馈状态删除失败: {kb_id}") from exc
+            try:
+                knowledge_index = getattr(self, "knowledge_index", None)
+                clear_knowledge_index = getattr(knowledge_index, "clear_kb", None)
+                if callable(clear_knowledge_index):
+                    clear_knowledge_index(kb_id)
+            except Exception as exc:
+                raise KBCleanupError(f"KB 派生知识索引删除失败: {kb_id}") from exc
+            claim_reviews = getattr(self, "claim_verification_review_store", None)
+            if claim_reviews is not None:
+                try:
+                    claim_reviews.clear_kb("default", kb_id)
+                except Exception as exc:
+                    raise KBCleanupError(f"KB 声明核验状态删除失败: {kb_id}") from exc
             # 连带清掉该库的会话历史，否则同名新库复用 doc_id 会捡到旧对话。
             try:
                 self.sessions.clear_kb(kb_id)
             except Exception as exc:
                 raise KBCleanupError(f"KB 会话状态删除失败: {kb_id}") from exc
+            try:
+                self._clear_connector_kb_state(kb_id)
+            except Exception as exc:
+                raise KBCleanupError(f"KB 连接器状态删除失败: {kb_id}") from exc
+            access_store = getattr(self, "resource_access_store", None)
+            if access_store is not None:
+                try:
+                    access_store.clear_kb("default", kb_id)
+                except Exception as exc:
+                    raise KBCleanupError(f"KB ACL 状态删除失败: {kb_id}") from exc
+            index_job_store = getattr(self, "index_job_store", None)
+            if index_job_store is not None:
+                try:
+                    index_job_store.clear_kb(kb_id)
+                except Exception as exc:
+                    raise KBCleanupError(f"KB 索引任务状态删除失败: {kb_id}") from exc
+            try:
+                shared_mutation_journal().clear_kb(kb_id)
+            except Exception as exc:
+                raise KBCleanupError(f"KB mutation journal 删除失败: {kb_id}") from exc
             self.registry.delete(kb_id)
+        delete_trace_files(doc_id=kb_id)
 
     # 完成 cmd知识库 处理。
     def cmd_kb(self, sub: str, name: str) -> None:
@@ -1591,7 +1743,7 @@ class Console:
         model = input(f"  云端模型名 [{settings.llm_model_name}]: ").strip()
         cur_key = settings.llm_api_key
         key_hint = _mask_key(cur_key) if cur_key else "未设置"
-        key = input(f"  云端 API Key [{key_hint}]: ").strip()
+        key = getpass.getpass(f"  云端 API Key [{key_hint}]: ").strip()
         final_key = key or cur_key
         if not final_key:
             print("❌ 未提供 API Key，云端模式不可用。")
@@ -1900,8 +2052,8 @@ BANNER = r"""
 """
 
 
-# 启动入口。
-def main():
+# 启动旧版本地直连控制台。正常产品使用走下方 API CLI；该入口仅用于离线维护。
+def local_main():
     configure_logging()
 
     # CLI 与 API 共用进程锁：CLI 会构建索引（写），不得与运行中的实例并发写同一数据目录。
@@ -1978,6 +2130,17 @@ def main():
         console.close()
     finally:
         _release_runtime_lock(lock_fh)
+
+
+def main():
+    """Start the API-backed product CLI, or explicit offline maintenance mode."""
+
+    if sys.argv[1:2] in (["--local-storage"], ["local-storage"]):
+        del sys.argv[1]
+        return local_main()
+    from cogdoc.api_cli import main as api_main
+
+    raise SystemExit(api_main(sys.argv[1:]))
 
 
 if __name__ == "__main__":

@@ -1,15 +1,36 @@
 from __future__ import annotations
 
 import logging
+import json
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
-
-import httpx
 
 from cogdoc.api.schemas import DerivedKnowledge
 from cogdoc.api.time_utils import now_iso
 from cogdoc.config.settings import get_settings
+from cogdoc.connectors.http_transport import HttpTransport
 from cogdoc.observability.logger import log_event
+
+
+def validate_webhook_url(url: str) -> str:
+    """Validate one credential-free HTTPS origin and return its host."""
+
+    parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("webhook URL is invalid") from exc
+    host = str(parts.hostname or "").casefold()
+    if (
+        parts.scheme != "https"
+        or not host
+        or port not in {None, 443}
+        or parts.username is not None
+        or parts.password is not None
+    ):
+        raise ValueError("webhook URL must be a credential-free HTTPS URL")
+    return host
 
 
 # 发送外部回调。
@@ -20,6 +41,8 @@ class WebhookDispatcher:
         url: str | None = None,
         secret: str | None = None,
         timeout_seconds: float | None = None,
+        allow_private_hosts: bool | None = None,
+        transport: Any | None = None,
     ):
         settings = get_settings()
         self._url = (url if url is not None else settings.cogdoc_webhook_url).strip()
@@ -31,6 +54,21 @@ class WebhookDispatcher:
             if timeout_seconds is not None
             else settings.cogdoc_webhook_timeout_seconds
         )
+        self._transport = transport
+        if self._url:
+            host = validate_webhook_url(self._url)
+            if self._transport is None:
+                self._transport = HttpTransport(
+                    allowed_hosts={host},
+                    timeout_seconds=self._timeout_seconds,
+                    max_response_bytes=settings.cogdoc_webhook_max_response_bytes,
+                    max_redirects=settings.cogdoc_webhook_max_redirects,
+                    allow_private_hosts=(
+                        settings.cogdoc_webhook_allow_private_hosts
+                        if allow_private_hosts is None
+                        else allow_private_hosts
+                    ),
+                )
 
     @property
     def enabled(self) -> bool:
@@ -47,17 +85,17 @@ class WebhookDispatcher:
             "occurred_at": now_iso(),
             "payload": payload,
         }
-        headers = {}
+        headers = {"Content-Type": "application/json"}
         if self._secret:
             headers["X-CogDoc-Webhook-Secret"] = self._secret
         try:
-            response = httpx.post(
+            assert self._transport is not None
+            self._transport.request(
+                "POST",
                 self._url,
-                json=body,
                 headers=headers,
-                timeout=self._timeout_seconds,
+                body=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             )
-            response.raise_for_status()
         except Exception as exc:
             log_event(
                 "webhook",

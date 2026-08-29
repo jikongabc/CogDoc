@@ -95,6 +95,9 @@ def _runtime() -> HARuntime:
             settings.cogdoc_webhook_url,
             secret=settings.cogdoc_webhook_secret,
             timeout_seconds=settings.cogdoc_webhook_timeout_seconds,
+            allow_private_hosts=settings.cogdoc_webhook_allow_private_hosts,
+            max_response_bytes=settings.cogdoc_webhook_max_response_bytes,
+            max_redirects=settings.cogdoc_webhook_max_redirects,
         )
         if settings.cogdoc_webhook_url.strip()
         else None

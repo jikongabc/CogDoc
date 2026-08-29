@@ -53,6 +53,7 @@ def _app(tmp_path, monkeypatch, *, max_kbs=0):
                 "role": "owner",
             },
         },
+        derived_knowledge_index_clearer=lambda _storage_id: None,
     )
     if max_kbs:
         app.state.tenant_quota = TenantQuotaManager(

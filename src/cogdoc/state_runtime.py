@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
+import weakref
+
 from cogdoc.api.derived_knowledge_store import (
     DerivedKnowledgeStore,
     SqliteDerivedKnowledgeStore,
@@ -252,6 +254,35 @@ class StateRuntime:
     ) -> None:
         self.derived_knowledge_index.record_error(kb_id, error_class)
 
+    def clear_derived_knowledge_index(self, kb_id: str) -> None:
+        if self._closed:
+            raise RuntimeError("StateRuntime is closed")
+        # Only snapshot the current authority under the construction lock.
+        # Cleanup drains readers, and an existing reader may still need this
+        # lock to finish lazy index construction; holding it while draining
+        # would recreate the same lock-order inversion at the runtime layer.
+        with self._index_lock:
+            index = self._derived_knowledge_index
+        if index is None:
+            from cogdoc.tools.retriever.derived_knowledge import (
+                clear_derived_knowledge_index_storage,
+            )
+
+            persist_directory = self.derived_knowledge_index_persist_directory
+            state_directory = self.derived_knowledge_index_state_directory
+            if persist_directory is None or state_directory is None:
+                raise RuntimeError("derived knowledge index paths are unavailable")
+            clear_derived_knowledge_index_storage(
+                kb_id,
+                persist_directory=persist_directory,
+                state_directory=state_directory,
+            )
+            return
+        clear_kb = getattr(index, "clear_kb", None)
+        if not callable(clear_kb):
+            raise RuntimeError("derived knowledge index does not support KB cleanup")
+        clear_kb(kb_id)
+
     @property
     def derived_knowledge_retriever(self):
         # Construction opens the vector index lazily; keep one retriever per runtime.
@@ -264,9 +295,17 @@ class StateRuntime:
                         DerivedKnowledgeRetriever,
                     )
 
+                    runtime_ref = weakref.ref(self)
+
+                    def resolve_index():
+                        runtime = runtime_ref()
+                        if runtime is None or runtime.closed:
+                            raise RuntimeError("StateRuntime is unavailable")
+                        return runtime.derived_knowledge_index
+
                     self._derived_knowledge_retriever = DerivedKnowledgeRetriever(
                         self.knowledge_store,
-                        index_factory=lambda: self.derived_knowledge_index,
+                        index_factory=resolve_index,
                     )
         return self._derived_knowledge_retriever
 
@@ -294,7 +333,11 @@ class StateRuntime:
                 self.retrieval_feedback_store,
                 self.retrieval_eval_draft_store,
                 self.research_job_store,
+                self._derived_knowledge_index,
+                self._derived_knowledge_retriever,
             ):
+                if store is None:
+                    continue
                 if id(store) in seen:
                     continue
                 seen.add(id(store))
@@ -310,10 +353,19 @@ class StateRuntime:
                     f"failed to close {len(errors)} StateRuntime store(s)"
                 ) from errors[0]
 
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Interpreter shutdown and garbage collection cannot surface a
+            # cleanup failure. Explicit close/reset paths still report errors.
+            pass
+
 
 _default_runtime: StateRuntime | None = None
 _default_runtime_key: tuple[str, ...] | None = None
 _default_runtime_lock = Lock()
+_retired_default_runtimes: list[weakref.ReferenceType[StateRuntime]] = []
 
 
 def _settings_key(settings: Settings) -> tuple[str, ...]:
@@ -340,7 +392,6 @@ def default_state_runtime() -> StateRuntime:
     global _default_runtime, _default_runtime_key
     settings = get_settings()
     key = _settings_key(settings)
-    previous = None
     with _default_runtime_lock:
         if (
             _default_runtime is None
@@ -350,9 +401,12 @@ def default_state_runtime() -> StateRuntime:
             previous = _default_runtime
             _default_runtime = StateRuntime.from_settings(settings)
             _default_runtime_key = key
+            if previous is not None:
+                # A caller may still be using the object returned immediately
+                # before this settings boundary. Retire it and close only at
+                # the explicit reset/quiescence boundary.
+                _retired_default_runtimes.append(weakref.ref(previous))
         runtime = _default_runtime
-    if previous is not None and previous is not runtime:
-        previous.close()
     return runtime
 
 
@@ -361,8 +415,16 @@ def reset_default_state_runtime(*, close: bool = True) -> None:
 
     global _default_runtime, _default_runtime_key
     with _default_runtime_lock:
-        previous = _default_runtime
+        previous = [
+            runtime
+            for reference in _retired_default_runtimes
+            if (runtime := reference()) is not None
+        ]
+        if _default_runtime is not None:
+            previous.append(_default_runtime)
+        _retired_default_runtimes.clear()
         _default_runtime = None
         _default_runtime_key = None
-    if close and previous is not None:
-        previous.close()
+    if close:
+        for runtime in previous:
+            runtime.close()

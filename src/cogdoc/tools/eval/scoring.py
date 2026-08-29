@@ -7,6 +7,7 @@ Judge 的 pass 只是诊断信号，Trial/Case/Run 的最终决策由本模块�
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -69,7 +70,11 @@ def _text(value: Any) -> str:
 
 def _normalize_score(value: Any) -> float:
     number = float(value)
-    return max(0.0, min(1.0, (number - 1.0) / 4.0 if number > 1 else number))
+    if not math.isfinite(number):
+        raise ValueError("score must be finite")
+    # Judge scores use the closed 1..5 scale.  Always shift the origin before
+    # clamping: 1 means the worst score (0.0), not a perfect score (1.0).
+    return max(0.0, min(1.0, (number - 1.0) / 4.0))
 
 
 def _default_role(evaluator_type: str, config: Mapping[str, Any]) -> str:
@@ -88,10 +93,13 @@ def spec_from_dict(raw: Mapping[str, Any]) -> EvaluatorSpec:
     role = str(raw.get("role") or _default_role(evaluator_type, config)).upper()
     if role not in {"GATE", "QUALITY", "DIAGNOSTIC"}:
         raise ValueError(f"unsupported evaluator role: {role}")
+    weight = float(raw.get("weight", 1.0))
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError("evaluator.weight must be a finite non-negative number")
     return EvaluatorSpec(
         type=evaluator_type,
         role=role,
-        weight=max(0.0, float(raw.get("weight", 1.0))),
+        weight=weight,
         requires=tuple(str(item) for item in raw.get("requires", ())),
         optional=tuple(str(item) for item in raw.get("optional", ())),
         gate_policy=raw.get("gate_policy") or {},
@@ -440,6 +448,8 @@ def evaluate_gate(spec: EvaluatorSpec, result: Mapping[str, Any]) -> str:
     level = str((spec.gate_policy or {}).get("level", "CRITICAL")).upper()
     rank = {"WARNING": 0, "CRITICAL": 1, "FATAL": 2}.get(level, 1)
     status = str(result.get("status", "ERROR"))
+    if rank == 0 and status != "PASS":
+        return "PASS_WITH_WARNING"
     if status == "ERROR":
         return "FATAL" if rank >= 2 else "GATE_ERROR"
     if status == "FAIL":
@@ -456,6 +466,10 @@ def evaluate_gate(spec: EvaluatorSpec, result: Mapping[str, Any]) -> str:
 
 
 def evaluate_trial(trial: Mapping[str, Any], evaluators: Sequence[Mapping[str, Any]], judge: LLMJudge | None = None, *, pass_threshold: float = 0.8, margin: float = 0.05) -> dict[str, Any]:
+    if not math.isfinite(pass_threshold) or not 0.0 <= pass_threshold <= 1.0:
+        raise ValueError("pass_threshold must be between 0 and 1")
+    if not math.isfinite(margin) or not 0.0 <= margin <= pass_threshold:
+        raise ValueError("margin must be between 0 and pass_threshold")
     specs = [spec_from_dict(raw) for raw in evaluators]
     results = []
     gate_decisions = []
@@ -471,10 +485,21 @@ def evaluate_trial(trial: Mapping[str, Any], evaluators: Sequence[Mapping[str, A
     quality_score = None
     if quality_scores and sum(weight for _, weight in quality_scores) > 0:
         quality_score = sum(score * weight for score, weight in quality_scores) / sum(weight for _, weight in quality_scores)
-    execution_status = str(trial.get("execution_status", "SUCCESS"))
+    execution_status = str(trial.get("execution_status") or "UNKNOWN")
     has_review = any(row.get("status") == "NEEDS_REVIEW" for row in results)
     if any(item in gate_decisions for item in {"FATAL", "FATAL_GATE_UNOBSERVABLE", "GATE_ERROR", "GATE_FAIL"}):
         decision = "FAIL"
+    elif execution_status in EXECUTION_FAILED:
+        # A deterministic evaluator can still score partial output from a
+        # timed-out or failed execution.  That score is diagnostic only: an
+        # execution which did not complete must never be promoted to PASS.
+        decision = "FAIL"
+    elif execution_status not in EXECUTION_COMPLETED:
+        # Unknown producer statuses fail closed without conflating a protocol
+        # version skew with a confirmed quality failure.
+        decision = "NEEDS_REVIEW"
+    elif "GATE_REVIEW" in gate_decisions:
+        decision = "NEEDS_REVIEW"
     elif quality_score is None:
         decision = "NEEDS_REVIEW"
     elif execution_status == "TRACE_INCOMPLETE" or has_review:
@@ -496,11 +521,19 @@ def evaluate_trial(trial: Mapping[str, Any], evaluators: Sequence[Mapping[str, A
 
 
 def aggregate_case(trials: Sequence[Mapping[str, Any]], *, min_trials: int = 3, min_success_rate: float = 0.8, max_stddev: float = 0.15) -> dict[str, Any]:
+    if type(min_trials) is not int or min_trials < 1:
+        raise ValueError("min_trials must be a positive integer")
+    if not math.isfinite(min_success_rate) or not 0.0 <= min_success_rate <= 1.0:
+        raise ValueError("min_success_rate must be between 0 and 1")
+    if not math.isfinite(max_stddev) or not 0.0 <= max_stddev <= 1.0:
+        raise ValueError("max_stddev must be between 0 and 1")
     all_trials = list(trials)
     n_total = len(all_trials)
     completed = [trial for trial in all_trials if trial.get("execution_status") in EXECUTION_COMPLETED]
     evaluable = [trial for trial in completed if trial.get("quality_score") is not None]
     scores = [float(trial["quality_score"]) for trial in evaluable]
+    if any(not math.isfinite(score) or not 0.0 <= score <= 1.0 for score in scores):
+        raise ValueError("trial quality_score must be finite and between 0 and 1")
     n_passed = sum(1 for trial in all_trials if trial.get("execution_status") == "SUCCESS" and trial.get("decision") == "PASS")
     completion_rate = len(completed) / n_total if n_total else 0.0
     pass_rate = n_passed / n_total if n_total else 0.0
@@ -535,6 +568,8 @@ def aggregate_case(trials: Sequence[Mapping[str, Any]], *, min_trials: int = 3, 
 def aggregate_run(cases: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     rows = list(cases)
     scores = [float(row["quality_score"]) for row in rows if row.get("quality_score") is not None]
+    if any(not math.isfinite(score) or not 0.0 <= score <= 1.0 for score in scores):
+        raise ValueError("case quality_score must be finite and between 0 and 1")
     has_unstable = any(row.get("stability_status") == "UNSTABLE" for row in rows)
     has_insufficient = any(row.get("stability_status") == "INSUFFICIENT" for row in rows)
     decision = "FAIL" if has_unstable else "NEEDS_REVIEW" if has_insufficient or not scores else "PASS"

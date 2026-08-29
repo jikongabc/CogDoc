@@ -390,7 +390,7 @@ def test_drain_purge_queue_retries_and_dequeues_on_success(tmp_path, monkeypatch
     calls = []
 
     # 清理。
-    def purge(kb, gid):
+    def purge(kb, gid, _segment_ids=()):
         calls.append(gid)
         if gid == "g1":
             raise RuntimeError("chroma down")  # g1 失败保留

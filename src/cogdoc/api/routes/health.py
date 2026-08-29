@@ -355,7 +355,11 @@ async def health_ready(request: Request):
 @router.get("/metrics")
 async def metrics(request: Request):
     # Prometheus 抓取端点：返回每 app 注册表的文本快照，鉴权/限流已豁免。
+    content = await run_sync(
+        request.app.state.offload_executor,
+        request.app.state.metrics.render,
+    )
     return Response(
-        content=request.app.state.metrics.render(),
+        content=content,
         media_type=CONTENT_TYPE_LATEST,
     )

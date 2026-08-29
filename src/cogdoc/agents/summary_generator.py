@@ -75,10 +75,6 @@ _MARKDOWN_CLOSERS = ("***", "___", "**", "__", "~~", "*", "_")
 _MARKDOWN_FENCE_PATTERN = re.compile(r"^\s*(?:`{3,}|~{3,})")
 _LINE_ENDING_PATTERN = re.compile(r"(?:\r\n|\r|\n)$")
 
-# 云端逐单元 LLM 调用相互独立，并发执行降低 Summary/Compare 端到端延迟；本地走串行。
-CLOUD_SECTION_MAX_WORKERS = get_settings().cloud_section_max_workers
-
-
 def _summary_claim_audit_projection(
     answer: str,
     results: List[SummarySectionResult],
@@ -125,7 +121,9 @@ def resolve_section_workers(is_local: bool, task_count: int) -> int:
     # 本地 Ollama 并发会放大显存/内存压力，退回串行；单任务无需起线程池。
     if task_count <= 1 or is_local:
         return 1
-    return min(task_count, CLOUD_SECTION_MAX_WORKERS)
+    # Read through the cached Settings boundary at execution time so an
+    # explicit cache_clear/config reload is reflected without module reload.
+    return min(task_count, get_settings().cloud_section_max_workers)
 
 
 # 运行 section cells。

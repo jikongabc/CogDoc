@@ -159,8 +159,12 @@ async def _task_endpoint(
             chat_history = []
         else:
             authority_guard = None
-            chat_history = session_store.get_history(
-                session_scope_id, body.session_id, body.query
+            chat_history = await run_sync(
+                request.app.state.offload_executor,
+                session_store.get_history,
+                session_scope_id,
+                body.session_id,
+                body.query,
             )
         if coordinator is not None:
             result = await run_sync(
@@ -182,6 +186,7 @@ async def _task_endpoint(
                     forced_task,
                     internal_session_id(request, body.session_id),
                     retrieval_scope,
+                    expected_epoch,
                 ),
             )
         else:
@@ -196,6 +201,7 @@ async def _task_endpoint(
                 forced_task,
                 internal_session_id(request, body.session_id),
                 retrieval_scope,
+                expected_epoch,
             )
     except ChatServiceError as exc:
         code = classify_error_code(exc.stage, exc.error_class, exc.message)
@@ -220,7 +226,13 @@ async def _task_endpoint(
         update={"doc_id": session_store_doc_id(request, body.doc_id)}
     )
     if coordinator is None:
-        _record_task_session(request, session_body, result)
+        await run_sync(
+            request.app.state.offload_executor,
+            _record_task_session,
+            request,
+            session_body,
+            result,
+        )
     request.app.state.metrics.chat_results.labels(
         result.task_type, str(result.is_valid).lower()
     ).inc()
@@ -294,11 +306,16 @@ def _call_retrieve_runner(runner, body: RetrieveRequest, retrieval_scope):
     docs = (
         runner(body, retrieval_scope=retrieval_scope) if accepts_scope else runner(body)
     )
-    return [
+    allowed = [
         doc
         for doc in docs
         if isinstance(doc, Mapping) and retrieval_scope.allows_document(doc)
     ]
+    # Multi-route retrieval deliberately expands the internal candidate pool,
+    # but the public endpoint promises at most ``top_k`` final hits.  Apply the
+    # limit after the authorization filter so inaccessible rows never consume
+    # a caller-visible slot.
+    return allowed[: body.top_k]
 
 
 # 截断文本预览。

@@ -238,6 +238,11 @@ export const controlApi = {
       `/knowledge/${pathPart(knowledgeId)}/${pathPart(action)}`,
       json("POST", { note }),
     ),
+  batchReviewKnowledge: (knowledgeIds: string[], action: "batch-approve" | "batch-reject", note?: string) =>
+    apiFetch<unknown>(
+      `/knowledge/${action}`,
+      json("POST", { knowledge_ids: knowledgeIds, note }),
+    ),
   reviseKnowledge: (knowledgeId: string, payload: JsonRecord) =>
     apiFetch<unknown>(
       `/knowledge/${pathPart(knowledgeId)}/revise`,

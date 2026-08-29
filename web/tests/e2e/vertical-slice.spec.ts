@@ -53,6 +53,7 @@ async function installApi(page: Page, options: ApiFixtureOptions = {}) {
   let documentReady = false;
   let jobReads = 0;
   let feedbackPayload: Record<string, unknown> | null = null;
+  let savedKnowledgePayload: Record<string, unknown> | null = null;
 
   await page.route("**/api/cogdoc/v1/**", async (route) => {
     const request = route.request();
@@ -168,10 +169,14 @@ async function installApi(page: Page, options: ApiFixtureOptions = {}) {
       feedbackPayload = request.postDataJSON() as Record<string, unknown>;
       return json(route, { schema_version: "v1", feedback_id: "fb-1", status: "recorded", is_bad_case: false }, 201);
     }
+    if (path === "/knowledge" && request.method() === "POST") {
+      savedKnowledgePayload = request.postDataJSON() as Record<string, unknown>;
+      return json(route, { knowledge_id: "knowledge-saved", status: "pending" }, 201);
+    }
     return json(route, { schema_version: "v1", error_code: "NOT_FOUND", message: `Unhandled ${request.method()} ${path}` }, 404);
   });
 
-  return { feedback: () => feedbackPayload };
+  return { feedback: () => feedbackPayload, savedKnowledge: () => savedKnowledgePayload };
 }
 
 test("login to evidence feedback vertical slice", async ({ page }) => {
@@ -220,6 +225,16 @@ test("login to evidence feedback vertical slice", async ({ page }) => {
   await page.getByRole("button", { name: "回答有帮助" }).click();
   await expect(page.getByLabel("对话").getByText("反馈已记录")).toBeVisible();
   expect(apiState.feedback()).toMatchObject({ trace_id: "trace-1", feedback: "thumbs_up", kb_id: "policies" });
+  await page.getByRole("button", { name: "保存为派生知识" }).click();
+  await expect(page.getByRole("button", { name: "已保存" })).toBeVisible();
+  expect(apiState.savedKnowledge()).toMatchObject({
+    kb_id: "policies",
+    created_from_trace_id: "trace-1",
+    related_source: "security.pdf",
+    related_chunk_ids: ["chunk-1"],
+    related_page_start: 3,
+    related_page_end: 3,
+  });
 });
 
 test("delayed history is gated and restores trace-backed evidence", async ({ page }) => {

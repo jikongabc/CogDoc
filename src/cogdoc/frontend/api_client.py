@@ -4,12 +4,18 @@ import mimetypes
 import os
 from collections.abc import Mapping
 from typing import Any, Callable, Iterable, Iterator
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 
 DEFAULT_TIMEOUT = 180.0
 WORKSPACE_HEADER = "X-CogDoc-Workspace"
+
+
+def _path_segment(value: Any) -> str:
+    """Encode one opaque identifier for use as exactly one URL path segment."""
+
+    return quote(str(value), safe="")
 
 
 def _canonical_workspace_id(value: str | None) -> str | None:
@@ -172,6 +178,46 @@ class CogDocClient:
         if isinstance(workspace_id, str):
             self.set_workspace(workspace_id)
         return response
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        json_body: Any = None,
+    ) -> httpx.Response:
+        """Call a versioned endpoint for CLI/admin workflows not yet typed here."""
+
+        normalized_method = method.strip().upper()
+        if normalized_method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise ValueError("unsupported HTTP method")
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        decoded_path = normalized_path
+        for _ in range(8):
+            expanded = unquote(decoded_path)
+            if expanded == decoded_path:
+                break
+            decoded_path = expanded
+        else:
+            raise ValueError("path encoding is too deeply nested")
+        if (
+            not decoded_path.startswith("/v1/")
+            or any(segment in {".", ".."} for segment in decoded_path.split("/"))
+            or "\\" in decoded_path
+            or "?" in decoded_path
+            or "#" in decoded_path
+            or any(ord(character) < 32 or ord(character) == 127 for character in decoded_path)
+        ):
+            raise ValueError("path must start with /v1/")
+        return httpx.request(
+            normalized_method,
+            self._url(normalized_path),
+            params=dict(params or {}),
+            json=json_body,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
 
     # 读取部署的账号认证能力；该端点始终公开且不会携带凭据也能调用。
     def get_auth_config(self) -> httpx.Response:
@@ -630,7 +676,7 @@ class CogDocClient:
 
     def delete_auth_session(self, session_id: str) -> httpx.Response:
         return httpx.delete(
-            self._url(f"/v1/auth/sessions/{session_id}"),
+            self._url(f"/v1/auth/sessions/{_path_segment(session_id)}"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -645,7 +691,7 @@ class CogDocClient:
 
     def get_workspace(self, workspace_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/workspaces/{workspace_id}"),
+            self._url(f"/v1/workspaces/{_path_segment(workspace_id)}"),
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
         )
@@ -666,7 +712,7 @@ class CogDocClient:
     ) -> httpx.Response:
         payload = {"name": name, "expected_revision": expected_revision}
         return httpx.patch(
-            self._url(f"/v1/workspaces/{workspace_id}"),
+            self._url(f"/v1/workspaces/{_path_segment(workspace_id)}"),
             json={key: value for key, value in payload.items() if value is not None},
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
@@ -674,14 +720,14 @@ class CogDocClient:
 
     def delete_workspace(self, workspace_id: str) -> httpx.Response:
         return httpx.delete(
-            self._url(f"/v1/workspaces/{workspace_id}"),
+            self._url(f"/v1/workspaces/{_path_segment(workspace_id)}"),
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
         )
 
     def switch_workspace(self, workspace_id: str) -> httpx.Response:
         response = httpx.post(
-            self._url(f"/v1/workspaces/{workspace_id}/switch"),
+            self._url(f"/v1/workspaces/{_path_segment(workspace_id)}/switch"),
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
         )
@@ -689,14 +735,14 @@ class CogDocClient:
 
     def list_workspace_members(self, workspace_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/workspaces/{workspace_id}/members"),
+            self._url(f"/v1/workspaces/{_path_segment(workspace_id)}/members"),
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
         )
 
     def list_workspace_roles(self, workspace_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/workspaces/{workspace_id}/roles"),
+            self._url(f"/v1/workspaces/{_path_segment(workspace_id)}/roles"),
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
         )
@@ -709,7 +755,7 @@ class CogDocClient:
         description: str = "",
     ) -> httpx.Response:
         return httpx.post(
-            self._url(f"/v1/workspaces/{workspace_id}/roles"),
+            self._url(f"/v1/workspaces/{_path_segment(workspace_id)}/roles"),
             json={
                 "name": name,
                 "base_role": base_role,
@@ -719,11 +765,12 @@ class CogDocClient:
             headers=self._headers_for_workspace(workspace_id),
         )
 
-    def delete_workspace_role(
-        self, workspace_id: str, role_id: str
-    ) -> httpx.Response:
+    def delete_workspace_role(self, workspace_id: str, role_id: str) -> httpx.Response:
         return httpx.delete(
-            self._url(f"/v1/workspaces/{workspace_id}/roles/{role_id}"),
+            self._url(
+                f"/v1/workspaces/{_path_segment(workspace_id)}/roles/"
+                f"{_path_segment(role_id)}"
+            ),
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
         )
@@ -737,7 +784,10 @@ class CogDocClient:
     ) -> httpx.Response:
         payload = {"role_id": role_id, "expected_revision": expected_revision}
         return httpx.patch(
-            self._url(f"/v1/workspaces/{workspace_id}/members/{member_id}"),
+            self._url(
+                f"/v1/workspaces/{_path_segment(workspace_id)}/members/"
+                f"{_path_segment(member_id)}"
+            ),
             json={key: value for key, value in payload.items() if value is not None},
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
@@ -752,7 +802,10 @@ class CogDocClient:
     ) -> httpx.Response:
         payload = {"role": role, "expected_revision": expected_revision}
         return httpx.patch(
-            self._url(f"/v1/workspaces/{workspace_id}/members/{member_id}"),
+            self._url(
+                f"/v1/workspaces/{_path_segment(workspace_id)}/members/"
+                f"{_path_segment(member_id)}"
+            ),
             json={key: value for key, value in payload.items() if value is not None},
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
@@ -762,7 +815,10 @@ class CogDocClient:
         self, workspace_id: str, member_id: str
     ) -> httpx.Response:
         return httpx.delete(
-            self._url(f"/v1/workspaces/{workspace_id}/members/{member_id}"),
+            self._url(
+                f"/v1/workspaces/{_path_segment(workspace_id)}/members/"
+                f"{_path_segment(member_id)}"
+            ),
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
         )
@@ -771,7 +827,7 @@ class CogDocClient:
         self, workspace_id: str, email: str, role: str
     ) -> httpx.Response:
         return httpx.post(
-            self._url(f"/v1/workspaces/{workspace_id}/invites"),
+            self._url(f"/v1/workspaces/{_path_segment(workspace_id)}/invites"),
             json={"email": email, "role": role},
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
@@ -779,7 +835,7 @@ class CogDocClient:
 
     def list_workspace_invites(self, workspace_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/workspaces/{workspace_id}/invites"),
+            self._url(f"/v1/workspaces/{_path_segment(workspace_id)}/invites"),
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
         )
@@ -788,7 +844,10 @@ class CogDocClient:
         self, workspace_id: str, invite_id: str
     ) -> httpx.Response:
         return httpx.delete(
-            self._url(f"/v1/workspaces/{workspace_id}/invites/{invite_id}"),
+            self._url(
+                f"/v1/workspaces/{_path_segment(workspace_id)}/invites/"
+                f"{_path_segment(invite_id)}"
+            ),
             timeout=self.timeout,
             headers=self._headers_for_workspace(workspace_id),
         )
@@ -833,15 +892,20 @@ class CogDocClient:
     # 知识库和文档的可见性策略与按主体授权。
     def get_kb_access_policy(self, kb_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/knowledge-bases/{kb_id}/access"),
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}/access"),
             timeout=self.timeout,
             headers=self._headers,
         )
 
-    def update_kb_access_policy(self, kb_id: str, policy: str) -> httpx.Response:
+    def update_kb_access_policy(
+        self, kb_id: str, policy: str, role_ids: list[str] | None = None
+    ) -> httpx.Response:
+        payload: dict[str, Any] = {"schema_version": "v1", "policy": policy}
+        if role_ids is not None:
+            payload["role_ids"] = role_ids
         return httpx.patch(
-            self._url(f"/v1/knowledge-bases/{kb_id}/access"),
-            json={"schema_version": "v1", "policy": policy},
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}/access"),
+            json=payload,
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -850,7 +914,10 @@ class CogDocClient:
         self, kb_id: str, document_id: str
     ) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access"),
+            self._url(
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/documents/"
+                f"{_path_segment(document_id)}/access"
+            ),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -862,10 +929,16 @@ class CogDocClient:
         policy: str,
         *,
         source: str | None = None,
+        role_ids: list[str] | None = None,
     ) -> httpx.Response:
         payload = {"schema_version": "v1", "policy": policy, "source": source}
+        if role_ids is not None:
+            payload["role_ids"] = role_ids
         return httpx.patch(
-            self._url(f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access"),
+            self._url(
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/documents/"
+                f"{_path_segment(document_id)}/access"
+            ),
             json={key: value for key, value in payload.items() if value is not None},
             timeout=self.timeout,
             headers=self._headers,
@@ -873,14 +946,14 @@ class CogDocClient:
 
     def list_kb_grants(self, kb_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/knowledge-bases/{kb_id}/access/grants"),
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}/access/grants"),
             timeout=self.timeout,
             headers=self._headers,
         )
 
     def grant_kb_access(self, kb_id: str, subject_id: str, role: str) -> httpx.Response:
         return httpx.post(
-            self._url(f"/v1/knowledge-bases/{kb_id}/access/grants"),
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}/access/grants"),
             json={
                 "schema_version": "v1",
                 "subject_id": subject_id,
@@ -892,7 +965,10 @@ class CogDocClient:
 
     def revoke_kb_access(self, kb_id: str, subject_id: str) -> httpx.Response:
         return httpx.delete(
-            self._url(f"/v1/knowledge-bases/{kb_id}/access/grants/{subject_id}"),
+            self._url(
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/access/grants/"
+                f"{_path_segment(subject_id)}"
+            ),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -900,7 +976,8 @@ class CogDocClient:
     def list_document_grants(self, kb_id: str, document_id: str) -> httpx.Response:
         return httpx.get(
             self._url(
-                f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access/grants"
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/documents/"
+                f"{_path_segment(document_id)}/access/grants"
             ),
             timeout=self.timeout,
             headers=self._headers,
@@ -915,7 +992,8 @@ class CogDocClient:
     ) -> httpx.Response:
         return httpx.post(
             self._url(
-                f"/v1/knowledge-bases/{kb_id}/documents/{document_id}/access/grants"
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/documents/"
+                f"{_path_segment(document_id)}/access/grants"
             ),
             json={
                 "schema_version": "v1",
@@ -931,8 +1009,9 @@ class CogDocClient:
     ) -> httpx.Response:
         return httpx.delete(
             self._url(
-                f"/v1/knowledge-bases/{kb_id}/documents/{document_id}"
-                f"/access/grants/{subject_id}"
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/documents/"
+                f"{_path_segment(document_id)}/access/grants/"
+                f"{_path_segment(subject_id)}"
             ),
             timeout=self.timeout,
             headers=self._headers,
@@ -946,6 +1025,16 @@ class CogDocClient:
             headers=self._headers,
         )
         return _expect_list(_checked_json(response), "知识库列表")
+
+    def list_embedding_profiles(self) -> list[dict]:
+        """Return the same embedding choices exposed by the Web upload flow."""
+
+        response = httpx.get(
+            self._url("/v1/embedding-profiles"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+        return _expect_list(_checked_json(response), "Embedding 配置列表")
 
     # 创建知识库。
     def create_knowledge_base(
@@ -971,7 +1060,7 @@ class CogDocClient:
     # 删除知识库。
     def delete_knowledge_base(self, kb_id: str) -> httpx.Response:
         return httpx.delete(
-            self._url(f"/v1/knowledge-bases/{kb_id}"),
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -979,7 +1068,7 @@ class CogDocClient:
     # 列出文档。
     def list_documents(self, kb_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/knowledge-bases/{kb_id}/documents"),
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}/documents"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -987,7 +1076,7 @@ class CogDocClient:
     # 列出知识库来源文件。
     def list_sources(self, kb_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/knowledge-bases/{kb_id}/sources"),
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}/sources"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -1003,7 +1092,10 @@ class CogDocClient:
     ) -> httpx.Response:
         params = {"offset": offset, "limit": limit, "anchor_text": anchor_text}
         return httpx.get(
-            self._url(f"/v1/knowledge-bases/{kb_id}/sources/{source}/chunks"),
+            self._url(
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/sources/"
+                f"{_path_segment(source)}/chunks"
+            ),
             params={k: v for k, v in params.items() if v is not None},
             timeout=self.timeout,
             headers=self._headers,
@@ -1026,7 +1118,7 @@ class CogDocClient:
             )
         }
         return httpx.post(
-            self._url(f"/v1/knowledge-bases/{kb_id}/documents"),
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}/documents"),
             files=files,
             data=(
                 [("allowed_role_ids", role_id) for role_id in allowed_role_ids]
@@ -1037,9 +1129,57 @@ class CogDocClient:
             headers=self._headers,
         )
 
+    def upload_documents(
+        self,
+        kb_id: str,
+        documents: Iterable[tuple[str, bytes]],
+        *,
+        allowed_role_ids: list[str] | None = None,
+        embedding_profile_id: str | None = None,
+    ) -> httpx.Response:
+        """Submit one batch upload job, matching the current Web client."""
+
+        files = [
+            (
+                "files",
+                (
+                    filename,
+                    content,
+                    mimetypes.guess_type(filename)[0] or "application/octet-stream",
+                ),
+            )
+            for filename, content in documents
+        ]
+        data: list[tuple[str, str]] = []
+        data.extend(
+            ("allowed_role_ids", role_id) for role_id in (allowed_role_ids or [])
+        )
+        if embedding_profile_id is not None:
+            data.append(("embedding_profile_id", embedding_profile_id))
+        return httpx.post(
+            self._url(f"/v1/knowledge-bases/{quote(kb_id, safe='')}/documents/batch"),
+            files=files,
+            data=data,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_index_jobs(
+        self, kb_id: str | None = None, *, limit: int = 200
+    ) -> httpx.Response:
+        params: dict[str, Any] = {"limit": limit}
+        if kb_id is not None:
+            params["kb_id"] = kb_id
+        return httpx.get(
+            self._url("/v1/index-jobs"),
+            params=params,
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
     def list_connections(self, kb_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/knowledge-bases/{kb_id}/connections"),
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}/connections"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -1048,7 +1188,7 @@ class CogDocClient:
         self, kb_id: str, payload: Mapping[str, Any]
     ) -> httpx.Response:
         return httpx.post(
-            self._url(f"/v1/knowledge-bases/{kb_id}/connections"),
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}/connections"),
             json=dict(payload),
             timeout=self.timeout,
             headers=self._headers,
@@ -1058,29 +1198,92 @@ class CogDocClient:
         self, kb_id: str, connection_id: str, enabled: bool
     ) -> httpx.Response:
         return httpx.patch(
-            self._url(f"/v1/knowledge-bases/{kb_id}/connections/{connection_id}"),
+            self._url(
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/connections/"
+                f"{_path_segment(connection_id)}"
+            ),
             json={"enabled": enabled},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def update_connection(
+        self, kb_id: str, connection_id: str, payload: Mapping[str, Any]
+    ) -> httpx.Response:
+        return httpx.patch(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/connections/"
+                f"{quote(connection_id, safe='')}"
+            ),
+            json=dict(payload),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def delete_connection(self, kb_id: str, connection_id: str) -> httpx.Response:
+        return httpx.delete(
+            self._url(
+                f"/v1/knowledge-bases/{quote(kb_id, safe='')}/connections/"
+                f"{quote(connection_id, safe='')}"
+            ),
             timeout=self.timeout,
             headers=self._headers,
         )
 
     def start_connection_sync(self, kb_id: str, connection_id: str) -> httpx.Response:
         return httpx.post(
-            self._url(f"/v1/knowledge-bases/{kb_id}/connections/{connection_id}/sync"),
+            self._url(
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/connections/"
+                f"{_path_segment(connection_id)}/sync"
+            ),
             timeout=self.timeout,
             headers=self._headers,
         )
 
     def list_sync_jobs(self, kb_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/knowledge-bases/{kb_id}/sync-jobs"),
+            self._url(f"/v1/knowledge-bases/{_path_segment(kb_id)}/sync-jobs"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_workspace_sync_jobs(self, *, limit: int = 200) -> httpx.Response:
+        return httpx.get(
+            self._url("/v1/sync-jobs"),
+            params={"limit": limit},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def list_ha_jobs(self, *, limit: int = 200) -> httpx.Response:
+        return httpx.get(
+            self._url("/v1/ha/jobs"),
+            params={"limit": limit},
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def cancel_ha_job(self, job_id: str) -> httpx.Response:
+        return httpx.post(
+            self._url(f"/v1/ha/jobs/{quote(job_id, safe='')}/cancel"),
+            timeout=self.timeout,
+            headers=self._headers,
+        )
+
+    def replay_ha_job(self, job_id: str, replay_key: str) -> httpx.Response:
+        return httpx.post(
+            self._url(f"/v1/ha/jobs/{quote(job_id, safe='')}/replay"),
+            json={"replay_key": replay_key},
             timeout=self.timeout,
             headers=self._headers,
         )
 
     def get_sync_job(self, kb_id: str, job_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/knowledge-bases/{kb_id}/sync-jobs/{job_id}"),
+            self._url(
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/sync-jobs/"
+                f"{_path_segment(job_id)}"
+            ),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -1353,7 +1556,10 @@ class CogDocClient:
     # 删除文档。
     def delete_document(self, kb_id: str, name: str) -> httpx.Response:
         return httpx.delete(
-            self._url(f"/v1/knowledge-bases/{kb_id}/documents/{name}"),
+            self._url(
+                f"/v1/knowledge-bases/{_path_segment(kb_id)}/documents/"
+                f"{_path_segment(name)}"
+            ),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -1361,7 +1567,7 @@ class CogDocClient:
     # 获取任务。
     def get_job(self, job_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/index-jobs/{job_id}"),
+            self._url(f"/v1/index-jobs/{_path_segment(job_id)}"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -1369,7 +1575,7 @@ class CogDocClient:
     # 获取跟踪。
     def get_trace(self, trace_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/traces/{trace_id}"),
+            self._url(f"/v1/traces/{_path_segment(trace_id)}"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -1388,7 +1594,7 @@ class CogDocClient:
     # 获取会话历史。
     def get_session_history(self, session_id: str, kb_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/sessions/{session_id}/history"),
+            self._url(f"/v1/sessions/{_path_segment(session_id)}/history"),
             params={"doc_id": kb_id},
             timeout=self.timeout,
             headers=self._headers,
@@ -1406,7 +1612,7 @@ class CogDocClient:
     # 删除会话。
     def delete_session(self, session_id: str, kb_id: str) -> httpx.Response:
         return httpx.delete(
-            self._url(f"/v1/sessions/{session_id}"),
+            self._url(f"/v1/sessions/{_path_segment(session_id)}"),
             params={"doc_id": kb_id},
             timeout=self.timeout,
             headers=self._headers,
@@ -1525,6 +1731,7 @@ class CogDocClient:
         *,
         kb_id: str,
         text: str,
+        related_document_id: str | None = None,
         related_source: str | None = None,
         related_source_sha256: str | None = None,
         related_chunk_ids: list[str] | None = None,
@@ -1541,6 +1748,7 @@ class CogDocClient:
         payload = {
             "kb_id": kb_id,
             "text": text,
+            "related_document_id": related_document_id,
             "related_source": related_source,
             "related_source_sha256": related_source_sha256,
             "related_chunk_ids": related_chunk_ids or [],
@@ -1718,7 +1926,10 @@ class CogDocClient:
             "related_anchor_text": related_anchor_text,
         }
         return httpx.post(
-            self._url(f"/v1/knowledge/{knowledge_id}/{action}"),
+            self._url(
+                f"/v1/knowledge/{_path_segment(knowledge_id)}/"
+                f"{_path_segment(action)}"
+            ),
             json={k: v for k, v in payload.items() if v is not None},
             timeout=self.timeout,
             headers=self._headers,
@@ -1759,7 +1970,7 @@ class CogDocClient:
             "created_by": created_by,
         }
         return httpx.post(
-            self._url(f"/v1/knowledge/{knowledge_id}/revise"),
+            self._url(f"/v1/knowledge/{_path_segment(knowledge_id)}/revise"),
             json={k: v for k, v in payload.items() if v is not None},
             timeout=self.timeout,
             headers=self._headers,
@@ -1775,7 +1986,7 @@ class CogDocClient:
     ) -> httpx.Response:
         payload = {"knowledge_ids": knowledge_ids, "actor": actor, "note": note}
         return httpx.post(
-            self._url(f"/v1/knowledge/{action}"),
+            self._url(f"/v1/knowledge/{_path_segment(action)}"),
             json={k: v for k, v in payload.items() if v is not None},
             timeout=self.timeout,
             headers=self._headers,
@@ -1784,7 +1995,7 @@ class CogDocClient:
     # 删除派生知识。
     def delete_knowledge(self, knowledge_id: str) -> httpx.Response:
         return httpx.delete(
-            self._url(f"/v1/knowledge/{knowledge_id}"),
+            self._url(f"/v1/knowledge/{_path_segment(knowledge_id)}"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -1818,7 +2029,10 @@ class CogDocClient:
         if not enabled:
             kwargs["json"] = {k: v for k, v in payload.items() if v is not None}
         return httpx.post(
-            self._url(f"/v1/retrieval-feedback/{feedback_id}/{action}"),
+            self._url(
+                f"/v1/retrieval-feedback/{_path_segment(feedback_id)}/"
+                f"{_path_segment(action)}"
+            ),
             **kwargs,
         )
 
@@ -1849,7 +2063,7 @@ class CogDocClient:
 
     def get_retrieval_eval_draft(self, draft_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/retrieval-eval-drafts/{draft_id}"),
+            self._url(f"/v1/retrieval-eval-drafts/{_path_segment(draft_id)}"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -1895,14 +2109,14 @@ class CogDocClient:
 
     def get_index_migration(self, run_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/index-migrations/{run_id}"),
+            self._url(f"/v1/index-migrations/{_path_segment(run_id)}"),
             timeout=self.timeout,
             headers=self._headers,
         )
 
     def rollback_index_migration(self, run_id: str) -> httpx.Response:
         return httpx.post(
-            self._url(f"/v1/index-migrations/{run_id}/rollback"),
+            self._url(f"/v1/index-migrations/{_path_segment(run_id)}/rollback"),
             json={"kb_ids": []},
             timeout=self.timeout,
             headers=self._headers,
@@ -1910,7 +2124,7 @@ class CogDocClient:
 
     def finalize_index_migration(self, run_id: str) -> httpx.Response:
         return httpx.post(
-            self._url(f"/v1/index-migrations/{run_id}/finalize"),
+            self._url(f"/v1/index-migrations/{_path_segment(run_id)}/finalize"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -1943,7 +2157,9 @@ class CogDocClient:
         self, draft_id: str, *, top_k: int = 12
     ) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/retrieval-eval-drafts/{draft_id}/candidates"),
+            self._url(
+                f"/v1/retrieval-eval-drafts/{_path_segment(draft_id)}/candidates"
+            ),
             params={"top_k": top_k},
             timeout=self.timeout,
             headers=self._headers,
@@ -1966,7 +2182,7 @@ class CogDocClient:
         if annotations is not None:
             payload["annotations"] = dict(annotations)
         return httpx.post(
-            self._url(f"/v1/retrieval-eval-drafts/{draft_id}/review"),
+            self._url(f"/v1/retrieval-eval-drafts/{_path_segment(draft_id)}/review"),
             json=payload,
             timeout=self.timeout,
             headers=self._headers,
@@ -1988,11 +2204,18 @@ class CogDocClient:
             headers=self._headers,
         )
 
-    def claim_verification_review_summary(self) -> httpx.Response:
+    def claim_verification_review_summary(
+        self, kb_id: str | None = None
+    ) -> httpx.Response:
+        request_options: dict[str, Any] = {
+            "timeout": self.timeout,
+            "headers": self._headers,
+        }
+        if kb_id is not None:
+            request_options["params"] = {"kb_id": kb_id}
         return httpx.get(
             self._url("/v1/claim-verification/reviews/summary"),
-            timeout=self.timeout,
-            headers=self._headers,
+            **request_options,
         )
 
     def list_claim_verification_reviews(
@@ -2001,8 +2224,14 @@ class CogDocClient:
         status: str | None = None,
         limit: int = 25,
         cursor: str | None = None,
+        kb_id: str | None = None,
     ) -> httpx.Response:
-        params = {"status": status, "limit": limit, "cursor": cursor}
+        params = {
+            "status": status,
+            "limit": limit,
+            "cursor": cursor,
+            "kb_id": kb_id,
+        }
         return httpx.get(
             self._url("/v1/claim-verification/reviews"),
             params={key: value for key, value in params.items() if value is not None},
@@ -2012,7 +2241,7 @@ class CogDocClient:
 
     def get_claim_verification_review(self, review_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/claim-verification/reviews/{review_id}"),
+            self._url(f"/v1/claim-verification/reviews/{_path_segment(review_id)}"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -2026,7 +2255,9 @@ class CogDocClient:
         review_note: str = "",
     ) -> httpx.Response:
         return httpx.post(
-            self._url(f"/v1/claim-verification/reviews/{review_id}/label"),
+            self._url(
+                f"/v1/claim-verification/reviews/{_path_segment(review_id)}/label"
+            ),
             json={
                 "expected_verdict": expected_verdict,
                 "expected_revision": expected_revision,
@@ -2151,7 +2382,7 @@ class CogDocClient:
 
     def get_research_job(self, job_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/research-jobs/{job_id}"),
+            self._url(f"/v1/research-jobs/{_path_segment(job_id)}"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -2164,7 +2395,7 @@ class CogDocClient:
         sections: list[dict[str, str]],
     ) -> httpx.Response:
         return httpx.put(
-            self._url(f"/v1/research-jobs/{job_id}/plan"),
+            self._url(f"/v1/research-jobs/{_path_segment(job_id)}/plan"),
             json={
                 "expected_revision": expected_revision,
                 "sections": sections,
@@ -2181,7 +2412,7 @@ class CogDocClient:
         is_local: bool | None = None,
     ) -> httpx.Response:
         return httpx.post(
-            self._url(f"/v1/research-jobs/{job_id}/plan/auto"),
+            self._url(f"/v1/research-jobs/{_path_segment(job_id)}/plan/auto"),
             json={
                 "expected_revision": expected_revision,
                 "is_local": is_local,
@@ -2201,21 +2432,23 @@ class CogDocClient:
         }:
             raise ValueError(f"unsupported research action: {action}")
         return httpx.post(
-            self._url(f"/v1/research-jobs/{job_id}/{action}"),
+            self._url(
+                f"/v1/research-jobs/{_path_segment(job_id)}/{_path_segment(action)}"
+            ),
             timeout=self.timeout,
             headers=self._headers,
         )
 
     def get_research_provenance(self, job_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/research-jobs/{job_id}/provenance"),
+            self._url(f"/v1/research-jobs/{_path_segment(job_id)}/provenance"),
             timeout=self.timeout,
             headers=self._headers,
         )
 
     def get_research_report(self, job_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/research-jobs/{job_id}/report"),
+            self._url(f"/v1/research-jobs/{_path_segment(job_id)}/report"),
             timeout=self.timeout,
             headers=self._headers,
         )
@@ -2228,7 +2461,7 @@ class CogDocClient:
         decisions: list[dict[str, str]],
     ) -> httpx.Response:
         return httpx.put(
-            self._url(f"/v1/research-jobs/{job_id}/review"),
+            self._url(f"/v1/research-jobs/{_path_segment(job_id)}/review"),
             json={
                 "expected_revision": expected_revision,
                 "decisions": decisions,
@@ -2241,7 +2474,7 @@ class CogDocClient:
         self, job_id: str, *, expected_revision: int
     ) -> httpx.Response:
         return httpx.post(
-            self._url(f"/v1/research-jobs/{job_id}/publish"),
+            self._url(f"/v1/research-jobs/{_path_segment(job_id)}/publish"),
             json={"expected_revision": expected_revision},
             timeout=self.timeout,
             headers=self._headers,
@@ -2249,14 +2482,14 @@ class CogDocClient:
 
     def get_published_research_report(self, job_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/research-jobs/{job_id}/published-report"),
+            self._url(f"/v1/research-jobs/{_path_segment(job_id)}/published-report"),
             timeout=self.timeout,
             headers=self._headers,
         )
 
     def get_published_research_bundle(self, job_id: str) -> httpx.Response:
         return httpx.get(
-            self._url(f"/v1/research-jobs/{job_id}/published-bundle"),
+            self._url(f"/v1/research-jobs/{_path_segment(job_id)}/published-bundle"),
             timeout=self.timeout,
             headers=self._headers,
         )

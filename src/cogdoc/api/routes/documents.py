@@ -2,6 +2,7 @@ from collections.abc import Callable, Mapping
 from functools import lru_cache
 import mimetypes
 import os
+import time
 from fastapi import APIRouter, File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from cogdoc.api.ingest import KBExistsError
@@ -79,6 +80,42 @@ router = APIRouter(prefix="/v1", tags=["documents"])
 
 MAX_BATCH_UPLOAD_FILES = 20
 MAX_BATCH_UPLOAD_BYTES = 500 * 1024 * 1024
+
+
+def _with_quota_commit_guard(
+    authorization_guard: Callable[[], None] | None,
+    quota: object | None,
+    reservations: list[str | None],
+) -> Callable[[], None] | None:
+    """Combine live authorization and quota ownership at the commit fence."""
+
+    if quota is None or getattr(quota, "enabled", True) is False:
+        return authorization_guard
+    assert_live = getattr(quota, "assert_live", None)
+    if not callable(assert_live):
+        raise RuntimeError("tenant quota manager does not support commit fencing")
+
+    def guard() -> None:
+        if authorization_guard is not None:
+            authorization_guard()
+        for reservation in reservations:
+            assert_live(reservation)
+
+    return guard
+
+
+def _safe_document_filename(value: str | None) -> str | None:
+    raw = str(value or "")
+    if (
+        not raw
+        or raw in {".", ".."}
+        or raw != os.path.basename(raw)
+        or "/" in raw
+        or "\\" in raw
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
+        return None
+    return raw
 
 
 @lru_cache(maxsize=1024)
@@ -269,9 +306,11 @@ def _delete_kb(
     retrieval_feedback_store=None,
     retrieval_eval_draft_store=None,
     research_job_store=None,
+    claim_verification_review_store=None,
     resource_access_store=None,
     tenant_id="default",
     authorization_guard: Callable[..., None] | None = None,
+    derived_knowledge_index_clearer: Callable[[str], None] | None = None,
 ):
     # registry 删除与落 tombstone 必须与 create 在同一把锁内原子完成。
     authorized = False
@@ -300,6 +339,23 @@ def _delete_kb(
                 )
             except Exception as exc:
                 raise KBCleanupError(f"KB 派生/反馈状态删除失败: {kb_id}") from exc
+            try:
+                if derived_knowledge_index_clearer is not None:
+                    derived_knowledge_index_clearer(kb_id)
+            except Exception as exc:
+                raise KBCleanupError(f"KB 派生知识索引删除失败: {kb_id}") from exc
+            try:
+                if claim_verification_review_store is not None:
+                    clear_claim_reviews = getattr(
+                        claim_verification_review_store, "clear_kb", None
+                    )
+                    if not callable(clear_claim_reviews):
+                        raise RuntimeError(
+                            "claim verification review store does not support KB cleanup"
+                        )
+                    clear_claim_reviews(tenant_id, kb_id)
+            except Exception as exc:
+                raise KBCleanupError(f"KB 声明核验状态删除失败: {kb_id}") from exc
             # 连带清掉该库的会话历史，否则同名新库复用 kb_id 会捡到旧对话。
             try:
                 if session_store is not None:
@@ -312,6 +368,10 @@ def _delete_kb(
                     resource_access_store.clear_kb(tenant_id, kb_id)
                 except Exception as exc:
                     raise KBCleanupError(f"KB ACL 状态删除失败: {kb_id}") from exc
+            try:
+                index_jobs.clear_kb(kb_id)
+            except Exception as exc:
+                raise KBCleanupError(f"KB 索引任务状态删除失败: {kb_id}") from exc
             # Registry deletion is the final commit point. Every state keyed
             # by the deterministic storage ID is gone first, so a same-slug
             # create can never inherit old documents, grants, or capabilities.
@@ -452,7 +512,9 @@ def _validate_workspace_role_ids(
             not role_id
             or len(role_id) > 160
             or role_id != raw
-            or any(ord(character) < 32 or ord(character) == 127 for character in role_id)
+            or any(
+                ord(character) < 32 or ord(character) == 127 for character in role_id
+            )
         ):
             raise ValueError("角色标识无效")
         if role_id not in selected:
@@ -463,9 +525,7 @@ def _validate_workspace_role_ids(
     else:
         rows = auth_store.list_workspace_roles(tenant_id)
         available = {
-            str(row.get("role_id") or "")
-            for row in rows
-            if isinstance(row, Mapping)
+            str(row.get("role_id") or "") for row in rows if isinstance(row, Mapping)
         }
     if any(role_id not in available for role_id in selected):
         raise ValueError("包含不存在的工作区角色")
@@ -748,6 +808,13 @@ async def delete_knowledge_base(kb_id: str, request: Request):
                 storage_id,
                 authority=authority_evidence,
             )
+            try:
+                delete_trace_files(doc_id=storage_id)
+            except Exception:
+                # The distributed deletion is already committed. Trace access
+                # remains epoch-fenced, so a node-local cleanup failure must not
+                # turn a successful DELETE into an unretryable 500 response.
+                pass
         except KeyError:
             return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
         except (HAChatAuthorityChanged, StaleSessionLease, PermissionError):
@@ -892,6 +959,7 @@ async def delete_knowledge_base(kb_id: str, request: Request):
             request.app.state.retrieval_feedback_store,
             request.app.state.retrieval_eval_draft_store,
             request.app.state.research_job_store,
+            request.app.state.claim_verification_review_store,
             getattr(request.app.state, "resource_access_store", None),
             scope.tenant_id,
             # Live authority was linearized immediately before connector
@@ -900,6 +968,7 @@ async def delete_knowledge_base(kb_id: str, request: Request):
             # already erased credentials/artifacts; lifecycle fencing prevents
             # any unrelated mutation from entering this queue in between.
             None,
+            request.app.state.derived_knowledge_index_clearer,
         )
     except KBCleanupError:
         # 清理不完整：registry 与 manifest 均保留，返回可重试错误而非误报删除成功。
@@ -1014,7 +1083,9 @@ async def upload_document(
     if scope is None:
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
 
-    filename = os.path.basename(file.filename or "")
+    filename = _safe_document_filename(file.filename)
+    if filename is None:
+        return _error(ErrorCode.BAD_REQUEST, "文件名无效", 422)
     suffix = os.path.splitext(filename)[1].casefold()
     if filename.startswith(CONNECTOR_MATERIALIZED_PREFIX):
         return _error(
@@ -1031,9 +1102,7 @@ async def upload_document(
 
     principal = request_principal(request)
     try:
-        selected_embedding_profile = _validate_embedding_profile(
-            embedding_profile_id
-        )
+        selected_embedding_profile = _validate_embedding_profile(embedding_profile_id)
     except (RuntimeError, ValueError) as exc:
         return _error(ErrorCode.BAD_REQUEST, str(exc), 422)
     try:
@@ -1127,6 +1196,9 @@ async def upload_document(
             return _error(ErrorCode.TENANT_QUOTA_EXCEEDED, str(exc), 409)
         except TenantMutationInProgress as exc:
             return _error(ErrorCode.BAD_REQUEST, str(exc), 409)
+    authorization_guard = _with_quota_commit_guard(
+        authorization_guard, quota, [reservation]
+    )
     # submit_upload 含同步 SQLite 写：放线程池执行，绝不阻塞事件循环（否则 SQLite 锁竞争会冻结整个 API）。
     try:
         job = await run_sync(
@@ -1177,9 +1249,7 @@ async def upload_documents_batch(
         selected_roles = _validate_workspace_role_ids(
             request, principal.tenant_id, allowed_role_ids
         )
-        selected_embedding_profile = _validate_embedding_profile(
-            embedding_profile_id
-        )
+        selected_embedding_profile = _validate_embedding_profile(embedding_profile_id)
     except (RuntimeError, ValueError) as exc:
         return _error(ErrorCode.BAD_REQUEST, str(exc), 422)
 
@@ -1189,7 +1259,9 @@ async def upload_documents_batch(
     seen_names: set[str] = set()
     total_bytes = 0
     for upload in files:
-        filename = os.path.basename(upload.filename or "")
+        filename = _safe_document_filename(upload.filename)
+        if filename is None:
+            return _error(ErrorCode.BAD_REQUEST, "批量上传中存在无效文件名", 422)
         suffix = os.path.splitext(filename)[1].casefold()
         if not filename or filename in seen_names:
             return _error(
@@ -1230,9 +1302,7 @@ async def upload_documents_batch(
                     413,
                 )
         if suffix != ".pdf" and content.startswith(_PDF_MAGIC):
-            return _error(
-                ErrorCode.INVALID_PDF, f"{filename}: 内容与扩展名不匹配", 400
-            )
+            return _error(ErrorCode.INVALID_PDF, f"{filename}: 内容与扩展名不匹配", 400)
         if suffix == ".pdf" and not content.startswith(_PDF_MAGIC):
             return _error(ErrorCode.INVALID_PDF, f"{filename}: 不是合法 PDF", 400)
         uploads.append((filename, bytes(content)))
@@ -1292,9 +1362,7 @@ async def upload_documents_batch(
         for guard in authorization_guards:
             guard()
 
-    authorization_guard = (
-        revalidate_authorization if authorization_guards else None
-    )
+    authorization_guard = revalidate_authorization if authorization_guards else None
 
     storage_id = scope.storage_id
     source_dir = registry.source_dir(storage_id)
@@ -1328,6 +1396,10 @@ async def upload_documents_batch(
             for reservation in reservations:
                 quota.release(reservation)
 
+    authorization_guard = _with_quota_commit_guard(
+        authorization_guard, quota, reservations
+    )
+
     try:
         job = await run_sync(
             request.app.state.offload_executor,
@@ -1357,21 +1429,57 @@ async def delete_document(kb_id: str, name: str, request: Request):
     if scope is None:
         return _error(ErrorCode.KB_NOT_FOUND, "知识库不存在", 404)
 
-    safe_name = os.path.basename(name)
+    safe_name = _safe_document_filename(name)
+    if safe_name is None:
+        return _error(ErrorCode.BAD_REQUEST, "文件名无效", 400)
     if safe_name.startswith(CONNECTOR_MATERIALIZED_PREFIX):
-        return _error(ErrorCode.DOCUMENT_NOT_FOUND, "文档不存在", 404)
-    if not source_is_authorized(
-        request, scope, safe_name, permission=Permission.DELETE
-    ):
         return _error(ErrorCode.DOCUMENT_NOT_FOUND, "文档不存在", 404)
     storage_id = scope.storage_id
     path = os.path.join(registry.source_dir(storage_id), safe_name)
     access_store = getattr(request.app.state, "resource_access_store", None)
+    document_id = build_document_id(safe_name)
+    managed_by = f"document-delete:{document_id}"
+    pending_finalize = False
+    if access_store is not None:
+        pending_finalize = document_id in access_store.retiring_document_ids(
+            scope.tenant_id,
+            storage_id,
+            managed_by,
+        )
+    source_authorized = source_is_authorized(
+        request, scope, safe_name, permission=Permission.DELETE
+    )
+    if not source_authorized and pending_finalize:
+        decision = resource_access_decision(
+            request,
+            scope,
+            permission=Permission.DELETE,
+        )
+        source_authorized = decision is None or (
+            decision is not False and bool(getattr(decision, "is_allowed", False))
+        )
+    if not source_authorized:
+        return _error(ErrorCode.DOCUMENT_NOT_FOUND, "文档不存在", 404)
+    claim_review_store = getattr(
+        request.app.state, "claim_verification_review_store", None
+    )
     on_succeeded: Callable[[], None] | None = None
     on_retiring: Callable[[], None] | None = None
+    succeeded_callbacks: list[Callable[[], None]] = []
+    if claim_review_store is not None:
+        clear_document_reviews = getattr(claim_review_store, "clear_document", None)
+        if not callable(clear_document_reviews):
+            return _error(
+                ErrorCode.KB_CLEANUP_FAILED,
+                "声明核验存储不支持文档清理",
+                503,
+            )
+
+        def clear_claim_reviews() -> None:
+            clear_document_reviews(scope.tenant_id, storage_id, safe_name)
+
+        succeeded_callbacks.append(clear_claim_reviews)
     if access_store is not None:
-        document_id = build_document_id(safe_name)
-        managed_by = f"document-delete:{document_id}"
 
         def fence_document_access() -> None:
             access_store.begin_document_retirement(
@@ -1392,13 +1500,32 @@ async def delete_document(kb_id: str, name: str, request: Request):
                 (document_id,),
             )
 
-        on_retiring = fence_document_access
-        on_succeeded = clear_document_access
+        if not pending_finalize:
+            on_retiring = fence_document_access
+        succeeded_callbacks.append(clear_document_access)
+    if succeeded_callbacks:
+
+        def finalize_document_deletion() -> None:
+            for callback in succeeded_callbacks:
+                last_error: Exception | None = None
+                for attempt in range(4):
+                    try:
+                        callback()
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < 3:
+                            time.sleep(0.05 * (2**attempt))
+                if last_error is not None:
+                    raise last_error
+
+        on_succeeded = finalize_document_deletion
     authorization_guard = _live_session_authorization_guard(
         request,
         scope,
         permission=Permission.DELETE,
-        source=safe_name,
+        source=None if pending_finalize else safe_name,
     )
     # 同步 SQLite 写下放线程池，不阻塞事件循环；存在性检查仍在 executor command 内完成，路由始终 202。
     job = await run_sync(
@@ -1409,6 +1536,7 @@ async def delete_document(kb_id: str, name: str, request: Request):
         on_succeeded,
         authorization_guard,
         on_retiring,
+        pending_finalize,
     )
     return _public_job(job, request)
 

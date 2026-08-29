@@ -54,6 +54,7 @@ def _sink(
     acl_sync=None,
     quota_reserver=None,
     quota_releaser=None,
+    quota_checker=None,
     recovering_commit=False,
     connector_type="local-directory",
     index_timeout_seconds=30.0,
@@ -70,6 +71,7 @@ def _sink(
         artifact_versions_to_keep=artifact_versions_to_keep,
         quota_reserver=quota_reserver,
         quota_releaser=quota_releaser,
+        quota_checker=quota_checker,
         index_timeout_seconds=index_timeout_seconds,
     )
     sink.begin(
@@ -99,6 +101,7 @@ def test_materialized_sink_batches_manifest_and_quota_handoff(tmp_path, monkeypa
         [],
         quota_reserver=reserve,
         quota_releaser=releases.append,
+        quota_checker=lambda token: None,
     )
     manifest_writes = 0
     original_write = sink._write_manifest
@@ -140,6 +143,26 @@ def test_materialized_sink_batches_manifest_and_quota_handoff(tmp_path, monkeypa
     sink.finalize()
     assert releases == ["quota-token"]
     catalog.close()
+
+
+def test_manifest_recovery_rejects_traversal_filename(tmp_path):
+    current = tmp_path / "current"
+    current.mkdir()
+    MaterializedSyncSink._write_json_atomic(
+        current / ".cogdoc-connection.json",
+        {
+            "schema_version": 1,
+            "sources": {
+                "source-1": {
+                    "filename": "../outside.md",
+                    "document": {},
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="manifest filename is invalid"):
+        MaterializedSyncSink._read_manifest(current, required=True)
 
 
 def test_materialized_sink_delete_removes_the_staged_file(tmp_path):
@@ -293,6 +316,7 @@ def test_commit_recovery_uses_backup_for_quota_after_first_swap_rename(tmp_path)
         job="job-interrupted",
         quota_reserver=quota.reserve_connector_snapshot,
         quota_releaser=quota.release,
+        quota_checker=quota.assert_live,
         recovering_commit=True,
     )
     recovered.recover_commit(heartbeat=lambda: None)

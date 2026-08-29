@@ -146,6 +146,7 @@ async def test_kb_delete_erases_connector_capabilities_and_blocks_old_incarnatio
         source_artifact_store=artifacts,
         connector_credential_vault=vault,
         connector_oauth=oauth,
+        derived_knowledge_index_clearer=lambda _storage_id: None,
         connector_oauth_redirect_uris={"notion": callback_uri},
     )
 

@@ -849,6 +849,27 @@ def test_s3_signs_session_token_lists_and_fetches_object():
     assert "x-amz-security-token" in transport.calls[0][2]["Authorization"]
 
 
+def test_s3_signature_canonical_host_matches_lowercase_transport_host_with_port():
+    upper_transport = FakeTransport([_response(b"")])
+    lower_transport = FakeTransport([_response(b"")])
+    options = {
+        "bucket": "bucket",
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": "secret",
+        "clock": lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+    }
+    upper = S3Connector(transport=upper_transport, **options)
+    lower = S3Connector(transport=lower_transport, **options)
+
+    upper._signed("GET", "https://BUCKET.S3.EXAMPLE:9443/docs/a.md")
+    lower._signed("GET", "https://bucket.s3.example:9443/docs/a.md")
+
+    assert upper_transport.calls[0][2]["Authorization"] == (
+        lower_transport.calls[0][2]["Authorization"]
+    )
+
+
 def test_http_transport_blocks_private_dns_before_opening():
     opener = SimpleNamespace(open=lambda request, timeout: pytest.fail("must not open"))
     transport = HttpTransport(

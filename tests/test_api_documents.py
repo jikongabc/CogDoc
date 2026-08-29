@@ -82,6 +82,7 @@ def _make_app(
             path=str(tmp_path / "retrieval_eval_drafts.jsonl")
         ),
         research_job_store=ResearchJobStore(path=str(tmp_path / "research_jobs.json")),
+        derived_knowledge_index_clearer=lambda _kb_id: None,
         resource_access_store=resource_access_store,
     )
     return app, source_dir_for
@@ -260,6 +261,50 @@ async def test_delete_recreated_kb_clears_review_state(tmp_path, monkeypatch):
                 json={"kb_id": "kb", "objective": "删除后不应保留的研究目标"},
             )
             assert research_response.status_code == 201
+            app.state.index_jobs._store.create(
+                {
+                    "job_id": "old-index-job",
+                    "kb_id": "kb",
+                    "status": "succeeded",
+                    "created_at": "2026-08-27T00:00:00+00:00",
+                }
+            )
+            app.state.claim_verification_review_store.record_candidates(
+                "default",
+                [
+                    {
+                        "review_id": "a" * 32,
+                        "kb_id": "kb",
+                        "task_type": "qa",
+                        "policy_id": "b" * 16,
+                        "effective_mode": "shadow",
+                        "decision": "would_allow",
+                        "claim_id": "claim-1",
+                        "claim": "删除后不应保留的声明",
+                        "actual_verdict": "supported",
+                        "reason": "测试",
+                        "confidence": 0.9,
+                        "duration_ms": 1.0,
+                        "cited_chunk_ids": ["chunk-1"],
+                        "supporting_chunk_ids": ["chunk-1"],
+                        "evidence": [
+                            {
+                                "chunk_id": "chunk-1",
+                                "source": "old.pdf",
+                                "text": "删除后不应保留的证据",
+                            }
+                        ],
+                        "evidence_complete": True,
+                    }
+                ],
+            )
+            app.state.index_jobs._journal.begin_upload(
+                "old-journal",
+                "kb",
+                str(tmp_path / "old.pdf"),
+                str(tmp_path / "old.backup"),
+                had_old=True,
+            )
 
             before = await client.get("/v1/review-queue", params={"kb_id": "kb"})
             deleted = await client.delete("/v1/knowledge-bases/kb")
@@ -270,6 +315,11 @@ async def test_delete_recreated_kb_clears_review_state(tmp_path, monkeypatch):
             )
             eval_drafts_after = app.state.retrieval_eval_draft_store.export_records()
             research_jobs_after = app.state.research_job_store.export_records()
+            index_jobs_after = app.state.index_jobs.list({"kb"})
+            claim_reviews_after = app.state.claim_verification_review_store.list_page(
+                "default", kb_id="kb"
+            )["items"]
+            journal_after = app.state.index_jobs._journal.has_entries("kb")
 
     assert before.json()["feedback_counts"]["total"] == 1
     assert before.json()["retrieval_feedback"]["enabled"] == 1
@@ -283,7 +333,11 @@ async def test_delete_recreated_kb_clears_review_state(tmp_path, monkeypatch):
     assert body["retrieval_feedback"]["enabled"] == 0
     assert eval_drafts_after == []
     assert research_jobs_after == []
+    assert index_jobs_after == []
+    assert claim_reviews_after == []
     assert pending_count.json()["total"] == 0
+
+    assert journal_after is False
 
 
 # 验证 delete kb cleanup failure keeps kb。
@@ -635,9 +689,7 @@ async def test_batch_upload_writes_all_files_and_indexes_once(tmp_path, monkeypa
         calls.append((kb_id, embedding_profile_id))
         return SimpleNamespace(document_count=2, chunk_count=4, ocr_summary=None)
 
-    app, source_dir_for = _make_app(
-        tmp_path, ingest_fn=ingest, monkeypatch=monkeypatch
-    )
+    app, source_dir_for = _make_app(tmp_path, ingest_fn=ingest, monkeypatch=monkeypatch)
     async with app.router.lifespan_context(app):
         async with await _client(app) as client:
             await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
@@ -771,9 +823,15 @@ async def test_successful_document_delete_clears_acl_before_job_succeeds_and_reu
                 "default", storage_id, "alice", "viewer", document_id=document_id
             )
 
+            cleared_reviews = []
+            app.state.claim_verification_review_store.clear_document = lambda *scope: (
+                cleared_reviews.append(scope)
+            )
+
             deleted = await client.delete("/v1/knowledge-bases/kb/documents/a.pdf")
             deleted_done = await _wait_job(client, deleted.json()["job_id"])
             assert deleted_done.json()["status"] == "succeeded"
+            assert cleared_reviews == [("default", storage_id, "a.pdf")]
             # The terminal success is published only after both policy and
             # document-scoped grants have been removed.
             assert (
@@ -795,6 +853,82 @@ async def test_successful_document_delete_clears_acl_before_job_succeeds_and_reu
     new_policy = access_store.get_document_policy("default", storage_id, document_id)
     assert new_policy is not None
     assert new_policy["policy"] == "inherit"
+    assert (
+        access_store.list_grants("default", storage_id, document_id=document_id) == []
+    )
+
+
+@pytest.mark.anyio
+async def test_document_delete_retry_finishes_acl_after_source_commit(
+    tmp_path, monkeypatch
+):
+    access_store = ResourceAccessStore(tmp_path / "resource-access.db")
+    app, _ = _make_app(
+        tmp_path,
+        monkeypatch=monkeypatch,
+        resource_access_store=access_store,
+    )
+    document_id = build_document_id("a.pdf")
+    original_finish = access_store.finish_document_retirement
+    attempts = 0
+
+    def fail_finish(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise OSError("temporary ACL failure")
+
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            created = await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
+            assert created.status_code == 201
+            storage_id = app.state.kb_registry.resolve("kb", "default")["storage_id"]
+            uploaded = await client.post(
+                "/v1/knowledge-bases/kb/documents",
+                files={"file": ("a.pdf", b"%PDF-1.4 data", "application/pdf")},
+            )
+            assert (await _wait_job(client, uploaded.json()["job_id"])).json()[
+                "status"
+            ] == "succeeded"
+            access_store.set_document_policy(
+                "default", storage_id, document_id, "a.pdf", policy="private"
+            )
+            access_store.grant_subject(
+                "default", storage_id, "alice", "viewer", document_id=document_id
+            )
+            monkeypatch.setattr(
+                access_store,
+                "finish_document_retirement",
+                fail_finish,
+            )
+
+            first = await client.delete("/v1/knowledge-bases/kb/documents/a.pdf")
+            first_done = await _wait_job(client, first.json()["job_id"])
+            assert first_done.json()["status"] == "failed"
+            assert attempts == 4
+            assert access_store.retiring_document_ids(
+                "default",
+                storage_id,
+                f"document-delete:{document_id}",
+            ) == (document_id,)
+
+            monkeypatch.setattr(
+                access_store,
+                "finish_document_retirement",
+                original_finish,
+            )
+            retried = await client.delete("/v1/knowledge-bases/kb/documents/a.pdf")
+            retried_done = await _wait_job(client, retried.json()["job_id"])
+            assert retried_done.json()["status"] == "succeeded"
+
+    assert (
+        access_store.retiring_document_ids(
+            "default",
+            storage_id,
+            f"document-delete:{document_id}",
+        )
+        == ()
+    )
+    assert access_store.get_document_policy("default", storage_id, document_id) is None
     assert (
         access_store.list_grants("default", storage_id, document_id=document_id) == []
     )

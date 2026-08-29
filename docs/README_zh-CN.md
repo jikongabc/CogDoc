@@ -97,26 +97,23 @@ make run        # 构建/复用索引、预热模型、启动控制台
 
 把 `.env.example` 复制为 `.env`，至少设置云端 `LLM_API_KEY`（或用 `/local` 走 Ollama）。把受支持的文档放进收件箱 `your_documents/`（或设置 `COGDOC_DOC_DIR`）。每次修改 `rust_core/src/` 下的代码后都必须重跑 `make native`——`.so` 不会自动重建，也不纳入版本控制。
 
-持久账号默认关闭，保证旧部署升级后行为不突变。个人或团队部署应设置 `COGDOC_ACCOUNT_AUTH_ENABLED=true`，启动 API 后注册首位 owner，并使用返回的 Bearer token。企业可随后配置 [OIDC 单点登录](OIDC_zh-CN.md)，按需接入 [SCIM 2.0](SCIM_zh-CN.md) 预配用户/组，再设置 `COGDOC_SELF_REGISTRATION_ENABLED=false` 关闭公开注册。
+持久账号默认关闭，保证旧部署升级后行为不突变。个人或团队初始化时应临时同时设置 `COGDOC_ACCOUNT_AUTH_ENABLED=true` 与 `COGDOC_SELF_REGISTRATION_ENABLED=true`，注册首位 owner 后立即关闭自主注册，后续使用邀请或 SSO。企业可配置 [OIDC 单点登录](OIDC_zh-CN.md)，并按需接入 [SCIM 2.0](SCIM_zh-CN.md) 预配用户/组。
 
 ## 使用流程
 
-CLI 和网页端共用同一条 建库 → 入库 → 提问 流程。先按[快速开始](#快速开始)装一次环境：安装依赖、构建原生扩展（`make native && make check`）、配置 `.env`、把 PDF 放进 `your_documents/`。
+CLI 和网页端使用同一套版本化 API、账号、Workspace、ACL 与任务状态。先按[快速开始](#快速开始)安装依赖、构建原生扩展（`make native && make check`）、配置 `.env` 并启动 API。
 
 ### 命令行控制台
 
 ```bash
-make run            # python -m cogdoc.cli
+make serve                         # Web 与产品 CLI 共用的 FastAPI
+cogdoc login owner@example.com     # 只保存不透明会话令牌，文件权限 0600
+cogdoc                              # 进入交互式 API 控制台
 ```
 
-之后在控制台里用斜杠命令完成全部操作：
+`cogdoc --help` 提供适合自动化的命令，覆盖工作区、角色、知识库/文档 ACL、批量上传、流式对话、会话、派生知识、Research、连接器、任务、Trace、RAG 评测和索引代际。交互模式中同一命令可以带 `/` 前缀，直接输入普通文本会在当前知识库发起流式问答。
 
-1. `/kb new <名称>` — 建知识库，`/kb` 列出/切换。
-2. `/add <文件名>` — 把收件箱 `your_documents/` 里的受支持文档加入当前库（同步重建索引）。
-3. `/new` — 开新对话；`/chats`、`/open` 浏览持久化历史。
-4. 直接提问走 **QA**；"总结 `<文件>`" 走 **Summary**；"对比 `<a>` 和 `<b>`" 走 **Compare**。
-5. `/cloud` 用云端 LLM，`/local` 用 Ollama；`/help` 列出命令；`exit` 退出。
-6. `/dk` 或 `/knowledge` 管理派生知识，`/feedback` 查看反馈与反馈分析，`/tuning` 控制检索调权，`/review` 查看审核队列摘要、闭环指标和导出结果。
+旧版直连存储的收件箱控制台仅作为离线恢复入口保留：`cogdoc --local-storage` 或 `cogdoc-local`。它使用兼容用的 `default` 租户，不是正常多租户产品入口。详细约定见 [CLI 与 Web 功能对齐](cli-web-parity.md)。
 
 `make debug` 打开针对单个库的独立 Debug 控制台。可以直接提问获得回答和 trace 摘要，再用 `/trace`、`/steps`、`/rewrite`、`/evidence`、`/config` 查看最近一次请求，也可以用 `/retrieve <问题>` 只检查召回和重排输出、不调用 LLM。需要直接调试指定知识库时，可运行 `python -m cogdoc.debug --kb <kb_id>`。
 
@@ -234,7 +231,7 @@ Compare 的中间模型文本可能包含内部 Evidence ID，且尚未通过终
 
 ### 账号、工作区与 RAG 权限
 
-`COGDOC_ACCOUNT_AUTH_ENABLED=false` 是向后兼容默认值。设为 `true` 后启用持久真人身份：注册会在一个事务内创建用户、owner 成员关系、个人工作区及登录会话。密码最少 12 个字符，以带版本和随机盐的 scrypt 哈希保存。登录会话与邀请值都是只在签发时返回的不透明 bearer 秘密，数据库仅保存其 SHA-256 摘要，邀请只能使用一次。会话会过期，可单独或全量撤销；修改密码会撤销其他活动会话；连续登录失败会触发可配置的临时锁定。客户端用 `Authorization: Bearer <token>` 发送会话，不应把 token 放入 URL 或日志。
+`COGDOC_ACCOUNT_AUTH_ENABLED=false` 是向后兼容的本地开发默认值。无凭据 owner 访问只接受回环地址客户端，非回环客户端统一返回 401。设为 `true` 后启用持久真人身份：注册会在一个事务内创建用户、owner 成员关系、个人工作区及登录会话。密码最少 12 个字符，以带版本和随机盐的 scrypt 哈希保存。登录会话与邀请值都是只在签发时返回的不透明 bearer 秘密，数据库仅保存其 SHA-256 摘要，邀请只能使用一次。会话会过期，可单独或全量撤销；修改密码会撤销其他活动会话；连续登录失败会触发可配置的临时锁定。客户端用 `Authorization: Bearer <token>` 发送会话，不应把 token 放入 URL 或日志。
 
 owner 可管理工作区本身；admin 同时拥有写入、删除、审核/发布和权限管理；editor 可读、查询和写入；reviewer 可读、查询、审核和发布；viewer 可读和查询。owner/admin 管理成员与邀请，但普通角色修改不能凭空产生另一个 owner，也不能移除最后一位 owner。切换工作区会改变该登录会话的兼容活动工作区；新版客户端还会在每个受保护请求中发送非敏感的 `X-CogDoc-Workspace` 选择器，因此两个共用同一 Bearer 的浏览器标签页也能各自固定到不同成员关系。服务端仍会验证该成员关系；选择器与 `/v1/workspaces/{id}` 路径冲突时以不透明 404 fail-closed。不带该 header 的旧客户端继续使用 session 活动工作区。同一公开 slug 的知识库按工作区使用不同物理身份；真人账号的对话会话与 Trace 还会按用户分隔。跨工作区请求统一表现为资源不存在，不泄露另一租户的资源。
 
@@ -244,7 +241,7 @@ owner 可管理工作区本身；admin 同时拥有写入、删除、审核/发�
 
 查询权限会固化成明确的 `ALL`、非空 `SUBSET` 或 `DENY`。当结果为子集时，Chroma 向量过滤、BM25 候选选择、已审核派生知识、Summary、Compare 与 QA 都会在 top-k/重排之前使用来源 allowlist；融合后还有第二道过滤，防止过期或自定义后端忽略过滤后把越权结果带入 Prompt、Trace 或持久证据。这也避免高分越权 chunk 在 top-k 中挤掉可见证据。后台 Research 会冻结创建者及精确来源边界，在召回前后重新检查当前成员关系和 ACL；无法执行子集过滤的后端会被拒绝，权限撤销会中止任务，后续新增授权也不会静默扩大已经运行的任务范围。
 
-静态服务主体仍可用于自动化和分阶段升级。`COGDOC_API_PRINCIPALS` 把每个 key 映射到 `tenant_id`、`subject_id` 与角色；旧 `COGDOC_API_KEYS` 和 `COGDOC_EVAL_REVIEW_API_KEYS` 仍作为 `default` 工作区 admin。开启账号鉴权后，显式服务 key 与真人会话可以并存；关闭账号鉴权时，只有三类静态凭据全部为空才进入开放本地 owner 模式。同时发送 Bearer 与 `X-API-Key` 时 Bearer 优先。显式 reviewer/admin/owner 可使用证据评测和 Research 审核接口，落盘操作人始终来自认证身份。硬配额覆盖知识库数、已提交加在途 PDF 数及 PDF 字节；`/v1/tenant` 返回 `limits`、`usage`、`reserved`，超限返回 HTTP 409 与 `TENANT_QUOTA_EXCEEDED`。
+静态服务主体仍可用于自动化和分阶段升级。`COGDOC_API_PRINCIPALS` 把每个 key 映射到 `tenant_id`、`subject_id` 与角色；旧 `COGDOC_API_KEYS` 仍作为 `default` 工作区 admin，`COGDOC_EVAL_REVIEW_API_KEYS` 则按最小权限作为 `default` 工作区 reviewer。开启账号鉴权后，显式服务 key 与真人会话可以并存；关闭账号鉴权时，只有三类静态凭据全部为空才进入仅限 loopback 的本地 owner 模式。同时发送 Bearer 与 `X-API-Key` 时 Bearer 优先。显式 reviewer/admin/owner 可使用证据评测和 Research 审核接口，落盘操作人始终来自认证身份。硬配额覆盖知识库数、已提交加在途 PDF 数及 PDF 字节；`/v1/tenant` 返回 `limits`、`usage`、`reserved`，超限返回 HTTP 409 与 `TENANT_QUOTA_EXCEEDED`。
 
 `COGDOC_API_KEY`（单数）是 Streamlit/CLI 客户端向外发请求时使用的凭据，不是服务端的 key 白名单。如果 Streamlit 进程设置了它，而当前浏览器没有真人会话 token，界面会按设计直接进入服务 key 模式并跳过账号登录页。共享或多用户前端必须留空该变量；API 端用 `COGDOC_API_KEYS` / `COGDOC_API_PRINCIPALS` 配置可接受的服务身份，真人用户应正常登录。单数 key 只适合受信的单用户控制台或专用自动化前端。
 
@@ -388,7 +385,7 @@ flowchart TD
     class LLM,RUST,EMB native
 ```
 
-CLI 和 Debug 会绕过 FastAPI HTTP 适配层，直接在同一进程内调用 Python 核心服务；内置 Streamlit 网页端才通过 HTTP/SSE 访问 FastAPI。CLI、Debug 和 FastAPI 都会在启动时获取单实例进程锁，并先恢复 mutation journal，再处理知识库变更。
+产品 CLI 与 Web 都通过 HTTP/SSE 访问 FastAPI，因此共享账号、Workspace、ACL 与异步任务状态。只有 `cogdoc-debug` 和显式的 `cogdoc-local` 离线维护控制台仍在进程内调用 Python 服务；这两个维护入口会获取单实例锁，不能与使用同一数据目录的 API 同时运行。
 
 下图展开入库、检索和本地持久化的边界：PDF 内容与已审核派生知识分别建索引，查询时再汇入同一候选池；反馈不会直接改写索引，而是先沉淀为可审核记录或可回滚的检索调权。
 
@@ -660,7 +657,8 @@ CogDoc/
 
 | 路径 | 负责内容 |
 | --- | --- |
-| `src/cogdoc/cli.py` | 多知识库、多对话命令行入口（`python -m cogdoc.cli` / `cogdoc`） |
+| `src/cogdoc/api_cli.py` | 轻量 API 产品命令行入口（`python -m cogdoc.api_cli` / `cogdoc`） |
+| `src/cogdoc/cli.py` | 显式离线直连存储维护控制台（`cogdoc-local`） |
 | `src/cogdoc/debug.py` | 独立 Trace Debug 控制台（`python -m cogdoc.debug` / `cogdoc-debug`） |
 | `src/cogdoc/agents/` | 路由、问题改写、生成、引用校验、反馈理解，以及 Summary / Compare 的 Agent 原语 |
 | `src/cogdoc/api/` | FastAPI app、路由、schema、持久化、访问控制、metrics、feedback / knowledge store、webhook |
@@ -727,6 +725,7 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `COGDOC_WEBHOOK_URL` | 未设置 | 待审核知识与连接同步生命周期事件的可选回调地址 |
 | `COGDOC_WEBHOOK_SECRET` | 未设置 | 回调请求携带的可选共享密钥 |
 | `COGDOC_WEBHOOK_TIMEOUT_SECONDS` | `3` | 回调投递请求超时时间 |
+| `COGDOC_WEBHOOK_ALLOW_PRIVATE_HOSTS` | `false` | 显式允许私网 HTTPS 回调目标；默认仅允许经 DNS 固定校验的公网 HTTPS |
 | `COGDOC_CREDENTIAL_MASTER_KEYS` | 未设置 | key ID 到 base64url 32 字节 AES key 的 JSON keyring；未设置时关闭 vault/OAuth，环境引用连接保持兼容 |
 | `COGDOC_CREDENTIAL_ACTIVE_KEY_VERSION` | `v1` | 新建/轮换凭据 envelope 使用的 key ID，必须存在于 keyring |
 | `COGDOC_CONNECTOR_OAUTH_PUBLIC_BASE_URL` | 未设置 | 用于构造供应商精确 callback 的 API 公网 origin；生产必须 HTTPS |
@@ -748,16 +747,16 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `COGDOC_FEEDBACK_STORE` | `jsonl` | 反馈存储后端；设为 `sqlite` 时使用数据库并导出逐行对象副本 |
 | `COGDOC_DERIVED_KNOWLEDGE_INDEX_AUTO_REFRESH` | `false` | 知识审核变更后在后台重建派生知识向量索引 |
 | `COGDOC_ACCOUNT_AUTH_ENABLED` | `false` | 启用持久真人账号、登录会话、工作区、邀请及资源 ACL；默认关闭以兼容旧部署 |
-| `COGDOC_SELF_REGISTRATION_ENABLED` | `true` | 账号模式下允许公开注册；企业完成首位 owner 初始化后可关闭，仅使用邀请 |
+| `COGDOC_SELF_REGISTRATION_ENABLED` | `false` | 仅在首位 owner 初始化时临时开启；完成后立即关闭并使用邀请或 SSO |
 | `COGDOC_AUTH_SESSION_TTL_SECONDS` | `2592000` | 登录会话有效期（30 天） |
 | `COGDOC_AUTH_INVITE_TTL_SECONDS` | `604800` | 一次性工作区邀请有效期（7 天） |
 | `COGDOC_AUTH_MAX_FAILED_LOGINS` | `5` | 触发临时锁定前允许的连续密码失败次数 |
 | `COGDOC_AUTH_LOCKOUT_SECONDS` | `900` | 达到失败上限后的账号锁定时长 |
 | `COGDOC_API_KEYS` | 未设置 | 逗号分隔的旧版 default/admin key；仅当它、principals、审核 key 都为空时开放鉴权 |
 | `COGDOC_API_PRINCIPALS` | 未设置 | API key 到 `tenant_id`、`subject_id`、RBAC `role` 的单行 JSON 映射；团队工作区首选 |
-| `COGDOC_EVAL_REVIEW_API_KEYS` | 未设置 | 旧版证据评测/Research 审核 key；同时可按 default/admin 访问普通路由 |
-| `RATE_LIMIT_PER_MINUTE` | `120` | 受保护 API 路由的令牌桶补充速率 |
-| `RATE_LIMIT_BURST` | `120` | 令牌桶突发容量；`<=0` 表示关闭限流 |
+| `COGDOC_EVAL_REVIEW_API_KEYS` | 未设置 | 旧版证据评测/Research 审核 key；按最小权限映射为 `default` 工作区 reviewer |
+| `COGDOC_RATE_LIMIT_PER_MINUTE` | `120` | 受保护 API 路由的令牌桶补充速率；继续兼容旧变量 `RATE_LIMIT_PER_MINUTE` |
+| `COGDOC_RATE_LIMIT_BURST` | `120` | 令牌桶突发容量；`<=0` 表示关闭限流；继续兼容旧变量 `RATE_LIMIT_BURST` |
 | `COGDOC_TENANT_MAX_KNOWLEDGE_BASES` | `0` | 每工作区知识库硬上限；`0` 表示不限 |
 | `COGDOC_TENANT_MAX_DOCUMENTS` | `0` | 每工作区已提交加在途 PDF 硬上限；`0` 表示不限 |
 | `COGDOC_TENANT_MAX_STORAGE_MB` | `0` | 每工作区已提交加在途 PDF MiB 硬上限；`0` 表示不限 |
