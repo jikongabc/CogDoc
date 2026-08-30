@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from cogdoc.source_model import SourceDocument
 
 
-SOURCE_PARSER_VERSION = "unified-source-parser-v1"
+SOURCE_PARSER_VERSION = "unified-source-parser-v2"
 CONNECTOR_MATERIALIZED_PREFIX = ".cogdoc-connector-"
 MAX_SOURCE_BYTES = 100 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 20_000
@@ -270,6 +270,17 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def _attribute_by_local_name(element: ET.Element, name: str) -> str:
+    return next(
+        (
+            str(value)
+            for key, value in element.attrib.items()
+            if _local_name(key) == name
+        ),
+        "",
+    )
+
+
 def _element_text(element: ET.Element) -> str:
     pieces: list[str] = []
     for node in element.iter():
@@ -312,7 +323,7 @@ def _parse_docx(path: str) -> list[dict[str, Any]]:
             if text:
                 style = next(
                     (
-                        str(node.attrib.get("{w}val") or node.attrib.get("val") or "")
+                        _attribute_by_local_name(node, "val")
                         for node in child.iter()
                         if _local_name(node.tag) == "pStyle"
                     ),
@@ -349,7 +360,7 @@ def _parse_pptx(path: str) -> list[dict[str, Any]]:
         return int(match.group(1))
 
     with _safe_archive(path) as archive:
-        names = sorted(
+        fallback_names = sorted(
             (
                 name
                 for name in archive.namelist()
@@ -357,6 +368,59 @@ def _parse_pptx(path: str) -> list[dict[str, Any]]:
             ),
             key=slide_number,
         )
+        names = fallback_names
+        presentation_part = "ppt/presentation.xml"
+        relationships_part = "ppt/_rels/presentation.xml.rels"
+        package_names = set(archive.namelist())
+        if presentation_part in package_names or relationships_part in package_names:
+            if not {
+                presentation_part,
+                relationships_part,
+            }.issubset(package_names):
+                raise SourceParseError(
+                    "PowerPoint presentation relationships are incomplete"
+                )
+            presentation = _xml_part(archive, presentation_part)
+            relationships = _relationship_targets(archive, relationships_part)
+            ordered_names: list[str] = []
+            for slide in (
+                node
+                for node in presentation.iter()
+                if _local_name(node.tag) == "sldId"
+            ):
+                relationship_id = next(
+                    (
+                        str(value)
+                        for key, value in slide.attrib.items()
+                        if _local_name(key) == "id" and str(value) in relationships
+                    ),
+                    "",
+                )
+                target = relationships.get(relationship_id, "")
+                target_path = PurePosixPath(target)
+                if (
+                    not relationship_id
+                    or not target
+                    or target.startswith(("/", "\\"))
+                    or ".." in target_path.parts
+                ):
+                    raise UnsafeSourceArchiveError(
+                        "slide relationship escapes its package directory"
+                    )
+                part = str(PurePosixPath("ppt") / target_path)
+                if (
+                    not re.fullmatch(r"ppt/slides/slide\d+\.xml", part)
+                    or part not in package_names
+                    or part in ordered_names
+                ):
+                    raise SourceParseError(
+                        "PowerPoint slide relationship targets an invalid part"
+                    )
+                ordered_names.append(part)
+            # Once presentation metadata exists it is authoritative even for
+            # an empty deck. Falling back to every slide*.xml part would index
+            # orphan/deleted slide content that is not part of the presentation.
+            names = ordered_names
         pages = []
         for index, name in enumerate(names, 1):
             root = _xml_part(archive, name)

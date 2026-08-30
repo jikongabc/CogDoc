@@ -114,6 +114,43 @@ def test_requirement_coverage_supports_source_gold_and_hard_negatives():
     assert metrics["hard_negative_rejection@2"] == 0.0
 
 
+def test_chunk_gold_takes_precedence_over_same_source_fallback():
+    requirements = [
+        {
+            "requirement_id": "r1",
+            "acceptable_chunk_ids": ["answer"],
+            "acceptable_sources": ["policy.pdf"],
+        }
+    ]
+    retrieved = [
+        {"chunk_id": "wrong", "source": "policy.pdf"},
+        {"chunk_id": "answer", "source": "policy.pdf"},
+    ]
+
+    metrics = evaluate_requirement_coverage(retrieved, requirements, [1, 2])
+
+    assert metrics["requirement_recall@1"] == 0.0
+    assert metrics["chunk_precision@1"] == 0.0
+    assert metrics["evidence_ndcg@1"] == 0.0
+    assert metrics["requirement_recall@2"] == 1.0
+
+
+def test_source_only_gold_allows_null_chunk_field():
+    metrics = evaluate_requirement_coverage(
+        [{"chunk_id": "chunk", "source": "policy.pdf"}],
+        [
+            {
+                "requirement_id": "r1",
+                "acceptable_chunk_ids": None,
+                "acceptable_sources": ["policy.pdf"],
+            }
+        ],
+        [1],
+    )
+
+    assert metrics["requirement_recall@1"] == 1.0
+
+
 def test_mixed_evidence_unit_outcomes_keep_no_evidence_labels_local():
     retrieved = [
         {

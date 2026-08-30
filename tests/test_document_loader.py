@@ -66,6 +66,13 @@ def test_select_source_for_summary_matches_full_name_or_stem():
     assert select_source_for_summary("summarize paper-b.pdf.", sources) == "paper-b.pdf"
 
 
+def test_select_source_for_summary_matches_adjacent_chinese_command_and_stem():
+    sources = ["ACM竞赛简介.pdf", "大模型开发应用赛.pdf"]
+
+    assert select_source_for_summary("总结大模型开发应用赛", sources) == "大模型开发应用赛.pdf"
+    assert select_source_for_summary("请总结：大模型开发应用赛.pdf", sources) == "大模型开发应用赛.pdf"
+
+
 # 验证 select source for summary does not match short stem 场景。
 def test_select_source_for_summary_does_not_match_short_stem():
     assert (

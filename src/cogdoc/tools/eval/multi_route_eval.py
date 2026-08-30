@@ -33,12 +33,23 @@ def _identity(hit: Mapping[str, Any]) -> str:
     return str(hit.get("chunk_id") or "")
 
 
+def _string_set(value: Any) -> set[str]:
+    if not isinstance(value, Sequence) or isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return set()
+    return {str(item).strip() for item in value if str(item).strip()}
+
+
 def _relevant(hit: Mapping[str, Any], case: Mapping[str, Any]) -> bool:
-    chunks = set(str(value) for value in case.get("expected_chunk_ids", []))
-    sources = set(str(value) for value in case.get("expected_sources", []))
-    return (_identity(hit) in chunks if chunks else False) or (
-        str(hit.get("source") or "") in sources if sources else False
-    )
+    chunks = _string_set(case.get("expected_chunk_ids"))
+    if chunks:
+        # Chunk annotations are the precise contract.  ``expected_sources`` is
+        # fallback/descriptive metadata and must not turn a wrong chunk from
+        # the right document into a relevant result.
+        return _identity(hit) in chunks
+    sources = _string_set(case.get("expected_sources"))
+    return str(hit.get("source") or "") in sources if sources else False
 
 
 def ranking_metrics(
@@ -47,9 +58,10 @@ def ranking_metrics(
     *,
     k: int,
 ) -> dict[str, float]:
-    expected = set(str(value) for value in case.get("expected_chunk_ids", []))
-    if not expected:
-        expected = set(str(value) for value in case.get("expected_sources", []))
+    expected_chunks = _string_set(case.get("expected_chunk_ids"))
+    expected = expected_chunks
+    if not expected_chunks:
+        expected = _string_set(case.get("expected_sources"))
         retrieved = [str(hit.get("source") or "") for hit in hits[:k]]
     else:
         retrieved = [_identity(hit) for hit in hits[:k]]
@@ -59,7 +71,7 @@ def ranking_metrics(
     gains = []
     seen_relevant: set[str] = set()
     for rank, hit in enumerate(hits[:k], start=1):
-        identity = _identity(hit) if case.get("expected_chunk_ids") else str(
+        identity = _identity(hit) if expected_chunks else str(
             hit.get("source") or ""
         )
         relevant = _relevant(hit, case) and identity not in seen_relevant
@@ -85,11 +97,14 @@ def requirement_coverage(
         return 1.0
     covered = 0
     for requirement in requirements:
-        chunks = set(str(value) for value in requirement.get("acceptable_chunk_ids", []))
-        sources = set(str(value) for value in requirement.get("acceptable_sources", []))
+        chunks = _string_set(requirement.get("acceptable_chunk_ids"))
+        sources = _string_set(requirement.get("acceptable_sources"))
         if any(
-            (_identity(hit) in chunks if chunks else False)
-            or (str(hit.get("source") or "") in sources if sources else False)
+            (
+                _identity(hit) in chunks
+                if chunks
+                else str(hit.get("source") or "") in sources
+            )
             for hit in hits
         ):
             covered += 1

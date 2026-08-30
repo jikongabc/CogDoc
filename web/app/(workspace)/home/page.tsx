@@ -11,6 +11,7 @@ import { useSessionStore } from "@/stores/session-store";
 import { api } from "@/lib/api/client";
 import { queryKeys } from "@/lib/query/keys";
 import { LoadingState } from "@/components/ui/spinner";
+import { Button } from "@/components/ui/button";
 
 export default function WorkspaceHomePage() {
   const router = useRouter();
@@ -25,17 +26,26 @@ export default function WorkspaceHomePage() {
     queryFn: () => api.sessions(selectedKb),
     enabled: Boolean(selectedKb),
   });
-  const sessionId = useRef<string | null>(null);
+  const sessionTarget = useRef<{ kbId: string; sessionId: string } | null>(null);
 
   useEffect(() => {
-    if (!selectedKb || sessions.isPending) return;
-    sessionId.current ||= sessions.data?.sessions?.[0]?.session_id || crypto.randomUUID();
+    if (!selectedKb || sessions.isPending || sessions.isError) return;
+    if (sessionTarget.current?.kbId !== selectedKb) {
+      sessionTarget.current = {
+        kbId: selectedKb,
+        sessionId: sessions.data?.sessions?.[0]?.session_id || crypto.randomUUID(),
+      };
+    }
     setSelectedKbId(selectedKb);
-    router.replace(`/knowledge/${encodeURIComponent(selectedKb)}/chat/${sessionId.current}`);
-  }, [router, selectedKb, sessions.data, sessions.isPending, setSelectedKbId]);
+    router.replace(`/knowledge/${encodeURIComponent(selectedKb)}/chat/${sessionTarget.current.sessionId}`);
+  }, [router, selectedKb, sessions.data, sessions.isError, sessions.isPending, setSelectedKbId]);
 
   if (knowledgeBases.isError) {
     return <div className="mx-auto mt-16 max-w-lg border-l-2 border-error bg-error-subtle px-4 py-3 text-sm text-error"><p className="font-medium">无法打开知识工作台</p><p className="mt-1 text-xs">{knowledgeBases.error.message}</p></div>;
+  }
+
+  if (selectedKb && sessions.isError) {
+    return <div className="mx-auto mt-16 max-w-lg border-l-2 border-error bg-error-subtle px-4 py-3 text-sm text-error"><p className="font-medium">无法恢复最近对话</p><p className="mt-1 text-xs">{sessions.error.message}</p><Button variant="secondary" size="compact" className="mt-3" onClick={() => void sessions.refetch()}>重试</Button></div>;
   }
 
   if (knowledgeBases.data && !knowledgeBases.data.length) {

@@ -76,6 +76,13 @@ def test_fact_query_detection_is_selective():
     assert requires_evidence_verification("比赛时长分别是多少") is True
     assert requires_evidence_verification("报名费报销比例是多少") is True
     assert requires_evidence_verification("What is the deadline?") is True
+    assert requires_evidence_verification("项目负责人是谁") is True
+    assert requires_evidence_verification("ICPC全称是什么") is True
+    assert requires_evidence_verification("系统是否支持 SSO") is True
+    assert requires_evidence_verification("Who founded the company?") is True
+    assert requires_evidence_verification("Does CogDoc support SSO?") is True
+    assert requires_evidence_verification("Can viewers export audit logs?") is True
+    assert requires_evidence_verification("当前版本会自动备份吗？") is True
     assert requires_evidence_verification("介绍一下这个比赛") is False
 
 
@@ -179,8 +186,8 @@ def test_should_verify_supported_and_borderline_fact_queries():
     )
 
 
-# 阈值附近已经召回明确证据时，普通身份问题也应进入二阶段校验，避免错误拒答。
-def test_borderline_simple_query_still_triggers_evidence_verification():
+# 身份问题无论一阶段是强召回还是阈值附近，都进入二阶段校验，避免“提到即支持”。
+def test_identity_query_always_triggers_evidence_verification():
     settings = _settings(qa_evidence_verify_borderline_min_score=0.75)
 
     assert should_verify_evidence(
@@ -194,7 +201,7 @@ def test_borderline_simple_query_still_triggers_evidence_verification():
         settings,
     )
 
-    assert not should_verify_evidence(
+    assert should_verify_evidence(
         {
             "query": "项目负责人是谁",
             "retrieval_first_stage_supported": True,

@@ -15,20 +15,22 @@ import { apiDownload } from "@/lib/api/client";
 import { controlApi, numberValue, records, textValue, type JsonRecord } from "@/lib/api/control-plane";
 import { formatDateTime } from "@/lib/utils";
 import { useSessionStore } from "@/stores/session-store";
+import { usePermission } from "@/features/auth/permissions";
 
 export default function AuditPage() {
   const queryClient = useQueryClient();
   const workspaceId = useSessionStore((state) => state.workspace?.workspace_id || "");
+  const canManage = usePermission("manage_access");
   const events = useQuery({
     queryKey: ["admin", "audit-events"],
     queryFn: () => controlApi.auditEvents(250),
-    enabled: Boolean(workspaceId),
+    enabled: canManage && Boolean(workspaceId),
     refetchInterval: 15_000,
   });
   const exportsQuery = useQuery({
     queryKey: ["admin", "audit-exports"],
     queryFn: () => controlApi.auditExports(),
-    enabled: Boolean(workspaceId),
+    enabled: canManage && Boolean(workspaceId),
     refetchInterval: 10_000,
   });
   const eventRows = records(events.data, ["items", "events"]);

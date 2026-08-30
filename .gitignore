@@ -3,9 +3,24 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 env/
 venv/
 ENV/
+
+# 操作系统、编辑器和 Office 临时文件。
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+~$*
+.~*
 
 # 本地工具配置目录。
 .cursor/
@@ -34,6 +49,7 @@ backups/
 
 测试论文/
 your_documents/
+artifacts/local-docs/
 
 # 真实评测集绑定私有语料名与本机索引标识，不入库；只提交匿名样例。
 eval/*.jsonl
@@ -44,20 +60,15 @@ eval/retrieval_eval_report.json
 eval/retrieval_eval_baseline.json
 eval/retrieval_gate.json
 
-# Local retrieval-evaluation workbench data. Final calibrated reports may be
-# committed deliberately; reviewer drafts, private corpus copies, and pending
-# plans are reproducible working files and can contain source text.
-artifacts/reliability/eval-data/kb/*/generations/
-artifacts/reliability/eval-data/knowledge/
-artifacts/reliability/retrieval_eval_drafts.jsonl
-artifacts/reliability/retrieval_eval_pending_plans.jsonl
-artifacts/reliability/retrieval_eval_review_checklist.json
-artifacts/reliability/*-pending-plans.json
-# Multi-route raw evaluation contains per-case queries and retrieved source text.
-# Keep only the deliberately reviewed baseline/calibration summaries eligible.
-artifacts/reliability/multi-route-eval.json
-# Local reliability runs persist index-migration state under the workbench root.
-artifacts/reliability/eval-data/reliability/
+# Reliability workbench state and generated reports can contain local paths,
+# private corpus copies, queries, answers, and retrieved source text. Keep only
+# deliberately reviewed baseline/calibration summaries eligible for commits.
+artifacts/reliability/eval-data/
+artifacts/reliability/*.json
+artifacts/reliability/*.jsonl
+!artifacts/reliability/*-baseline.json
+!artifacts/reliability/*-calibration.json
+!artifacts/reliability/confidence-calibration-v3.json
 
 # Node / mermaid-cli 本地渲染依赖。
 node_modules/

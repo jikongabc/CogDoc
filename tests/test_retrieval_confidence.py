@@ -56,8 +56,8 @@ def test_support_accepts_semantic_or_lexical_signal():
     assert lexical.supported is True
 
 
-# 小语料中 BM25 的 IDF 可能退化；完整精确词覆盖仍应作为独立支持信号。
-def test_support_accepts_exact_query_terms_when_bm25_has_no_score():
+# 小语料中 BM25 的 IDF 可能退化；完整词覆盖只送二阶段核验，不能直接放行。
+def test_exact_query_terms_require_verification_when_bm25_has_no_score():
     result = assess_retrieval_support(
         [_doc(distance=0.95, text="项目负责人负责发布审核。")],
         _settings(),
@@ -69,9 +69,69 @@ def test_support_accepts_exact_query_terms_when_bm25_has_no_score():
         query="项目负责人是谁",
     )
 
-    assert result.supported is True
+    assert result.supported is False
+    assert result.reason == "lexical_coverage_requires_verification"
+    assert result.score >= _settings().qa_evidence_verify_borderline_min_score
+    assert result.score < 1.0
     assert result.signals["query_lexical_coverage"] == 1.0
     assert partial.supported is False
+
+
+# 中文疑问词描述答案形态，不应要求证据逐字复述；实体和关系词仍须完整命中。
+def test_support_ignores_chinese_question_words_for_exact_term_coverage():
+    result = assess_retrieval_support(
+        [_doc(distance=0.95, text="ACM，全称 ACM-ICPC 国际大学生程序设计竞赛。")],
+        _settings(),
+        query="ICPC全称是什么",
+    )
+    missing_relation = assess_retrieval_support(
+        [_doc(distance=0.95, text="ICPC 国际大学生程序设计竞赛。")],
+        _settings(),
+        query="ICPC全称是什么",
+    )
+
+    assert result.supported is False
+    assert result.reason == "lexical_coverage_requires_verification"
+    assert result.signals["query_lexical_coverage"] == 1.0
+    assert missing_relation.supported is False
+
+
+def test_support_ignores_english_question_words_for_exact_term_coverage():
+    settings = _settings()
+
+    identity = assess_retrieval_support(
+        [_doc(distance=0.95, text="Steve Jobs founded Apple.")],
+        settings,
+        query="Who founded Apple?",
+    )
+    polar = assess_retrieval_support(
+        [_doc(distance=0.95, text="CogDoc does not support SSO.")],
+        settings,
+        query="Does CogDoc support SSO?",
+    )
+
+    for result in (identity, polar):
+        assert result.supported is False
+        assert result.reason == "lexical_coverage_requires_verification"
+        assert result.signals["query_lexical_coverage"] == 1.0
+
+
+def test_exact_terms_do_not_treat_missing_or_negated_answer_as_supported():
+    settings = _settings()
+    cases = [
+        ("什么是ICPC", "这份资料提到了 ICPC 报名截止日期。"),
+        ("ICPC全称是什么", "资料包含 ICPC 全称字段，但没有给出展开。"),
+        ("苹果公司创始人是谁", "苹果公司创始人栏目暂缺。"),
+        ("系统是否支持SSO", "系统不支持 SSO。"),
+    ]
+
+    for query, text in cases:
+        result = assess_retrieval_support(
+            [_doc(distance=0.95, text=text)], settings, query=query
+        )
+        assert result.supported is False
+        assert result.score < 1.0
+        assert result.reason == "lexical_coverage_requires_verification"
 
 
 def test_partial_query_coverage_does_not_raise_borderline_confidence():
@@ -104,6 +164,19 @@ def test_support_fails_closed_when_confidence_signals_are_unavailable():
         [_doc()], _settings(qa_abstain_allow_missing_signals=True)
     )
     assert compatible.supported is True
+
+
+def test_zero_query_coverage_is_not_treated_as_a_missing_signal():
+    result = assess_retrieval_support(
+        [_doc(text="completely unrelated evidence")],
+        _settings(qa_abstain_allow_missing_signals=True),
+        query="CogDoc supports SSO",
+    )
+
+    assert result.supported is False
+    assert result.reason == "below_threshold"
+    assert result.score == 0.0
+    assert result.signals["query_lexical_coverage"] == 0.0
 
 
 # 验证派生知识使用独立支持度阈值。
@@ -158,7 +231,11 @@ def test_rerank_node_marks_low_confidence_retrieval_for_abstention(monkeypatch):
 
     assert output["retrieval_abstained"] is True
     assert output["retrieval_abstain_reason"] == "below_threshold"
-    assert output["retrieval_signals"] == {"distance": 0.95, "bm25_score": 5.0}
+    assert output["retrieval_signals"] == {
+        "distance": 0.95,
+        "bm25_score": 5.0,
+        "query_lexical_coverage": 0.0,
+    }
     assert output["verification_docs"]
     assert output["evidence_verification_pending"] is False
 

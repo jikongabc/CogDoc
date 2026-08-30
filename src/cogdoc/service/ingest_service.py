@@ -268,7 +268,15 @@ def _auto_rebind_updates(row: dict, chunks: list[dict]) -> dict | None:
         scored.append((priority, chunk_hash, meta))
     if not scored:
         return None
-    _, chunk_hash, meta = min(scored, key=lambda item: item[0])
+    best_priority = min(item[0] for item in scored)
+    best_matches = [item for item in scored if item[0] == best_priority]
+    # Re-approving an evidence binding is only safe when the strongest
+    # locator (exact prior text hash, otherwise anchor text) identifies one
+    # new chunk. Repeated boilerplate must go back to review instead of being
+    # rebound to an arbitrary lexicographically-smallest hash/page.
+    if len(best_matches) != 1:
+        return None
+    _, chunk_hash, meta = best_matches[0]
     chunk_id = str(meta.get("chunk_id") or "")
     updates = {
         "related_source_sha256": meta.get("source_sha256"),

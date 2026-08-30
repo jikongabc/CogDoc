@@ -16,7 +16,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { useWorkspaceStore } from "@/stores/workspace-store";
 import { Spinner } from "@/components/ui/spinner";
 
 export function WorkspaceSwitcher({ collapsed = false }: { collapsed?: boolean }) {
@@ -25,13 +24,11 @@ export function WorkspaceSwitcher({ collapsed = false }: { collapsed?: boolean }
   const workspace = useSessionStore((state) => state.workspace);
   const authMode = useSessionStore((state) => state.authMode);
   const setSession = useSessionStore((state) => state.setSession);
-  const clearKnowledgeContext = useWorkspaceStore((state) => state.clearKnowledgeContext);
   const { data } = useQuery({ queryKey: queryKeys.me, queryFn: api.me, enabled: authMode === "account" });
   const mutation = useMutation({
     mutationFn: api.switchWorkspace,
     onSuccess: async (session) => {
       setSession(session);
-      clearKnowledgeContext();
       queryClient.clear();
       await queryClient.prefetchQuery({ queryKey: queryKeys.me, queryFn: api.me });
       router.push("/home");

@@ -101,6 +101,30 @@ def test_ranking_and_requirement_metrics_use_chunk_gold():
     ) == 0.5
 
 
+def test_chunk_gold_rejects_wrong_chunk_from_expected_source():
+    wrong = _hit("wrong", source="policy.pdf")
+    correct = _hit("answer", source="policy.pdf")
+    case = {
+        "expected_chunk_ids": ["answer"],
+        "expected_sources": ["policy.pdf"],
+    }
+
+    wrong_metrics = ranking_metrics([wrong, correct], case, k=1)
+
+    assert wrong_metrics["recall@1"] == 0.0
+    assert wrong_metrics["mrr"] == 0.0
+    assert wrong_metrics["ndcg@1"] == 0.0
+    assert requirement_coverage(
+        [wrong],
+        [
+            {
+                "acceptable_chunk_ids": ["answer"],
+                "acceptable_sources": ["policy.pdf"],
+            }
+        ],
+    ) == 0.0
+
+
 def test_source_level_ndcg_deduplicates_chunks_from_the_same_document():
     case = {"expected_chunk_ids": [], "expected_sources": ["paper.pdf"]}
     metrics = ranking_metrics(

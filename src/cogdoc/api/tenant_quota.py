@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import Any
 
+from cogdoc.service.mutation_paths import original_name_from_backup
 from cogdoc.tools.source_parser import SUPPORTED_EXTENSIONS
 
 
@@ -108,7 +109,11 @@ class TenantQuotaManager:
             return result
         with entries:
             for entry in entries:
-                if os.path.splitext(entry.name)[1].casefold() not in SUPPORTED_EXTENSIONS:
+                logical_name = original_name_from_backup(entry.name)
+                if (
+                    os.path.splitext(logical_name)[1].casefold()
+                    not in SUPPORTED_EXTENSIONS
+                ):
                     continue
                 try:
                     if not entry.is_file(follow_symlinks=False):
@@ -123,7 +128,14 @@ class TenantQuotaManager:
                     # unreadable committed entry must reject admission rather
                     # than be treated as zero usage.
                     raise
-                result[entry.name] = max(0, int(size))
+                # A replacement/delete temporarily moves the committed source
+                # to ``<name>.<mutation-token>.cogdoc-bak``. Count it under the logical
+                # source name (and take the larger copy if the replacement was
+                # already written) so the in-flight mutation cannot lend quota
+                # that it may still roll back to.
+                result[logical_name] = max(
+                    result.get(logical_name, 0), max(0, int(size))
+                )
         return result
 
     @classmethod

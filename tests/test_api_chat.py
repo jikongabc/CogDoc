@@ -383,6 +383,8 @@ async def test_chat_stream_emits_sse_frames_and_writes_session(monkeypatch):
 
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
+    assert resp.headers["cache-control"] == "no-cache, no-store, no-transform"
+    assert resp.headers["x-accel-buffering"] == "no"
     body = resp.text
     assert "event: start" in body and "trace-sse" in body
     assert "event: token" in body
@@ -612,6 +614,70 @@ async def test_chat_stream_idle_timeout_emits_error_and_ends(monkeypatch):
     assert "event: error" in response.text
     assert "STREAM_INTERRUPTED" in response.text
     assert "event: final" not in response.text
+
+
+@pytest.mark.anyio
+async def test_chat_stream_sends_keepalive_during_long_step(monkeypatch):
+    import cogdoc.api.app as app_module
+    import cogdoc.api.routes.chat as chat_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(chat_module, "_STREAM_KEEPALIVE_SECONDS", 0.01)
+    result = _result("最终答案", "trace-keepalive")
+
+    def slow_stream(doc_id, query, is_local, chat_history, forced_task):
+        yield ChatEvent("request_started", {"trace_id": "trace-keepalive"})
+        threading.Event().wait(0.08)
+        yield ChatEvent("final", {"result": result, "output": result.raw_output})
+
+    app = create_app(chat_stream_runner=slow_stream, session_store=SessionStore())
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/stream",
+                json={"query": "问题", "doc_id": "kb", "session_id": "s1"},
+            )
+
+    assert ": keepalive" in response.text
+    assert "event: final" in response.text
+
+
+@pytest.mark.anyio
+async def test_chat_stream_reports_session_record_failure(monkeypatch):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    result = _result("不能确认已保存的答案", "trace-record-failed")
+
+    class BrokenSessionStore(SessionStore):
+        def record(self, *_args, **_kwargs):
+            raise OSError("sensitive storage detail")
+
+    def stream_runner(*_args, **_kwargs):
+        yield ChatEvent("request_started", {"trace_id": result.trace_id})
+        yield ChatEvent("final", {"result": result, "output": result.raw_output})
+
+    app = create_app(
+        chat_stream_runner=stream_runner,
+        session_store=BrokenSessionStore(),
+    )
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/stream",
+                json={"query": "问题", "doc_id": "kb", "session_id": "s1"},
+            )
+
+    assert "event: start" in response.text
+    assert "event: error" in response.text
+    assert "STREAM_INTERRUPTED" in response.text
+    assert "event: final" not in response.text
+    assert "sensitive storage detail" not in response.text
 
 
 # 验证注入流式 runner 的畸形 audit 不会在 final 帧前被指标/摘要转换打断。

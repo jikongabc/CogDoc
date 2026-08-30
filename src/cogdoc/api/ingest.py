@@ -21,6 +21,7 @@ from cogdoc.service.kb_epoch import shared_epoch_store
 from cogdoc.service.kb_lifecycle import LIFECYCLE_ACTIVE, shared_lifecycle_store
 from cogdoc.service.kb_locks import kb_write_lock
 from cogdoc.service.mutation_journal import MutationJournal, shared_mutation_journal
+from cogdoc.service.mutation_paths import mutation_backup_path
 
 
 class _DelegatedMutationCall:
@@ -30,6 +31,29 @@ class _DelegatedMutationCall:
 
     def __call__(self, *args):
         return self.function(*args)
+
+
+class _AbortableMutationCall:
+    """Ensure admission-side state is released if a queued job never starts."""
+
+    def __init__(self, function: Callable, on_unstarted: Callable[[], None]) -> None:
+        self.function = function
+        self._on_unstarted = on_unstarted
+        self._started = False
+        self._aborted = False
+        self._lock = Lock()
+
+    def __call__(self, *args):
+        with self._lock:
+            self._started = True
+        return self.function(*args)
+
+    def abort_if_unstarted(self) -> None:
+        with self._lock:
+            if self._started or self._aborted:
+                return
+            self._aborted = True
+        self._on_unstarted()
 
 
 # 返回当前 UTC 时间字符串。
@@ -417,9 +441,6 @@ class KnowledgeBaseRegistry:
 
 
 _MAX_KB_EXECUTORS = 256  # 防止持续创建/删库积累无界线程对象
-_BAK_SUFFIX = ".cogdoc-bak"  # 源文件回滚备份后缀；不以 .pdf 结尾故不被索引扫描
-
-
 # 每个 kb_id 独享一个单线程 executor：不同 KB 并发构建，同 KB 内 mutation + 构建全部串行。
 class IndexJobManager:
     # 每个 kb_id 独享一个单线程 executor：不同 KB 并发构建，同 KB 内 mutation + 构建全部串行。
@@ -666,7 +687,7 @@ class IndexJobManager:
         source_dir: str,
     ) -> None:
         # Persist crash-recovery evidence first, then make the live authorization
-        # check the final fallible operation immediately before switch_active.
+        # check before staging the HA source snapshot and switching active.
         self._prepare_commit(job_id, gen_id)
         if authorization_guard is not None:
             authorization_guard()
@@ -780,6 +801,29 @@ class IndexJobManager:
         return ex.submit(runner)
 
     def _run_distributed_claimed(
+        self,
+        fn: Callable,
+        job_id: str,
+        kb_id: str,
+        base_epoch: int,
+        *args,
+    ) -> object:
+        try:
+            return self._run_distributed_claimed_inner(
+                fn, job_id, kb_id, base_epoch, *args
+            )
+        finally:
+            abort_if_unstarted = getattr(fn, "abort_if_unstarted", None)
+            if callable(abort_if_unstarted):
+                try:
+                    abort_if_unstarted()
+                except Exception as exc:
+                    try:
+                        self._fail_job(job_id, kb_id, exc)
+                    except Exception:
+                        pass
+
+    def _run_distributed_claimed_inner(
         self,
         fn: Callable,
         job_id: str,
@@ -985,17 +1029,33 @@ class IndexJobManager:
         on_finished: Callable[[], None] | None = None,
         authorization_guard: Callable[[], None] | None = None,
         embedding_profile_id: str | None = None,
+        on_aborted: Callable[[], None] | None = None,
+        on_started: Callable[[], None] | None = None,
     ) -> dict:
         # 写文件与构建索引作为一个 executor command：保证每个 job 快照与其 mutation 精确对应。
+        operation: Callable = self._run_with_write
+        if on_aborted is not None or on_finished is not None:
+
+            def cleanup_unstarted() -> None:
+                try:
+                    if on_aborted is not None:
+                        on_aborted()
+                finally:
+                    if on_finished is not None:
+                        on_finished()
+
+            operation = _AbortableMutationCall(operation, cleanup_unstarted)
         return self._enqueue(
             kb_id,
-            self._run_with_write,
+            operation,
             source_dir,
             filename,
             content,
             on_finished,
             authorization_guard,
             embedding_profile_id,
+            on_aborted,
+            on_started,
         )
 
     def submit_upload_batch(
@@ -1006,19 +1066,35 @@ class IndexJobManager:
         on_finished: Callable[[], None] | None = None,
         authorization_guard: Callable[[], None] | None = None,
         embedding_profile_id: str | None = None,
+        on_aborted: Callable[[], None] | None = None,
+        on_started: Callable[[], None] | None = None,
     ) -> dict:
         """Commit several source mutations and one index generation as one job."""
 
         if not uploads:
             raise ValueError("batch upload requires at least one file")
+        operation: Callable = self._run_with_writes
+        if on_aborted is not None or on_finished is not None:
+
+            def cleanup_unstarted() -> None:
+                try:
+                    if on_aborted is not None:
+                        on_aborted()
+                finally:
+                    if on_finished is not None:
+                        on_finished()
+
+            operation = _AbortableMutationCall(operation, cleanup_unstarted)
         return self._enqueue(
             kb_id,
-            self._run_with_writes,
+            operation,
             source_dir,
             uploads,
             on_finished,
             authorization_guard,
             embedding_profile_id,
+            on_aborted,
+            on_started,
         )
 
     # 提交删除文档。
@@ -1175,8 +1251,18 @@ class IndexJobManager:
         on_finished: Callable[[], None] | None = None,
         authorization_guard: Callable[[], None] | None = None,
         embedding_profile_id: str | None = None,
+        on_aborted: Callable[[], None] | None = None,
+        on_started: Callable[[], None] | None = None,
     ) -> None:
+        committed = False
+
+        def mark_committed() -> None:
+            nonlocal committed
+            committed = True
+
         try:
+            if on_started is not None:
+                on_started()
             self._run_with_write_reserved(
                 job_id,
                 kb_id,
@@ -1186,10 +1272,15 @@ class IndexJobManager:
                 content,
                 authorization_guard,
                 embedding_profile_id,
+                mark_committed,
             )
         finally:
-            if on_finished is not None:
-                on_finished()
+            try:
+                if not committed and on_aborted is not None:
+                    on_aborted()
+            finally:
+                if on_finished is not None:
+                    on_finished()
 
     def _run_with_write_reserved(
         self,
@@ -1201,6 +1292,7 @@ class IndexJobManager:
         content: bytes,
         authorization_guard: Callable[[], None] | None = None,
         embedding_profile_id: str | None = None,
+        on_committed: Callable[[], None] | None = None,
     ) -> None:
         if self._store.get(job_id) is None:
             return
@@ -1224,7 +1316,7 @@ class IndexJobManager:
             )
             return
         dest = os.path.join(source_dir, filename)
-        backup = f"{dest}.{job_id}{_BAK_SUFFIX}"  # 唯一名，绝不覆盖上次崩溃遗留的备份
+        backup = mutation_backup_path(dest, job_id)  # 唯一名，绝不覆盖上次崩溃遗留的备份
         had_old = os.path.exists(dest)
         try:
             os.makedirs(source_dir, exist_ok=True)
@@ -1255,6 +1347,11 @@ class IndexJobManager:
             embedding_profile_id=embedding_profile_id,
         )
         if ok:
+            # The generation authority has already advanced.  Mark this before
+            # journal/log cleanup so a post-commit housekeeping failure never
+            # rolls back the ACL of a now-queryable document.
+            if on_committed is not None:
+                on_committed()
             # 已提交：先打不可逆 committed 标记，再 best-effort 清备份，最后无条件清 journal。 不能因备份清理失败而保留 journal——否则后续切代/删库会让它被误判未提交而回滚已提交源文件。
             committed_marked = self._journal.mark_committed(job_id)
             if had_old:
@@ -1322,8 +1419,13 @@ class IndexJobManager:
         on_finished: Callable[[], None] | None = None,
         authorization_guard: Callable[[], None] | None = None,
         embedding_profile_id: str | None = None,
+        on_aborted: Callable[[], None] | None = None,
+        on_started: Callable[[], None] | None = None,
     ) -> None:
+        committed = False
         try:
+            if on_started is not None:
+                on_started()
             if self._store.get(job_id) is None:
                 return
             if self._stale(kb_id, base_epoch):
@@ -1354,7 +1456,7 @@ class IndexJobManager:
                 for index, (filename, content) in enumerate(uploads):
                     journal_id = f"{job_id}-{index}"
                     dest = os.path.join(source_dir, filename)
-                    backup = f"{dest}.{journal_id}{_BAK_SUFFIX}"
+                    backup = mutation_backup_path(dest, journal_id)
                     had_old = os.path.exists(dest)
                     self._journal.begin_upload(journal_id, kb_id, dest, backup, had_old)
                     mutations.append((journal_id, dest, backup, had_old))
@@ -1396,6 +1498,7 @@ class IndexJobManager:
                 ),
                 embedding_profile_id=embedding_profile_id,
             )
+            committed = ok
             if ok:
                 for journal_id, _dest, backup, had_old in mutations:
                     committed_marked = self._journal.mark_committed(journal_id)
@@ -1408,8 +1511,12 @@ class IndexJobManager:
                     if self._rollback_upload(journal_id, kb_id, dest, backup, had_old):
                         self._finish_rollback(journal_id)
         finally:
-            if on_finished is not None:
-                on_finished()
+            try:
+                if not committed and on_aborted is not None:
+                    on_aborted()
+            finally:
+                if on_finished is not None:
+                    on_finished()
 
     # 运行with删除文档。
     def _run_with_delete_doc(
@@ -1482,7 +1589,7 @@ class IndexJobManager:
             except Exception as exc:
                 self._fail_job(job_id, kb_id, exc)
                 return
-        quarantine = f"{path}.{job_id}{_BAK_SUFFIX}"  # 唯一名，避免覆盖遗留备份
+        quarantine = mutation_backup_path(path, job_id)  # 唯一名，避免覆盖遗留备份
         try:
             self._journal.begin_delete(job_id, kb_id, path, quarantine)
             os.replace(path, quarantine)  # 移入隔离区而非直接删除，构建失败可恢复

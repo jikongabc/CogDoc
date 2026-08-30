@@ -35,6 +35,37 @@ def _result(trace_id: str, task_type: str) -> ChatResult:
 
 
 @pytest.mark.anyio
+async def test_legacy_chat_scope_rejects_path_unsafe_kb_ids(tmp_path, monkeypatch):
+    import cogdoc.api.app as app_module
+
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    registry = KnowledgeBaseRegistry(
+        registry_path=str(tmp_path / "registry.json"),
+        source_dir_for=lambda storage_id: str(tmp_path / storage_id / "sources"),
+    )
+    calls = []
+
+    def runner(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _result("unexpected", "qa")
+
+    app = create_app(kb_registry=registry, chat_runner=runner)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            responses = [
+                await client.post(
+                    "/v1/chat", json={"query": "probe", "doc_id": kb_id}
+                )
+                for kb_id in ("../outside", "nested/kb", ".", "..", "x" * 57)
+            ]
+
+    assert all(response.status_code == 404 for response in responses)
+    assert calls == []
+
+
+@pytest.mark.anyio
 async def test_chat_sessions_and_agent_calls_use_physical_tenant_scope(
     tmp_path, monkeypatch
 ):

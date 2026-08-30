@@ -125,7 +125,10 @@ def run_retrieval_diagnostics(
         final_rows.append(row)
 
     support = assess_retrieval_support(
-        final_docs, settings, requirement_ids=requirement_ids
+        final_docs,
+        settings,
+        query=query,
+        requirement_ids=requirement_ids,
     )
     covered = {
         str(requirement_id)

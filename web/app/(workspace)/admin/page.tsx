@@ -22,6 +22,7 @@ import { controlApi, numberValue, records, textValue, type JsonRecord } from "@/
 import { useSessionStore } from "@/stores/session-store";
 import { roleLabel } from "@/components/access/role-selector";
 import { CreateWorkspaceRoleDialog } from "@/components/access/create-role-dialog";
+import { usePermission } from "@/features/auth/permissions";
 
 const inviteSchema = z.object({ email: z.email("请输入有效邮箱"), role: z.enum(["viewer", "reviewer", "editor", "admin"]) });
 
@@ -80,10 +81,11 @@ export default function AdminPage() {
   const queryClient = useQueryClient();
   const workspace = useSessionStore((state) => state.workspace);
   const authMode = useSessionStore((state) => state.authMode);
+  const canManage = usePermission("manage_access");
   const workspaceId = workspace?.workspace_id || "";
-  const members = useQuery({ queryKey: ["admin", "members", workspaceId], queryFn: () => controlApi.members(workspaceId), enabled: Boolean(workspaceId) });
-  const roles = useQuery({ queryKey: ["admin", "roles", workspaceId], queryFn: () => controlApi.roles(workspaceId), enabled: Boolean(workspaceId) });
-  const invites = useQuery({ queryKey: ["admin", "invites", workspaceId], queryFn: () => controlApi.invites(workspaceId), enabled: Boolean(workspaceId) });
+  const members = useQuery({ queryKey: ["admin", "members", workspaceId], queryFn: () => controlApi.members(workspaceId), enabled: canManage && Boolean(workspaceId) });
+  const roles = useQuery({ queryKey: ["admin", "roles", workspaceId], queryFn: () => controlApi.roles(workspaceId), enabled: canManage && Boolean(workspaceId) });
+  const invites = useQuery({ queryKey: ["admin", "invites", workspaceId], queryFn: () => controlApi.invites(workspaceId), enabled: canManage && Boolean(workspaceId) });
   const memberRows = records(members.data, ["items", "members"]);
   const roleRows = records(roles.data, ["items", "roles"]);
   const inviteRows = records(invites.data, ["items", "invites"]);

@@ -16,7 +16,7 @@ import { PageHeader } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useAnyPermission } from "@/features/auth/permissions";
+import { usePermission } from "@/features/auth/permissions";
 import { controlApi, isRecord, numberValue, records, textValue, type JsonRecord } from "@/lib/api/control-plane";
 import { formatDateTime } from "@/lib/utils";
 import { useSessionStore } from "@/stores/session-store";
@@ -43,7 +43,7 @@ export default function SecurityPage() {
   const clearSession = useSessionStore((state) => state.clearSession);
   const workspaceId = useSessionStore((state) => state.workspace?.workspace_id || "");
   const authMode = useSessionStore((state) => state.authMode);
-  const canManage = useAnyPermission(["manage_access", "manage_tenant"]);
+  const canManage = usePermission("manage_access");
   const isAccount = authMode === "account";
   const personalSessions = useQuery({ queryKey: ["auth", "sessions"], queryFn: controlApi.authSessions, enabled: isAccount });
   const policy = useQuery({ queryKey: ["admin", "session-policy", workspaceId], queryFn: () => controlApi.sessionPolicy(workspaceId), enabled: canManage && Boolean(workspaceId) });
@@ -89,7 +89,7 @@ export default function SecurityPage() {
   });
   const logoutAll = useMutation({
     mutationFn: controlApi.logoutAll,
-    onSuccess: () => { clearSession(); router.replace("/login"); },
+    onSuccess: () => { queryClient.clear(); clearSession(); router.replace("/login"); },
     onError: (error) => toast.error(error.message),
   });
   const personalRows = personalSessions.data?.sessions ?? [];
@@ -116,12 +116,13 @@ export default function SecurityPage() {
       </section>
       {canManage ? <section className="border border-border bg-surface">
         <SectionHeader title="工作区会话策略" description="限制空闲时间、绝对时长和单个账号的并发会话数。" />
-        <form className="grid gap-4 p-4 sm:grid-cols-3 xl:grid-cols-1 2xl:grid-cols-3" onSubmit={policyForm.handleSubmit((values) => savePolicy.mutate(values))}>
+        <QueryState pending={policy.isPending} error={policy.error} onRetry={() => void policy.refetch()} />
+        {policy.data ? <form className="grid gap-4 p-4 sm:grid-cols-3 xl:grid-cols-1 2xl:grid-cols-3" onSubmit={policyForm.handleSubmit((values) => savePolicy.mutate(values))}>
           <div className="space-y-1.5"><Label htmlFor="idle">空闲超时（分钟）</Label><Input id="idle" type="number" min={5} max={43200} {...policyForm.register("idle", { valueAsNumber: true })} /></div>
           <div className="space-y-1.5"><Label htmlFor="absolute">最长会话（小时）</Label><Input id="absolute" type="number" min={1} max={8760} {...policyForm.register("absolute", { valueAsNumber: true })} /></div>
           <div className="space-y-1.5"><Label htmlFor="max-sessions">并发会话上限</Label><Input id="max-sessions" type="number" min={1} max={50} {...policyForm.register("maxSessions", { valueAsNumber: true })} /></div>
           <div className="sm:col-span-3 xl:col-span-1 2xl:col-span-3"><Button type="submit" variant="primary" loading={savePolicy.isPending}>保存会话策略</Button></div>
-        </form>
+        </form> : null}
       </section> : null}
       <section className="border border-border bg-surface xl:col-span-2">
         <SectionHeader title="我的登录设备" description="当前设备不能在列表中单独撤销；可使用“退出所有设备”结束全部会话。" />

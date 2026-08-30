@@ -22,7 +22,7 @@ CI 和自动化应使用最小权限服务账号令牌，通过 `COGDOC_API_KEY`
 COGDOC_API_KEY='cog_svc_...' cogdoc --workspace wsp_xxx kb list
 ```
 
-`cogdoc --local-storage`（或 `cogdoc-local`）是显式的离线维护入口。它使用 `default` 本地租户、会获取单实例写锁，不代表 Web 账号数据，也不能用于正常多租户操作。
+默认 `cogdoc` 只通过版本化 API 操作，与 Web 共享相同的账号、Workspace、ACL 和任务状态。`cogdoc --local-storage`（或 `cogdoc-local`）仍是显式的离线维护/恢复入口：它使用 `default` 本地租户、会获取单实例写锁，不代表 Web 账号数据，也不能用于正常多租户操作。
 
 ## 能力映射
 
@@ -56,7 +56,7 @@ cogdoc api GET /v1/workspaces/wsp_xxx/service-accounts
 ## 对齐规则
 
 1. Web 与 CLI 必须复用 `CogDocClient` 或同一个已版本化 API 契约，禁止从 CLI 新增数据库直写产品路径。
-2. CLI 切换 Workspace 后必须清空当前知识库选择，防止跨租户复用上下文。
+2. CLI 切换 Workspace 后必须清空当前知识库与对话会话选择，防止跨租户复用上下文。
 3. 创建知识库、上传文档和修改访问范围时，CLI 必须传递与 Web 相同的 `role_ids`。
 4. 文档上传必须走批量异步索引端点，并返回可在 Web 任务中心看到的 `job_id`。
 5. Chat 必须消费 `/v1/chat/stream`，在终端逐 token 输出，并保留最终引用、Trace 和 Session 标识。

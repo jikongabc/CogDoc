@@ -65,6 +65,20 @@ _FACT_MARKERS = (
     "带宽",
     "是否明确",
     "有没有明确",
+    "谁",
+    "是什么",
+    "是何",
+    "是否",
+    "能否",
+    "可否",
+    "有没有",
+    "会不会",
+    "全称",
+    "简称",
+    "定义",
+    "指的是",
+    "指什么",
+    "意味着",
     "分别是什么",
     "各是什么",
     "具体是什么",
@@ -75,11 +89,17 @@ _FACT_MARKERS = (
     "什么区别",
 )
 _ENGLISH_FACT_PATTERN = re.compile(
-    r"\b(?:how many|how much|when|where|which|whether|"
+    r"\b(?:who|what (?:is|are|was|were)|how many|how much|when|where|which|whether|"
     r"what (?:date|time|percentage|ratio|amount|address|email|model|version)|"
     r"duration|deadline|ranking|score|limit|price|cost)\b",
     re.IGNORECASE,
 )
+_ENGLISH_POLAR_FACT_PATTERN = re.compile(
+    r"^\s*(?:is|are|was|were|do|does|did|can|could|should|would|will|"
+    r"has|have|had)\b",
+    re.IGNORECASE,
+)
+_CHINESE_POLAR_FACT_PATTERN = re.compile(r"(?:吗|么)\s*[?？]?\s*$")
 VerificationDoc = TypeVar("VerificationDoc", bound=Mapping[str, Any])
 
 
@@ -124,6 +144,8 @@ def requires_evidence_verification(query: str) -> bool:
         return False
     return any(marker in normalized for marker in _FACT_MARKERS) or bool(
         _ENGLISH_FACT_PATTERN.search(normalized)
+        or _ENGLISH_POLAR_FACT_PATTERN.search(normalized)
+        or _CHINESE_POLAR_FACT_PATTERN.search(normalized)
     )
 
 
@@ -301,7 +323,11 @@ def should_verify_evidence(
         # 明确文本时，仅因向量距离略过校准线而被错误拒答。
         return (
             state.get("retrieval_abstain_reason")
-            in {"below_threshold", "requirement_coverage_incomplete"}
+            in {
+                "below_threshold",
+                "lexical_coverage_requires_verification",
+                "requirement_coverage_incomplete",
+            }
             and float(state.get("retrieval_confidence") or 0.0)
             >= settings.qa_evidence_verify_borderline_min_score
         )

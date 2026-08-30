@@ -216,7 +216,8 @@ export default function TasksPage() {
             const candidateAction = rowAction(row);
             const availableAction = candidateAction && (
               (row._kind === "sync" && canReadAudit)
-              || (["research", "system"].includes(row._kind) && canWrite)
+              || (row._kind === "research" && canWrite)
+              || (row._kind === "system" && canReadAudit)
             ) ? candidateAction : null;
             const taskHref = href(row);
             const actionPending = action.isPending && rowId(action.variables?.row ?? row) === taskId;

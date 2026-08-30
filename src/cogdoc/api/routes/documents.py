@@ -1144,42 +1144,7 @@ async def upload_document(
     if suffix == ".pdf" and not content.startswith(_PDF_MAGIC):
         return _error(ErrorCode.INVALID_PDF, "文件不是合法 PDF", 400)
 
-    if access_store is not None:
-        try:
-            existing_policy = access_store.get_document_by_source(
-                scope.tenant_id, scope.storage_id, filename
-            )
-            if existing_policy is None:
-                access_store.set_document_policy(
-                    scope.tenant_id,
-                    scope.storage_id,
-                    build_document_id(filename),
-                    filename,
-                    principal.subject_id,
-                    "inherit",
-                    owner_membership_id=principal.membership_id,
-                )
-            if selected_roles is not None:
-                access_store.replace_document_roles(
-                    scope.tenant_id,
-                    scope.storage_id,
-                    build_document_id(filename),
-                    selected_roles,
-                )
-        except Exception:
-            return _error(
-                ErrorCode.INTERNAL_ERROR,
-                "文档权限状态不可用，未执行上传",
-                503,
-            )
-
     storage_id = scope.storage_id
-    authorization_guard = _live_session_authorization_guard(
-        request,
-        scope,
-        permission=Permission.WRITE,
-        source=filename,
-    )
     source_dir = registry.source_dir(storage_id)
     quota = getattr(request.app.state, "tenant_quota", None)
     reservation = None
@@ -1196,6 +1161,45 @@ async def upload_document(
             return _error(ErrorCode.TENANT_QUOTA_EXCEEDED, str(exc), 409)
         except TenantMutationInProgress as exc:
             return _error(ErrorCode.BAD_REQUEST, str(exc), 409)
+
+    access_mutations = []
+
+    def rollback_access() -> None:
+        if access_store is not None and access_mutations:
+            last_error: Exception | None = None
+            for attempt in range(4):
+                try:
+                    access_store.rollback_document_upload_access_batch(
+                        access_mutations
+                    )
+                    access_mutations.clear()
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 3:
+                        time.sleep(0.05 * (2**attempt))
+            if last_error is not None:
+                raise last_error
+
+    def prepare_access() -> None:
+        if access_store is not None:
+            access_mutations.extend(
+                access_store.prepare_document_upload_access_batch(
+                    scope.tenant_id,
+                    storage_id,
+                    ((build_document_id(filename), filename),),
+                    principal.subject_id,
+                    owner_membership_id=principal.membership_id,
+                    role_ids=selected_roles,
+                )
+            )
+
+    authorization_guard = _live_session_authorization_guard(
+        request,
+        scope,
+        permission=Permission.WRITE,
+        source=filename,
+    )
     authorization_guard = _with_quota_commit_guard(
         authorization_guard, quota, [reservation]
     )
@@ -1211,10 +1215,15 @@ async def upload_document(
             (lambda: quota.release(reservation)) if quota is not None else None,
             authorization_guard,
             selected_embedding_profile,
+            rollback_access if access_store is not None else None,
+            prepare_access if access_store is not None else None,
         )
     except Exception:
-        if quota is not None:
-            quota.release(reservation)
+        try:
+            rollback_access()
+        finally:
+            if quota is not None:
+                quota.release(reservation)
         raise
     return _public_job(job, request)
 
@@ -1315,55 +1324,6 @@ async def upload_documents_batch(
             or str(getattr(getattr(decision, "mode", None), "value", "")) != "all"
         ):
             return _error(ErrorCode.DOCUMENT_NOT_FOUND, "文档不存在", 404)
-        try:
-            for filename, _content in uploads:
-                document_id = build_document_id(filename)
-                if (
-                    access_store.get_document_by_source(
-                        scope.tenant_id, scope.storage_id, filename
-                    )
-                    is None
-                ):
-                    access_store.set_document_policy(
-                        scope.tenant_id,
-                        scope.storage_id,
-                        document_id,
-                        filename,
-                        principal.subject_id,
-                        "inherit",
-                        owner_membership_id=principal.membership_id,
-                    )
-                if selected_roles is not None:
-                    access_store.replace_document_roles(
-                        scope.tenant_id,
-                        scope.storage_id,
-                        document_id,
-                        selected_roles,
-                    )
-        except Exception:
-            return _error(
-                ErrorCode.INTERNAL_ERROR,
-                "文档权限状态不可用，未执行上传",
-                503,
-            )
-
-    authorization_guards = [
-        guard
-        for filename, _content in uploads
-        if (
-            guard := _live_session_authorization_guard(
-                request, scope, permission=Permission.WRITE, source=filename
-            )
-        )
-        is not None
-    ]
-
-    def revalidate_authorization() -> None:
-        for guard in authorization_guards:
-            guard()
-
-    authorization_guard = revalidate_authorization if authorization_guards else None
-
     storage_id = scope.storage_id
     source_dir = registry.source_dir(storage_id)
     quota = getattr(request.app.state, "tenant_quota", None)
@@ -1391,6 +1351,58 @@ async def upload_documents_batch(
             )
             return _error(code, str(exc), status)
 
+    access_mutations = []
+
+    def rollback_access() -> None:
+        if access_store is not None and access_mutations:
+            last_error: Exception | None = None
+            for attempt in range(4):
+                try:
+                    access_store.rollback_document_upload_access_batch(
+                        access_mutations
+                    )
+                    access_mutations.clear()
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 3:
+                        time.sleep(0.05 * (2**attempt))
+            if last_error is not None:
+                raise last_error
+
+    def prepare_access() -> None:
+        if access_store is not None:
+            access_mutations.extend(
+                access_store.prepare_document_upload_access_batch(
+                    scope.tenant_id,
+                    storage_id,
+                    tuple(
+                        (build_document_id(filename), filename)
+                        for filename, _content in uploads
+                    ),
+                    principal.subject_id,
+                    owner_membership_id=principal.membership_id,
+                    role_ids=selected_roles,
+                )
+            )
+
+    authorization_guards = [
+        guard
+        for filename, _content in uploads
+        if (
+            guard := _live_session_authorization_guard(
+                request, scope, permission=Permission.WRITE, source=filename
+            )
+        )
+        is not None
+    ]
+
+    def revalidate_authorization() -> None:
+        for guard in authorization_guards:
+            guard()
+
+    authorization_guard = revalidate_authorization if authorization_guards else None
+
     def release_reservations() -> None:
         if quota is not None:
             for reservation in reservations:
@@ -1410,9 +1422,14 @@ async def upload_documents_batch(
             release_reservations if quota is not None else None,
             authorization_guard,
             selected_embedding_profile,
+            rollback_access if access_store is not None else None,
+            prepare_access if access_store is not None else None,
         )
     except Exception:
-        release_reservations()
+        try:
+            rollback_access()
+        finally:
+            release_reservations()
         raise
     return _public_job(job, request)
 

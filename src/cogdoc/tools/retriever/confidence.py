@@ -1,10 +1,75 @@
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from cogdoc.config.settings import Settings, get_settings
 from cogdoc.tools.tokenizer import tokenize_mixed_text
+
+
+# 疑问词描述的是用户想要的答案形态，并不是应当在证据中逐字出现的实体。
+# 仅在精确词覆盖信号中忽略它们；BM25、向量召回与重排仍使用完整原始查询。
+_QUERY_FUNCTION_WORDS = frozenset(
+    {
+        "什么",
+        "为何",
+        "为什么",
+        "怎么",
+        "怎样",
+        "如何",
+        "是否",
+        "哪里",
+        "哪个",
+        "哪些",
+        "哪种",
+        "何时",
+        "多少",
+        # English tokens are stemmed by ``tokenize_mixed_text`` (for example,
+        # ``why`` -> ``whi`` and ``many`` -> ``mani``).  These interrogatives
+        # describe the requested answer shape rather than the topic that must
+        # occur verbatim in evidence.
+        "who",
+        "what",
+        "when",
+        "where",
+        "which",
+        "whether",
+        "whi",
+        "how",
+        "mani",
+        "much",
+        "can",
+        "could",
+        "should",
+        "would",
+        "will",
+        "doe",
+        "did",
+    }
+)
+
+
+def _coverage_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for token in tokenize_mixed_text(text):
+        normalized = token.strip().casefold()
+        if len(normalized) < 2:
+            continue
+        terms.add(normalized)
+        # 标识符分词会保留连字符/句点；拆分后的纯英文组件还要重新走同一
+        # stemmer，否则查询末尾 ``Apple?`` 得到 ``appl``，而证据末尾
+        # ``Apple.`` 拆出原始 ``apple``，相同词会被误判为未覆盖。
+        for part in re.split(r"[-_.]+", normalized):
+            if len(part) < 2:
+                continue
+            terms.add(part)
+            terms.update(
+                stemmed.strip().casefold()
+                for stemmed in tokenize_mixed_text(part)
+                if len(stemmed.strip()) >= 2
+            )
+    return terms
 
 
 @dataclass(frozen=True)
@@ -52,11 +117,7 @@ def _query_lexical_coverage(
     matches on particles and isolated numbers.
     """
 
-    query_terms = {
-        token.strip().casefold()
-        for token in tokenize_mixed_text(query)
-        if len(token.strip()) >= 2
-    }
+    query_terms = _coverage_terms(query) - _QUERY_FUNCTION_WORDS
     if not query_terms:
         return None
     evidence_terms: set[str] = set()
@@ -71,11 +132,7 @@ def _query_lexical_coverage(
                 meta.get("context"),
             )
         )
-        evidence_terms.update(
-            token.strip().casefold()
-            for token in tokenize_mixed_text(searchable)
-            if len(token.strip()) >= 2
-        )
+        evidence_terms.update(_coverage_terms(searchable))
     return len(query_terms & evidence_terms) / len(query_terms)
 
 
@@ -150,9 +207,10 @@ def assess_retrieval_support(
             "bm25_score": bm25_score,
             "knowledge_vector_score": knowledge_vector_score,
             "knowledge_lexical_score": knowledge_lexical_score,
-            "query_lexical_coverage": (
-                query_lexical_coverage if query_lexical_coverage else None
-            ),
+            # Zero is an observed negative signal, not a missing signal.  Keep
+            # it so the legacy ``allow_missing_signals`` switch cannot turn a
+            # known lexical mismatch into confidence 1.0.
+            "query_lexical_coverage": query_lexical_coverage,
             "rerank_score": max(rerank_scores) if rerank_scores else None,
             "rerank_margin": (
                 max(rerank_scores) - sorted(rerank_scores, reverse=True)[1]
@@ -185,13 +243,21 @@ def assess_retrieval_support(
         knowledge_lexical_score is not None
         and knowledge_lexical_score >= settings.qa_abstain_min_knowledge_lexical_score
     )
-    exact_query_terms_supported = query_lexical_coverage == 1.0
+    exact_query_terms_covered = query_lexical_coverage == 1.0
     supported = (
         semantic_supported
         or lexical_supported
         or knowledge_vector_supported
         or knowledge_lexical_supported
-        or exact_query_terms_supported
+    )
+    # Exact term overlap proves topicality, not that the evidence answers the
+    # question.  Keep it at the verifier admission threshold so small-corpus
+    # BM25 failures can be recovered by the closed-set evidence verifier without
+    # turning a mention, negation, or empty field into confidence 1.0.
+    lexical_verification_score = (
+        settings.qa_evidence_verify_borderline_min_score
+        if exact_query_terms_covered
+        else 0.0
     )
     score = max(
         _distance_ratio(distance, settings.qa_abstain_max_vector_distance),
@@ -204,7 +270,7 @@ def assess_retrieval_support(
             knowledge_lexical_score,
             settings.qa_abstain_min_knowledge_lexical_score,
         ),
-        1.0 if exact_query_terms_supported else 0.0,
+        lexical_verification_score,
     )
     if normalized_requirements:
         coverage = len(normalized_requirements & covered_requirements) / len(
@@ -215,9 +281,13 @@ def assess_retrieval_support(
             return RetrievalSupport(
                 False, score, "requirement_coverage_incomplete", signals
             )
-    return RetrievalSupport(
-        supported,
-        score,
-        "supported" if supported else "below_threshold",
-        signals,
+    reason = (
+        "supported"
+        if supported
+        else (
+            "lexical_coverage_requires_verification"
+            if exact_query_terms_covered
+            else "below_threshold"
+        )
     )
+    return RetrievalSupport(supported, score, reason, signals)

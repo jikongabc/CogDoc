@@ -4,7 +4,7 @@
 
 [English](README.md) · [简体中文](docs/README_zh-CN.md)
 
-A local RAG knowledge-base console for individuals and teams, built on **LangGraph multi-agent orchestration** with a **deterministic Rust core (PyO3 + maturin)** underneath. It answers questions, summarizes and compares documents, and turns feedback into reviewable derived knowledge over PDF, Markdown, HTML, Office, spreadsheet, and image sources. Every generated claim is pinned to a versioned source location that is *checked, not trusted*—PDF citations remain `[source:Pn]`, while slides, cells, lines, images, and sections use format-aware locators. Use it from a **CLI console**, a **Streamlit web app** backed by FastAPI, or a standalone **Debug console** for trace inspection.
+A local RAG knowledge-base console for individuals and teams, built on **LangGraph multi-agent orchestration** with a **deterministic Rust core (PyO3 + maturin)** underneath. It answers questions, summarizes and compares documents, and turns feedback into reviewable derived knowledge over PDF, Markdown, HTML, Office, spreadsheet, and image sources. Every generated claim is pinned to a versioned source location that is *checked, not trusted*—PDF citations remain `[source:Pn]`, while slides, cells, lines, images, and sections use format-aware locators. Use it from the primary **Next.js web workspace**, the API-backed **CogDoc CLI**, the retained Streamlit compatibility client, or a standalone **Debug console** for trace inspection.
 
 > **Optional local OCR.** OCR is disabled by default. When enabled, pages without enough usable native text are rendered with PyMuPDF and recognized by a local Tesseract CLI; native-text pages keep the existing fast path.
 
@@ -20,22 +20,28 @@ A local RAG knowledge-base console for individuals and teams, built on **LangGra
 
 - **Multi-document comparison** — per-document profiles across fixed dimensions, rendered as cited dimension-by-dimension blocks.
 
-- **Hybrid retrieval, query-level fusion** — each original, rewritten, and requirement-specific query searches the PDF vector+BM25 hybrid channel and the approved-derived-knowledge channel; the resulting query/channel rankings are fused with equally weighted deterministic RRF, and a requirement quota prevents late focused queries from being starved before rerank. Tokenization and BM25 are native — Chinese via `jieba-rs`, English lowercased + Snowball-stemmed + stopword-filtered.
+- **Hybrid retrieval, query-level fusion** — each original, rewritten, and requirement-specific query searches the source-document vector+BM25 hybrid channel and the approved-derived-knowledge channel; the resulting query/channel rankings are fused with equally weighted deterministic RRF, and a requirement quota prevents late focused queries from being starved before rerank. Tokenization and BM25 are native — Chinese via `jieba-rs`, English lowercased + Snowball-stemmed + stopword-filtered.
 
 - **Structure-aware Parent–Child context** — conservative Markdown, numbered, and common Chinese/English headings form section parents. Retrieval and citations remain child-chunk precise, while reranked hits can hydrate a bounded contiguous sibling window from the same section; legacy or unstructured indexes fall back to the existing ±1 neighbor window.
 
-- **Content-addressed incremental cache** — a per-file SHA-256 manifest plus a versioned chunk-identity contract: unchanged files reuse the existing index, and only a changed PDF or chunking scheme triggers an incremental rebuild.
+- **Content-addressed incremental cache** — a per-file SHA-256 manifest plus a versioned chunk-identity contract: unchanged files reuse the existing index, and only a changed source, parser/chunking contract, or embedding contract triggers a rebuild.
+
+- **Batch upload with explicit embedding and role scope** — one job can ingest multiple supported files, select the local BGE-M3 or configured cloud embedding profile, and bind a document role allowlist. A profile change rebuilds the KB generation instead of mixing vector contracts.
+
 - **Source operations control plane** — local folders, Git, URLs, Zotero, Notion, Confluence, SharePoint, and S3 share one resumable sync runtime with checkpoints, health snapshots, dead letters/replay, budgets, and fail-closed ACL mapping. Connector secrets can use an AES-256-GCM vault, manual rotation, or Notion/Atlassian/Microsoft OAuth, while legacy environment references remain supported. Operators can browse the source catalog, download or diff immutable versions, and soft-delete/restore historical raw artifacts. See [the connector guide](docs/CONNECTORS_zh-CN.md).
+
+- **Optional distributed control plane and immutable index publication** — PostgreSQL leases, a persistent single-thread scheduler, transactional outbox, S3 generations, and fencing/CAS publication can scale background workers horizontally without allowing incomplete or stale generations to become current. The primary API remains single-writer; see the [HA deployment guide](docs/HA_DEPLOYMENT_zh-CN.md) for boundaries and rollout steps.
 
 - **Multiple knowledge bases · multiple conversations · layered memory** — full display history is persisted for replay; validated recent turns form bounded short-term memory, evicted turns become session-level summaries and decisions, and only explicit stable facts enter cross-session long-term memory. Wrong answers never enter Agent memory.
 
-- **Deep Research workspace with reproducible evidence** — generate or edit an outline whose sections contain atomic evidence requirements, execute every requirement through the production hybrid retrieval path, and pause/resume/cancel through durable attempt leases. Admission, phase deadlines, retrieval/document/LLM/input budgets, and stale-worker commits are bounded fail-closed. Report claims are independently audited, every atomic requirement must be covered by supported cited claims, and the two gates share at most one repair before failing closed. Each run freezes index/source/derived-knowledge/tuning and retrieval-contract provenance; stale evidence must be refreshed before review or publication, and publication produces an integrity-checked Markdown snapshot plus a deterministic verification bundle. A paginated, ETag-aware summary index keeps collection polling independent of report and evidence size.
+- **Deep Research workspace with reproducible evidence** — generate or edit an outline, execute its atomic evidence requirements through production retrieval, and pause/resume/cancel durable runs. Claims and requirement coverage are audited against a closed evidence set; frozen provenance prevents stale review or publication, and publication produces an integrity-checked report and verification bundle.
 
-- **Web, CLI, and Debug entry points** — a slash-command CLI console, a Streamlit web UI over FastAPI, and a focused `make debug` console for trace inspection.
+- **Web, CLI, and Debug entry points** — a production Next.js workspace, an interactive and automation-friendly API CLI, a retained Streamlit compatibility client, and a focused `make debug` console for trace inspection.
 
 - **Derived knowledge review loop** — manually add knowledge, save validated answers, or turn corrections / no-evidence feedback into pending knowledge cards with source bindings, conflict groups, stale scans, revisions, batch approve/reject, and archive/delete flows.
 
 - **Feedback analysis and attributed retrieval tuning** — thumbs-up/down, corrections, ratings, issue types, and evidence context are persisted by `trace_id`; positive signals may boost cited chunks, while negative signals penalize them only when `feedback_type=bad_retrieval`. `skip_retrieval_feedback=true` disables tuning for an entry, and every tuning record remains reviewable and rollbackable.
+
 - **Evidence-level retrieval-eval flywheel** — a complete successful server trace plus an explicit `thumbs_down` / `bad_retrieval` signal creates an unlabelled review draft for QA requirements, Summary sections, or Compare source×dimension cells. Gold chunks/spans and hard negatives can only be added by an authorized reviewer; approvals and exports fail closed when the index generation, chunk identity contract, or source SHA has changed.
 
 - **Trace observability, review queue, and webhooks** — every request can export a safe JSON trace with config, node timings, rewrites, evidence previews, and errors; the web UI scopes traces to the current conversation, aggregates pending/stale knowledge and feedback into a review queue, and can emit webhook events for new pending knowledge.
@@ -44,56 +50,68 @@ A local RAG knowledge-base console for individuals and teams, built on **LangGra
 
 ## Feature Walkthrough
 
-1. **Web chat with citations and evidence.** Pick a knowledge base, ask in natural language, watch live execution progress, then receive the finalized answer and inspect its citation sources, evidence snippets, and feedback controls.
+1. **Web workspace, ingestion, chat, and evidence.** Create a knowledge base, batch-upload the original competition documents with an embedding profile and role scope, follow parsing/indexing progress, then ask in natural language and inspect the finalized answer's evidence.
 
-   <img src="./docs/images/web-chat.png" alt="Web chat" width="800">
+   <img src="./docs/images/knowledge-workspace.png" alt="Knowledge workspace" width="800">
 
-2. **CLI console.** A slash-command console for knowledge bases, ingestion, multi-conversation history, and forced task modes.
+   <img src="./docs/images/workspace-batch-upload.png" alt="Batch document upload" width="800">
 
-   <img src="./docs/images/cli-console1.png" alt="CLI console" width="800">
+   <img src="./docs/images/workspace-indexing.png" alt="Document parsing and indexing progress" width="800">
+
+   <img src="./docs/images/chat-conversation.png" alt="Streaming conversation" width="800">
+
+   <img src="./docs/images/evidence-detail.png" alt="Citation evidence detail" width="800">
+
+2. **CLI console.** The familiar CogDoc slash-command console, now backed by the same API as the Web workspace, for accounts, workspaces, ACLs, knowledge bases, ingestion, chat/history, Research, integrations, diagnostics, evaluation, and administration.
+
+   <img src="./docs/images/cli-console-current.png" alt="CogDoc CLI console" width="800">
 
 3. **Standalone Debug console.** `make debug` opens a focused console for one KB; after a normal answer, continue with `/trace`, `/steps`, `/rewrite`, `/evidence`, and `/config`, or run `/retrieve <query>` to inspect retrieval without calling the LLM.
 
-   <img src="./docs/images/debug-console1.png" alt="Standalone Debug console" width="800">
+   <img src="./docs/images/debug-console-current.png" alt="Current standalone Debug console" width="800">
 
 4. **Grounded QA.** Every factual sentence ends with a citation whose file name and page exist in the retrieved context; invalid ones bounce the answer back for regeneration.
 
-   <img src="./docs/images/qa_net.png" alt="Grounded QA web view" width="800">
+   <img src="./docs/images/chat-grounded-qa.png" alt="Grounded QA web view" width="800">
 
 5. **Structured summary.** Summarize one named document into fixed sections with deterministic per-section citations.
 
-   <img src="./docs/images/summary_net.png" alt="Structured summary web view" width="800">
+   <img src="./docs/images/chat-summary.png" alt="Structured summary web view" width="800">
 
 6. **Multi-document comparison.** Compare two or more named documents method-by-method, metric-by-metric, with citations on every cell.
 
-   <img src="./docs/images/compare_net.png" alt="Comparison web view" width="800">
+   <img src="./docs/images/chat-compare.png" alt="Comparison web view" width="800">
 
 7. **Trace debug panel.** Inspect only the current conversation's traces, including routing, query rewrites, retrieval/rerank steps, request config, and citation audits.
 
-   <img src="./docs/images/web-trace-debug.png" alt="Trace debug panel" width="800">
+   <img src="./docs/images/trace-debugger.png" alt="Trace debug panel" width="800">
+
+   <img src="./docs/images/retrieval-diagnostics.png" alt="Retrieval diagnostics" width="800">
 
 8. **Derived knowledge review center.** Add manual knowledge, save an answer, inspect source bindings, review conflicts, approve/reject/archive items, and rebuild the approved derived-knowledge index.
 
-   <img src="./docs/images/derived-knowledge3.png" alt="Derived knowledge review center" width="800">
+   <img src="./docs/images/derived-knowledge-review.png" alt="Derived knowledge review center" width="800">
+
+   <img src="./docs/images/access-control.png" alt="Knowledge-base and document access roles" width="800">
 
 9. **Feedback and tuning.** Every thumbs-up/down, correction, and no-evidence feedback entry is tied to the answer's `trace_id`, query, answer, citations, and evidence; CogDoc turns bad cases into the evaluation ledger, converts fixable content into pending derived knowledge, and creates enable/disable retrieval-tuning records so future ranking can keep improving from human feedback.
-
-   <img src="./docs/images/feedback.png" alt="Feedback and tuning" width="800">
 
 ## Quick Start
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev,frontend]"   # runtime + build/test + Streamlit deps
+pip install -e ".[dev,frontend]"   # runtime + build/test + compatibility UI dependencies
+npm ci --prefix web                # locked Next.js workspace dependencies
 make native     # build the Rust extension: cd rust_core && maturin develop --release
 make check      # verify the extension and its native symbols
-make run        # build/reuse the index, warm up models, start the console
+make serve      # terminal 1: FastAPI
+make web        # terminal 2: Next.js workspace
 ```
 
-Dependencies live in [pyproject.toml](pyproject.toml): runtime in `[project.dependencies]`, with `dev` (build/test) and `frontend` (Streamlit client) as optional extras — install both for the full local experience via `.[dev,frontend]`. The package uses a `src/` layout (`src/cogdoc/`); the `make` targets put `src/` on `PYTHONPATH`, so no install is strictly required to run the suite.
+Dependencies live in [pyproject.toml](pyproject.toml): runtime in `[project.dependencies]`, with `dev` (build/test) and `frontend` (Streamlit compatibility client) as optional extras. The Web workspace requires Node.js 22 or newer and uses the lockfile under `web/`. The package uses a `src/` layout (`src/cogdoc/`); the `make` targets put `src/` on `PYTHONPATH`, so no install is strictly required to run the suite.
 
-Copy `.env.example` to `.env` and set at least your cloud `LLM_API_KEY` (or run `/local` with Ollama). Put supported documents in the inbox `your_documents/` (or set `COGDOC_DOC_DIR`). `make native` must be re-run after any change under `rust_core/src/` — the `.so` is not auto-rebuilt and not committed.
+Copy `.env.example` to `.env` and set at least your cloud `LLM_API_KEY`, or configure Ollama and use the Web local-mode toggle / `cogdoc chat --local "<question>"`. Upload supported documents through the Web/API; `your_documents/` (`COGDOC_DOC_DIR`) remains the inbox for explicit offline maintenance. `make native` must be re-run after any change under `rust_core/src/` — the `.so` is not auto-rebuilt and not committed.
 
 Persistent accounts default to off for a no-surprise upgrade. For an individual or team bootstrap, temporarily set both `COGDOC_ACCOUNT_AUTH_ENABLED=true` and `COGDOC_SELF_REGISTRATION_ENABLED=true`, register the first owner, then disable self-registration and use invitations or SSO. An enterprise can configure [OIDC SSO](docs/OIDC_zh-CN.md) and optionally provision users and groups through [SCIM 2.0](docs/SCIM_zh-CN.md).
 
@@ -106,21 +124,21 @@ The CLI and web app use the same versioned API, account, workspace, ACL, and job
 ```bash
 make serve                         # FastAPI, required by Web and product CLI
 cogdoc login owner@example.com     # stores only the opaque session token (mode 0600)
-cogdoc                              # interactive API console
+cogdoc                              # enter the CogDoc interactive console
 ```
 
-Use `cogdoc --help` for automation-friendly commands covering workspaces, roles, KB/document ACL, batch upload, streaming chat, sessions, derived knowledge, Research, integrations, jobs, traces, evaluation, and index migrations. Inside the interactive console, the same commands may start with `/`; plain text starts a streaming chat against the selected KB.
-
-The old direct-storage inbox console is retained only for offline recovery as `cogdoc --local-storage` or `cogdoc-local`. It uses the legacy `default` tenant and is intentionally not the normal multi-tenant product path. See [CLI/Web parity](docs/cli-web-parity.md).
+Use `cogdoc --help` for automation-friendly commands covering workspaces, roles, KB/document ACL, batch upload, streaming chat, sessions, derived knowledge, Research, integrations, jobs, traces, evaluation, and index migrations. Inside the same interactive console, established commands such as `/kb new`, `/add`, `/docs`, `/qa`, `/summary`, and `/compare` remain available; plain text starts a streaming chat against the selected KB.
 
 `make debug` opens the standalone Debug console for one KB. Ask questions there to get normal answers plus trace summaries, use `/trace`, `/steps`, `/rewrite`, `/evidence`, and `/config` to inspect the latest request, or run `/retrieve <query>` to inspect retrieval and rerank output without calling the LLM. To debug a specific KB directly, run `python -m cogdoc.debug --kb <kb_id>`.
 
-### Web app (Streamlit + FastAPI)
+### Web app (Next.js + FastAPI)
 
 ```bash
 make serve          # terminal 1: FastAPI at http://localhost:8000
-make frontend       # terminal 2: Streamlit UI (opens in the browser)
+make web            # terminal 2: Next.js workspace at http://localhost:3000
 ```
+
+`make frontend` remains available for existing Streamlit workflows; the Next.js workspace is the primary product interface.
 
 In the browser:
 
@@ -130,12 +148,16 @@ In the browser:
 4. **Conversations** — start a new conversation or reopen a previous one (session and KB persist in the URL, so a refresh resumes the same chat).
 5. **Chat** — pick a mode (`auto` / `qa` / `summary` / `compare`), ask, watch live progress, and read the finalized answer with its citation sources, evidence snippets, and 👍/👎 feedback.
 6. Toggle **Local Ollama mode** in the sidebar to route generation to the local model.
-7. Open **Debug** to inspect traces for the current conversation only, or use **Retrieval debug** to call `/v1/retrieve` directly and inspect chunk hits, rerank scores, and retrieval metadata.
+7. Open **Diagnostics** to inspect traces for the current conversation, run retrieval diagnostics, inspect index generations, and use the reviewer-only **RAG Evaluation** tab.
 8. Switch the main view to **Derived Knowledge** to create knowledge, review pending/stale items, inspect feedback analysis, enable/disable retrieval tuning, export the review queue, and scan for stale bindings after document changes.
+9. Open **Research** to plan, execute, pause/resume, review, and publish evidence-bound long-form reports.
+10. Use **External integrations** for connector credentials, synchronization, health, source versions, replay, and recovery; materialized documents remain visible in the target KB.
+11. Use **Tasks** to inspect ingestion, synchronization, Research, and HA jobs without losing the owning KB or resource context.
+12. Use **Admin** to manage members, built-in/custom roles, invitations, identity, service accounts, session security, and audit exports.
 
 ### Calling the API directly
 
-The Streamlit app is a thin client over the FastAPI service — you can hit it directly:
+The Next.js workspace and compatibility clients use the same FastAPI service — you can hit it directly:
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -143,18 +165,29 @@ The Streamlit app is a thin client over the FastAPI service — you can hit it d
 | `POST /v1/auth/oidc/authorize`, `GET /v1/auth/oidc/callback`, `POST /v1/auth/oidc/exchange` | Run a PKCE/nonce-protected enterprise login and exchange a one-time browser handoff for a normal CogDoc session |
 | `POST /v1/auth/oidc/link/authorize`, `GET/DELETE /v1/auth/oidc/identities[/{id}]` | Explicitly link, inspect, or unlink a federated identity |
 | `GET/PUT /v1/workspaces/{id}/oidc-policy` | Manage revision-safe issuer/domain JIT admission for a workspace (owner/admin) |
+| `GET /v1/workspaces/{id}/scim-status` | Inspect credential-free SCIM synchronization state (owner/admin) |
+| `GET/POST /scim/v2/Users`, `GET/PUT/PATCH/DELETE /scim/v2/Users/{id}` | Provision, update, deactivate, or soft-delete users with a workspace-scoped SCIM Bearer |
+| `GET/POST /scim/v2/Groups`, `GET/PUT/PATCH/DELETE /scim/v2/Groups/{id}` | Synchronize groups and apply exact group-to-role mappings |
+| `GET/POST /v1/workspaces/{id}/service-accounts`, `PATCH/DELETE .../{service_account_id}` | Manage persistent machine identities and their live roles |
+| `GET/POST .../service-accounts/{id}/tokens`, `DELETE .../tokens/{token_id}` | Issue a one-time token, inspect metadata, or revision-safely revoke it |
+| `GET/PUT /v1/workspaces/{id}/service-account-policy` | Bound machine-account count, token count/TTL, non-expiring credentials, and grantable permissions |
+| `GET/PUT /v1/workspaces/{id}/session-policy` | Configure idle, absolute, and per-user concurrency limits |
+| `GET/DELETE /v1/workspaces/{id}/security-sessions[/session_id]` | Page through security-safe session metadata and revoke workspace sessions |
 | `GET /v1/auth/me`, `POST /v1/auth/logout`, `POST /v1/auth/logout-all` | Inspect the current identity or revoke one/all login sessions |
 | `GET /v1/auth/sessions`, `DELETE /v1/auth/sessions/{id}`, `POST /v1/auth/change-password` | Manage devices/sessions and rotate the password |
 | `GET/POST /v1/workspaces`, `POST /v1/workspaces/{id}/switch` | List/create workspaces and switch the current session's active workspace |
 | `GET /v1/workspaces/{id}/members`, `PATCH/DELETE /v1/workspaces/{id}/members/{member_id}` | List members, change roles, or remove a member |
+| `GET/POST /v1/workspaces/{id}/roles`, `DELETE /v1/workspaces/{id}/roles/{role_id}` | List built-in/custom roles, create a role from a non-owner template, or delete an unused custom role |
 | `POST/GET /v1/workspaces/{id}/invites`, `DELETE /v1/workspaces/{id}/invites/{invite_id}`, `POST /v1/auth/invitations/accept` | Issue, inspect, revoke, or accept one-time workspace invitations |
 | `GET /v1/tenant` | Inspect the authenticated workspace, subject, role, permissions, and quota usage |
 | `GET /v1/audit-events` | Page through the current workspace's hash-chained audit metadata (owner/admin) |
+| `POST/GET /v1/audit-events/exports`, `GET .../{job_id}/content` | Create, poll, and download integrity-described tenant audit NDJSON exports |
+| `GET /v1/embedding-profiles` | List safe local/cloud embedding profile metadata and availability without exposing credentials |
 | `POST /v1/knowledge-bases`, `GET /v1/knowledge-bases` | Create / list knowledge bases |
 | `GET/PATCH /v1/knowledge-bases/{kb}/access` | Inspect or change a KB's `workspace` / `private` policy |
 | `GET/PATCH /v1/knowledge-bases/{kb}/documents/{document_id}/access` | Inspect or change a document's `inherit` / `workspace` / `private` policy |
 | `GET/POST/DELETE .../access/grants[/subject_id]` | Manage subject grants at either KB or document scope |
-| `POST /v1/knowledge-bases/{kb}/documents` | Upload + ingest a supported document/image (returns an async `job_id`) |
+| `POST /v1/knowledge-bases/{kb}/documents/batch` | Batch upload supported documents/images with one role allowlist and local/cloud embedding profile (returns an async `job_id`) |
 | `GET/POST /v1/knowledge-bases/{kb}/connections` | List or create durable source connections using a vault credential or environment reference |
 | `GET/POST /v1/knowledge-bases/{kb}/connector-credentials` | List metadata or encrypt a manual connector credential (secret values are write-only) |
 | `PATCH/DELETE .../connector-credentials/{credential_id}`, `GET .../connector-credentials/audit/events` | Rotate/delete credentials with revision protection, or inspect metadata-only credential audit events |
@@ -168,7 +201,9 @@ The Streamlit app is a thin client over the FastAPI service — you can hit it d
 | `DELETE .../{version_id}/artifact`, `POST .../source-artifacts/{recovery_token}/restore` | Soft-delete a non-current raw version or restore it with its scoped recovery token |
 | `GET .../source-artifacts/usage`, `DELETE .../source-artifacts/trash?older_than=...` | Inspect active/trash usage or irreversibly purge scoped trash older than an epoch boundary |
 | `GET /v1/knowledge-bases/{kb}/sources`, `GET /v1/knowledge-bases/{kb}/sources/{source}/chunks` | Browse indexed sources and chunk previews |
-| `GET /v1/index-jobs/{job_id}` | Poll ingestion progress |
+| `GET /v1/index-jobs`, `GET /v1/index-jobs/{job_id}` | List or poll ingestion progress |
+| `GET /v1/sync-jobs`, `GET /v1/research-jobs/summaries`, `GET /v1/ha/jobs` | Feed the task center with bounded workspace-scoped job summaries |
+| `GET /v1/index-migrations/scan`, `POST /v1/index-migrations`, `GET .../{run_id}` | Scan, start, inspect, roll back, or finalize a single-flight index-generation migration |
 | `POST /v1/chat`, `POST /v1/chat/stream` | Ask (JSON or SSE streaming) |
 | `POST /v1/summary`, `POST /v1/compare` | Run explicit Summary / Compare tasks without router ambiguity |
 | `POST /v1/retrieve` | Return child-level retrieval hits with parent/section identity, source/page previews, and ranking metadata |
@@ -204,11 +239,11 @@ The Streamlit app is a thin client over the FastAPI service — you can hit it d
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | Health, readiness, Prometheus metrics |
 
 `/v1/chat/stream` always streams lifecycle and node-progress events. For QA,
-Summary, and Compare, model text is intentionally buffered because intermediate
-output can contain internal Evidence IDs and has not yet passed finalization; the
-client receives the finalized answer as one `token` event immediately before the
-normal `final` event, not as token-by-token prose. Other tasks retain live model
-tokens unless the global claim-verification gate requires buffering.
+Summary, and Compare, unsafe intermediate model text is buffered because it can contain
+internal Evidence IDs and has not yet passed finalization. Once the public answer passes
+the citation/claim boundary, the API emits it incrementally as bounded Unicode `token`
+chunks, then sends the structured `final` event. Other task paths may forward live model
+tokens unless the global claim-verification gate requires the same audited release.
 
 ### Source operations and connector credentials
 
@@ -226,11 +261,13 @@ Owners can manage the workspace itself; admins combine write, delete, review/pub
 
 New knowledge bases default to `workspace`; uploaded documents default to `inherit`. A `private` KB is visible only to its resource owner, workspace owner/admin, or a same-workspace subject with a KB grant. Documents may inherit the KB, reopen visibility to the workspace, or become private; a document grant can expose only that document. Grant roles and workspace roles are intersected, so an ACL grant cannot elevate a user's workspace permissions. Missing, malformed, or unavailable ACL state denies access in account mode. Only owner/admin identities with `manage_access` can alter policies or grants.
 
+Every workspace has the built-in `owner`, `admin`, `editor`, `reviewer`, and `viewer` roles; an invitation without an explicit role defaults to `viewer`. Owners/admins can create a custom role with its own `role_id` by inheriting a non-owner built-in permission template. Members bind to exactly one active role, while KB and document role allowlists match the exact role ID rather than every role sharing the same template. The KB allowlist is the parent boundary and a document allowlist narrows it further. A custom role still referenced by a member, KB, or document cannot be deleted.
+
 Query authorization is materialized as an explicit `ALL`, non-empty `SUBSET`, or `DENY` scope. For a subset, Chroma vector filtering, BM25 candidate selection, approved-derived-knowledge lookup, Summary, Compare, and QA all apply the source allowlist before top-k/reranking; a second post-fusion guard removes any result returned by a stale or custom backend that ignored the filter. This avoids unauthorized high-scoring chunks crowding authorized evidence out of top-k and prevents forbidden text from entering prompts, traces, or persisted evidence. Background Research freezes its creator and exact source boundary, rechecks current workspace membership and ACLs before/after retrieval, refuses a backend that cannot enforce a subset, and stops if access has been revoked; later grants do not silently broaden an already-running job.
 
-Static service principals remain available for automation and staged upgrades. `COGDOC_API_PRINCIPALS` maps each key to a `tenant_id`, `subject_id`, and role; legacy `COGDOC_API_KEYS` remain `default`-workspace admins, while `COGDOC_EVAL_REVIEW_API_KEYS` are least-privileged `default`-workspace reviewers. When account auth is enabled, configured service keys and human sessions coexist. With account auth disabled and no static credentials, only effective loopback clients receive the local owner identity. A reverse proxy deployment must list only its proxy networks in `COGDOC_TRUSTED_PROXY_CIDRS` and overwrite either `Forwarded` or `X-Forwarded-For`; requests from a configured proxy without a valid chain fail closed, so its loopback TCP address cannot grant owner access to an external client. Bearer takes precedence over `X-API-Key` if both are sent. Explicit reviewer/admin/owner principals can use evidence-eval and Research review routes; persisted actors always come from the authenticated identity. Hard quotas cover KB count, committed plus in-flight PDF count, and PDF bytes. `/v1/tenant` reports `limits`, `usage`, and `reserved`; quota failures return HTTP 409 with `TENANT_QUOTA_EXCEEDED`.
+Static service principals remain available for automation and staged upgrades. `COGDOC_API_PRINCIPALS` maps each key to a `tenant_id`, `subject_id`, and role; legacy `COGDOC_API_KEYS` remain `default`-workspace admins, while `COGDOC_EVAL_REVIEW_API_KEYS` are least-privileged `default`-workspace reviewers. When account auth is enabled, configured service keys and human sessions coexist. With account auth disabled and no static credentials, only effective loopback clients receive the local owner identity. A reverse proxy deployment must list only its proxy networks in `COGDOC_TRUSTED_PROXY_CIDRS` and overwrite either `Forwarded` or `X-Forwarded-For`; requests from a configured proxy without a valid chain fail closed, so its loopback TCP address cannot grant owner access to an external client. Bearer takes precedence over `X-API-Key` if both are sent. Explicit reviewer/admin/owner principals can use evidence-eval and Research review routes; persisted actors always come from the authenticated identity. Hard quotas cover KB count, committed plus in-flight document count, and source bytes. `/v1/tenant` reports `limits`, `usage`, and `reserved`; quota failures return HTTP 409 with `TENANT_QUOTA_EXCEEDED`.
 
-`COGDOC_API_KEY` (singular) is an outbound credential consumed by the Streamlit/CLI client, not a server credential allowlist. If it is present in the Streamlit process and the browser has no human session token, the UI deliberately enters service-key mode and skips the account login screen. Leave it empty on every shared or multi-user frontend; configure accepted service identities on the API with `COGDOC_API_KEYS` / `COGDOC_API_PRINCIPALS`, and let human users sign in normally. A singular key is appropriate only for a trusted single-user console or dedicated automation frontend.
+`COGDOC_API_KEY` (singular) is an outbound credential consumed by the CLI and Streamlit compatibility client, not a server credential allowlist. The Next.js workspace uses human browser sessions and does not consume this server-side variable. Keep it empty on shared compatibility frontends; configure machine identities with persistent service accounts or the API-side `COGDOC_API_KEYS` / `COGDOC_API_PRINCIPALS`, and let human users sign in normally.
 
 The module-level production app durably appends metadata-only events to `COGDOC_DATA_DIR/audit/events.jsonl`: mutations receive an intent record before execution and an HTTP response-commit record before response headers are sent; reads receive the latter. A corrupt or unwritable chain makes protected traffic fail closed with HTTP 503. `GET /v1/audit-events` returns the current workspace newest-first, with an exclusive `before_sequence` cursor. Public probes/docs and unauthenticated 401 attempts are not recorded. The per-workspace SHA-256 chain detects malformed, truncated, rewritten, or broken history during a live process and validates self-consistency after restart, but it is not a signature, WORM store, or external trusted head; back up and externally anchor it when adversarial filesystem tampering is in scope.
 
@@ -294,9 +331,10 @@ Only after all three steps succeed should `.env` be changed to `COGDOC_STATE_BAC
 ## Tech Stack
 
 - **Deterministic core** — a custom [Rust](https://www.rust-lang.org/) extension ([PyO3](https://pyo3.rs/) + [maturin](https://www.maturin.rs/)) carries `jieba-rs` CN/EN tokenization, BM25, RRF fusion, SHA-256 manifest, and citation validation — all native, independently unit-tested, stable across agent/prompt churn.
-- **Retrieval** — `bge-m3` multilingual vector recall + BM25 keyword recall, fused by the Rust RRF kernel and reranked by `bge-reranker-v2-m3`; PDF vectors and approved derived-knowledge vectors live in [Chroma](https://www.trychroma.com/), PDFs are parsed by PyMuPDF.
+- **Retrieval** — local `bge-m3` or a configured cloud embedding profile + BM25 keyword recall, fused by the Rust RRF kernel and reranked by `bge-reranker-v2-m3`; source-document and approved-derived-knowledge vectors live in [Chroma](https://www.trychroma.com/). The format-neutral loader handles PDF, Markdown, text, HTML, DOCX, PPTX, XLSX, and supported images; PDF parsing uses PyMuPDF with optional local OCR.
 - **Orchestration** — [LangGraph](https://langchain-ai.github.io/langgraph/) wires routing → task subgraphs → physical citation self-heal → optional parent-graph claim audit / bounded repair / refusal into a loopable state graph.
 - **Models** — OpenAI-compatible dual backend, hot-swappable: cloud DeepSeek or local Ollama `qwen2.5:7b`.
+- **Web workspace** — Next.js 16 + React 19 + strict TypeScript, Tailwind CSS, Radix/shadcn foundations, TanStack Query, Zustand, React Hook Form + Zod, and Playwright.
 - **Serving and observability** — FastAPI with SSE streaming, optional persistent-account/service-key auth, workspace RBAC/resource ACLs, and token-bucket rate limiting; sessions, index jobs, feedback, review queues, and derived knowledge are persisted locally; JSON traces feed the web Trace panel and standalone Debug console.
 
 ## Architecture
@@ -316,13 +354,13 @@ flowchart TD
     subgraph ENTRY["Entry points"]
         CLI["CLI console"]
         DEBUG["Debug console"]
-        WEB["Streamlit web UI"]
+        WEB["Next.js web workspace"]
     end
 
     subgraph HTTP["FastAPI HTTP API"]
         APISTART["app startup"]
         ACCESS["API key auth / rate limit / metrics"]
-        ROUTES["routes: chat / agent / documents / knowledge / feedback / traces / health"]
+        ROUTES["identity / documents / chat / research / integrations / diagnostics / admin"]
     end
 
     subgraph CORE["Core Python services"]
@@ -417,9 +455,9 @@ flowchart TD
     class LLM,RUST,EMB native
 ```
 
-The product CLI and Web UI both use FastAPI over HTTP/SSE, so they share authentication, workspace selection, ACL enforcement, and asynchronous job state. `cogdoc-debug` and the explicit `cogdoc-local` offline-maintenance console still call Python services in-process; those maintenance tools acquire the single-instance lock and must not run beside the API over the same data directory.
+The CogDoc CLI and Web UI both use FastAPI over HTTP/SSE, so they share authentication, workspace selection, ACL enforcement, and asynchronous job state. The `cogdoc --local-storage` recovery mode and `cogdoc-debug` call Python services in-process; those maintenance modes acquire the single-instance lock and must not run beside the API over the same data directory.
 
-The next diagram expands ingestion, retrieval, and local persistence boundaries: source PDFs and approved derived knowledge are indexed separately, then joined into one candidate pool at query time; feedback does not rewrite indexes directly, but is persisted as reviewable records or rollbackable retrieval tuning.
+The next diagram expands ingestion, retrieval, and local persistence boundaries: source documents and approved derived knowledge are indexed separately, then joined into one candidate pool at query time; feedback does not rewrite indexes directly, but is persisted as reviewable records or rollbackable retrieval tuning.
 
 **Index, Retrieval, and Storage**
 
@@ -446,7 +484,7 @@ flowchart LR
     end
 
     subgraph INGESTION["Ingestion pipeline"]
-        PARSE["PDF parse / chunk / manifest"]
+        PARSE["source parse / chunk / manifest"]
     end
 
     subgraph NATIVE["Rust core"]
@@ -454,7 +492,7 @@ flowchart LR
     end
 
     subgraph STORE["Local storage"]
-        PDFVEC["Chroma PDF vectors"]
+        PDFVEC["Chroma source vectors"]
         BM25["BM25 artifact"]
         ARTIFACTS["artifacts: manifest / journal"]
     end
@@ -497,7 +535,7 @@ flowchart LR
     end
 
     subgraph STORE["Local storage"]
-        PDFVEC["Chroma PDF vectors"]
+        PDFVEC["Chroma source vectors"]
         BM25["BM25 artifact"]
         DKVEC["Chroma derived-knowledge vectors"]
         TUNESTORE["retrieval tuning store: tuning records"]
@@ -505,10 +543,10 @@ flowchart LR
 
     subgraph RETRIEVAL["QA retrieval pipeline"]
         QUERY["query + rewrites"]
-        VECH["PDF vector recall: Chroma"]
-        BM25CH["PDF keyword recall: BM25"]
+        VECH["source vector recall: Chroma"]
+        BM25CH["source keyword recall: BM25"]
         DKCH["derived-knowledge channel: vector search"]
-        FUSION["PDF RRF fusion"]
+        FUSION["source RRF fusion"]
         CAND["candidate pool"]
         TUNE["feedback weights"]
         RERANK["bge-reranker-v2-m3"]
@@ -601,19 +639,19 @@ flowchart LR
 
 Summary builds a fixed-section structured summary of one named document; Compare builds a per-document profile across fixed dimensions and renders cited Markdown comparison blocks grouped by dimension. Both bind `[source:Pn]` citations deterministically from chunk metadata and run the same `validate_citations_native` checker as QA.
 
-The Python layer owns orchestration, prompts, model clients, indexing, the CLI console, the standalone Debug console, and the FastAPI/Streamlit front ends. Approved derived knowledge is stored/reviewed in Python, indexed into Chroma, and searched as a separate QA evidence source; pending, stale, rejected, and archived entries do not enter retrieval. The Rust layer (`rust_core`) owns deterministic kernels that stay stable across agent changes and are unit-tested independently.
+The Python layer owns orchestration, prompts, model clients, indexing, the API-backed CLI, the offline recovery console, the standalone Debug console, the FastAPI control plane, and the Streamlit compatibility client. The primary Web workspace lives under `web/` and consumes the same versioned API. Approved derived knowledge is stored/reviewed in Python, indexed into Chroma, and searched as a separate QA evidence source; pending, stale, rejected, and archived entries do not enter retrieval. The Rust layer (`rust_core`) owns deterministic kernels that stay stable across agent changes and are unit-tested independently.
 
 ## Indexing Pipeline
 
-Driven by `build_kb_index_transactional` whenever a KB's files change (`/add`, `/rm`, or the cloud upload/delete endpoints):
+Driven by `build_kb_index_transactional` whenever a KB's supported sources change through Web/API upload, connector synchronization, deletion, CLI maintenance, or an explicit rebuild:
 
-1. **Scan** — `scan_pdf_manifest_native` (Rust) hashes every PDF with rayon-parallel, 1 MiB-buffered SHA-256 and returns `{doc_id, documents: [{name, size, sha256}]}`, sorted by filename.
+1. **Scan** — an all-PDF corpus uses `scan_pdf_manifest_native` (Rust) for rayon-parallel, 1 MiB-buffered SHA-256; mixed-format corpora use the format-neutral source scanner. Both return a filename-sorted `{doc_id, documents: [{name, size, sha256}]}` manifest.
 2. **Compare** — `manifests_match` reuses the index only if `doc_id`, `chunk_identity_version`, and every `{name, sha256}` match the saved manifest; any mismatch forces a rebuild.
-3. **Parse** — `smart_parse` (PyMuPDF) extracts page text and reflows two-column layouts by block center-x. When optional OCR is enabled, low-text pages are rendered and recognized by local Tesseract within configured page-count and timeout budgets; otherwise they remain flagged as `is_ocr_fallback` and contribute only their native-text result.
+3. **Parse** — PDFs use `smart_parse` / PyMuPDF for page text, block-aware two-column reflow, and optional bounded local Tesseract OCR. The format-neutral `parse_source` path preserves appropriate locators for Markdown/text/HTML lines and sections, DOCX paragraphs, PPTX slides, XLSX sheets/cells, and supported images.
 4. **Chunk** — `chunk_paper` first detects conservative section spans, then keeps each child under 600 chars with 60-char overlap, preferring paragraph, sentence/semicolon, newline, and whitespace boundaries before falling back to a fixed window for very long unbroken text. The legacy 30-character minimum still filters unstructured noise, while every non-empty detected section or preamble is retained so structural boundaries cannot erase short evidence. Children never cross a detected section boundary. Each child stores a stable `parent_chunk_id`, section breadcrumb and within-parent order, plus up to 160 chars of section-bounded context; its own stable `chunk_id` and page span remain the citation identity.
 5. **Index** — chunks land in Chroma (vector) and a persisted BM25 artifact that stores a compact chunk registry plus native `Bm25Index` bytes. Source name, section breadcrumb, locator context, and child body form the search text, while both stores round-trip the structural metadata and return the original child body. Loading restores the native index from bytes instead of rebuilding it from a Python tokenized corpus. `save_index_manifest` persists the manifest. Tokenization uses `tokenize_mixed_text_native` / `tokenize_corpus_native` (`jieba-rs` for Chinese, Snowball stemming + stopword removal for English).
 
-Approved derived knowledge is indexed separately from source PDFs. Review actions can rebuild its Chroma collection, and stale scans mark knowledge whose document binding no longer matches the current KB documents.
+Approved derived knowledge is indexed separately from source documents. Review actions can rebuild its Chroma collection, and stale scans mark knowledge whose document binding no longer matches the current KB documents.
 
 **Chunk identity contract:**
 
@@ -621,13 +659,13 @@ Approved derived knowledge is indexed separately from source PDFs. Review action
 chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{local_chunk_index}
 ```
 
-`chunk_id` is the single stable child identity key across chunker, index, retriever, RRF, citations, and evidence — dedup and fusion never rely on array position. `document_id = doc-{sha256(source-name-v1)}` is the stable per-KB ACL identity, while `parent_chunk_id = sha256:{source_sha256}:src:{source_name}:section:{section_index}` groups children for context hydration but never replaces their citation identity. The contract is versioned (`chunk_identity_version = source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index_cs600_ov60_min30_ctx160`); changing document identity, chunk boundaries, structure detection, or indexed text must bump `CHUNK_IDENTITY_BASE_VERSION` so stale indexes rebuild instead of mixing schemes.
+`chunk_id` is the single stable child identity key across chunker, index, retriever, RRF, citations, and evidence — dedup and fusion never rely on array position. `document_id = doc-{sha256(source-name-v1)}` is the stable per-KB ACL identity, while `parent_chunk_id = sha256:{source_sha256}:src:{source_name}:section:{section_index}` groups children for context hydration but never replaces their citation identity. The current contract is `source_sha256_name_page_span_local_v7_document_acl_parent_child_section_index_adaptive_blocks_cs600_ov60_min30_ctx160_strategy_adaptive-structural-v2`; changing document identity, chunk boundaries, structure detection, or indexed text must bump `CHUNK_IDENTITY_BASE_VERSION` so stale indexes rebuild instead of mixing schemes.
 
 ## Query Pipeline
 
 - **Intent routing** — `RouterAgent` asks the LLM for structured `task_type ∈ {qa, summary, compare, unknown}` and falls back to a keyword rule on any parse error. All of `qa`, `summary`, and `compare` are wired to real subgraphs.
 - **Rewrite + evidence-requirement planning** — `QueryRewriteAgent` emits 1–3 keyword queries plus at most three atomic drafts shaped as `{question, retrieval_query, recovery_query}`; the server assigns stable `r1..r3` IDs and falls back to one original-question requirement on empty/failed planning. `RewriteVerifyAgent` uses one embedding batch for two semantic guards: each requirement question is compared with the original question plus recent history, then its primary/recovery queries are compared with that requirement. A drifting requirement is dropped, a drifting focused query falls back to its requirement question, and an all-dropped plan falls back to the original requirement. The existing rewrite kept/dropped behavior and `steps_trace` remain intact.
-- **Query-level RRF with provenance** — every original, rewritten, and requirement query searches the hybrid PDF engine and approved derived knowledge. Each query/channel ranking contributes equally through `score(d) = Σ_q,c 1 / (k + rank_q,c(d))` (`k = 60`), candidates are deduplicated by stable `chunk_id`, and ties break by identity key. Fused metadata records matched queries, channels, requirement IDs, hit count, original-query participation, best rank, and retrieval round instead of collapsing provenance to one rewrite.
+- **Query-level RRF with provenance** — every original, rewritten, and requirement query searches the hybrid source-document engine and approved derived knowledge. Each query/channel ranking contributes equally through `score(d) = Σ_q,c 1 / (k + rank_q,c(d))` (`k = 60`), candidates are deduplicated by stable `chunk_id`, and ties break by identity key. Fused metadata records matched queries, channels, requirement IDs, hit count, original-query participation, best rank, and retrieval round instead of collapsing provenance to one rewrite.
 - **Bounded Parent–Child hydration** — after child-level reranking and support decisions, each source hit loads a contiguous, balanced window of children sharing its `parent_chunk_id`, bounded independently by chunk and character budgets. Added siblings keep their own IDs/pages and carry `context_anchor_chunk_id` plus `context_expansion=section`; derived knowledge is never expanded. Missing/incomplete structure and disabled parent hydration use the legacy neighbor path, so old indexes remain readable while the version gate schedules new indexes for rebuild.
 - **Query-aware extractive evidence span** — before the global pack budget is applied, each canonical long chunk is reduced to one continuous, verbatim source interval selected from query and requirement-term overlap; no paraphrasing or synthetic joining is allowed. `evidence_span_start` / `evidence_span_end` are 0-based, half-open offsets into the ultimate child text. If no match is reliable, selection fails open to the complete available body. The isolated model view removes `meta.context` so facts outside the verified span cannot re-enter through rendering. Adaptive retrieval may reselect from a private local source copy, but that copy is excluded from API and trace payloads.
 - **Deterministic Evidence Pack** — hydrated anchors, requirement-attributed candidates, adaptive-retrieval carryovers, and sibling context are reduced to one immutable QA evidence closure under global document and character budgets. The character budget equals the exact rendered QA generation-evidence context—including document/knowledge tags, identity attributes, locator headers, materialized text, and block separators—while excluding system instructions, conversation history, and the query; it does not pretend to be a model-token estimate. Anchors and verified carryovers are hard requirements: if they alone exceed either budget, QA fails closed instead of silently dropping them. The evidence verifier (which may select a subset), answer generator, and claim audit can only consume chunks from this same closure. Exact overlap between consecutive children is removed only in the isolated packed copy; `retrieval.evidence_text_start`, `retrieval.evidence_text_end`, and `retrieval.evidence_trimmed_overlap_chars` preserve its source-text range and trimming provenance.
@@ -636,13 +674,13 @@ chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{
 - **Attributed feedback weights** — positive feedback (thumbs-up or an above-neutral rating) may boost its cited/evidence chunks. Thumbs-down, corrections, and below-neutral ratings create a negative retrieval weight only when explicitly classified as `feedback_type=bad_retrieval`; other answer-quality failures do not punish potentially correct evidence. `skip_retrieval_feedback=true` suppresses both positive and negative tuning for that entry.
 - **Generation + citation self-heal** — `Generator` (OpenAI-compatible; cloud `deepseek-chat` or local `qwen2.5:7b`, `temperature = 0.2`) wraps docs as `<Document source=… page=… chunk_id=…>` and forces `[source:Pn]` tags. `validate_citations_native` (Rust) returns structured `missing_citations` / `invalid_sources` / `invalid_pages`; `citation_node` turns failures into a critique and loops `generate → citation` up to `max_iteration_count` (default `2`). Only physically validated answers leave the task subgraphs.
 - **Parent-graph claim verification with staged rollout** — `CLAIM_VERIFICATION_MODE=off|shadow|enforce` controls QA, Summary, and Compare after their physical citation checks. `CLAIM_VERIFICATION_ROLLOUT_PERCENT` promotes a deterministic, session-sticky traffic cohort to that configured mode: unselected `shadow` traffic falls back to `off`, while unselected `enforce` traffic falls back to `shadow`. `CLAIM_VERIFICATION_ROLLOUT_SEED` deliberately rebuckets traffic when changed. `off` skips the model verifier. `shadow` runs the same claim/evidence audit but never repairs, blocks, or mutates the delivered answer; it records `would_allow`, `would_repair`, or `would_block`, and candidates that would be intercepted are excluded from Agent memory. `enforce` enables bounded repair and fail-closed rejection. `ClaimEvidenceVerifierAgent` only judges each factual claim against evidence explicitly cited by that claim. Repaired answers must pass deterministic citation validation and a fresh semantic audit; attempts are capped by `CLAIM_VERIFICATION_MAX_REPAIR_ATTEMPTS` (default `1`). `CLAIM_VERIFICATION_ENABLED=true` remains a compatibility fallback for `enforce` only when the new mode is unset.
-- **ACL-safe claim-verification review workbench** — Human-review sampling is disabled by default. When explicitly enabled, deterministic claim-level samples retain only the claim, verifier verdict, and bounded snapshots of that claim's exact cited evidence—never the query, full answer, session, trace ID, or raw cohort identity. Reviewer endpoints support ACL-filtered aggregate metrics, keyset pagination, detail-on-demand, optimistic-concurrency labeling, and bounded eval-compatible export. Tenant, KB, and source ACLs are rechecked on every operation, so revoked access immediately hides old snapshots. The web Evidence Review Desk exposes this as a full queue with status filters, page navigation, exact evidence sheets, human/model agreement metrics, conflict feedback, and JSONL release-gate downloads.
+- **ACL-safe claim-verification review workbench** — Human-review sampling is disabled by default. When explicitly enabled, deterministic claim-level samples retain only the claim, verifier verdict, and bounded snapshots of that claim's exact cited evidence—never the query, full answer, session, trace ID, or raw cohort identity. Reviewer endpoints support ACL-filtered aggregate metrics, keyset pagination, detail-on-demand, optimistic-concurrency labeling, and bounded eval-compatible export. Tenant, KB, and source ACLs are rechecked on every operation, so revoked access immediately hides old snapshots. The current KB's Diagnostics → RAG Evaluation tab exposes this as a queue with status filters, exact evidence, human/model agreement metrics, conflict feedback, and JSONL release-gate downloads.
 
   Every final chat response exposes the identity-free policy ID, configured/effective mode, percentage, bucket and decision in its bounded `claim_verification` projection; traces retain the same safe summary. Prometheus exports the existing decision counter plus `cogdoc_claim_verification_cohorts_total{task_type,configured_mode,effective_mode,selected}`. A recommended rollout is `off → shadow at 5/25/100% →` pass the reviewed release gate `→ enforce at 5/25/100%`. Keep the seed unchanged while increasing percentages so existing cohorts remain sticky.
 
   Production also persists a bounded, tenant-scoped observation row for each final rollout. Rows contain only time, task/policy/mode/decision/status and boolean outcomes—never query, answer, evidence, document, session, or raw cohort identity. Reviewer-capable principals can query `GET /v1/claim-verification/observations/summary` with a bounded time window and an optional effective-mode filter. The endpoint defaults to the current policy ID so old rollout configurations cannot contaminate readiness; reviewers may explicitly provide a prior policy ID for historical inspection. Its `operational_readiness` checks sample maturity and verifier error rate only; `semantic_release_gate_required` is always true, so this endpoint can never replace the manually labeled release gate. Observation write failure is fail-open for chat delivery, while the summary endpoint returns `503` when its store is unavailable.
 
-  QA, Summary, and Compare always buffer candidate model tokens because their intermediate text can contain internal Evidence IDs and has not yet passed final rendering. Enabling this gate preserves the same buffering rule for any other routed candidate it audits. Node progress events still stream; once parent post-processing completes (pass, an intentional `not_run`, or fail-closed refusal), the finalized answer is emitted as one token event followed by the normal `final` event.
+  QA, Summary, and Compare always buffer candidate model tokens because their intermediate text can contain internal Evidence IDs and has not yet passed final rendering. Enabling this gate preserves the same buffering rule for any other routed candidate it audits. Node progress events still stream; once parent post-processing completes (pass, an intentional `not_run`, or fail-closed refusal), the finalized public answer is emitted incrementally as bounded Unicode `token` chunks followed by the normal `final` event.
 
 **Summary subgraph** — `document_loader` selects one named document (or the only document in the corpus; ambiguous multi-document queries get an actionable message), `section_planner` fixes the sections to background/goals, solution/process, rules/requirements, value/output, and limitations/notes unless custom titles are supplied in state, `section_summary` writes one short paragraph per section (model writes prose only; `[source:Pn]` tags are bound deterministically from the chunks it used), and `global_summary` assembles the answer and re-runs the citation checker. No-evidence sections carry no citation and no evidence.
 
@@ -654,7 +692,7 @@ chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{
 
 | Symbol | Module | Purpose |
 | --- | --- | --- |
-| `scan_pdf_manifest_native` | `scanner.rs` | Rayon-parallel, buffered SHA-256 of every PDF; size + hash manifest, stably sorted |
+| `scan_pdf_manifest_native` | `scanner.rs` | Rayon-parallel, buffered SHA-256 all-PDF fast path; mixed formats use the Python source scanner |
 | `rrf_fusion_native` | `rrf.rs` | Deterministic RRF (`k=60`) merge of vector + BM25 results, keyed on `chunk_id` |
 | `validate_citations_native` | `citation.rs` | Structured citation check → `invalid_sources` / `invalid_pages` / `missing_citations` |
 | `tokenize_mixed_text_native` | `tokenizer.rs` | Mixed CN/EN tokenizer: `jieba-rs` for Chinese, Snowball stemming + stopword removal for English (identifiers/versions kept verbatim); token-for-token aligned with a Python reference |
@@ -680,6 +718,7 @@ CogDoc/
 │   └── tools/
 │       └── retriever/
 ├── rust_core/src/
+├── web/
 ├── scripts/
 ├── tests/
 ├── eval/
@@ -690,14 +729,15 @@ CogDoc/
 | Path | Responsibility |
 | --- | --- |
 | `src/cogdoc/api_cli.py` | Lightweight API product CLI (`python -m cogdoc.api_cli` / `cogdoc`) |
-| `src/cogdoc/cli.py` | Explicit offline/direct-storage maintenance console (`cogdoc-local`) |
+| `src/cogdoc/cli.py` | Existing offline/direct-storage recovery console (`cogdoc --local-storage` / `cogdoc-local`) |
 | `src/cogdoc/debug.py` | Standalone Trace Debug console (`python -m cogdoc.debug` / `cogdoc-debug`) |
 | `src/cogdoc/agents/` | Routing, query rewrite, generation, citation validation, feedback understanding, and Summary / Compare agent primitives |
 | `src/cogdoc/api/` | FastAPI app, routes, schemas, persistence, access control, metrics, feedback / knowledge stores, webhooks |
-| `src/cogdoc/frontend/` | Streamlit thin client and API client |
+| `web/` | Primary Next.js + TypeScript product workspace and Playwright tests |
+| `src/cogdoc/frontend/` | Streamlit compatibility client and shared Python API client |
 | `src/cogdoc/graph/` | LangGraph state, main workflow, and QA / Summary / Compare subgraphs |
 | `src/cogdoc/service/` | Chat / ingest services, KB lifecycle, transactional indexing, locks, cleanup, and background work |
-| `src/cogdoc/tools/` | PDF parsing, chunking, manifests, embedding, rerank, Rust loading, and retrievers |
+| `src/cogdoc/tools/` | Format-neutral source parsing, PDF/OCR handling, chunking, manifests, embedding, rerank, Rust loading, and retrievers |
 | `rust_core/src/` | PyO3 native core: scanner, tokenizer, BM25, RRF, citation validator |
 | `scripts/`, `tests/`, `eval/`, `docs/` | Health-check scripts, tests, offline eval sets, and project docs |
 
@@ -705,7 +745,7 @@ CogDoc/
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `COGDOC_DOC_DIR` | `your_documents` | Inbox directory of PDFs that `/add` ingests into a KB |
+| `COGDOC_DOC_DIR` | `your_documents` | Legacy/offline inbox for supported source documents ingested with `/add` |
 | `COGDOC_DATA_DIR` | `./data` | Root for persisted KB state, SQLite DBs, manifests, and index artifacts |
 | `COGDOC_TRACE_ENABLED` | `true` | Enable JSON trace export for request inspection |
 | `COGDOC_TRACE_DIR` | `logs/traces` | Directory for exported trace JSON files |
@@ -748,9 +788,9 @@ CogDoc/
 | `COGDOC_RATE_LIMIT_PER_MINUTE` | `120` | Token-bucket refill rate for protected API routes; legacy `RATE_LIMIT_PER_MINUTE` remains accepted |
 | `COGDOC_RATE_LIMIT_BURST` | `120` | Token-bucket burst capacity; `<=0` disables rate limiting; legacy `RATE_LIMIT_BURST` remains accepted |
 | `COGDOC_TENANT_MAX_KNOWLEDGE_BASES` | `0` | Hard KB limit per workspace; `0` is unlimited |
-| `COGDOC_TENANT_MAX_DOCUMENTS` | `0` | Hard committed + in-flight PDF limit per workspace; `0` is unlimited |
-| `COGDOC_TENANT_MAX_STORAGE_MB` | `0` | Hard committed + in-flight PDF-byte limit per workspace in MiB; `0` is unlimited |
-| `COGDOC_MAX_UPLOAD_MB` | `50` | Maximum PDF upload size through the API/frontend |
+| `COGDOC_TENANT_MAX_DOCUMENTS` | `0` | Hard committed + in-flight document limit per workspace; `0` is unlimited |
+| `COGDOC_TENANT_MAX_STORAGE_MB` | `0` | Hard committed + in-flight source-byte limit per workspace in MiB; `0` is unlimited |
+| `COGDOC_MAX_UPLOAD_MB` | `50` | Maximum single supported-source upload size through the API/Web workspace |
 | `COGDOC_RESEARCH_WORKERS` | `2` | Maximum concurrent background research evidence/report jobs |
 | `COGDOC_CHAT_STREAM_IDLE_TIMEOUT_SECONDS` | `300` | Maximum idle time between SSE worker events; prevents indefinitely open streams |
 | `COGDOC_RESEARCH_RETRIEVAL_TOP_K` | `8` | Candidate depth retrieved and reranked per research section |
@@ -830,9 +870,13 @@ Standard factory-built `ChatOpenAI` calls used by automatic Research planning an
 
 `<NODE>` can be `ROUTER`, `QUERY_REWRITER`, `SOURCE_RESOLVER`, `EVIDENCE_VERIFIER`, `CLAIM_VERIFIER`, `CLAIM_REPAIRER`, `QA_GENERATOR`, `SUMMARY_GENERATOR`, `COMPARE_PROFILE`, or `COMPARE_CONCLUSION`. For independent post-generation review, for example, keep answer generation on cloud while setting `LLM_CLAIM_VERIFIER_BACKEND=local` and `OLLAMA_CLAIM_VERIFIER_MODEL_NAME=<review-model>`; to repair locally too, set `LLM_CLAIM_REPAIRER_BACKEND=local` and `OLLAMA_CLAIM_REPAIRER_MODEL_NAME=<repair-model>`. The corresponding cloud model overrides are `LLM_CLAIM_VERIFIER_MODEL_NAME` and `LLM_CLAIM_REPAIRER_MODEL_NAME`. Citation syntax and source/page membership remain deterministically validated by Rust; the claim verifier adds the optional model-based semantic support decision.
 
-Requirements: Python 3.11+ (developed on 3.13; the extension targets 3.8+), a Rust toolchain with `cargo` (edition 2024, via [rustup](https://rustup.rs/)), and [maturin](https://www.maturin.rs/). Optional: [Ollama](https://ollama.com/) for local models. See `.env.example` for the full set of tunables (retrieval `top_k`, rerank `top_n`, RRF `k`, CUDA memory floors, eval set paths).
+Requirements: Python 3.11+ (developed on 3.13), Node.js 22+ for the primary Web workspace, a Rust toolchain with `cargo` (edition 2024, via [rustup](https://rustup.rs/)), and [maturin](https://www.maturin.rs/). Optional: [Ollama](https://ollama.com/) for local models. See `.env.example` for the full set of tunables (retrieval `top_k`, rerank `top_n`, RRF `k`, CUDA memory floors, eval set paths).
 
 ## Development & Testing
+
+Frontend changes follow the normative [architecture](docs/frontend-architecture.md),
+[design system](docs/frontend-design-system.md), and [UI guidelines](docs/ui-guidelines.md).
+Cross-client behavior follows the [CLI/Web parity contract](docs/cli-web-parity.md).
 
 For distributed index/control workers, install the optional `cogdoc[ha]`
 extra. It adds PostgreSQL leases and `SKIP LOCKED` queues, a durable scheduler,
@@ -868,7 +912,10 @@ the explicit single-writer boundary that still applies to the main API.
 | `make eval-suite-update-baseline` | Refresh `eval/eval_suite_baseline.json` after review |
 | `make run` | Start the interactive CLI console |
 | `make serve` | Start the FastAPI service (`uvicorn cogdoc.api.app:app`) |
-| `make frontend` | Load `.env` without overriding exported values, then start the Streamlit web app |
+| `make web` | Start the primary Next.js product workspace |
+| `make frontend` | Start the retained Streamlit compatibility client |
+| `make web-check` | Run Web lint, strict TypeScript, and the production build |
+| `make web-e2e` | Run the Playwright product workflows |
 | `make debug` | Start the standalone Debug console |
 | `uvicorn scripts.cogeval_cogdoc_wrapper:app --port 8003` | Start the optional CogEval-compatible adapter for a running CogDoc API |
 | `cd rust_core && cargo test` | Run Rust unit tests |
@@ -927,9 +974,9 @@ Run `python scripts/eval_retrieval.py --rerank --verify-evidence` to include the
 
 Use `python scripts/migrate_v7_indexes.py scan` before rollout, then `run` to rebuild stale KBs transactionally while retaining the previous generation. A recorded run can be reverted with `rollback <run_id>` and, after acceptance, its retained generations can be removed with `finalize <run_id>`.
 
-Authorized reviewers can run the same single-flight workflow through `/v1/index-migrations` or the Evidence Review Desk's generation control. Tenant filtering is enforced and physical storage IDs are never returned. `make eval-multi-route` and `make calibrate-multi-route` expose the evaluation and calibration workflow as standard development targets.
+Authorized reviewers can run the same single-flight workflow through `/v1/index-migrations` or Diagnostics → Index Generations. Tenant filtering is enforced and physical storage IDs are never returned. `make eval-multi-route` and `make calibrate-multi-route` expose the evaluation and calibration workflow as standard development targets.
 
-Run `scripts/eval_multi_route_retrieval.py` to produce full, per-route, and leave-one-out evaluations with layered ranking, coverage, abstention, and latency metrics. Feed that report to `scripts/calibrate_multi_route_retrieval.py` to generate a versioned, rollbackable recommendation for route weights, top-k, per-route quota, and abstention thresholds. The evaluator and calibrator write artifacts only; they never change live settings. The Evidence Review Desk in the web UI now includes a retrieval path console for raw routes, RRF contributions, rerank movement, gate decisions, and review-gated human labels.
+Run `scripts/eval_multi_route_retrieval.py` to produce full, per-route, and leave-one-out evaluations with layered ranking, coverage, abstention, and latency metrics. Feed that report to `scripts/calibrate_multi_route_retrieval.py` to generate a versioned, rollbackable recommendation for route weights, top-k, per-route quota, and abstention thresholds. The evaluator and calibrator write artifacts only; they never change live settings. The current KB's Diagnostics → RAG Evaluation workspace includes a retrieval path console for raw routes, RRF contributions, rerank movement, gate decisions, and review-gated human labels.
 
 `make eval-multi-route-gate` runs the release workflow with reranking enabled and rejects stale pre-v7 indexes. Calibration keeps a deterministic stratified outer holdout, then uses five stratified inner folds to select fusion parameters by mean quality with a variance penalty and to aggregate abstention thresholds by fold median. The untouched validation partition is checked with deterministic percentile-bootstrap confidence bounds, paired regression bounds, sample maturity, latency, and query-type slice limits from `eval/multi_route_gate.json`. Set `MULTI_ROUTE_BASELINE=<artifact>` to compare against a prior v2/v3 calibration artifact; a mismatched validation split fails closed. `make eval-multi-route-promote` writes a compact baseline atomically only when every gate passes; failed candidates never overwrite the accepted baseline or change live settings.
 
@@ -941,16 +988,16 @@ Claim-audit metrics in the general quality report remain useful diagnostics. Str
 
 The default release contract requires at least 360 claims: 120 supported, 200 unsupported/insufficient, 40 not-factual, and at least 100 from each generation path. With zero unsafe accepts, 200 unsafe claims are enough to put the two-sided 95% Wilson upper bound below 2%. The example set validates only the format and toolchain. A reviewed set should additionally cover Chinese and English, numbers and dates, cross-document comparisons, near-miss evidence, no-answer cases, physically valid but semantically unsupported citations, and prompt-injection text.
 
-Every chat request gets a `request_id`/`trace_id`. When `COGDOC_TRACE_ENABLED=true`, the service writes JSON traces under `COGDOC_TRACE_DIR` (default `logs/traces`), and the same safe payload is available through `GET /v1/traces/{trace_id}`. `GET /v1/traces` lists recent traces and can be scoped by `doc_id` and `session_id`, which is how the Streamlit Trace panel shows only the current conversation. Trace files include `schema_version`, `status` (`ok`, `degraded`, or `failed`), total `duration_ms`, a safe config snapshot, step summaries, rewrite summaries, error summaries, and only truncated evidence previews rather than full document text. QA rerank steps additionally expose Evidence Pack input/kept/dropped counts and characters, overlap removed, drop-reason counts, anchor/pinned counts, and the hard-constraint `over_budget` decision. The standalone Debug console reads the same trace format.
+Every chat request gets a `request_id`/`trace_id`. When `COGDOC_TRACE_ENABLED=true`, the service writes JSON traces under `COGDOC_TRACE_DIR` (default `logs/traces`), and the same safe payload is available through `GET /v1/traces/{trace_id}`. `GET /v1/traces` lists recent traces and can be scoped by `doc_id` and `session_id`, which is how the Web Trace panel shows only the current conversation. Trace files include `schema_version`, `status` (`ok`, `degraded`, or `failed`), total `duration_ms`, a safe config snapshot, step summaries, rewrite summaries, error summaries, and only truncated evidence previews rather than full document text. QA rerank steps additionally expose Evidence Pack input/kept/dropped counts and characters, overlap removed, drop-reason counts, anchor/pinned counts, and the hard-constraint `over_budget` decision. The standalone Debug console reads the same trace format.
 
-Backup/restore and index rebuild rules are covered in [PRODUCTION_zh-CN.md](docs/PRODUCTION_zh-CN.md).
+Backup/restore and index rebuild rules are covered in [PRODUCTION.md](PRODUCTION.md).
 
 ## Known Limitations
 
 - **OCR is an opt-in Tesseract MVP.** It is disabled by default, supports locally installed language packs, and intentionally has no hosted provider. Recognition quality depends on scan quality, selected languages, and DPI.
 - Summary and Compare are fixed-schema MVPs; cloud mode runs independent section/dimension LLM cells concurrently with stable output order, while local Ollama mode stays serial to avoid memory pressure. The default section/dimension sets are fixed unless passed through graph state.
-- Research reports support editable AI planning, atomic evidence requirements, closed-set verification, deterministic citations, mandatory section-local claim and requirement-coverage auditing with one shared bounded repair, per-section review, explicit gap acceptance, bounded version history, selective regeneration, and immutable publication. Atomic requirements are the machine-enforced completion contract; free-form `success_criteria` remains a human review note. Selective regeneration only retrieves, verifies, and rewrites `changes_requested` or legacy unaudited sections; approved sections and accepted gaps are preserved while the global public citation ledger is rebuilt and validated. A frozen provenance contract—including retrieval/verification settings and model routing—blocks stale evidence from generation, review, and publication until an explicit full refresh archives the old report. A local Research job is a privacy constraint: planning, evidence verification, writing, claim/coverage audit, and repair all reject cloud node overrides.
-- Published v2 artifacts hash the exact Markdown, citation ledger, trackable provenance, bounded `verification.json` claim/coverage summaries, evidence identity/hash commitments, version, and generation timestamp. The deterministic ZIP also carries per-file hashes. Legacy Markdown is served only as `legacy-unverified` and cannot produce a bundle; malformed or tampered current/published bodies are withheld from list, detail, and download responses.
+- Research uses atomic evidence requirements as its machine-enforced completion contract; free-form `success_criteria` remains a human review note. Selective regeneration preserves approved sections, stale provenance requires an explicit refresh, and local Research jobs reject cloud node overrides.
+- Published v2 reports bind Markdown, citations, provenance, verification summaries, evidence commitments, and file hashes. Legacy reports remain `legacy-unverified`; malformed or tampered artifacts are withheld.
 - Local Compare intentionally supports only two documents, uses four core dimensions, and skips the extra conclusion generation step to reduce Ollama memory pressure.
 - With `CLAIM_VERIFICATION_MODE=off` (the default), citation validation for QA, Summary, and Compare proves only physical citation legality (`source` / `page` or knowledge ID), not semantic support. `shadow` measures the model-based claim/evidence gate without changing delivered answers, so those answers are not guaranteed faithful; candidates that would trigger enforcement are kept out of Agent memory. `enforce` adds bounded repair and fail-closed rejection. Research report generation always enforces claim support and atomic-requirement coverage against section-local exact evidence, independently of this rollout switch. Model-based verification still requires calibration against a reviewed domain baseline.
 - The rewrite similarity threshold defaults to `0.5` and should be calibrated on real project data.
@@ -960,8 +1007,9 @@ Backup/restore and index rebuild rules are covered in [PRODUCTION_zh-CN.md](docs
 
 - `Rust 扩展 rust_core 未安装` / `缺少: …` — run `make native`, then `make check`.
 - Rust edits don't change behavior — you didn't rebuild; the old `.so` is still loaded. Run `make native`.
-- `Model Mismatch!` — the index's embedding model differs from `Embedder.MODEL_NAME`; rebuild the index (clear the `doc_id`'s Chroma collection or change `doc_id`).
-- Streamlit can't reach the backend — start `make serve` first, and check the **Backend URL** field in the sidebar (defaults to `http://localhost:8000`).
+- `Model Mismatch!` — the active index uses a different embedding contract. Select the intended profile during upload/rebuild, or run the supported index-migration workflow; do not manually delete a live Chroma collection.
+- Web workspace cannot reach the backend — start `make serve` first and verify `COGDOC_API_URL` (default `http://localhost:8000`) before restarting `make web`.
+- Streamlit compatibility client cannot reach the backend — start `make serve` first and check its backend URL.
 - Hugging Face anonymous-rate warning — set `HF_TOKEN` for higher Hub limits; public models usually download without it.
 
 ## License

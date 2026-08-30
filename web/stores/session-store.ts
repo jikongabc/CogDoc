@@ -3,6 +3,7 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import type { AuthSession, AuthUser, Workspace } from "@/lib/api/types";
+import { useWorkspaceStore } from "@/stores/workspace-store";
 
 interface SessionState {
   hydrated: boolean;
@@ -39,8 +40,12 @@ export const useSessionStore = create<SessionState>()(
       ...emptySession,
       sidebarCollapsed: false,
       setHydrated: (hydrated) => set({ hydrated }),
-      enterLegacy: () => set({ ...emptySession, authMode: "legacy" }),
-      setSession: (session) =>
+      enterLegacy: () => {
+        useWorkspaceStore.getState().clearKnowledgeContext();
+        set({ ...emptySession, authMode: "legacy" });
+      },
+      setSession: (session) => {
+        useWorkspaceStore.getState().clearKnowledgeContext();
         set({
           authMode: "account",
           accessToken: session.access_token,
@@ -49,7 +54,8 @@ export const useSessionStore = create<SessionState>()(
           workspace: session.workspace,
           selectedWorkspaceId: session.workspace.workspace_id,
           permissions: session.permissions,
-        }),
+        });
+      },
       setWorkspace: (workspace, permissions) =>
         set({
           workspace,
@@ -57,7 +63,10 @@ export const useSessionStore = create<SessionState>()(
           ...(permissions ? { permissions } : {}),
         }),
       setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
-      clearSession: () => set(emptySession),
+      clearSession: () => {
+        useWorkspaceStore.getState().clearKnowledgeContext();
+        set(emptySession);
+      },
     }),
     {
       name: "cogdoc.session.v1",

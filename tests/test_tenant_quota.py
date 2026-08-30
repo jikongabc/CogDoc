@@ -9,6 +9,7 @@ from cogdoc.api.tenant_quota import (
     TenantQuotaManager,
     TenantQuotaPolicy,
 )
+from cogdoc.service.mutation_paths import mutation_backup_path
 
 
 class _Registry:
@@ -220,7 +221,52 @@ def test_smaller_pending_replacement_does_not_lend_speculative_quota(tmp_path):
         manager.reserve_upload(
             "a", "a-kb", registry.source_dir("a-kb"), "new.pdf", 2
         )
+
+    source_dir = Path(registry.source_dir("a-kb"))
+    (source_dir / "large.pdf").replace(
+        source_dir / "large.pdf.upload-job.cogdoc-bak"
+    )
+    # The worker has moved the old source out of its supported extension, but
+    # it can still roll back. Admission must continue counting those 8 bytes.
+    assert manager.snapshot("a")["usage"]["storage_bytes"] == 8
+    with pytest.raises(TenantQuotaExceeded):
+        manager.reserve_upload(
+            "a", "a-kb", registry.source_dir("a-kb"), "new.pdf", 2
+        )
+
+    (source_dir / "large.pdf").write_bytes(b"x")
+    assert manager.snapshot("a")["usage"] == {
+        "knowledge_bases": 1,
+        "documents": 1,
+        "storage_bytes": 8,
+    }
     manager.release(replacement)
+
+
+def test_backup_with_dotted_mutation_id_counts_under_original_document(tmp_path):
+    registry = _Registry(tmp_path)
+    registry.records.append(
+        {"tenant_id": "a", "storage_id": "a-kb", "kb_id": "kb"}
+    )
+    source_dir = Path(registry.source_dir("a-kb"))
+    source_dir.mkdir(parents=True)
+    source = source_dir / "report.v1.pdf"
+    source.write_bytes(b"12345678")
+    source.replace(mutation_backup_path(str(source), "upload.job.segment.1"))
+    manager = TenantQuotaManager(
+        registry,
+        TenantQuotaPolicy(max_documents=1, max_storage_bytes=8),
+    )
+
+    assert manager.snapshot("a")["usage"] == {
+        "knowledge_bases": 1,
+        "documents": 1,
+        "storage_bytes": 8,
+    }
+    with pytest.raises(TenantQuotaExceeded):
+        manager.reserve_upload(
+            "a", "a-kb", registry.source_dir("a-kb"), "second.pdf", 1
+        )
 
 
 def test_knowledge_base_reservations_are_bounded(tmp_path):

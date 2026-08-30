@@ -17,9 +17,11 @@ function LegacyReviewsRedirectContent() {
   const knowledgeBases = useKnowledgeBases();
   const selectedKbId = useWorkspaceStore((state) => state.selectedKnowledgeBaseId);
   const availableKbIds = knowledgeBases.data?.map((item) => item.kb_id) ?? [];
-  const kbId = legacyKbId || (selectedKbId && availableKbIds.includes(selectedKbId)
-    ? selectedKbId
-    : availableKbIds[0]);
+  const kbId = legacyKbId && availableKbIds.includes(legacyKbId)
+    ? legacyKbId
+    : selectedKbId && availableKbIds.includes(selectedKbId)
+      ? selectedKbId
+      : availableKbIds[0];
 
   useEffect(() => {
     if (knowledgeBases.isPending) return;

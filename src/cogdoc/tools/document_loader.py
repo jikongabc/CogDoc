@@ -104,6 +104,21 @@ def select_source_for_summary(query: str, sources: List[str]) -> Optional[str]:
         return sources[0]
 
     query_lower = query.lower()
+
+    # 中文用户通常不会在动词和文件名之间加空格（如“总结项目方案”）。
+    # 仅当去掉明确的摘要指令后，剩余文本与完整文件名或 stem 完全一致时命中，
+    # 避免放宽下面用于防止中文复合词误匹配的边界规则。
+    normalized_query = query_lower.strip()
+    for prefix in ("请总结", "帮我总结", "总结", "摘要", "概括", "归纳"):
+        if not normalized_query.startswith(prefix):
+            continue
+        subject = normalized_query[len(prefix) :].strip(" ：:，,。.!！?？")
+        for source in sources:
+            source_lower = source.lower()
+            stem_lower = os.path.splitext(source_lower)[0]
+            if subject in {source_lower, stem_lower}:
+                return source
+
     for source in sources:
         if _full_source_match_start(query_lower, source.lower()) is not None:
             return source

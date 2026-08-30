@@ -50,6 +50,29 @@ def test_docx_extracts_paragraphs_and_tables(tmp_path):
     assert "Heading" in text and "| A | B |" in text
 
 
+def test_docx_preserves_heading_style_with_real_ooxml_namespace(tmp_path):
+    path = tmp_path / "headed.docx"
+    namespace = (
+        "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    )
+    _zip(
+        path,
+        {
+            "word/document.xml": (
+                f"<w:document xmlns:w='{namespace}'><w:body>"
+                "<w:p><w:pPr><w:pStyle w:val='Heading2'/></w:pPr>"
+                "<w:r><w:t>Architecture</w:t></w:r></w:p>"
+                "<w:p><w:r><w:t>Details</w:t></w:r></w:p>"
+                "</w:body></w:document>"
+            )
+        },
+    )
+
+    assert parse_source(str(path))[0]["text"].startswith(
+        "## Architecture\n\nDetails"
+    )
+
+
 def test_pptx_returns_one_location_per_slide(tmp_path):
     path = tmp_path / "deck.pptx"
 
@@ -66,6 +89,52 @@ def test_pptx_returns_one_location_per_slide(tmp_path):
     pages = parse_source(str(path))
     assert [page["text"] for page in pages] == ["First", "Second"]
     assert pages[1]["location"] == {"slide": 2}
+
+
+def test_pptx_uses_presentation_relationship_order(tmp_path):
+    path = tmp_path / "reordered.pptx"
+    _zip(
+        path,
+        {
+            "ppt/presentation.xml": (
+                "<p:presentation xmlns:p='presentation' xmlns:r='relationships'>"
+                "<p:sldIdLst><p:sldId id='256' r:id='r2'/>"
+                "<p:sldId id='257' r:id='r1'/></p:sldIdLst>"
+                "</p:presentation>"
+            ),
+            "ppt/_rels/presentation.xml.rels": (
+                "<Relationships><Relationship Id='r1' "
+                "Target='slides/slide1.xml'/><Relationship Id='r2' "
+                "Target='slides/slide2.xml'/></Relationships>"
+            ),
+            "ppt/slides/slide1.xml": "<p:sld xmlns:p='p'><p:t>First</p:t></p:sld>",
+            "ppt/slides/slide2.xml": "<p:sld xmlns:p='p'><p:t>Second</p:t></p:sld>",
+        },
+    )
+
+    pages = parse_source(str(path))
+
+    assert [page["text"] for page in pages] == ["Second", "First"]
+    assert [page["location"] for page in pages] == [{"slide": 1}, {"slide": 2}]
+
+
+def test_pptx_does_not_index_orphan_slide_parts(tmp_path):
+    path = tmp_path / "empty-with-orphan.pptx"
+    _zip(
+        path,
+        {
+            "ppt/presentation.xml": (
+                "<p:presentation xmlns:p='presentation'><p:sldIdLst/>"
+                "</p:presentation>"
+            ),
+            "ppt/_rels/presentation.xml.rels": "<Relationships/>",
+            "ppt/slides/slide1.xml": (
+                "<p:sld xmlns:p='p'><p:t>Deleted confidential slide</p:t></p:sld>"
+            ),
+        },
+    )
+
+    assert parse_source(str(path)) == []
 
 
 def test_pptx_preserves_tables_as_markdown(tmp_path):

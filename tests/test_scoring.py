@@ -295,6 +295,31 @@ def test_claim_audit_assertion_downgrades_inconsistent_supported_evidence():
     assert result["details"]["counts"]["insufficient"] == 1
 
 
+def test_claim_audit_assertion_rejects_string_in_place_of_citation_id_list():
+    report = evaluate_trial(
+        {
+            "execution_status": "SUCCESS",
+            "claim_audit": {
+                "status": "passed",
+                "claims": [
+                    {
+                        "claim_id": "c1",
+                        "verdict": "supported",
+                        "cited_chunk_ids": "chunk-1",
+                        "supporting_chunk_ids": "chunk-1",
+                    }
+                ],
+            },
+        },
+        [{"type": "claim_audit_assertion"}],
+    )
+
+    result = report["evaluators"][0]
+    assert result["status"] == "FAIL"
+    assert result["details"]["counts"]["supported"] == 0
+    assert result["details"]["counts"]["insufficient"] == 1
+
+
 def test_case_counts_execution_failures_and_mutually_exclusive_buckets():
     case = aggregate_case(
         [

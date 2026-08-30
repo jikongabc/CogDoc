@@ -2,7 +2,7 @@
 
 import { Suspense, useEffect, useRef, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowRight, BookOpenCheck, Building2, Check, Database, ShieldCheck } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useForm } from "react-hook-form";
@@ -26,6 +26,7 @@ type LoginValues = z.infer<typeof loginSchema>;
 
 function LoginContent() {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const searchParams = useSearchParams();
   const hydrated = useSessionStore((state) => state.hydrated);
   const authMode = useSessionStore((state) => state.authMode);
@@ -40,7 +41,11 @@ function LoginContent() {
   const form = useForm<LoginValues>({ resolver: zodResolver(loginSchema), defaultValues: { email: "", password: "" } });
   const login = useMutation({
     mutationFn: (values: LoginValues) => api.login(values.email, values.password),
-    onSuccess: (session) => { setSession(session); router.replace("/home"); },
+    onSuccess: (session) => {
+      queryClient.clear();
+      setSession(session);
+      router.replace("/home");
+    },
   });
   const oidcExchange = useMutation({
     mutationFn: api.exchangeOidc,
@@ -49,6 +54,7 @@ function LoginContent() {
         toast.error("身份服务未返回登录会话");
         return;
       }
+      queryClient.clear();
       setSession(result.session);
       router.replace("/home");
     },
@@ -96,6 +102,7 @@ function LoginContent() {
     ? "邮箱或密码不正确"
     : login.error?.message;
   const authenticated = (session: Parameters<typeof setSession>[0]) => {
+    queryClient.clear();
     setSession(session);
     router.replace("/home");
   };
@@ -125,7 +132,7 @@ function LoginContent() {
                   variant="primary"
                   size="form"
                   className="mt-5 w-full"
-                  onClick={() => { enterLegacy(); router.replace("/home"); }}
+                  onClick={() => { queryClient.clear(); enterLegacy(); router.replace("/home"); }}
                 >
                   进入本地工作区<ArrowRight className="size-4" />
                 </Button>

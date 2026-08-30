@@ -1,4 +1,5 @@
 import os
+from threading import Event
 from unittest.mock import MagicMock, patch
 import pytest
 from cogdoc.api.ingest import IndexJobManager
@@ -71,6 +72,68 @@ def test_upload_new_file_build_failure_remove_fail_keeps_journal(tmp_path):
     mgr.shutdown()
 
     assert any(p.name.endswith(".json") for p in (tmp_path / "j").iterdir())
+
+
+def test_upload_post_commit_cleanup_failure_does_not_run_abort_callback(tmp_path):
+    source_dir = str(tmp_path / "src")
+    journal = MutationJournal(journal_dir=str(tmp_path / "j"))
+    aborted = []
+    mgr = IndexJobManager(
+        ingest_fn=lambda _kb, _source_dir: MagicMock(
+            document_count=1, chunk_count=1
+        ),
+        source_dir_for=lambda _kb: source_dir,
+        job_store=InMemoryJobStore(),
+        journal=journal,
+    )
+
+    with patch.object(
+        journal, "mark_committed", side_effect=RuntimeError("journal read failed")
+    ):
+        mgr.submit_upload(
+            "kb",
+            source_dir,
+            "a.pdf",
+            b"NEW",
+            on_aborted=lambda: aborted.append(True),
+        )
+        mgr.run_blocking("kb", lambda: None)
+    mgr.shutdown()
+
+    assert aborted == []
+    assert (tmp_path / "src" / "a.pdf").read_bytes() == b"NEW"
+
+
+def test_upload_admission_callback_does_not_run_before_worker_starts(tmp_path):
+    source_dir = str(tmp_path / "src")
+    mgr = IndexJobManager(
+        ingest_fn=lambda _kb, _source_dir: MagicMock(
+            document_count=1, chunk_count=1
+        ),
+        source_dir_for=lambda _kb: source_dir,
+        job_store=InMemoryJobStore(),
+        journal=MutationJournal(journal_dir=str(tmp_path / "j")),
+    )
+    release_worker = Event()
+    blocker = mgr._get_executor("kb").submit(
+        lambda: release_worker.wait(timeout=5)
+    )
+    started = []
+
+    mgr.submit_upload(
+        "kb",
+        source_dir,
+        "a.pdf",
+        b"NEW",
+        on_started=lambda: started.append(True),
+    )
+    assert started == []
+
+    release_worker.set()
+    blocker.result(timeout=5)
+    mgr.run_blocking("kb", lambda: None)
+    mgr.shutdown()
+    assert started == [True]
 
 
 # 验证 journal recover remove fail keeps entry。
@@ -263,6 +326,21 @@ def test_journal_struct_corrupt_quarantined(tmp_path):
     j = MutationJournal(journal_dir=str(jdir))
     with pytest.raises(MutationJournalError):
         j.recover_all()
+    assert list(jdir.glob("bad.json.corrupt-*"))
+    assert (jdir / ".degraded").exists()
+
+
+def test_journal_invalid_utf8_is_quarantined_and_fails_closed(tmp_path):
+    jdir = tmp_path / "j"
+    jdir.mkdir()
+    (jdir / "bad.json").write_bytes(b"\xff\xfe")
+    journal = MutationJournal(journal_dir=str(jdir))
+
+    assert journal.has_entries("kb") is True
+    assert journal.mark_committed("bad") is False
+    with pytest.raises(MutationJournalError):
+        journal.recover_all()
+
     assert list(jdir.glob("bad.json.corrupt-*"))
     assert (jdir / ".degraded").exists()
 

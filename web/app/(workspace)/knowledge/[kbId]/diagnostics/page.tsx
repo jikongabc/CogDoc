@@ -124,7 +124,7 @@ export default function DiagnosticsPage() {
   const canReview = usePermission("review");
   const [selectedTab, setSelectedTab] = useState<string | null>(null);
   const requestedTab = selectedTab ?? (searchParams.get("tab") === "rag" ? "rag" : "traces");
-  const activeTab = requestedTab === "rag" && !canReview ? "traces" : requestedTab;
+  const activeTab = canReview || requestedTab === "traces" ? requestedTab : "traces";
   const [migrationRunId, setMigrationRunId] = useState("");
   const retrievalForm = useForm<RetrievalForm>({ defaultValues: { query: "", topK: 12, rerank: true } });
   const diagnose = useMutation({
@@ -132,12 +132,12 @@ export default function DiagnosticsPage() {
     onSuccess: (value) => toast.success(`检索诊断完成，返回 ${records(value, ["final", "hits", "items", "results"]).length} 条证据`),
     onError: (error) => toast.error(error.message),
   });
-  const migrations = useQuery({ queryKey: ["diagnostics", "migrations"], queryFn: controlApi.scanIndexMigrations, retry: false });
+  const migrations = useQuery({ queryKey: ["diagnostics", "migrations"], queryFn: controlApi.scanIndexMigrations, enabled: canReview, retry: false });
   const migrationRows = records(migrations.data, ["items", "knowledge_bases", "entries", "scan"]);
   const run = useQuery({
     queryKey: ["diagnostics", "migration-run", migrationRunId],
     queryFn: () => controlApi.indexMigration(migrationRunId),
-    enabled: Boolean(migrationRunId),
+    enabled: canReview && Boolean(migrationRunId),
     refetchInterval: (query) => {
       const value = isRecord(query.state.data) ? query.state.data : {};
       return ["queued", "running", "pending"].includes(textValue(value.status, "").toLowerCase()) ? 3000 : false;
@@ -199,24 +199,24 @@ export default function DiagnosticsPage() {
       <PageHeader eyebrow="Operator tools" title="诊断" description="检查 Trace、检索路径、索引代际和当前知识库的 RAG 评测数据。" />
       <div className="p-4 md:p-6">
         <Tabs value={activeTab} onValueChange={changeTab}>
-          <TabsList className="mb-4"><TabsTrigger value="traces">Trace 调试</TabsTrigger><TabsTrigger value="retrieval">检索诊断</TabsTrigger><TabsTrigger value="migrations">索引代际</TabsTrigger>{canReview ? <TabsTrigger value="rag">RAG 评测</TabsTrigger> : null}</TabsList>
+          <TabsList className="mb-4"><TabsTrigger value="traces">Trace 调试</TabsTrigger>{canReview ? <><TabsTrigger value="retrieval">检索诊断</TabsTrigger><TabsTrigger value="migrations">索引代际</TabsTrigger><TabsTrigger value="rag">RAG 评测</TabsTrigger></> : null}</TabsList>
           <TabsContent value="traces"><TraceDebugger kbId={kbId} /></TabsContent>
-          <TabsContent value="retrieval">
+          {canReview ? <TabsContent value="retrieval">
             <section className="border border-border bg-surface">
               <form className="flex flex-wrap items-end gap-3 border-b border-border p-4" onSubmit={retrievalForm.handleSubmit((values) => diagnose.mutate(values), () => toast.error("请填写有效的检索问题和 Top K"))}><div className="min-w-[260px] flex-1 space-y-1.5"><Label htmlFor="diagnostic-query">检索问题</Label><Input id="diagnostic-query" aria-invalid={Boolean(retrievalForm.formState.errors.query)} placeholder="输入需要检查的真实查询" {...retrievalForm.register("query", { required: "请输入检索问题", validate: (value) => Boolean(value.trim()) || "检索问题不能为空", onChange: () => diagnose.reset() })} />{retrievalForm.formState.errors.query ? <p className="text-[11px] text-error">{retrievalForm.formState.errors.query.message}</p> : null}</div><div className="w-24 space-y-1.5"><Label htmlFor="top-k">Top K</Label><Input id="top-k" type="number" aria-invalid={Boolean(retrievalForm.formState.errors.topK)} {...retrievalForm.register("topK", { valueAsNumber: true, required: true, min: 1, max: 50, onChange: () => diagnose.reset() })} /></div><label className="flex h-9 items-center gap-2 text-xs"><input type="checkbox" className="size-4 accent-primary" {...retrievalForm.register("rerank", { onChange: () => diagnose.reset() })} />启用重排</label><Button type="submit" variant="primary" loading={diagnose.isPending}><Play className="size-4" />{diagnose.isPending ? "诊断中…" : "运行诊断"}</Button></form>
               <QueryState pending={diagnose.isPending} error={diagnose.error} onRetry={() => void retrievalForm.handleSubmit((values) => diagnose.mutate(values))()} label="正在执行多路召回与重排" errorTitle="检索诊断失败" />
               {!diagnose.isPending && !diagnose.error && diagnose.data ? <RetrievalDiagnosticsResult key={diagnose.submittedAt} value={diagnosticRow} kbId={kbId} onSaved={() => changeTab("rag")} /> : null}
               {!diagnose.isPending && !diagnose.error && !diagnose.data ? <EmptyState icon={ScanSearch} compact title="运行一次检索诊断" description="查看召回路由、融合得分、重排移动和最终证据。" /> : null}
             </section>
-          </TabsContent>
-          <TabsContent value="migrations">
+          </TabsContent> : null}
+          {canReview ? <TabsContent value="migrations">
             <section className="overflow-hidden border border-border bg-surface">
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3"><div><h3 className="text-[13px] font-semibold">索引代际迁移</h3><p className="text-[11px] text-muted-foreground">扫描、迁移、回切和验收均沿用现有后端状态机。</p></div><div className="flex gap-2"><Button onClick={() => void migrations.refetch()}><Gauge className="size-4" />重新扫描</Button><Button variant="primary" onClick={() => startMigration.mutate()} loading={startMigration.isPending}><Play className="size-4" />迁移当前知识库</Button></div></div>
               <QueryState pending={migrations.isPending} error={migrations.error} onRetry={() => void migrations.refetch()} />
               {migrationRows.length ? <div className="divide-y divide-border">{migrationRows.map((row, index) => <div key={textValue(row.kb_id, String(index))} className="grid grid-cols-[minmax(0,1fr)_160px_120px] items-center gap-4 px-4 py-3 text-[13px]"><div><p className="font-medium">{textValue(row.kb_id, "知识库")}</p><p className="font-mono text-[10px] text-muted-foreground">{textValue(row.active_generation_id, textValue(row.current_generation, textValue(row.generation_id)))}</p></div><span className="text-xs text-muted-foreground">{Array.isArray(row.reasons) ? row.reasons.join("、") : textValue(row.reason, "索引契约检查")}</span><StatusBadge status={textValue(row.status, Boolean(row.needs_migration) ? "pending" : "ready")} /></div>)}</div> : migrations.data ? <EmptyState icon={Gauge} compact title="没有需要迁移的索引" description="当前知识库索引契约没有发现代际迁移项。" /> : null}
               {migrationRunId ? <div className="border-t border-border bg-surface-subtle p-4"><div className="flex flex-wrap items-center gap-3"><div className="min-w-0 flex-1"><p className="text-[13px] font-semibold">迁移运行 <span className="font-mono text-[10px] font-normal text-muted-foreground">{migrationRunId}</span></p><div className="mt-1 flex items-center gap-2"><StatusBadge status={runStatus || "pending"} /><span className="text-[11px] text-muted-foreground">{textValue(runRow.updated_at, textValue(runRow.created_at))}</span></div></div><Button onClick={() => void run.refetch()}>刷新进度</Button><Button onClick={() => migrationAction.mutate("rollback")} disabled={!['completed', 'completed_with_failures'].includes(runStatus)} loading={migrationAction.isPending}><RotateCcw className="size-4" />回滚旧代</Button><Button variant="primary" onClick={() => migrationAction.mutate("finalize")} disabled={runStatus !== "completed"} loading={migrationAction.isPending}><CheckCircle2 className="size-4" />验收并清理</Button></div>{run.data ? <pre className="mt-3 max-h-56 overflow-auto whitespace-pre-wrap border border-border bg-surface p-3 font-mono text-[10px] leading-4 text-muted-foreground">{JSON.stringify(run.data, null, 2)}</pre> : null}</div> : null}
             </section>
-          </TabsContent>
+          </TabsContent> : null}
           {canReview ? <TabsContent value="rag"><RagEvaluation kbId={kbId} onOpenRetrievalDiagnostics={openRetrievalDiagnostics} /></TabsContent> : null}
         </Tabs>
       </div>

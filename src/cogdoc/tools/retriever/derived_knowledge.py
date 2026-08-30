@@ -289,7 +289,11 @@ class DerivedKnowledgeIndex:
                 == self.embedder.EMBEDDING_CONTRACT_VERSION
             ):
                 expected_count = _int_or_zero(state.get("count"))
-                if expected_count <= 0 or self._collection(kb_id).count() > 0:
+                # A non-empty collection is not necessarily a complete one.
+                # Exact count equality lets the normal freshness path repair a
+                # partially lost/corrupted Chroma collection instead of
+                # silently searching an incomplete approved-knowledge set.
+                if self._collection(kb_id).count() == expected_count:
                     return
             self.rebuild(kb_id, revision_token=token)
 

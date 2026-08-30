@@ -105,6 +105,31 @@ class QueryAuthorization:
         return str(source or "") in self.allowed_sources
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentUploadAccessMutation:
+    """Compare-and-swap token for provisional upload ACL changes.
+
+    Upload routes publish a document policy before the asynchronous index job
+    runs so its commit-time authorization check can see the source.  If the
+    job aborts before publishing an index generation, this token restores only
+    the state written by that upload.  The expected policy fingerprint and
+    role set prevent a delayed rollback from overwriting a concurrent ACL edit.
+    """
+
+    tenant_id: str
+    kb_id: str
+    document_id: str
+    source: str
+    policy_created: bool
+    policy_fingerprint: tuple[str, str | None, str, str, str]
+    previous_role_ids: tuple[str, ...]
+    expected_role_ids: tuple[str, ...]
+
+    @property
+    def changed(self) -> bool:
+        return self.policy_created or self.previous_role_ids != self.expected_role_ids
+
+
 # Alias used by authorization-oriented callers.
 ResourceAccessDecision = QueryAuthorization
 
@@ -720,6 +745,315 @@ class ResourceAccessStore:
 
     put_document_policy = set_document_policy
     register_document = set_document_policy
+
+    def prepare_document_upload_access(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        document_id: str,
+        source: str,
+        owner_id: str,
+        *,
+        owner_membership_id: str | None = None,
+        role_ids: Iterable[str] | None = None,
+    ) -> DocumentUploadAccessMutation:
+        """Atomically stage one upload's policy and optional role allowlist."""
+
+        return self.prepare_document_upload_access_batch(
+            tenant_id,
+            kb_id,
+            ((document_id, source),),
+            owner_id,
+            owner_membership_id=owner_membership_id,
+            role_ids=role_ids,
+        )[0]
+
+    def prepare_document_upload_access_batch(
+        self,
+        tenant_id: str,
+        kb_id: str,
+        documents: Sequence[tuple[str, str]],
+        owner_id: str,
+        *,
+        owner_membership_id: str | None = None,
+        role_ids: Iterable[str] | None = None,
+    ) -> tuple[DocumentUploadAccessMutation, ...]:
+        """Atomically stage document ACLs for an asynchronous upload job.
+
+        Existing policies keep their owner and visibility; only the optional
+        role allowlist is replaced.  New policies inherit the KB visibility.
+        The returned immutable tokens can later be passed to
+        :meth:`rollback_document_upload_access_batch` if indexing aborts.
+        """
+
+        tenant = _identity(tenant_id, field="tenant_id")
+        knowledge_base = _identity(kb_id, field="kb_id")
+        creator = _identity(owner_id, field="owner_id")
+        membership = (
+            _identity(owner_membership_id, field="owner_membership_id")
+            if owner_membership_id is not None
+            else None
+        )
+        if isinstance(documents, (str, bytes)) or not documents:
+            raise ValueError("documents must contain at least one document")
+        normalized_documents: list[tuple[str, str]] = []
+        seen_document_ids: set[str] = set()
+        seen_sources: set[str] = set()
+        for item in documents:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                raise TypeError("documents must contain (document_id, source) pairs")
+            document = _identity(item[0], field="document_id")
+            normalized_source = _source(item[1])
+            if document in seen_document_ids or normalized_source in seen_sources:
+                raise ValueError("documents must not contain duplicate identities")
+            seen_document_ids.add(document)
+            seen_sources.add(normalized_source)
+            normalized_documents.append((document, normalized_source))
+
+        desired_roles: tuple[str, ...] | None
+        if role_ids is None:
+            desired_roles = None
+        else:
+            if isinstance(role_ids, (str, bytes)):
+                raise TypeError("role_ids must be an iterable of identifiers")
+            desired_roles = tuple(
+                sorted({_identity(role_id, field="role_id") for role_id in role_ids})
+            )
+
+        now = _now_iso()
+        mutations: list[DocumentUploadAccessMutation] = []
+        changed = False
+        try:
+            with self._write_transaction():
+                kb_row = self._conn.execute(
+                    "SELECT owner_id FROM resource_access_kb_policies "
+                    "WHERE tenant_id=? AND kb_id=?",
+                    (tenant, knowledge_base),
+                ).fetchone()
+                if kb_row is None and not self._legacy_workspace_default:
+                    raise ResourceAccessNotFoundError(
+                        f"knowledge-base policy does not exist: {tenant}/{knowledge_base}"
+                    )
+                self._lock_subjects_locked(tenant, (creator,))
+                self._reject_revoked_membership_locked(tenant, creator, membership)
+
+                for document, normalized_source in normalized_documents:
+                    self._reject_retiring_document_locked(
+                        tenant, knowledge_base, document
+                    )
+                    row = self._conn.execute(
+                        "SELECT source, owner_id, owner_membership_id, policy, "
+                        "created_at, updated_at "
+                        "FROM resource_access_document_policies "
+                        "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                        (tenant, knowledge_base, document),
+                    ).fetchone()
+                    policy_created = row is None
+                    if row is not None and str(row["source"]) != normalized_source:
+                        raise ResourceAccessConflictError(
+                            "document identity is already bound to another source: "
+                            f"{document}"
+                        )
+                    if row is None:
+                        self._conn.execute(
+                            "INSERT INTO resource_access_document_policies "
+                            "(tenant_id, kb_id, document_id, source, owner_id, "
+                            "owner_membership_id, policy, created_at, updated_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, 'inherit', ?, ?)",
+                            (
+                                tenant,
+                                knowledge_base,
+                                document,
+                                normalized_source,
+                                creator,
+                                membership,
+                                now,
+                                now,
+                            ),
+                        )
+                        row = self._conn.execute(
+                            "SELECT source, owner_id, owner_membership_id, policy, "
+                            "created_at, updated_at "
+                            "FROM resource_access_document_policies "
+                            "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                            (tenant, knowledge_base, document),
+                        ).fetchone()
+                        if row is None:
+                            raise ResourceAccessError(
+                                "document upload policy was not persisted"
+                            )
+
+                    previous_roles = tuple(
+                        str(role_row["role_id"])
+                        for role_row in self._conn.execute(
+                            "SELECT role_id "
+                            "FROM resource_access_document_role_grants "
+                            "WHERE tenant_id=? AND kb_id=? AND document_id=? "
+                            "ORDER BY role_id",
+                            (tenant, knowledge_base, document),
+                        ).fetchall()
+                    )
+                    expected_roles = (
+                        previous_roles if desired_roles is None else desired_roles
+                    )
+                    if previous_roles != expected_roles:
+                        self._conn.execute(
+                            "DELETE FROM resource_access_document_role_grants "
+                            "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                            (tenant, knowledge_base, document),
+                        )
+                        for role_id in expected_roles:
+                            self._conn.execute(
+                                "INSERT INTO resource_access_document_role_grants "
+                                "(tenant_id,kb_id,document_id,role_id,created_at) "
+                                "VALUES (?,?,?,?,?)",
+                                (tenant, knowledge_base, document, role_id, now),
+                            )
+
+                    fingerprint = (
+                        str(row["owner_id"]),
+                        (
+                            str(row["owner_membership_id"])
+                            if row["owner_membership_id"] is not None
+                            else None
+                        ),
+                        str(row["policy"]),
+                        str(row["created_at"]),
+                        str(row["updated_at"]),
+                    )
+                    mutation = DocumentUploadAccessMutation(
+                        tenant_id=tenant,
+                        kb_id=knowledge_base,
+                        document_id=document,
+                        source=normalized_source,
+                        policy_created=policy_created,
+                        policy_fingerprint=fingerprint,
+                        previous_role_ids=previous_roles,
+                        expected_role_ids=expected_roles,
+                    )
+                    mutations.append(mutation)
+                    changed = changed or mutation.changed
+
+                if changed:
+                    self._bump_epoch_locked(tenant, knowledge_base)
+        except sqlite3.IntegrityError as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                raise ResourceAccessConflictError(
+                    "source is already bound to another document"
+                ) from exc
+            raise
+        return tuple(mutations)
+
+    def rollback_document_upload_access(
+        self, mutation: DocumentUploadAccessMutation
+    ) -> bool:
+        """Restore one provisional upload ACL if it was not concurrently edited."""
+
+        return self.rollback_document_upload_access_batch((mutation,))
+
+    def rollback_document_upload_access_batch(
+        self, mutations: Sequence[DocumentUploadAccessMutation]
+    ) -> bool:
+        """Compare-and-swap rollback for an aborted upload ACL publication.
+
+        ``False`` means a policy, role allowlist, grant, or retirement fence was
+        changed after staging.  In that case nothing is rolled back, preserving
+        the newer authority instead of clobbering it.
+        """
+
+        if isinstance(mutations, (str, bytes)):
+            raise TypeError("mutations must contain upload ACL tokens")
+        tokens = tuple(mutations)
+        if not tokens:
+            return True
+        if any(not isinstance(token, DocumentUploadAccessMutation) for token in tokens):
+            raise TypeError("mutations must contain upload ACL tokens")
+        tenant = tokens[0].tenant_id
+        knowledge_base = tokens[0].kb_id
+        if any(
+            token.tenant_id != tenant or token.kb_id != knowledge_base
+            for token in tokens
+        ):
+            raise ValueError("upload ACL tokens must share one tenant and knowledge base")
+        changed_tokens = tuple(token for token in tokens if token.changed)
+        if not changed_tokens:
+            return True
+
+        with self._write_transaction():
+            # Validate the complete batch before touching any row.  A mixed
+            # rollback would be worse than retaining provisional ACL state.
+            for token in changed_tokens:
+                row = self._conn.execute(
+                    "SELECT source, owner_id, owner_membership_id, policy, "
+                    "created_at, updated_at "
+                    "FROM resource_access_document_policies "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant, knowledge_base, token.document_id),
+                ).fetchone()
+                if row is None or str(row["source"]) != token.source:
+                    return False
+                fingerprint = (
+                    str(row["owner_id"]),
+                    (
+                        str(row["owner_membership_id"])
+                        if row["owner_membership_id"] is not None
+                        else None
+                    ),
+                    str(row["policy"]),
+                    str(row["created_at"]),
+                    str(row["updated_at"]),
+                )
+                if fingerprint != token.policy_fingerprint:
+                    return False
+                current_roles = tuple(
+                    str(role_row["role_id"])
+                    for role_row in self._conn.execute(
+                        "SELECT role_id "
+                        "FROM resource_access_document_role_grants "
+                        "WHERE tenant_id=? AND kb_id=? AND document_id=? "
+                        "ORDER BY role_id",
+                        (tenant, knowledge_base, token.document_id),
+                    ).fetchall()
+                )
+                if current_roles != token.expected_role_ids:
+                    return False
+                if token.policy_created:
+                    grant = self._conn.execute(
+                        "SELECT 1 FROM resource_access_subject_grants "
+                        "WHERE tenant_id=? AND kb_id=? AND document_key=? LIMIT 1",
+                        (tenant, knowledge_base, token.document_id),
+                    ).fetchone()
+                    retiring = self._conn.execute(
+                        "SELECT 1 FROM resource_access_retiring_documents "
+                        "WHERE tenant_id=? AND kb_id=? AND document_id=? LIMIT 1",
+                        (tenant, knowledge_base, token.document_id),
+                    ).fetchone()
+                    if grant is not None or retiring is not None:
+                        return False
+
+            now = _now_iso()
+            for token in changed_tokens:
+                self._conn.execute(
+                    "DELETE FROM resource_access_document_role_grants "
+                    "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                    (tenant, knowledge_base, token.document_id),
+                )
+                if token.policy_created:
+                    self._conn.execute(
+                        "DELETE FROM resource_access_document_policies "
+                        "WHERE tenant_id=? AND kb_id=? AND document_id=?",
+                        (tenant, knowledge_base, token.document_id),
+                    )
+                else:
+                    for role_id in token.previous_role_ids:
+                        self._conn.execute(
+                            "INSERT INTO resource_access_document_role_grants "
+                            "(tenant_id,kb_id,document_id,role_id,created_at) "
+                            "VALUES (?,?,?,?,?)",
+                            (tenant, knowledge_base, token.document_id, role_id, now),
+                        )
+            self._bump_epoch_locked(tenant, knowledge_base)
+        return True
 
     def apply_managed_document_access(
         self,
@@ -2387,6 +2721,7 @@ class ResourceAccessStore:
 __all__ = [
     "AccessMode",
     "AccessPolicy",
+    "DocumentUploadAccessMutation",
     "QueryAccessMode",
     "QueryAuthorization",
     "ResourceAccessConflictError",

@@ -13,6 +13,7 @@ from cogdoc.api.retrieval_feedback_store import RetrievalFeedbackStore
 from cogdoc.api.retrieval_eval_draft_store import RetrievalEvalDraftStore
 from cogdoc.api.research_job_store import ResearchJobStore
 from cogdoc.api.resource_access import ResourceAccessStore
+from cogdoc.api.tenant_quota import TenantQuotaExceeded
 from cogdoc.api.routes import documents as documents_route
 from cogdoc.tools.chunk_identity import build_document_id
 from cogdoc.tools.eval.retrieval_eval_drafts import create_pending_draft
@@ -729,6 +730,141 @@ async def test_batch_upload_rejects_duplicate_names(tmp_path, monkeypatch):
 
     assert response.status_code == 422
     assert response.json()["error_code"] == "BAD_REQUEST"
+
+
+@pytest.mark.anyio
+async def test_upload_quota_rejection_does_not_create_document_acl(
+    tmp_path, monkeypatch
+):
+    class RejectingQuota:
+        enabled = True
+
+        def reserve_upload(self, *_args):
+            raise TenantQuotaExceeded(
+                "documents", limit=0, used=0, requested=1
+            )
+
+    access_store = ResourceAccessStore(tmp_path / "resource-access.db")
+    app, _ = _make_app(
+        tmp_path,
+        monkeypatch=monkeypatch,
+        resource_access_store=access_store,
+    )
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            assert (
+                await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
+            ).status_code == 201
+            storage_id = app.state.kb_registry.resolve("kb", "default")["storage_id"]
+            app.state.tenant_quota = RejectingQuota()
+            response = await client.post(
+                "/v1/knowledge-bases/kb/documents",
+                files={"file": ("new.pdf", b"%PDF-1.4 data", "application/pdf")},
+            )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "TENANT_QUOTA_EXCEEDED"
+    assert access_store.get_document_by_source("default", storage_id, "new.pdf") is None
+
+
+@pytest.mark.anyio
+async def test_upload_submit_failure_removes_new_document_acl(tmp_path, monkeypatch):
+    access_store = ResourceAccessStore(tmp_path / "resource-access.db")
+    app, _ = _make_app(
+        tmp_path,
+        monkeypatch=monkeypatch,
+        resource_access_store=access_store,
+    )
+
+    def fail_submit(*_args):
+        raise RuntimeError("executor unavailable")
+
+    monkeypatch.setattr(app.state.index_jobs, "submit_upload", fail_submit)
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            assert (
+                await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
+            ).status_code == 201
+            storage_id = app.state.kb_registry.resolve("kb", "default")["storage_id"]
+            with pytest.raises(RuntimeError, match="executor unavailable"):
+                await client.post(
+                    "/v1/knowledge-bases/kb/documents",
+                    files={
+                        "file": ("new.pdf", b"%PDF-1.4 data", "application/pdf")
+                    },
+                )
+
+    assert access_store.get_document_by_source("default", storage_id, "new.pdf") is None
+
+
+@pytest.mark.anyio
+async def test_failed_batch_upload_rolls_back_all_provisional_document_acls(
+    tmp_path, monkeypatch
+):
+    def boom(_kb_id, _source_dir):
+        raise RuntimeError("index failed")
+
+    access_store = ResourceAccessStore(tmp_path / "resource-access.db")
+    rollback = access_store.rollback_document_upload_access_batch
+    rollback_attempts = []
+
+    def flaky_rollback(mutations):
+        rollback_attempts.append(True)
+        if len(rollback_attempts) < 3:
+            raise RuntimeError("resource access store is temporarily locked")
+        return rollback(mutations)
+
+    monkeypatch.setattr(
+        access_store, "rollback_document_upload_access_batch", flaky_rollback
+    )
+    app, _ = _make_app(
+        tmp_path,
+        ingest_fn=boom,
+        monkeypatch=monkeypatch,
+        resource_access_store=access_store,
+    )
+
+    async with app.router.lifespan_context(app):
+        async with await _client(app) as client:
+            assert (
+                await client.post("/v1/knowledge-bases", json={"kb_id": "kb"})
+            ).status_code == 201
+            storage_id = app.state.kb_registry.resolve("kb", "default")["storage_id"]
+            existing_id = build_document_id("existing.txt")
+            new_id = build_document_id("new.txt")
+            access_store.set_document_policy(
+                "default",
+                storage_id,
+                existing_id,
+                "existing.txt",
+                owner_id="original-owner",
+                policy="private",
+            )
+            access_store.replace_document_roles(
+                "default", storage_id, existing_id, ["viewer"]
+            )
+
+            response = await client.post(
+                "/v1/knowledge-bases/kb/documents/batch",
+                files=[
+                    ("files", ("existing.txt", b"replacement", "text/plain")),
+                    ("files", ("new.txt", b"new", "text/plain")),
+                ],
+                data={"allowed_role_ids": "editor"},
+            )
+            done = await _wait_job(client, response.json()["job_id"])
+
+    assert response.status_code == 202
+    assert done.json()["status"] == "failed"
+    existing = access_store.get_document_policy("default", storage_id, existing_id)
+    assert existing is not None
+    assert existing["owner_id"] == "original-owner"
+    assert existing["policy"] == "private"
+    assert access_store.list_document_roles("default", storage_id, existing_id) == [
+        "viewer"
+    ]
+    assert access_store.get_document_policy("default", storage_id, new_id) is None
+    assert len(rollback_attempts) == 3
 
 
 # 验证 upload rejects oversize。

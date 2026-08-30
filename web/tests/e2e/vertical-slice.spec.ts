@@ -43,17 +43,30 @@ interface ApiFixtureOptions {
   streamLocation?: Record<string, unknown>;
   jobAlwaysRunning?: boolean;
   uploadDelayMs?: number;
+  metadataDelayMs?: number;
+  initialKnowledgeBase?: boolean;
+  initialEmbeddingProfile?: "local" | "cloud";
+  includeCustomRole?: boolean;
   permissions?: string[];
   authMeFails?: boolean;
 }
 
 async function installApi(page: Page, options: ApiFixtureOptions = {}) {
   const fixtureSession = { ...session, permissions: options.permissions ?? session.permissions };
-  let knowledgeBases: Record<string, unknown>[] = [];
+  let knowledgeBases: Record<string, unknown>[] = options.initialKnowledgeBase ? [{
+    kb_id: "policies",
+    created_at: "2026-08-23T00:00:00Z",
+    document_count: 0,
+    tenant_id: workspace.workspace_id,
+    owner_id: user.user_id,
+    embedding_profile_id: options.initialEmbeddingProfile ?? "local",
+    embedding_model: options.initialEmbeddingProfile === "cloud" ? "enterprise-embed" : "BAAI/bge-m3",
+  }] : [];
   let documentReady = false;
   let jobReads = 0;
   let feedbackPayload: Record<string, unknown> | null = null;
   let savedKnowledgePayload: Record<string, unknown> | null = null;
+  let uploadedBody = "";
 
   await page.route("**/api/cogdoc/v1/**", async (route) => {
     const request = route.request();
@@ -65,13 +78,21 @@ async function installApi(page: Page, options: ApiFixtureOptions = {}) {
     if (path === "/auth/me") return options.authMeFails
       ? json(route, { schema_version: "v1", error_code: "INTERNAL_ERROR", message: "identity service unavailable" }, 503)
       : json(route, { schema_version: "v1", user, workspace, permissions: fixtureSession.permissions, workspaces: [workspace] });
+    if (path === `/workspaces/${workspace.workspace_id}/roles`) {
+      if (options.metadataDelayMs) await new Promise((resolve) => setTimeout(resolve, options.metadataDelayMs));
+      const roleIds = ["owner", "admin", "editor", "reviewer", "viewer", ...(options.includeCustomRole ? ["legal"] : [])];
+      return json(route, { schema_version: "v1", workspace_id: workspace.workspace_id, roles: roleIds.map((roleId) => ({ role_id: roleId, name: roleId, base_role: roleId === "legal" ? "viewer" : roleId, system: roleId !== "legal", member_count: roleId === "owner" ? 1 : 0, revision: 1 })) });
+    }
     if (path === "/embedding-profiles") return json(route, [
       { profile_id: "local", kind: "local", label: "本地 · BGE-M3", model: "BAAI/bge-m3", dimensions: 1024, available: true, description: "本地模型" },
       { profile_id: "cloud", kind: "cloud", label: "云端 · enterprise-embed", model: "enterprise-embed", dimensions: 1024, available: true, description: "云端模型" },
     ]);
-    if (path === "/knowledge-bases" && request.method() === "GET") return options.knowledgeBasesFail
-      ? json(route, { schema_version: "v1", error_code: "INTERNAL_ERROR", message: "知识服务暂不可用" }, 503)
-      : json(route, knowledgeBases);
+    if (path === "/knowledge-bases" && request.method() === "GET") {
+      if (options.metadataDelayMs) await new Promise((resolve) => setTimeout(resolve, options.metadataDelayMs));
+      return options.knowledgeBasesFail
+        ? json(route, { schema_version: "v1", error_code: "INTERNAL_ERROR", message: "知识服务暂不可用" }, 503)
+        : json(route, knowledgeBases);
+    }
     if (path === "/knowledge-bases" && request.method() === "POST") {
       const payload = request.postDataJSON() as { kb_id: string };
       const created = { kb_id: payload.kb_id, created_at: "2026-08-23T00:00:00Z", document_count: 0, tenant_id: workspace.workspace_id, owner_id: user.user_id, embedding_profile_id: "local", embedding_model: "BAAI/bge-m3" };
@@ -82,6 +103,7 @@ async function installApi(page: Page, options: ApiFixtureOptions = {}) {
       return json(route, documentReady ? [{ name: "security.pdf", sha256: "abc123", document_id: "doc-security", source_id: "src-security", version_id: "ver-1", connector_type: "legacy-upload", media_type: "application/pdf", kind: "file", origin_uri: null }] : []);
     }
     if ((path === "/knowledge-bases/policies/documents" || path === "/knowledge-bases/policies/documents/batch") && request.method() === "POST") {
+      uploadedBody = request.postData() || "";
       if (options.uploadDelayMs) await new Promise((resolve) => setTimeout(resolve, options.uploadDelayMs));
       return json(route, { job_id: "job-1" }, 202);
     }
@@ -176,7 +198,7 @@ async function installApi(page: Page, options: ApiFixtureOptions = {}) {
     return json(route, { schema_version: "v1", error_code: "NOT_FOUND", message: `Unhandled ${request.method()} ${path}` }, 404);
   });
 
-  return { feedback: () => feedbackPayload, savedKnowledge: () => savedKnowledgePayload };
+  return { feedback: () => feedbackPayload, savedKnowledge: () => savedKnowledgePayload, uploadedBody: () => uploadedBody };
 }
 
 test("login to evidence feedback vertical slice", async ({ page }) => {
@@ -521,6 +543,17 @@ test("server failures are distinct from empty knowledge and session states", asy
   await expect(page.getByText("还没有历史对话", { exact: true })).toHaveCount(0);
 });
 
+test("home does not replace a failed session lookup with a new conversation", async ({ page }) => {
+  await installApi(page, { initialKnowledgeBase: true, sessionsFail: true });
+  await page.goto("/login");
+  await page.getByLabel("邮箱").fill("alice@acme.example");
+  await page.getByLabel("密码").fill("correct horse battery");
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  await expect(page).toHaveURL(/\/home$/);
+  await expect(page.getByText("无法恢复最近对话", { exact: true })).toBeVisible();
+  await expect(page).not.toHaveURL(/\/chat\//);
+});
+
 test("login failure remains actionable", async ({ page }) => {
   await page.route("**/api/cogdoc/v1/auth/config", (route) => json(route, { schema_version: "v1", account_auth_enabled: true, self_registration_enabled: false, oidc_enabled: false, oidc_display_name: "", scim_enabled: false }));
   await page.route("**/api/cogdoc/v1/auth/login", (route) => json(route, { schema_version: "v1", error_code: "UNAUTHORIZED", message: "invalid credentials" }, 401));
@@ -595,7 +628,7 @@ test("invalid final answer exposes review state separately from citation binding
 });
 
 test("viewer affordances follow backend permissions", async ({ page }) => {
-  await installApi(page, { permissions: ["read", "query"] });
+  await installApi(page, { initialKnowledgeBase: true, permissions: ["read", "query"] });
   await page.goto("/login");
   await page.getByLabel("邮箱").fill("alice@acme.example");
   await page.getByLabel("密码").fill("correct horse battery");
@@ -604,17 +637,52 @@ test("viewer affordances follow backend permissions", async ({ page }) => {
   await page.goto("/knowledge");
   await expect(page.getByRole("button", { name: "创建知识库" }).first()).toBeDisabled();
   await expect(page.getByRole("link", { name: "管理" })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "访问权限" })).toHaveCount(0);
+  await page.goto("/knowledge/policies/access");
+  await expect(page.getByText("当前角色不能管理访问权限")).toBeVisible();
   await page.goto("/knowledge/policies");
   await expect(page.getByRole("tab", { name: "上传" })).toBeDisabled();
   await expect(page.getByRole("navigation", { name: "知识库主视图" })).not.toContainText("证据审核");
   await page.goto("/knowledge/policies/diagnostics");
   await expect(page.getByRole("tab", { name: "RAG 评测" })).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: "检索诊断" })).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: "索引代际" })).toHaveCount(0);
   await page.goto("/reviews?kb=policies");
   await expect(page).toHaveURL(/\/knowledge\/policies\/diagnostics$/);
   await expect(page.getByRole("tab", { name: "RAG 评测" })).toHaveCount(0);
   await expect(page.getByRole("tab", { name: "Trace 调试" })).toHaveAttribute("data-state", "active");
   await page.goto("/admin");
   await expect(page.getByText("当前角色不能访问管理设置")).toBeVisible();
+});
+
+test("manage-access role sees access administration but not tenant settings", async ({ page }) => {
+  await installApi(page, { initialKnowledgeBase: true, permissions: ["read", "query", "manage_access"] });
+  await page.goto("/login");
+  await page.getByLabel("邮箱").fill("alice@acme.example");
+  await page.getByLabel("密码").fill("correct horse battery");
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  await page.goto("/knowledge");
+
+  await expect(page.getByRole("link", { name: "访问权限" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "管理" })).toHaveAttribute("href", "/admin");
+  await page.goto("/admin");
+  await expect(page.getByRole("link", { name: "成员与邀请" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "工作区设置" })).toHaveCount(0);
+});
+
+test("manage-tenant role enters tenant settings without access-management links", async ({ page }) => {
+  await installApi(page, { initialKnowledgeBase: true, permissions: ["read", "query", "manage_tenant"] });
+  await page.goto("/login");
+  await page.getByLabel("邮箱").fill("alice@acme.example");
+  await page.getByLabel("密码").fill("correct horse battery");
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  await page.goto("/knowledge");
+
+  await expect(page.getByRole("link", { name: "访问权限" })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "管理" })).toHaveAttribute("href", "/admin/workspace");
+  await page.goto("/admin/workspace");
+  await expect(page.getByRole("link", { name: "工作区设置" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "成员与邀请" })).toHaveCount(0);
 });
 
 test("streaming 401 clears the local session", async ({ page }) => {
@@ -642,7 +710,7 @@ test("temporary identity outage preserves the login session", async ({ page }) =
 });
 
 test("upload job is restored after navigation reload", async ({ page }) => {
-  await installApi(page, { jobAlwaysRunning: true, uploadDelayMs: 500 });
+  await installApi(page, { initialKnowledgeBase: true, jobAlwaysRunning: true, uploadDelayMs: 500 });
   await page.goto("/login");
   await page.getByLabel("邮箱").fill("alice@acme.example");
   await page.getByLabel("密码").fill("correct horse battery");
@@ -659,6 +727,40 @@ test("upload job is restored after navigation reload", async ({ page }) => {
   await page.getByRole("tab", { name: "上传" }).click();
   await expect(page.getByText("已恢复入库任务")).toBeVisible();
   await expect(page.getByText("正在解析、切分并建立索引")).toBeVisible();
+});
+
+test("upload waits for the knowledge base model and complete workspace roles", async ({ page }) => {
+  const apiState = await installApi(page, {
+    initialKnowledgeBase: true,
+    initialEmbeddingProfile: "cloud",
+    includeCustomRole: true,
+    metadataDelayMs: 1200,
+  });
+  await page.addInitScript((authenticatedSession) => {
+    window.sessionStorage.setItem("cogdoc.session.v1", JSON.stringify({
+      state: {
+        authMode: "account",
+        accessToken: authenticatedSession.access_token,
+        expiresAt: authenticatedSession.expires_at,
+        user: authenticatedSession.user,
+        workspace: authenticatedSession.workspace,
+        selectedWorkspaceId: authenticatedSession.workspace.workspace_id,
+        permissions: authenticatedSession.permissions,
+        sidebarCollapsed: false,
+      },
+      version: 0,
+    }));
+  }, session);
+
+  await page.goto("/knowledge/policies");
+  await page.getByRole("tab", { name: "上传" }).click();
+  await page.locator('input[type="file"]').setInputFiles({ name: "security.pdf", mimeType: "application/pdf", buffer: Buffer.from("mock pdf") });
+  const upload = page.getByRole("button", { name: "上传 1 个文件" });
+  await expect(upload).toBeDisabled();
+  await expect(upload).toBeEnabled({ timeout: 5000 });
+  await upload.click();
+  await expect.poll(() => apiState.uploadedBody()).toContain("cloud");
+  await expect.poll(() => apiState.uploadedBody()).toContain("legal");
 });
 
 test("mobile navigation closes after route change", async ({ page }) => {

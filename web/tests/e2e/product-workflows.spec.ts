@@ -522,7 +522,7 @@ test("batch knowledge review confirms scope and reports partial success", async 
   await page.getByLabel("密码").fill("a-valid-password");
   await page.getByRole("button", { name: "登录", exact: true }).click();
   await page.goto("/knowledge/policies/knowledge");
-  await page.getByRole("combobox").first().click();
+  await page.getByRole("combobox", { name: "派生知识状态" }).click();
   await page.getByRole("option", { name: "pending" }).click();
   await page.getByRole("button", { name: "批量通过当前列表" }).click();
   await expect(page.getByRole("heading", { name: "批量通过派生知识" })).toBeVisible();

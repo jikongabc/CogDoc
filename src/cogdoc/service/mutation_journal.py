@@ -94,7 +94,7 @@ class MutationJournal:
             try:
                 with open(self._path(job_id), encoding="utf-8") as f:
                     entry = json.load(f)
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError, UnicodeError):
                 return False
             entry["committed"] = True
             try:
@@ -112,7 +112,7 @@ class MutationJournal:
                     entry = json.load(f)
                 entry["rolled_back"] = True
                 self._write(job_id, entry)
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError, UnicodeError):
                 return False
             return True
 
@@ -152,7 +152,7 @@ class MutationJournal:
                 try:
                     with open(path, encoding="utf-8") as f:
                         entry = json.load(f)
-                except (OSError, json.JSONDecodeError) as exc:
+                except (OSError, json.JSONDecodeError, UnicodeError) as exc:
                     raise MutationJournalError(
                         f"mutation journal 无法安全清理: {name}"
                     ) from exc
@@ -190,7 +190,7 @@ class MutationJournal:
                 try:
                     with open(os.path.join(self._dir, name), encoding="utf-8") as f:
                         entry = json.load(f)
-                except (OSError, json.JSONDecodeError):
+                except (OSError, json.JSONDecodeError, UnicodeError):
                     return True
                 if entry.get("kb_id") == kb_id:
                     if not _valid_entry(entry):
@@ -228,7 +228,7 @@ class MutationJournal:
                 except OSError:
                     unresolved.append(name)
                     continue
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, UnicodeError):
                     _quarantine(path)  # 损坏改名留存供取证，不静默删除
                     _mark_degraded(self._degraded_path)
                     unresolved.append(name)

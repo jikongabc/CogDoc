@@ -311,6 +311,24 @@ def required_permission(method: str, path: str) -> Permission:
         if normalized_method in {"PATCH", "DELETE"}:
             return Permission.MANAGE_TENANT
 
+    if normalized_path == "/v1/ha" or normalized_path.startswith("/v1/ha/"):
+        return Permission.MANAGE_ACCESS
+
+    kb_parts = normalized_path.split("/")
+    if len(kb_parts) >= 5 and kb_parts[:3] == ["", "v1", "knowledge-bases"]:
+        resource = kb_parts[4]
+        if resource in {
+            "connector-credentials",
+            "connector-oauth",
+            "source-catalog",
+            "source-artifacts",
+        }:
+            return Permission.MANAGE_ACCESS
+        if resource in {"connections", "sync-jobs"} and normalized_method not in (
+            _READ_METHODS
+        ):
+            return Permission.MANAGE_ACCESS
+
     if normalized_path == "/v1/tenants" or normalized_path.startswith("/v1/tenants/"):
         return Permission.MANAGE_TENANT
     if normalized_path == "/v1/audit-events" or normalized_path.startswith(
@@ -325,6 +343,10 @@ def required_permission(method: str, path: str) -> Permission:
         return Permission.MANAGE_ACCESS
     if normalized_path == "/v1/retrieval-eval-drafts" or normalized_path.startswith(
         "/v1/retrieval-eval-drafts/"
+    ):
+        return Permission.REVIEW
+    if normalized_path == "/v1/retrieval-diagnostics" or normalized_path.startswith(
+        "/v1/retrieval-diagnostics/"
     ):
         return Permission.REVIEW
     if normalized_path == "/v1/review-queue" or normalized_path.startswith(

@@ -299,6 +299,37 @@ def test_changed_document_rebinds_knowledge_by_anchor(tmp_path):
     assert updated["related_chunk_ids"] == [chunk["meta"]["chunk_id"]]
 
 
+def test_changed_document_does_not_rebind_an_ambiguous_anchor(tmp_path):
+    store = DerivedKnowledgeStore(path=str(tmp_path / "knowledge.jsonl"))
+    row, _ = store.create(
+        {
+            "kb_id": "kb",
+            "text": "审批规则",
+            "status": "approved",
+            "related_source": "a.pdf",
+            "related_source_sha256": "H1",
+            "related_anchor_text": "必须由负责人确认",
+        }
+    )
+    first = _reg_doc("a.pdf", "H2", 1, 1, page_start=2, page_end=2)
+    first["text"] = "采购申请必须由负责人确认。"
+    second = _reg_doc("a.pdf", "H2", 2, 2, page_start=8, page_end=8)
+    second["text"] = "退款申请必须由负责人确认。"
+
+    reviewed = _review_changed_derived_knowledge(
+        "kb",
+        [("a.pdf", "H1")],
+        [first, second],
+        knowledge_store=store,
+    )
+    updated = store.list(kb_id="kb")[0]
+
+    assert reviewed == {"stale": 1, "rebound": 0}
+    assert updated["knowledge_id"] == row["knowledge_id"]
+    assert updated["status"] == "stale"
+    assert updated["related_source_sha256"] == "H1"
+
+
 # 验证无法定位新版分块时仍标记过期。
 def test_changed_document_marks_knowledge_stale_without_rebind(tmp_path):
     store = DerivedKnowledgeStore(path=str(tmp_path / "knowledge.jsonl"))

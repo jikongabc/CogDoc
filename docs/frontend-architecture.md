@@ -2,14 +2,14 @@
 
 Status: normative
 Scope: complete Next.js web workspace
-Last updated: 2026-08-25
+Last updated: 2026-08-30
 
 ## Product objective
 
 CogDoc Web is the primary enterprise product surface for every workflow already
 available in the Streamlit client and backend. It must preserve backend state
 transitions, permissions, request shapes, audit behavior, and failure semantics.
-The target is capability parity, not a demonstration slice.
+Capability parity is the current product contract, not a future demonstration slice.
 
 The Streamlit client is the behavioral reference for:
 
@@ -29,10 +29,10 @@ capability already exists.
 
 ## Current-state audit
 
-`src/cogdoc/frontend/app.py` is an approximately 8,000-line Streamlit application
-and `api_client.py` is an approximately 2,300-line backend adapter. Streamlit
-combines navigation, authentication, server state, forms, background SSE work,
-and all product domains in one rerun-driven module. The Next.js client now exposes
+`src/cogdoc/frontend/app.py` is the legacy Streamlit compatibility application;
+its Python API client remains available for compatibility and automation. Streamlit
+combines navigation, authentication, forms, background SSE work, and product
+domains in one rerun-driven module. The Next.js client exposes
 the complete route map below, including Research, source/version operations,
 governance, diagnostics, identity, service accounts, sessions, and audit. Ongoing
 parity work is therefore verified workflow by workflow rather than represented by
@@ -43,10 +43,10 @@ workflow itself.
 
 ## Information architecture
 
-The Streamlit workspace is the navigation contract. The React application must
-remain structurally familiar to an existing CogDoc user: one selected workspace,
+The established CogDoc workspace workflow is the navigation contract. The React application
+remains structurally familiar to an existing CogDoc user: one selected workspace,
 one selected knowledge base, its conversations and documents in the left rail,
-and the six stable work views in the main area. React routes provide durable
+and the five stable work views in the main area. React routes provide durable
 deep links; they do not redefine the user's workflow.
 
 ```text
@@ -63,8 +63,7 @@ Workspace
 │   ├── Research                 plan / run / provenance / review / publish
 │   ├── Documents                upload / index status / access / delete
 │   ├── Derived knowledge        author / review / conflicts / feedback loop
-│   ├── Evidence review          claim verification / retrieval evidence
-│   └── Diagnostics              trace / retrieval / migration inspection
+│   └── Diagnostics              trace / retrieval / migration / RAG evaluation
 └── Incremental product tools
     ├── All knowledge bases
     ├── Data ingestion           connectors / credentials / sync / catalog / versions
@@ -72,9 +71,9 @@ Workspace
     └── Administration           identity / members / security / audit
 ```
 
-The selected knowledge base is the primary working context, exactly as in the
-Streamlit client. Global list, task, and administration routes remain available
-as secondary utilities, but they must never displace, duplicate, or hide the six
+The selected knowledge base is the primary working context across the current Web and
+legacy Streamlit clients. Global list, task, and administration routes remain available
+as secondary utilities, but they must never displace, duplicate, or hide the five
 work views. Data ingestion is intentionally separate from the RAG document view:
 connections operate external systems, while their materialized documents remain
 visible in the selected knowledge base.
@@ -164,7 +163,7 @@ invented percentage progress. Mutations never retry automatically.
 - account session: expose password change, current sessions, revoke, logout-all,
   OIDC link/unlink, and workspace invitation acceptance in Admin/Security.
 
-The login surface preserves the Streamlit entry model: `登录`, `注册`, and
+The login surface preserves the established product entry model: `登录`, `注册`, and
 `接受邀请` are first-class tabs. Registration stays visible but disabled with a
 clear deployment-policy explanation when self-registration is off. Invitation
 tokens may be prefilled from a safe one-time URL parameter and are removed from
@@ -202,12 +201,14 @@ review decisions, permission affordances, and critical admin flows with API
 fixtures. Critical pages are reviewed at desktop and mobile widths, with keyboard
 navigation and reduced motion.
 
-## Migration rule
+## Compatibility rule
 
-Streamlit stays available as a fallback until this route map reaches verified
-parity. Its information architecture, labels, view order, state transitions, and
-user outcomes are normative. Implementation is still decomposed into shared React
-domains rather than mechanically translating 8,000 lines, but a redesign may not
-move or remove an existing capability merely because another SaaS pattern looks
-cleaner. Every deviation requires a demonstrable accessibility, security, or
-responsive-layout reason while preserving the original action in context.
+The Next.js workspace is the primary product interface and the route map above has
+reached verified workflow parity. Streamlit remains available as a legacy compatibility
+client, not as the source of new navigation or visual requirements. Established labels,
+state transitions, API semantics, and user outcomes remain normative across clients.
+Implementation stays decomposed into shared React domains rather than mechanically
+translating the legacy application, and no redesign may remove an existing capability
+merely because another SaaS pattern looks cleaner. Every intentional deviation requires
+a demonstrable accessibility, security, or responsive-layout reason while preserving
+the original action in context.

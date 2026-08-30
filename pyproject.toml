@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cogdoc"
 version = "0.1.0"
-description = "面向论文的本地 RAG 知识库 — LangGraph 多 Agent问答、结构化摘要、多论文对比，带可验证引用和 Rust 原生混合检索引擎"
+description = "面向团队与企业的本地 RAG 知识平台 — LangGraph 多 Agent、可验证引用、权限治理与 Rust 原生混合检索"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

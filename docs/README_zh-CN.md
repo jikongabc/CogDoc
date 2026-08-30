@@ -4,7 +4,7 @@
 
 [English](../README.md) · [简体中文](README_zh-CN.md)
 
-一个面向个人 / 企业的本地 RAG 知识库控制台，上层是 **LangGraph 多 Agent 编排**，底层是**确定性 Rust 核心（PyO3 + maturin）**。它能处理 PDF、Markdown、HTML、Office、表格和图片来源，做问答、总结与对比，也能把反馈沉淀为可审核的派生知识。每条生成结论都会绑定到固定版本的来源位置：PDF 继续使用 `[source:Pn]`，幻灯片、单元格、文本行、图片和章节使用各自定位；所有引用均**经过校验，而非默认可信**。你可以用**命令行控制台**、基于 FastAPI 服务的 **Streamlit 网页端**，也可以用独立 **Debug 控制台**查看 trace。
+一个面向个人 / 企业的本地 RAG 知识库控制台，上层是 **LangGraph 多 Agent 编排**，底层是**确定性 Rust 核心（PyO3 + maturin）**。它能处理 PDF、Markdown、HTML、Office、表格和图片来源，做问答、总结与对比，也能把反馈沉淀为可审核的派生知识。每条生成结论都会绑定到固定版本的来源位置：PDF 继续使用 `[source:Pn]`，幻灯片、单元格、文本行、图片和章节使用各自定位；所有引用均**经过校验，而非默认可信**。正式产品入口是 **Next.js Web 工作台**和 API **CogDoc CLI**；同时保留 Streamlit 兼容客户端和独立 **Debug 控制台**。
 
 > **可选本地 OCR。** OCR 默认关闭；开启后，原生文本不足的页面会由 PyMuPDF 渲染，并交给本机 Tesseract CLI 识别，带文字层的页面仍走现有快速路径。
 
@@ -20,24 +20,28 @@
 
 - **多文档对比** — 在固定维度上逐文档建 profile，按维度渲染带引用的对比块。
 
-- **混合检索、query-level 融合** — 每条原问题、改写查询和需求专用查询都会检索 PDF 向量+BM25 混合 channel 与已审核派生知识 channel；产生的 query/channel 排名等权进入确定性 RRF，requirement quota 防止后出现的聚焦查询在重排前被饿死。分词与 BM25 均为 native——中文走 `jieba-rs`，英文做小写化 + Snowball 词干化 + 停用词过滤。
+- **混合检索、query-level 融合** — 每条原问题、改写查询和需求专用查询都会检索来源文档向量+BM25 混合 channel 与已审核派生知识 channel；产生的 query/channel 排名等权进入确定性 RRF，requirement quota 防止后出现的聚焦查询在重排前被饿死。分词与 BM25 均为 native——中文走 `jieba-rs`，英文做小写化 + Snowball 词干化 + 停用词过滤。
 
 - **结构感知 Parent–Child 上下文** — 保守识别 Markdown、编号及中英文常见标题并形成章节父块。召回、重排和引用仍精确到 child chunk，命中后只从同章节补充有界连续 sibling 窗口；旧索引或无结构文档继续回退现有的前后各一块逻辑。
 
-- **内容寻址的增量缓存** — 逐文件 SHA-256 manifest 加带版本的 chunk 身份契约：未变化的文件直接复用已建索引，只有 PDF 内容或切块方案真正变化时才增量重建。
+- **内容寻址的增量缓存** — 逐文件 SHA-256 manifest 加带版本的 chunk 身份契约：未变化的文件直接复用已建索引，只有来源内容、解析/切块契约或 Embedding 契约变化时才重建。
+
+- **批量上传、Embedding 与角色范围** — 一个任务可上传多个受支持文件，选择本地 BGE-M3 或已配置的云端 Embedding，并绑定文档角色 allowlist；切换模型会重建知识库索引代，不会混用向量契约。
+
 - **知识源运维控制面** — 本地目录、Git、URL、Zotero、Notion、Confluence、SharePoint 与 S3 共用一套可恢复同步 runtime，支持 checkpoint、健康快照、死信/重放、预算与 fail-closed ACL 映射。连接密钥可使用 AES-256-GCM 凭据库、手工轮换或 Notion/Atlassian/Microsoft OAuth，旧环境变量引用继续兼容；管理员还可浏览来源目录、下载/比较不可变版本，并软删除/恢复历史原始 artifact。详见[连接器说明](CONNECTORS_zh-CN.md)。
 
 - **可选分布式控制面与不可变索引发布** — PostgreSQL 租约队列、单线程持久调度、transactional outbox、S3 generation 和 fencing/CAS 发布协议可横向扩展后台 worker；任何不完整或过期 worker 生成的索引都不能切成 current。主 API 仍保持单 writer，完整边界与上线步骤见[高可用部署指南](HA_DEPLOYMENT_zh-CN.md)。
 
 - **多知识库 · 多对话 · 分层记忆** — 完整展示历史持久化用于回放；通过引用校验的近期回合组成有界短期记忆，被淘汰回合转为会话级摘要和决策，只有带明确记忆信号的稳定事实才进入跨会话长期记忆，错误答案不会进入 Agent 记忆。
 
-- **可复现证据的 Deep Research 工作台** — AI 生成或人工编辑带原子证据需求的大纲，每个需求复用生产混合检索链执行，并通过持久 attempt lease 安全暂停、恢复和取消。准入、阶段截止时间、检索/文档/LLM/输入预算以及旧 worker 的迟到提交均有界且 fail-closed。报告声明会被独立审计，每个原子需求还必须由已支持且有引用的声明覆盖；两道门共享最多一次修复，仍不充分则 fail-closed。每次执行都会冻结索引、来源、派生知识、调权与检索契约版本；证据过期后必须刷新才能审阅或发布，发布同时提供完整性校验过的 Markdown 与确定性验证包。带 keyset 分页和 ETag 的轻量摘要索引使任务轮询不再随报告和证据体积增长。
+- **可复现证据的 Deep Research 工作台** — AI 生成或人工编辑大纲，原子证据需求复用生产检索链执行，任务可持久暂停、恢复和取消。声明与需求覆盖只针对闭集证据审核；冻结的 provenance 阻止使用过期证据审阅或发布，发布同时生成完整性校验过的报告与验证包。
 
-- **网页端、CLI 与 Debug 入口** — 斜杠命令 CLI、基于 FastAPI 的 Streamlit 网页端，以及聚焦 trace 诊断的 `make debug` 控制台。
+- **网页端、CLI 与 Debug 入口** — 正式 Next.js 工作台、交互/自动化 API CLI、保留的 Streamlit 兼容客户端，以及聚焦 trace 诊断的 `make debug` 控制台。
 
 - **派生知识审核闭环** — 支持手动新增知识、保存已校验答案、把纠错/无依据反馈转成待审核知识卡片；每条知识可绑定来源、检测冲突、扫描过期、创建修订版本，并支持批量通过/驳回、归档和删除。
 
 - **反馈分析与归因检索调权** — 赞踩、纠错、评分、问题类型和 evidence 上下文按 `trace_id` 落盘；正向信号可提升被引用 chunk，负向信号只有在 `feedback_type=bad_retrieval` 时才惩罚它们。`skip_retrieval_feedback=true` 可让单条反馈不参与调权，所有调权记录仍可审核、可回滚。
+
 - **证据级检索评测数据飞轮** — 只有完整成功的服务端 trace 加显式 `thumbs_down` / `bad_retrieval` 才会生成未标注草稿，统一覆盖 QA requirement、Summary section 和 Compare source×dimension；gold chunk/span 与 hard negative 只能由授权审核者补充，索引代、chunk 身份契约或来源 SHA 变化后审批和导出都会 fail closed。
 
 - **Trace 可观测、审核队列与 webhook** — 每次请求可导出安全 JSON trace，包含请求配置、节点耗时、改写、证据预览与错误摘要；网页端只展示当前对话的 trace，并把待审核/过期知识、反馈分析、检索调权聚合成审核队列，也可在新待审核知识产生时投递 webhook。
@@ -46,56 +50,68 @@
 
 ## 功能演示
 
-1. **网页端对话、引用与证据。** 选一个知识库，自然语言提问，实时查看执行进度，再接收已完成终态处理的答案，展开引用来源和证据片段，并打 👍/👎 反馈。
+1. **Web 工作台、批量入库、对话与证据。** 创建知识库，为原竞赛资料选择 Embedding 和可访问角色后批量上传，跟踪解析/索引进度，再自然语言提问并展开最终答案的引用证据。
 
-   <img src="./images/web-chat.png" alt="网页端对话" width="800">
+   <img src="./images/knowledge-workspace.png" alt="知识库工作台" width="800">
 
-2. **命令行控制台。** 用斜杠命令管理知识库、入库、多对话历史和强制任务模式。
+   <img src="./images/workspace-batch-upload.png" alt="批量上传文档" width="800">
 
-   <img src="./images/cli-console1.png" alt="命令行控制台" width="800">
+   <img src="./images/workspace-indexing.png" alt="文档解析与索引进度" width="800">
+
+   <img src="./images/chat-conversation.png" alt="流式对话" width="800">
+
+   <img src="./images/evidence-detail.png" alt="引用证据详情" width="800">
+
+2. **命令行控制台。** 保留 CogDoc 原有的斜杠命令交互，同时通过与 Web 相同的 API 管理账号、工作区、ACL、知识库、入库、对话/历史、Research、外部集成、诊断、评测和企业管理。
+
+   <img src="./images/cli-console-current.png" alt="CogDoc 命令行控制台" width="800">
 
 3. **独立 Debug 控制台。** `make debug` 针对一个知识库调试，普通提问后可继续用 `/trace`、`/steps`、`/rewrite`、`/evidence`、`/config` 查看细节，也可以用 `/retrieve <问题>` 只看召回与重排结果。
 
-   <img src="./images/debug-console1.png" alt="独立 Debug 控制台" width="800">
+   <img src="./images/debug-console-current.png" alt="当前独立 Debug 控制台" width="800">
 
 4. **带引用的问答。** 每条事实性句子都以引用结尾，且引用的文件名和页码必须存在于本轮检索上下文中；非法引用会把回答打回重新生成。
 
-   <img src="./images/qa_net.png" alt="带引用的问答网页视图" width="800">
+   <img src="./images/chat-grounded-qa.png" alt="带引用的问答网页视图" width="800">
 
 5. **结构化摘要。** 把一篇点名文档总结为固定章节，每节带确定性引用。
 
-   <img src="./images/summary_net.png" alt="结构化摘要网页视图" width="800">
+   <img src="./images/chat-summary.png" alt="结构化摘要网页视图" width="800">
 
 6. **多文档对比。** 对两篇或更多点名文档逐方法、逐指标对比，每个单元格都带引用。
 
-   <img src="./images/compare_net.png" alt="多文档对比网页视图" width="800">
+   <img src="./images/chat-compare.png" alt="多文档对比网页视图" width="800">
 
 7. **Trace 调试面板。** 只查看当前对话的 trace，可视化路由判别、问题改写、召回与重排、请求配置和引证审计。
 
-   <img src="./images/web-trace-debug.png" alt="Trace 调试面板" width="800">
+   <img src="./images/trace-debugger.png" alt="Trace 调试面板" width="800">
+
+   <img src="./images/retrieval-diagnostics.png" alt="检索诊断" width="800">
 
 8. **派生知识审核中心。** 新增知识、保存答案、检查来源绑定、查看冲突、通过/驳回/归档待处理项，并重建已通过派生知识索引。
 
-   <img src="./images/derived-knowledge3.png" alt="派生知识审核中心" width="800">
+   <img src="./images/derived-knowledge-review.png" alt="派生知识审核中心" width="800">
+
+   <img src="./images/access-control.png" alt="知识库与文档角色访问范围" width="800">
 
 9. **反馈与调权。** 每次赞踩、纠错和无依据反馈都会关联到本次回答的 `trace_id`、问题、答案、引用与证据；系统会把坏样本沉淀到评测台账，把可修正内容转为待审核派生知识，并生成可启用/禁用的检索调权记录，让后续召回排序能被人工反馈持续校正。
-
-   <img src="./images/feedback.png" alt="反馈与调权" width="800">
 
 ## 快速开始
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev,frontend]"   # 运行时 + 构建/测试 + Streamlit 依赖
+pip install -e ".[dev,frontend]"   # 运行时 + 构建/测试 + 兼容界面依赖
+npm ci --prefix web                # 安装锁定的 Next.js 工作台依赖
 make native     # 构建 Rust 扩展：cd rust_core && maturin develop --release
 make check      # 校验扩展及其 native 符号
-make run        # 构建/复用索引、预热模型、启动控制台
+make serve      # 终端 1：FastAPI
+make web        # 终端 2：Next.js 工作台
 ```
 
-依赖统一在 [pyproject.toml](../pyproject.toml)：运行时依赖在 `[project.dependencies]`，`dev`（构建/测试）与 `frontend`（Streamlit 客户端）为可选 extras；完整本地体验建议安装 `.[dev,frontend]`。包采用 `src/` 布局（`src/cogdoc/`）；`make` 目标会把 `src/` 加入 `PYTHONPATH`，因此跑测试无需先安装。
+依赖统一在 [pyproject.toml](../pyproject.toml)：运行时依赖在 `[project.dependencies]`，`dev`（构建/测试）和 `frontend`（Streamlit 兼容客户端）为可选 extras。Web 工作台要求 Node.js 22 或更高版本，并使用 `web/` 下的锁文件。包采用 `src/` 布局（`src/cogdoc/`）；`make` 目标会把 `src/` 加入 `PYTHONPATH`，因此跑测试无需先安装。
 
-把 `.env.example` 复制为 `.env`，至少设置云端 `LLM_API_KEY`（或用 `/local` 走 Ollama）。把受支持的文档放进收件箱 `your_documents/`（或设置 `COGDOC_DOC_DIR`）。每次修改 `rust_core/src/` 下的代码后都必须重跑 `make native`——`.so` 不会自动重建，也不纳入版本控制。
+把 `.env.example` 复制为 `.env`，至少设置云端 `LLM_API_KEY`；也可以配置 Ollama 后使用 Web 的本地模式开关或 `cogdoc chat --local "<问题>"`。正式流程通过 Web/API 上传受支持文档；`your_documents/`（`COGDOC_DOC_DIR`）只保留为显式离线维护收件箱。每次修改 `rust_core/src/` 下的代码后都必须重跑 `make native`——`.so` 不会自动重建，也不纳入版本控制。
 
 持久账号默认关闭，保证旧部署升级后行为不突变。个人或团队初始化时应临时同时设置 `COGDOC_ACCOUNT_AUTH_ENABLED=true` 与 `COGDOC_SELF_REGISTRATION_ENABLED=true`，注册首位 owner 后立即关闭自主注册，后续使用邀请或 SSO。企业可配置 [OIDC 单点登录](OIDC_zh-CN.md)，并按需接入 [SCIM 2.0](SCIM_zh-CN.md) 预配用户/组。
 
@@ -108,21 +124,21 @@ CLI 和网页端使用同一套版本化 API、账号、Workspace、ACL 与任�
 ```bash
 make serve                         # Web 与产品 CLI 共用的 FastAPI
 cogdoc login owner@example.com     # 只保存不透明会话令牌，文件权限 0600
-cogdoc                              # 进入交互式 API 控制台
+cogdoc                              # 进入 CogDoc 交互式控制台
 ```
 
-`cogdoc --help` 提供适合自动化的命令，覆盖工作区、角色、知识库/文档 ACL、批量上传、流式对话、会话、派生知识、Research、连接器、任务、Trace、RAG 评测和索引代际。交互模式中同一命令可以带 `/` 前缀，直接输入普通文本会在当前知识库发起流式问答。
-
-旧版直连存储的收件箱控制台仅作为离线恢复入口保留：`cogdoc --local-storage` 或 `cogdoc-local`。它使用兼容用的 `default` 租户，不是正常多租户产品入口。详细约定见 [CLI 与 Web 功能对齐](cli-web-parity.md)。
+`cogdoc --help` 提供适合自动化的命令，覆盖工作区、角色、知识库/文档 ACL、批量上传、流式对话、会话、派生知识、Research、连接器、任务、Trace、RAG 评测和索引代际。同一个交互控制台中保留 `/kb new`、`/add`、`/docs`、`/qa`、`/summary` 和 `/compare` 等原有命令；直接输入普通文本会在当前知识库发起流式问答。
 
 `make debug` 打开针对单个库的独立 Debug 控制台。可以直接提问获得回答和 trace 摘要，再用 `/trace`、`/steps`、`/rewrite`、`/evidence`、`/config` 查看最近一次请求，也可以用 `/retrieve <问题>` 只检查召回和重排输出、不调用 LLM。需要直接调试指定知识库时，可运行 `python -m cogdoc.debug --kb <kb_id>`。
 
-### 网页端（Streamlit + FastAPI）
+### 网页端（Next.js + FastAPI）
 
 ```bash
 make serve          # 终端 1：FastAPI，地址 http://localhost:8000
-make frontend       # 终端 2：Streamlit 网页端（自动在浏览器打开）
+make web            # 终端 2：Next.js 工作台，地址 http://localhost:3000
 ```
+
+`make frontend` 继续保留给现有 Streamlit 工作流；Next.js 工作台仍是正式产品入口。
 
 在浏览器里：
 
@@ -132,13 +148,17 @@ make frontend       # 终端 2：Streamlit 网页端（自动在浏览器打开�
 4. **对话** — 新建对话或重开历史对话（会话和知识库持久化进 URL，刷新后续上同一对话）。
 5. **聊天** — 选模式（`auto` / `qa` / `summary` / `compare`），提问，查看实时进度，再读取已完成终态处理的答案及其引用来源、证据片段和 👍/👎 反馈。
 6. 在侧栏打开 **本地 Ollama 模式** 即可把生成切到本地模型。
-7. 打开 **调试**，只查看当前对话的请求 trace；也可以用 **检索调试** 直接调用 `/v1/retrieve`，检查命中 chunk、重排分数和 retrieval 元数据。
+7. 打开 **调试**，查看当前对话 Trace、运行检索诊断、检查索引代际，并在具备审核权限时使用 **RAG 评测**。
 8. 切到主视图里的 **派生知识**，可以新增知识、审核待处理/过期项、查看反馈分析、启用/禁用检索调权、导出审核队列，并在文档变化后扫描过期绑定。
 9. 具备 Reviewer 权限时，可从当前知识库的 **调试 → RAG 评测** 进入离线评测工具，标注检索证据或核验回答声明；这些标注仅属于当前知识库，用于评测与改进，不会直接改写当前 RAG。
+10. 打开 **研究**，规划、执行、暂停/恢复、审阅并发布证据绑定的长报告。
+11. 在 **外部集成** 管理连接器凭据、同步、健康、来源版本、死信重放与恢复；物化文档仍回到目标知识库。
+12. 在 **任务** 汇总查看入库、同步、Research 和 HA 作业，并跳回准确的所属资源。
+13. 在 **管理** 维护成员、内置/自定义角色、邀请、企业身份、服务账号、会话安全和审计导出。
 
 ### 直接调用 API
 
-Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接调用：
+Next.js 工作台和兼容客户端都使用同一套 FastAPI 服务——你也可以直接调用：
 
 | 端点 | 用途 |
 | --- | --- |
@@ -163,11 +183,12 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 | `GET /v1/tenant` | 查看当前工作区、主体、角色、权限与配额使用量 |
 | `GET /v1/audit-events` | 分页读取当前工作区的哈希链审计元数据（owner/admin） |
 | `POST/GET /v1/audit-events/exports`、`GET .../{job_id}/content` | 创建、轮询与下载带完整性摘要的租户审计 NDJSON 导出 |
+| `GET /v1/embedding-profiles` | 返回不含凭据的本地/云端 Embedding profile、模型和可用状态 |
 | `POST /v1/knowledge-bases`、`GET /v1/knowledge-bases` | 创建 / 列出知识库 |
 | `GET/PATCH /v1/knowledge-bases/{kb}/access` | 查看或切换知识库的 `workspace` / `private` 策略 |
 | `GET/PATCH /v1/knowledge-bases/{kb}/documents/{document_id}/access` | 查看或切换文档的 `inherit` / `workspace` / `private` 策略 |
 | `GET/POST/DELETE .../access/grants[/subject_id]` | 在知识库或文档级管理主体 grant |
-| `POST /v1/knowledge-bases/{kb}/documents` | 上传 + 入库受支持的文档/图片（返回异步 `job_id`） |
+| `POST /v1/knowledge-bases/{kb}/documents/batch` | 用同一角色 allowlist 和本地/云端 Embedding 批量上传受支持文档/图片（返回异步 `job_id`） |
 | `GET/POST /v1/knowledge-bases/{kb}/connections` | 查看或创建使用 vault 凭据/环境引用的持久来源连接 |
 | `GET/POST /v1/knowledge-bases/{kb}/connector-credentials` | 查看 metadata 或加密写入手工凭据（secret value 只写不回显） |
 | `PATCH/DELETE .../connector-credentials/{credential_id}`、`GET .../connector-credentials/audit/events` | 带 revision 保护地轮换/删除凭据，或查看不含密钥的凭据审计事件 |
@@ -181,7 +202,9 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 | `DELETE .../{version_id}/artifact`、`POST .../source-artifacts/{recovery_token}/restore` | 软删除非当前原始版本，或用作用域恢复令牌还原 |
 | `GET .../source-artifacts/usage`、`DELETE .../source-artifacts/trash?older_than=...` | 查看活动区/trash 用量，或按 epoch 边界不可逆清理作用域 trash |
 | `GET /v1/knowledge-bases/{kb}/sources`、`GET /v1/knowledge-bases/{kb}/sources/{source}/chunks` | 浏览已索引来源文件与 chunk 预览 |
-| `GET /v1/index-jobs/{job_id}` | 轮询入库进度 |
+| `GET /v1/index-jobs`、`GET /v1/index-jobs/{job_id}` | 列出或轮询入库进度 |
+| `GET /v1/sync-jobs`、`GET /v1/research-jobs/summaries`、`GET /v1/ha/jobs` | 为任务中心提供有界、工作区隔离的作业摘要 |
+| `GET /v1/index-migrations/scan`、`POST /v1/index-migrations`、`GET .../{run_id}` | 扫描、启动、查看、回滚或完成单飞索引代际迁移 |
 | `POST /v1/chat`、`POST /v1/chat/stream` | 提问（JSON 或 SSE 流式） |
 | `POST /v1/summary`、`POST /v1/compare` | 显式执行 Summary / Compare，避免路由歧义 |
 | `POST /v1/retrieve` | 返回 child 级检索命中，包含 parent/section 身份、source/page 预览和排序元数据 |
@@ -217,9 +240,10 @@ Streamlit 前端只是 FastAPI 服务上的瘦客户端——你也可以直接�
 | `GET /healthz`、`GET /readyz`、`GET /metrics` | 健康、就绪、Prometheus 指标 |
 
 `/v1/chat/stream` 始终会流式发送生命周期和节点进度事件。QA、Summary 和
-Compare 的中间模型文本可能包含内部 Evidence ID，且尚未通过终态处理，
-因此会被有意缓冲；客户端不会收到逐 token 正文，而是在常规 `final` 事件前，
-通过单个 `token` 事件收到最终答案。其他任务保留实时模型 token，除非全局声明校验门禁要求缓冲。
+Compare 的不安全中间模型文本可能包含内部 Evidence ID，且尚未通过终态处理，
+因此会被有意缓冲；公开答案通过引用/声明边界后，API 会把它拆成有界 Unicode
+`token` 块增量发送，最后再发送结构化 `final` 事件。其他任务可保留实时模型 token，
+除非全局声明校验门禁要求采用相同的审计后释放方式。
 
 ### 知识源运维与连接凭据
 
@@ -241,9 +265,9 @@ owner 可管理工作区本身；admin 同时拥有写入、删除、审核/发�
 
 查询权限会固化成明确的 `ALL`、非空 `SUBSET` 或 `DENY`。当结果为子集时，Chroma 向量过滤、BM25 候选选择、已审核派生知识、Summary、Compare 与 QA 都会在 top-k/重排之前使用来源 allowlist；融合后还有第二道过滤，防止过期或自定义后端忽略过滤后把越权结果带入 Prompt、Trace 或持久证据。这也避免高分越权 chunk 在 top-k 中挤掉可见证据。后台 Research 会冻结创建者及精确来源边界，在召回前后重新检查当前成员关系和 ACL；无法执行子集过滤的后端会被拒绝，权限撤销会中止任务，后续新增授权也不会静默扩大已经运行的任务范围。
 
-静态服务主体仍可用于自动化和分阶段升级。`COGDOC_API_PRINCIPALS` 把每个 key 映射到 `tenant_id`、`subject_id` 与角色；旧 `COGDOC_API_KEYS` 仍作为 `default` 工作区 admin，`COGDOC_EVAL_REVIEW_API_KEYS` 则按最小权限作为 `default` 工作区 reviewer。开启账号鉴权后，显式服务 key 与真人会话可以并存；关闭账号鉴权时，只有三类静态凭据全部为空才进入仅限 loopback 的本地 owner 模式。同时发送 Bearer 与 `X-API-Key` 时 Bearer 优先。显式 reviewer/admin/owner 可使用证据评测和 Research 审核接口，落盘操作人始终来自认证身份。硬配额覆盖知识库数、已提交加在途 PDF 数及 PDF 字节；`/v1/tenant` 返回 `limits`、`usage`、`reserved`，超限返回 HTTP 409 与 `TENANT_QUOTA_EXCEEDED`。
+静态服务主体仍可用于自动化和分阶段升级。`COGDOC_API_PRINCIPALS` 把每个 key 映射到 `tenant_id`、`subject_id` 与角色；旧 `COGDOC_API_KEYS` 仍作为 `default` 工作区 admin，`COGDOC_EVAL_REVIEW_API_KEYS` 则按最小权限作为 `default` 工作区 reviewer。开启账号鉴权后，显式服务 key 与真人会话可以并存；关闭账号鉴权时，只有三类静态凭据全部为空才进入仅限 loopback 的本地 owner 模式。同时发送 Bearer 与 `X-API-Key` 时 Bearer 优先。显式 reviewer/admin/owner 可使用证据评测和 Research 审核接口，落盘操作人始终来自认证身份。硬配额覆盖知识库数、已提交加在途文档数及来源字节；`/v1/tenant` 返回 `limits`、`usage`、`reserved`，超限返回 HTTP 409 与 `TENANT_QUOTA_EXCEEDED`。
 
-`COGDOC_API_KEY`（单数）是 Streamlit/CLI 客户端向外发请求时使用的凭据，不是服务端的 key 白名单。如果 Streamlit 进程设置了它，而当前浏览器没有真人会话 token，界面会按设计直接进入服务 key 模式并跳过账号登录页。共享或多用户前端必须留空该变量；API 端用 `COGDOC_API_KEYS` / `COGDOC_API_PRINCIPALS` 配置可接受的服务身份，真人用户应正常登录。单数 key 只适合受信的单用户控制台或专用自动化前端。
+`COGDOC_API_KEY`（单数）是 CLI/Streamlit 兼容客户端向外发请求时使用的凭据，不是服务端 key 白名单；Next.js 工作台使用真人浏览器会话，不读取这个服务端变量。共享的兼容前端应留空该变量；机器身份优先使用持久服务账号。
 
 模块级生产应用把纯元数据事件持久追加到 `COGDOC_DATA_DIR/audit/events.jsonl`：修改操作执行前写 intent，发送响应头前写 HTTP response-commit；读取操作只写后者。链损坏或不可写时，受保护流量以 HTTP 503 fail-closed。`GET /v1/audit-events` 按当前工作区 sequence 倒序分页，`before_sequence` 是排他游标。公开探针/文档及未认证的 401 尝试不入审计。每工作区 SHA-256 链可在进程存活期间识别 malformed、截断、改写和断链，并在重启后验证自身一致性，但它不是签名、WORM 或外部可信 head；若威胁模型包含恶意文件系统写入，必须备份并在外部锚定。
 
@@ -262,9 +286,10 @@ owner 可管理工作区本身；admin 同时拥有写入、删除、审核/发�
 ## 技术栈
 
 - **确定性内核** — 自研 [Rust](https://www.rust-lang.org/) 扩展（[PyO3](https://pyo3.rs/) + [maturin](https://www.maturin.rs/)）扛下 `jieba-rs` 中英分词、BM25、RRF 融合、SHA-256 manifest 与引用校验，全部 native、独立单测，不随 Agent / Prompt 漂移。
-- **检索** — `bge-m3` 多语言向量召回 + BM25 关键词召回，Rust RRF 融合后再用 `bge-reranker-v2-m3` 精排；PDF 向量和已通过派生知识向量都落 [Chroma](https://www.trychroma.com/)，PDF 解析走 PyMuPDF。
+- **检索** — 本地 `bge-m3` 或已配置的云端 Embedding + BM25 关键词召回，经 Rust RRF 融合后再用 `bge-reranker-v2-m3` 精排；源文档向量和已审核派生知识向量都落 [Chroma](https://www.trychroma.com/)。统一来源解析器支持 PDF、Markdown、文本、HTML、DOCX、PPTX、XLSX 与受支持图片；PDF 由 PyMuPDF 解析，并可选用本地 OCR。
 - **编排** — [LangGraph](https://langchain-ai.github.io/langgraph/) 把路由 → 任务子图 → 物理引用自愈 → 可选父图声明审计 / 有限修复 / 拒答串成可循环状态图。
 - **模型** — OpenAI 兼容双后端、一键热切：云端 DeepSeek，本地 Ollama `qwen2.5:7b`。
+- **Web 工作台** — Next.js 16 + React 19 + strict TypeScript，使用 Tailwind CSS、Radix/shadcn 基础、TanStack Query、Zustand、React Hook Form + Zod 与 Playwright。
 - **服务与可观测** — FastAPI 提供 SSE 流式接口、可选持久账号/服务 key 鉴权、工作区 RBAC/资源 ACL 与令牌桶限流；会话、入库任务、反馈、审核队列和派生知识都本地持久化；JSON trace 同时服务于网页 Trace 面板和独立 Debug 控制台。
 
 ## 架构
@@ -284,13 +309,13 @@ flowchart TD
     subgraph ENTRY["入口"]
         CLI["CLI 控制台"]
         DEBUG["Debug 控制台"]
-        WEB["Streamlit 网页端"]
+        WEB["Next.js Web 工作台"]
     end
 
     subgraph HTTP["FastAPI HTTP API"]
         APISTART["app startup"]
         ACCESS["API key 鉴权 / 限流 / metrics"]
-        ROUTES["路由: chat / agent / documents / knowledge / feedback / traces / health"]
+        ROUTES["身份 / 文档 / 对话 / 研究 / 外部集成 / 诊断 / 管理"]
     end
 
     subgraph CORE["Python 核心服务"]
@@ -385,9 +410,9 @@ flowchart TD
     class LLM,RUST,EMB native
 ```
 
-产品 CLI 与 Web 都通过 HTTP/SSE 访问 FastAPI，因此共享账号、Workspace、ACL 与异步任务状态。只有 `cogdoc-debug` 和显式的 `cogdoc-local` 离线维护控制台仍在进程内调用 Python 服务；这两个维护入口会获取单实例锁，不能与使用同一数据目录的 API 同时运行。
+CogDoc CLI 与 Web 都通过 HTTP/SSE 访问 FastAPI，因此共享账号、Workspace、ACL 与异步任务状态。`cogdoc --local-storage` 恢复模式与 `cogdoc-debug` 会在进程内调用 Python 服务，不能与使用同一数据目录的 API 同时运行。
 
-下图展开入库、检索和本地持久化的边界：PDF 内容与已审核派生知识分别建索引，查询时再汇入同一候选池；反馈不会直接改写索引，而是先沉淀为可审核记录或可回滚的检索调权。
+下图展开入库、检索和本地持久化的边界：源文档与已审核派生知识分别建索引，查询时再汇入同一候选池；反馈不会直接改写索引，而是先沉淀为可审核记录或可回滚的检索调权。
 
 **索引、检索与存储**
 
@@ -414,7 +439,7 @@ flowchart LR
     end
 
     subgraph INGESTION["入库流水线"]
-        PARSE["PDF 解析 / 切块 / manifest"]
+        PARSE["来源解析 / 切块 / manifest"]
     end
 
     subgraph NATIVE["Rust 核心"]
@@ -422,7 +447,7 @@ flowchart LR
     end
 
     subgraph STORE["本地存储"]
-        PDFVEC["Chroma PDF 向量"]
+        PDFVEC["Chroma 源文档向量"]
         BM25["BM25 artifact"]
         ARTIFACTS["artifacts: manifest / journal"]
     end
@@ -465,7 +490,7 @@ flowchart LR
     end
 
     subgraph STORE["本地存储"]
-        PDFVEC["Chroma PDF 向量"]
+        PDFVEC["Chroma 源文档向量"]
         BM25["BM25 artifact"]
         DKVEC["Chroma 派生知识向量"]
         TUNESTORE["retrieval tuning store: 调权记录"]
@@ -473,10 +498,10 @@ flowchart LR
 
     subgraph RETRIEVAL["QA 检索流水线"]
         QUERY["查询 + 改写"]
-        VECH["PDF 向量召回: Chroma"]
-        BM25CH["PDF 关键词召回: BM25"]
+        VECH["源文档向量召回: Chroma"]
+        BM25CH["源文档关键词召回: BM25"]
         DKCH["派生知识通道: 向量搜索"]
-        FUSION["PDF RRF 融合"]
+        FUSION["源文档 RRF 融合"]
         CAND["候选池"]
         TUNE["反馈权重"]
         RERANK["bge-reranker-v2-m3"]
@@ -569,19 +594,19 @@ flowchart LR
 
 Summary 为单个点名文档生成固定章节结构化摘要；Compare 为每篇文档在固定维度上建 profile，再按维度渲染带引用的 Markdown 对比块。两者都从 chunk 元数据确定性地绑定 `[source:Pn]` 引用，并跑与 QA 同一套 `validate_citations_native` 校验。
 
-Python 层负责图编排、Prompt、模型客户端、索引、CLI 控制台、独立 Debug 控制台以及 FastAPI/Streamlit 前端。已通过的派生知识在 Python 层存储和审核，单独写入 Chroma，并作为 QA 的独立证据源参与检索；待审核、过期、驳回和归档知识不会进入召回。Rust 层（`rust_core`）负责确定性 kernel，不随 Agent 逻辑漂移，并独立做单元测试。
+Python 层负责图编排、Prompt、模型客户端、索引、API CLI、离线恢复控制台、独立 Debug 控制台、FastAPI 控制面和 Streamlit 兼容客户端；Web 工作台位于 `web/`，使用同一套版本化 API。已通过的派生知识在 Python 层存储和审核，单独写入 Chroma，并作为 QA 的独立证据源参与检索；待审核、过期、驳回和归档知识不会进入召回。Rust 层（`rust_core`）负责确定性 kernel，不随 Agent 逻辑漂移，并独立做单元测试。
 
 ## 索引链路
 
-由 `build_kb_index_transactional` 在某个库的文件变更时驱动（`/add`、`/rm` 或云端上传/删除接口）：
+由 `build_kb_index_transactional` 在知识库的受支持来源经 Web/API 上传、连接器同步、删除、CLI 维护或显式重建发生变化时驱动：
 
-1. **扫描** — `scan_pdf_manifest_native`（Rust）用 rayon 并行、1 MiB 缓冲的 SHA-256 计算每个 PDF，返回 `{doc_id, documents: [{name, size, sha256}]}`，按文件名排序。
+1. **扫描** — 全部为 PDF 时走 `scan_pdf_manifest_native`（Rust）的 rayon 并行、1 MiB 缓冲 SHA-256 快速路径；混合格式语料走统一来源扫描器。两者都会返回按文件名排序的 `{doc_id, documents: [{name, size, sha256}]}` manifest。
 2. **比对** — `manifests_match` 仅当 `doc_id`、`chunk_identity_version` 及每个 `{name, sha256}` 都与已存 manifest 一致时才复用索引；任一不匹配都强制重建。
-3. **解析** — `smart_parse`（PyMuPDF）抽取页文本，并按文本块中心 x 坐标重排双栏布局。开启可选 OCR 后，低文本页面会在页数与超时预算内渲染并交给本地 Tesseract 识别；未开启时仍标记为 `is_ocr_fallback`，且只保留原生文本结果。
+3. **解析** — PDF 通过 `smart_parse` / PyMuPDF 抽取页文本、按 block 重排双栏，并可在预算内调用本地 Tesseract OCR。统一 `parse_source` 路径为 Markdown/文本/HTML 保留行与章节定位，为 DOCX 保留段落定位，为 PPTX 保留幻灯片定位，为 XLSX 保留工作表/单元格定位，并支持图片来源。
 4. **切块** — `chunk_paper` 先保守识别章节，再把每个 child 限制在 600 字符以内、重叠 60 字符，优先沿段落、句末/分号、换行和空白边界切分，超长无断句文本才退回固定窗口。无结构噪声仍沿用最短 30 字符过滤，但每个非空的已识别章节或 preamble 都会保留，避免章节硬边界抹掉短证据。child 不跨越已识别的章节边界；每块保存稳定 `parent_chunk_id`、章节路径、父级内序号及最多 160 字符的章节内定位上下文，同时保留自己的稳定 `chunk_id` 和页码跨度作为引用身份。
 5. **建索引** — chunk 写入 Chroma（向量）和 BM25 持久化 artifact；来源名、章节路径、定位上下文和 child 正文共同组成检索文本，两路存储均完整透传结构元数据并返回原始 child 正文。BM25 artifact 保存精简 chunk registry 与 native `Bm25Index` 字节，加载时直接从字节恢复 native 索引，不再从 Python 分词语料重建。`save_index_manifest` 落盘 manifest。分词走 `tokenize_mixed_text_native` / `tokenize_corpus_native`（中文 `jieba-rs`，英文 Snowball 词干化 + 停用词过滤）。
 
-已审核派生知识与 PDF 源文档分开建索引。审核状态变化后可重建派生知识 Chroma collection，过期扫描会标记那些来源绑定已不再匹配当前知识库文档的知识。
+已审核派生知识与源文档分开建索引。审核状态变化后可重建派生知识 Chroma collection，过期扫描会标记那些来源绑定已不再匹配当前知识库文档的知识。
 
 **Chunk 身份契约：**
 
@@ -589,13 +614,13 @@ Python 层负责图编排、Prompt、模型客户端、索引、CLI 控制台、
 chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{local_chunk_index}
 ```
 
-`chunk_id` 是贯穿 chunker、index、retriever、RRF、引用和 evidence 的唯一稳定 child 身份键——去重和融合从不依赖数组下标。`document_id = doc-{sha256(source-name-v1)}` 是知识库内稳定的文档 ACL 身份；`parent_chunk_id = sha256:{source_sha256}:src:{source_name}:section:{section_index}` 只负责把 child 组织成可补充的上下文组，绝不替代 child 的引用身份。契约带版本（`chunk_identity_version = source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index_cs600_ov60_min30_ctx160`）；改动文档身份、切块边界、结构识别或索引文本必须 bump `CHUNK_IDENTITY_BASE_VERSION`，让旧索引重建而非混用两套方案。
+`chunk_id` 是贯穿 chunker、index、retriever、RRF、引用和 evidence 的唯一稳定 child 身份键——去重和融合从不依赖数组下标。`document_id = doc-{sha256(source-name-v1)}` 是知识库内稳定的文档 ACL 身份；`parent_chunk_id = sha256:{source_sha256}:src:{source_name}:section:{section_index}` 只负责把 child 组织成可补充的上下文组，绝不替代 child 的引用身份。当前契约为 `source_sha256_name_page_span_local_v7_document_acl_parent_child_section_index_adaptive_blocks_cs600_ov60_min30_ctx160_strategy_adaptive-structural-v2`；改动文档身份、切块边界、结构识别或索引文本必须 bump `CHUNK_IDENTITY_BASE_VERSION`，让旧索引重建而非混用两套方案。
 
 ## 查询链路
 
 - **意图路由** — `RouterAgent` 要求 LLM 返回结构化 `task_type ∈ {qa, summary, compare, unknown}`，任何解析异常都按关键词规则回退。`qa`、`summary`、`compare` 都已接到真实子图。
 - **改写 + 证据需求规划** — `QueryRewriteAgent` 生成 1–3 条关键词查询，同时起草最多 3 个 `{question, retrieval_query, recovery_query}` 原子需求；服务端确定性分配 `r1..r3`，空规划或模型失败时回退为一个原问题需求。`RewriteVerifyAgent` 用一次 embedding 批处理执行两层语义守卫：先用含近期历史的原问题校验 requirement question，再用该 requirement 校验主/恢复查询。漂移的 requirement 被丢弃，漂移的聚焦查询回退到 requirement question，全部丢弃时回退原问题需求；原有改写保留/丢弃行为和 `steps_trace` 不变。
-- **带归因的 query-level RRF** — 原问题、改写和 requirement 查询都会检索 PDF 混合引擎与已审核派生知识。每个 query/channel 排名等权贡献 `score(d) = Σ_q,c 1 / (k + rank_q,c(d))`（`k = 60`），候选按稳定 `chunk_id` 去重，同分按身份键确定性打破。融合元数据保留命中的 queries、channels、requirement IDs、命中数、原问题是否命中、最佳排名和检索轮次，不再把归因压缩为一条 rewrite。
+- **带归因的 query-level RRF** — 原问题、改写和 requirement 查询都会检索源文档混合引擎与已审核派生知识。每个 query/channel 排名等权贡献 `score(d) = Σ_q,c 1 / (k + rank_q,c(d))`（`k = 60`），候选按稳定 `chunk_id` 去重，同分按身份键确定性打破。融合元数据保留命中的 queries、channels、requirement IDs、命中数、原问题是否命中、最佳排名和检索轮次，不再把归因压缩为一条 rewrite。
 - **有界 Parent–Child 补充** — child 级 rerank 与支持度判断完成后，每个原文命中从相同 `parent_chunk_id` 中加载连续、左右平衡的 sibling 窗口，并分别受块数与字符预算限制。补入 child 保留自己的 ID/页码，并记录 `context_anchor_chunk_id` 和 `context_expansion=section`；派生知识不做扩展。结构缺失、不完整或显式关闭时走旧邻块路径，因此旧索引仍可读取，而版本门禁会让新索引安全重建。
 - **Query-aware 抽取式证据 span** — 应用全局 pack 预算前，每个 canonical 长 chunk 会根据 query 与 requirement 的词项重合，被缩减为一个连续、逐字保真的原文区间；禁止改写或拼接不连续片段。`evidence_span_start` / `evidence_span_end` 是相对最终 child 正文的 0-based、左闭右开 offset。没有可靠命中时 fail-open 保留当前可用全文。隔离的模型视图会移除 `meta.context`，避免 span 外事实通过渲染重新进入闭集。自适应检索可从本地私有原文副本重新选 span，但 API 与 trace 都不会暴露该副本。
 - **确定性 Evidence Pack** — 结构补充后的 anchor、requirement 归因候选、自适应检索 carryover 与 sibling 上下文会被压缩为一个不可变 QA 证据闭集，并统一受全局块数和字符预算限制。字符预算精确等于 QA generator 最终渲染的证据上下文，完整计入文档/知识标签、身份属性、定位头、materialize 后正文和块间分隔符；system 指令、对话历史和 query 不计入，也不伪装成模型 token 估算。anchor 与已验证 carryover 是硬约束；若它们单独就超出任一预算，QA 会 fail-closed，而不会静默丢弃。证据 verifier（可只选闭集子集）、答案 generator 和 claim audit 都只能消费同一闭集内的 chunk。连续 child 的精确 overlap 只会在隔离的 pack 副本中移除；`retrieval.evidence_text_start`、`retrieval.evidence_text_end` 和 `retrieval.evidence_trimmed_overlap_chars` 保留其原文范围与裁剪归因。
@@ -610,7 +635,7 @@ chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{
 
   生产应用还会为每个终态 rollout 持久化一条有界、按租户隔离的观测记录。记录只含时间、任务/策略/模式/决策/状态与布尔结果，绝不保存 query、answer、evidence、文档、session 或原始分桶身份。具备 Reviewer 权限的主体可通过 `GET /v1/claim-verification/observations/summary` 查询有界时间窗，并可按实际模式过滤。接口默认只统计当前策略 ID，避免历史灰度配置污染就绪度；Reviewer 也可显式传入旧策略 ID 做历史查询。返回的 `operational_readiness` 只检查样本成熟度和 verifier 错误率；`semantic_release_gate_required` 永远为 true，因此不能替代人工标注发布门禁。观测写入失败不影响回答交付，观测存储不可读时摘要接口返回 `503`。
 
-  QA、Summary 和 Compare 始终缓冲候选模型 token，因为中间文本可能包含内部 Evidence ID，且尚未完成最终渲染。开启本门禁后，它审计的其他路由候选也保持相同缓冲规则。节点进度事件仍会流式发送；父图后处理完成（通过、有意 `not_run` 或产生 fail-closed 拒答）后，服务会把最终答案作为单个 token 事件发送，随后照常发送 `final` 事件。
+  QA、Summary 和 Compare 始终缓冲候选模型 token，因为中间文本可能包含内部 Evidence ID，且尚未完成最终渲染。开启本门禁后，它审计的其他路由候选也保持相同缓冲规则。节点进度事件仍会流式发送；父图后处理完成（通过、有意 `not_run` 或产生 fail-closed 拒答）后，服务会把最终公开答案拆成有界 Unicode `token` 块持续发送，随后照常发送 `final` 事件。
 
 **Summary 子图** — `document_loader` 选定一个点名文档（若语料库只有一篇则可自动选中；多文档歧义 query 返回可操作提示），`section_planner` 默认固定为背景与目标、方案与流程、规则与要求、价值与产出、限制与注意事项五个章节（也可由 state 传入自定义标题），`section_summary` 逐章节生成一段短摘要（模型只写正文，`[source:Pn]` 由程序按所用 chunk 确定性绑定），`global_summary` 整合答案并复跑引用校验。无依据章节不带引用、不带 evidence。
 
@@ -622,7 +647,7 @@ chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{
 
 | 符号 | 模块 | 用途 |
 | --- | --- | --- |
-| `scan_pdf_manifest_native` | `scanner.rs` | rayon 并行、缓冲式 SHA-256 计算所有 PDF；size + 哈希 manifest，稳定排序 |
+| `scan_pdf_manifest_native` | `scanner.rs` | rayon 并行、缓冲式 SHA-256 的全 PDF 快速路径；混合格式改走 Python 来源扫描器 |
 | `rrf_fusion_native` | `rrf.rs` | 对 vector + BM25 结果做确定性 RRF（`k=60`）融合，以 `chunk_id` 为键 |
 | `validate_citations_native` | `citation.rs` | 结构化引用校验 → `invalid_sources` / `invalid_pages` / `missing_citations` |
 | `tokenize_mixed_text_native` | `tokenizer.rs` | 中英混合分词：中文走 `jieba-rs`，英文做 Snowball 词干化 + 停用词过滤（标识符/版本号原样保留），与 Python 参照逐 token 对齐 |
@@ -648,6 +673,7 @@ CogDoc/
 │   └── tools/
 │       └── retriever/
 ├── rust_core/src/
+├── web/
 ├── scripts/
 ├── tests/
 ├── eval/
@@ -658,14 +684,15 @@ CogDoc/
 | 路径 | 负责内容 |
 | --- | --- |
 | `src/cogdoc/api_cli.py` | 轻量 API 产品命令行入口（`python -m cogdoc.api_cli` / `cogdoc`） |
-| `src/cogdoc/cli.py` | 显式离线直连存储维护控制台（`cogdoc-local`） |
+| `src/cogdoc/cli.py` | 现有离线/直连存储恢复控制台（`cogdoc --local-storage` / `cogdoc-local`） |
 | `src/cogdoc/debug.py` | 独立 Trace Debug 控制台（`python -m cogdoc.debug` / `cogdoc-debug`） |
 | `src/cogdoc/agents/` | 路由、问题改写、生成、引用校验、反馈理解，以及 Summary / Compare 的 Agent 原语 |
 | `src/cogdoc/api/` | FastAPI app、路由、schema、持久化、访问控制、metrics、feedback / knowledge store、webhook |
-| `src/cogdoc/frontend/` | Streamlit 瘦客户端和 API client |
+| `web/` | 正式 Next.js + TypeScript 产品工作台和 Playwright 测试 |
+| `src/cogdoc/frontend/` | Streamlit 兼容客户端和共用 Python API client |
 | `src/cogdoc/graph/` | LangGraph 状态、主 workflow、QA / Summary / Compare 子图 |
 | `src/cogdoc/service/` | chat / ingest 服务、KB 生命周期、事务化索引、锁、清理和后台任务 |
-| `src/cogdoc/tools/` | PDF 解析、切块、manifest、embedding、rerank、Rust loader 和检索器 |
+| `src/cogdoc/tools/` | 统一来源解析、PDF/OCR、切块、manifest、embedding、rerank、Rust loader 和检索器 |
 | `rust_core/src/` | PyO3 原生内核：scanner、tokenizer、BM25、RRF、citation validator |
 | `scripts/`、`tests/`、`eval/`、`docs/` | 健康检查脚本、测试、离线评测集和项目文档 |
 
@@ -718,7 +745,7 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `COGDOC_DOC_DIR` | `your_documents` | 收件箱目录，`/add` 从这里把 PDF 选入知识库 |
+| `COGDOC_DOC_DIR` | `your_documents` | 旧版/离线维护收件箱，`/add` 从这里选取受支持源文档 |
 | `COGDOC_DATA_DIR` | `./data` | 知识库状态、SQLite、manifest 和索引产物根目录 |
 | `COGDOC_TRACE_ENABLED` | `true` | 是否导出请求 JSON trace |
 | `COGDOC_TRACE_DIR` | `logs/traces` | trace JSON 文件目录 |
@@ -726,6 +753,8 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `COGDOC_WEBHOOK_SECRET` | 未设置 | 回调请求携带的可选共享密钥 |
 | `COGDOC_WEBHOOK_TIMEOUT_SECONDS` | `3` | 回调投递请求超时时间 |
 | `COGDOC_WEBHOOK_ALLOW_PRIVATE_HOSTS` | `false` | 显式允许私网 HTTPS 回调目标；默认仅允许经 DNS 固定校验的公网 HTTPS |
+| `COGDOC_WEBHOOK_MAX_REDIRECTS` | `2` | Webhook 投递允许的有界同源 HTTPS 重定向次数 |
+| `COGDOC_WEBHOOK_MAX_RESPONSE_BYTES` | `1048576` | 投递失败前允许读取的最大 Webhook 响应体字节数 |
 | `COGDOC_CREDENTIAL_MASTER_KEYS` | 未设置 | key ID 到 base64url 32 字节 AES key 的 JSON keyring；未设置时关闭 vault/OAuth，环境引用连接保持兼容 |
 | `COGDOC_CREDENTIAL_ACTIVE_KEY_VERSION` | `v1` | 新建/轮换凭据 envelope 使用的 key ID，必须存在于 keyring |
 | `COGDOC_CONNECTOR_OAUTH_PUBLIC_BASE_URL` | 未设置 | 用于构造供应商精确 callback 的 API 公网 origin；生产必须 HTTPS |
@@ -753,14 +782,15 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `COGDOC_AUTH_MAX_FAILED_LOGINS` | `5` | 触发临时锁定前允许的连续密码失败次数 |
 | `COGDOC_AUTH_LOCKOUT_SECONDS` | `900` | 达到失败上限后的账号锁定时长 |
 | `COGDOC_API_KEYS` | 未设置 | 逗号分隔的旧版 default/admin key；仅当它、principals、审核 key 都为空时开放鉴权 |
+| `COGDOC_TRUSTED_PROXY_CIDRS` | 未设置 | 允许提供已校验客户端转发地址的反代网段；来自已配置网段的请求必须带合法转发链 |
 | `COGDOC_API_PRINCIPALS` | 未设置 | API key 到 `tenant_id`、`subject_id`、RBAC `role` 的单行 JSON 映射；团队工作区首选 |
 | `COGDOC_EVAL_REVIEW_API_KEYS` | 未设置 | 旧版证据评测/Research 审核 key；按最小权限映射为 `default` 工作区 reviewer |
 | `COGDOC_RATE_LIMIT_PER_MINUTE` | `120` | 受保护 API 路由的令牌桶补充速率；继续兼容旧变量 `RATE_LIMIT_PER_MINUTE` |
 | `COGDOC_RATE_LIMIT_BURST` | `120` | 令牌桶突发容量；`<=0` 表示关闭限流；继续兼容旧变量 `RATE_LIMIT_BURST` |
 | `COGDOC_TENANT_MAX_KNOWLEDGE_BASES` | `0` | 每工作区知识库硬上限；`0` 表示不限 |
-| `COGDOC_TENANT_MAX_DOCUMENTS` | `0` | 每工作区已提交加在途 PDF 硬上限；`0` 表示不限 |
-| `COGDOC_TENANT_MAX_STORAGE_MB` | `0` | 每工作区已提交加在途 PDF MiB 硬上限；`0` 表示不限 |
-| `COGDOC_MAX_UPLOAD_MB` | `50` | 网页/API 上传 PDF 的单文件大小上限 |
+| `COGDOC_TENANT_MAX_DOCUMENTS` | `0` | 每工作区已提交加在途文档硬上限；`0` 表示不限 |
+| `COGDOC_TENANT_MAX_STORAGE_MB` | `0` | 每工作区已提交加在途来源字节 MiB 硬上限；`0` 表示不限 |
+| `COGDOC_MAX_UPLOAD_MB` | `50` | 网页/API 上传受支持源文档的单文件大小上限 |
 | `COGDOC_RESEARCH_WORKERS` | `2` | 后台 Research 证据与报告任务最大并发数 |
 | `COGDOC_CHAT_STREAM_IDLE_TIMEOUT_SECONDS` | `300` | SSE worker 事件间最大空闲秒数，避免流式请求永久挂起 |
 | `COGDOC_RESEARCH_RETRIEVAL_TOP_K` | `8` | 每个研究章节的候选召回与重排深度 |
@@ -840,9 +870,12 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 
 `<NODE>` 可取 `ROUTER`、`QUERY_REWRITER`、`SOURCE_RESOLVER`、`EVIDENCE_VERIFIER`、`CLAIM_VERIFIER`、`CLAIM_REPAIRER`、`QA_GENERATOR`、`SUMMARY_GENERATOR`、`COMPARE_PROFILE` 或 `COMPARE_CONCLUSION`。例如，可让答案生成继续使用云端，同时设置 `LLM_CLAIM_VERIFIER_BACKEND=local` 和 `OLLAMA_CLAIM_VERIFIER_MODEL_NAME=<校验模型>`；若修复也走本地，再设置 `LLM_CLAIM_REPAIRER_BACKEND=local` 和 `OLLAMA_CLAIM_REPAIRER_MODEL_NAME=<修复模型>`。对应的云端模型覆盖为 `LLM_CLAIM_VERIFIER_MODEL_NAME` 和 `LLM_CLAIM_REPAIRER_MODEL_NAME`。引用格式及来源/页码合法性仍由 Rust 确定性校验；claim verifier 额外提供可选的模型语义支持度判断。
 
-环境要求：Python 3.11+（在 3.13 上开发；扩展目标 3.8+）、带 `cargo` 的 Rust 工具链（edition 2024，经 [rustup](https://rustup.rs/)）、[maturin](https://www.maturin.rs/)。可选：[Ollama](https://ollama.com/) 用于本地模型。完整可调项见 `.env.example`（检索 `top_k`、重排 `top_n`、RRF `k`、CUDA 显存下限、评测集路径等）。
+环境要求：Python 3.11+（在 3.13 上开发）、正式 Web 工作台使用 Node.js 22+、带 `cargo` 的 Rust 工具链（edition 2024，经 [rustup](https://rustup.rs/)）以及 [maturin](https://www.maturin.rs/)。可选：[Ollama](https://ollama.com/) 用于本地模型。完整可调项见 `.env.example`（检索 `top_k`、重排 `top_n`、RRF `k`、CUDA 显存下限、评测集路径等）。
 
 ## 开发与测试
+
+前端改动必须遵守[架构](frontend-architecture.md)、[设计系统](frontend-design-system.md)
+和 [UI 规范](ui-guidelines.md)；跨客户端行为以 [CLI/Web 对齐约定](cli-web-parity.md)为准。
 
 | 命令 | 说明 |
 | --- | --- |
@@ -868,7 +901,10 @@ python scripts/migrate_state.py --verify-only   # 校验导入结果
 | `make eval-suite-update-baseline` | 复核后刷新 `eval/eval_suite_baseline.json` |
 | `make run` | 启动交互式 CLI 控制台 |
 | `make serve` | 启动 FastAPI 服务（`uvicorn cogdoc.api.app:app`） |
-| `make frontend` | 加载 `.env`（不覆盖已导出变量）并启动 Streamlit 网页端 |
+| `make web` | 启动正式 Next.js 产品工作台 |
+| `make frontend` | 启动保留的 Streamlit 兼容客户端 |
+| `make web-check` | 运行 Web lint、严格 TypeScript 与生产构建 |
+| `make web-e2e` | 运行 Playwright 产品工作流 |
 | `make debug` | 启动独立 Debug 控制台 |
 | `uvicorn scripts.cogeval_cogdoc_wrapper:app --port 8003` | 为已运行的 CogDoc API 启动可选的 CogEval 兼容适配服务 |
 | `cd rust_core && cargo test` | 运行 Rust 单元测试 |
@@ -931,7 +967,7 @@ GitHub CI 会执行 Rust 格式/单测、构建并运行时校验 native wheel�
 
 先运行 `python scripts/migrate_v7_indexes.py scan` 检查各知识库的 chunk 身份与构建版本。`run` 会逐库事务化重建、持续写入进度和失败记录、刷新派生知识索引，并保留迁移前一代；验收异常时用 `rollback <run_id>` 原子回切，稳定后再用 `finalize <run_id>` 清理旧代。未执行 `finalize` 前会占用两代向量、BM25 和快照存储，这是可回滚性的成本。
 
-授权审核者也可通过 `GET /v1/index-migrations/scan`、`POST /v1/index-migrations` 以及 run 的查询/回滚/finalize 端点后台执行同一流程。API 同一时间只接受一个代际操作，按租户授权过滤知识库，并且不会返回物理 storage ID。网页端“证据判卷台 → 索引代际控制”提供对应操作。
+授权审核者也可通过 `GET /v1/index-migrations/scan`、`POST /v1/index-migrations` 以及 run 的查询/回滚/finalize 端点后台执行同一流程。API 同一时间只接受一个代际操作，按租户授权过滤知识库，并且不会返回物理 storage ID。网页端“调试 → 索引代际”提供对应操作。
 
 四路召回评测与校准分两步：
 
@@ -950,7 +986,7 @@ python scripts/calibrate_multi_route_retrieval.py \
 
 评测同时生成全路、四个单路和四个 leave-one-out 视图，按 query/doc/chunk 类型汇总 Recall@K、MRR、nDCG、需求覆盖、拒答准确率与 P50/P95 延迟；权重为零的路线不会访问底层索引。校准报告搜索路权重、top-k、融合保底配额和四类拒答阈值，输出 `recommended_env`，同时保留 `current_config` / `rollback_config`；它只产出建议，不会自动修改线上环境。
 
-网页端“证据判卷台”中的“检索路径诊断”可查看四路原始排名、逐块 RRF 贡献、重排位移、拒答原因和缺失需求。人工选择的正确证据/误导项先写入待审核评测草稿，仍需通过现有审核后才能导出到正式评测集。
+当前知识库“调试 → 检索诊断”可查看四路原始排名、逐块 RRF 贡献、重排位移、拒答原因和缺失需求。人工选择的正确证据/误导项先写入 RAG 评测草稿，仍需通过现有审核后才能导出到正式评测集。
 
 ### 声明语义核验发布门禁
 
@@ -960,7 +996,7 @@ python scripts/calibrate_multi_route_retrieval.py \
 
 默认发布契约要求至少 360 条声明，其中至少 120 条 supported、200 条 unsupported/insufficient、40 条 not-factual，并要求三种生成路径各至少 100 条。200 条危险声明在零误放时才能使双侧 95% Wilson 上界低于 2%；示例集只验证格式和工具链，不满足发布样本数。建议人工集合额外覆盖中英文、数字/日期、跨文档比较、近似证据、无答案、引用正确但语义不支持和提示注入文本。
 
-每次对话都会生成 `request_id` / `trace_id`。`COGDOC_TRACE_ENABLED=true` 时，服务会把 JSON trace 写入 `COGDOC_TRACE_DIR`（默认 `logs/traces`），同一份安全载荷也可通过 `GET /v1/traces/{trace_id}` 查询；`GET /v1/traces` 可按 `doc_id` 和 `session_id` 限定范围，Streamlit Trace 面板正是用它只展示当前对话。trace 文件包含 `schema_version`、`status`（`ok`、`degraded` 或 `failed`）、总 `duration_ms`、安全配置快照、步骤摘要、改写摘要、错误摘要，并且只保存截断后的 evidence preview，不写入完整文档正文。QA rerank 步骤还会暴露 Evidence Pack 的输入/保留/丢弃数与字符数、移除的 overlap、分原因丢弃计数、anchor/pinned 数，以及硬约束的 `over_budget` 决策。独立 Debug 控制台读取同一套 trace 格式。
+每次对话都会生成 `request_id` / `trace_id`。`COGDOC_TRACE_ENABLED=true` 时，服务会把 JSON trace 写入 `COGDOC_TRACE_DIR`（默认 `logs/traces`），同一份安全载荷也可通过 `GET /v1/traces/{trace_id}` 查询；`GET /v1/traces` 可按 `doc_id` 和 `session_id` 限定范围，Web Trace 面板正是用它只展示当前对话。trace 文件包含 `schema_version`、`status`（`ok`、`degraded` 或 `failed`）、总 `duration_ms`、安全配置快照、步骤摘要、改写摘要、错误摘要，并且只保存截断后的 evidence preview，不写入完整文档正文。QA rerank 步骤还会暴露 Evidence Pack 的输入/保留/丢弃数与字符数、移除的 overlap、分原因丢弃计数、anchor/pinned 数，以及硬约束的 `over_budget` 决策。独立 Debug 控制台读取同一套 trace 格式。
 
 备份恢复和索引重建规则见 [PRODUCTION_zh-CN.md](PRODUCTION_zh-CN.md)。
 
@@ -968,8 +1004,8 @@ python scripts/calibrate_multi_route_retrieval.py \
 
 - **OCR 是默认关闭的 Tesseract MVP。** 仅支持本机已安装的语言包，不提供托管 OCR provider；识别质量取决于扫描质量、语言选择和 DPI。
 - Summary 与 Compare 是固定 schema MVP：云端模式会并发执行相互独立的章节/维度 LLM cell，并保持输出顺序稳定；本地 Ollama 模式为避免内存压力仍走串行。默认章节/维度集合固定，除非通过 graph state 传入自定义配置。
-- Research 报告现已支持可编辑 AI 规划、原子证据需求、闭集校验、确定性引用、强制的章节局部声明审计与需求覆盖审计、一次共享的有限修复、逐章审阅、显式接受证据缺口、有界版本历史、选择性重新生成和冻结发布。原子需求是机器强制的完成契约；自由文本 `success_criteria` 只作为人工验收说明。选择性重生成只会检索、校验并改写 `changes_requested` 或旧版未审计章节；已批准章节和已接受缺口原样保留，同时重新构建并校验全文公开引用账本。冻结的 provenance（含检索/校验配置与模型路由）会阻止过期证据继续生成、审阅或发布，显式全量刷新会先归档旧报告。本地 Research 任务是隐私硬约束：规划、证据校验、写作、声明/覆盖审计与修复均拒绝云端节点覆盖。
-- v2 发布物的 SHA-256 会精确绑定 Markdown、引用账本、可追踪 provenance、有界 `verification.json` 声明/覆盖摘要、证据身份/文本哈希承诺、版本与生成时间；确定性 ZIP 另含逐文件哈希。旧版 Markdown 只能以 `legacy-unverified` 下载且不能生成验证包；畸形或被篡改的当前/已发布正文不会出现在列表、详情或下载响应中。
+- Research 使用原子证据需求作为机器强制的完成契约，自由文本 `success_criteria` 仅供人工验收。选择性重生成保留已批准章节，provenance 过期后必须显式刷新，本地 Research 任务拒绝云端节点覆盖。
+- v2 发布物绑定 Markdown、引用、provenance、验证摘要、证据承诺和逐文件哈希。旧版报告标记为 `legacy-unverified`；畸形或被篡改的发布物不会返回。
 - 本地 Compare 有意限制为 2 篇文档、4 个核心维度，并跳过额外结论生成，以降低 Ollama 内存压力。
 - `CLAIM_VERIFICATION_MODE=off`（默认）时，QA、Summary、Compare 的 Citation 校验只证明引用的 `source` / `page` 或知识 ID 物理合法，不证明语义支持。`shadow` 会测量模型声明门禁但不改变交付答案，因此该模式下答案仍不保证忠实；会触发强制干预的候选不会进入 Agent 记忆。`enforce` 才增加有限修复与 fail-closed 拒答。Research 报告生成不受该灰度开关影响，始终只使用章节局部精确证据执行声明支持与原子需求覆盖审计。模型校验仍应使用领域人工基线做标定。
 - Rewrite 相似度阈值默认 `0.5`，后续应基于真实数据标定。
@@ -979,8 +1015,9 @@ python scripts/calibrate_multi_route_retrieval.py \
 
 - `Rust 扩展 rust_core 未安装` / `缺少: …` — 运行 `make native`，再 `make check`。
 - 改了 Rust 但行为没变 — 没有重新构建，旧 `.so` 仍在被加载。运行 `make native`。
-- `Model Mismatch!` — 索引的 embedding 模型与 `Embedder.MODEL_NAME` 不一致；重建索引（清空该 `doc_id` 的 Chroma collection 或更换 `doc_id`）。
-- Streamlit 连不上后端 — 先 `make serve` 起服务，并检查侧栏的 **后端地址**（默认 `http://localhost:8000`）。
+- `Model Mismatch!` — 当前索引使用了不同的 Embedding 契约；请在上传/重建时选择目标 profile，或使用受支持的索引迁移流程，不要手工删除在线 Chroma collection。
+- Web 工作台连不上后端 — 先运行 `make serve`，确认 `COGDOC_API_URL`（默认 `http://localhost:8000`）后重启 `make web`。
+- Streamlit 兼容客户端连不上后端 — 先运行 `make serve`，再检查其后端地址。
 - Hugging Face 匿名限额提示 — 设置 `HF_TOKEN` 提高 Hub 限额；公开模型通常不设置也能下载。
 
 ## 许可证

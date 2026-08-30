@@ -2,7 +2,7 @@
 
 Status: normative
 Scope: copy, composition, interaction, and review
-Last updated: 2026-08-25
+Last updated: 2026-08-30
 
 ## Experience thesis
 
@@ -36,7 +36,7 @@ Desktop:
   派生知识、调试.
 - Main content fills available width. Reading content gets an internal maximum
   width; tables and split workspaces do not.
-- Evidence rail is 380–440px, resizable later, and overlays only below desktop.
+- Evidence rail is 380–440px and overlays only below desktop.
 
 Mobile/tablet:
 
@@ -67,7 +67,7 @@ Rules:
 - The active work view uses one subtle neutral background. Do not duplicate the
   state with a second underline or a filled brand-color block.
 - Home, all-knowledge, data ingestion, tasks, and admin are secondary utility destinations. They
-  may not replace or reorder the six work views.
+  may not replace or reorder the five work views.
 - Breadcrumbs identify location; they are not a second navigation menu.
 - Preserve deep links for knowledge bases and sessions.
 
@@ -91,8 +91,8 @@ and state labels appear only when they add navigation or operational meaning.
 
 ### Login
 
-- Use one restrained authentication workspace with the same three entry choices
-  as Streamlit: 登录、注册、接受邀请. A quiet product context area may appear on
+- Use one restrained authentication workspace with the established three entry choices:
+  登录、注册、接受邀请. A quiet product context area may appear on
   wide screens, but must not read as a marketing hero.
 - Never use a marketing hero, testimonials, floating shapes, or gradients.
 - Show enterprise sign-in only when the auth configuration permits it.
@@ -243,7 +243,8 @@ and state labels appear only when they add navigation or operational meaning.
   target knowledge base and links back to the materialized document list.
 - Research uses a master/detail workbench: queue left, plan/report center,
   lifecycle and provenance in the inspector.
-- Reviews use queue/detail composition with evidence adjacent to the decision.
+- Derived-knowledge review keeps evidence adjacent to the decision. Retrieval labeling
+  and claim verification remain inside the current KB's Diagnostics → RAG 评测 surface.
 - Tasks aggregate durable jobs by lifecycle and link back to the owning resource.
 - Admin uses a stable section sidebar and dense settings forms; never put all
   enterprise controls into one endless page.

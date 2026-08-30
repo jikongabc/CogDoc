@@ -6,7 +6,7 @@ CogDoc 的工作区 owner/admin 可以创建持久服务账号，为 CI、入库
 
 ## 安全边界
 
-- 原始 token 使用 256 bit 随机值和 `cog_svc_` 前缀，只在创建响应与当前 Streamlit rerun 中显示一次；数据库、列表、审计、日志和后续 API 永不返回原文。
+- 原始 token 使用 256 bit 随机值和 `cog_svc_` 前缀，只在创建 API 响应和当前 Web/Streamlit 创建结果中显示一次；页面关闭、rerun 或主动隐藏后无法找回，数据库、列表、审计、日志和后续 API 永不返回原文。
 - `state.db` 只保存 SHA-256、非敏感末四位 hint、标签、到期时间和节流更新的最后使用时间。高熵 token 的 hash 仍应按敏感 metadata 保护，不能替代文件权限、TLS 和加密备份。
 - 每个账号固定到一个工作区，角色只能是 `admin`、`editor`、`reviewer`、`viewer`，不能成为 owner。每个 token 还冻结一个非空权限子集，实际权限始终是“当前账号角色 ∩ token 作用域”：角色降低立即收窄旧 token，角色升级不会让旧 token 静默扩权。服务 token 带另一个工作区 header/path 时返回不透明 404。
 - 服务账号即使是 admin，也不能调用 `/v1/auth/*`、`/v1/workspaces/*` 或 `/v1/principals/*` 管理真人身份、OIDC/SCIM、成员、邀请或继续铸造 token。服务账号生命周期必须由实时 owner/admin 真人会话管理。
@@ -18,7 +18,7 @@ CogDoc 的工作区 owner/admin 可以创建持久服务账号，为 CI、入库
 
 ## 创建与使用
 
-在 Streamlit 侧栏以 owner/admin 登录，打开“服务账号与 API Token”：
+以 owner/admin 登录正式 Web 工作台并打开“管理 → 服务账号”，或在 Streamlit 兼容客户端侧栏打开“服务账号与 API Token”：
 
 1. 创建账号，填写用途并选择满足任务的最低角色；只读检索通常使用 `viewer`，写入文档/连接配置按现有 RBAC 选择 `editor` 或 `admin`。
 2. 在账号内生成 token，再从该角色权限中只勾选任务需要的作用域；复制一次性明文并立即存入 CI/密钥管理系统。
@@ -63,7 +63,7 @@ Bearer 与 `X-API-Key` 同时存在时仍由 Bearer 优先。不要把 token 放
 2. 为每个自动化用途创建独立服务账号，不要多个系统共用一个 token；角色先与旧 principal 等价，再按实际调用降权。
 3. 生成有期限的新 token，更新一个客户端并验证 `/v1/tenant`、代表性允许操作和一个应被拒绝的操作。
 4. 从服务器配置移除对应静态 key，受控重启，确认旧 key 返回 401、新 token继续工作。
-5. 全部迁移后只保留经过审批的 break-glass 静态主体。`COGDOC_API_KEY` 单数仍是 CLI/Streamlit 出站凭据，不是服务端账号库。
+5. 全部迁移后只保留经过审批的 break-glass 静态主体。`COGDOC_API_KEY` 单数仍是 CLI/Streamlit 兼容客户端/自动化的出站凭据，不是服务端账号库，Next.js 工作台不读取它。
 
 静态配置与持久服务账号使用相同 RBAC，但前者只有重启时读取，无法提供每 token 到期、最后使用和在线撤销。不要把“保留静态兼容”理解为两边会自动同步。
 

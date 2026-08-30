@@ -141,6 +141,61 @@ def test_kb_and_document_role_allowlists_are_enforced_as_an_intersection(tmp_pat
     assert store.role_usage_count("tenant-a", "rol_finance") == 2
 
 
+def test_aborted_upload_acl_batch_restores_existing_roles_and_removes_new_policy(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    store.set_kb_policy("tenant-a", "kb", "owner", "workspace")
+    store.set_document_policy(
+        "tenant-a",
+        "kb",
+        "existing",
+        "existing.pdf",
+        owner_id="original-owner",
+        policy="private",
+    )
+    store.replace_document_roles("tenant-a", "kb", "existing", ["viewer"])
+
+    mutations = store.prepare_document_upload_access_batch(
+        "tenant-a",
+        "kb",
+        (("existing", "existing.pdf"), ("new", "new.pdf")),
+        "uploader",
+        role_ids=["editor"],
+    )
+
+    assert store.list_document_roles("tenant-a", "kb", "existing") == ["editor"]
+    assert store.list_document_roles("tenant-a", "kb", "new") == ["editor"]
+    existing = store.get_document_policy("tenant-a", "kb", "existing")
+    assert existing is not None
+    assert existing["owner_id"] == "original-owner"
+    assert existing["policy"] == "private"
+
+    assert store.rollback_document_upload_access_batch(mutations) is True
+    assert store.list_document_roles("tenant-a", "kb", "existing") == ["viewer"]
+    assert store.get_document_policy("tenant-a", "kb", "new") is None
+
+
+def test_aborted_upload_acl_rollback_preserves_concurrent_role_edit(tmp_path):
+    store = _store(tmp_path)
+    store.set_kb_policy("tenant-a", "kb", "owner", "workspace")
+    store.set_document_policy("tenant-a", "kb", "doc", "document.pdf")
+    store.replace_document_roles("tenant-a", "kb", "doc", ["viewer"])
+    mutation = store.prepare_document_upload_access(
+        "tenant-a",
+        "kb",
+        "doc",
+        "document.pdf",
+        "uploader",
+        role_ids=["editor"],
+    )
+
+    store.replace_document_roles("tenant-a", "kb", "doc", ["reviewer"])
+
+    assert store.rollback_document_upload_access(mutation) is False
+    assert store.list_document_roles("tenant-a", "kb", "doc") == ["reviewer"]
+
+
 def test_grant_role_is_a_cap_intersected_with_principal_role(tmp_path):
     store = _store(tmp_path)
     store.set_kb_policy("tenant-a", "kb", "owner", AccessPolicy.PRIVATE)

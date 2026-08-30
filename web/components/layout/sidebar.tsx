@@ -27,7 +27,7 @@ import { api } from "@/lib/api/client";
 import { queryKeys } from "@/lib/query/keys";
 import { knowledgeBaseFromPath, sessionFromPath, workbenchHref, workbenchViewFromPath } from "@/lib/workbench";
 import { cn } from "@/lib/utils";
-import { useAnyPermission, usePermission } from "@/features/auth/permissions";
+import { usePermission } from "@/features/auth/permissions";
 import { useDocuments, useKnowledgeBases } from "@/features/knowledge/queries";
 import { CreateKnowledgeBaseDialog } from "@/features/knowledge/create-kb-dialog";
 import { UploadZone } from "@/components/knowledge/upload-zone";
@@ -84,12 +84,14 @@ export function Sidebar({ className, forceExpanded = false }: { className?: stri
   const selectedKbId = useWorkspaceStore((state) => state.selectedKnowledgeBaseId);
   const setSelectedKbId = useWorkspaceStore((state) => state.setSelectedKnowledgeBaseId);
   const rememberConversation = useWorkspaceStore((state) => state.rememberConversation);
-  const clearKnowledgeContext = useWorkspaceStore((state) => state.clearKnowledgeContext);
   const localMode = useWorkspaceStore((state) => state.localModelMode);
   const setLocalMode = useWorkspaceStore((state) => state.setLocalModelMode);
   const canWrite = usePermission("write");
   const canDelete = usePermission("delete");
-  const canManage = useAnyPermission(["manage_access", "manage_tenant"]);
+  const canManageAccess = usePermission("manage_access");
+  const canManageTenant = usePermission("manage_tenant");
+  const canOpenAdmin = canManageAccess || canManageTenant;
+  const adminHref = canManageAccess ? "/admin" : "/admin/workspace";
   const knowledgeBases = useKnowledgeBases();
   const routeKbId = knowledgeBaseFromPath(pathname);
   const selectedKbIsAvailable = Boolean(selectedKbId && knowledgeBases.data?.some((kb) => kb.kb_id === selectedKbId));
@@ -147,7 +149,7 @@ export function Sidebar({ className, forceExpanded = false }: { className?: stri
     mutationFn: (name: string) => api.deleteDocument(kbId, name),
     onSuccess: async () => {
       toast.success("文档已删除");
-      await queryClient.invalidateQueries({ queryKey: queryKeys.documents(workspaceId, kbId) });
+      await queryClient.invalidateQueries({ predicate: ({ queryKey }) => queryKey.some((part) => part === kbId) });
       await queryClient.invalidateQueries({ queryKey: queryKeys.knowledgeBases(workspaceId) });
     },
     onError: (error) => toast.error(error.message),
@@ -156,7 +158,6 @@ export function Sidebar({ className, forceExpanded = false }: { className?: stri
   const logout = async () => {
     try { await api.logout(); } catch { /* Browser cleanup remains authoritative. */ }
     clearSession();
-    clearKnowledgeContext();
     setLocalMode(false);
     queryClient.clear();
     router.replace("/login");
@@ -173,7 +174,7 @@ export function Sidebar({ className, forceExpanded = false }: { className?: stri
         <CollapsedLink href="/knowledge" label="全部知识库" icon={FolderCog} />
         <CollapsedLink href={kbId ? `/integrations?kb=${encodeURIComponent(kbId)}` : "/integrations"} label="数据接入" icon={Cable} />
         <CollapsedLink href="/tasks" label="后台任务" icon={ListChecks} />
-        {canManage ? <CollapsedLink href="/admin" label="管理" icon={Settings} /> : null}
+        {canOpenAdmin ? <CollapsedLink href={adminHref} label="管理" icon={Settings} /> : null}
         <div className="flex-1" />
         {!forceExpanded ? <Button variant="ghost" size="icon" onClick={() => setCollapsed(false)} aria-label="展开侧栏"><ChevronRight className="size-4" /></Button> : null}
       </aside>
@@ -211,7 +212,7 @@ export function Sidebar({ className, forceExpanded = false }: { className?: stri
           ) : <p className="px-2 py-2 text-xs leading-5 text-muted-foreground">还没有知识库，先创建一个。</p>}
           <div className="mt-2 flex items-center justify-between gap-2">
             <CreateKnowledgeBaseDialog triggerVariant="secondary" triggerSize="compact" />
-            {kbId ? <Button asChild variant="ghost" size="compact"><Link href={`/knowledge/${encodeURIComponent(kbId)}/access`}><FolderCog className="size-3.5" />访问权限</Link></Button> : null}
+            {kbId && canManageAccess ? <Button asChild variant="ghost" size="compact"><Link href={`/knowledge/${encodeURIComponent(kbId)}/access`}><FolderCog className="size-3.5" />访问权限</Link></Button> : null}
           </div>
         </RailSection>
 
@@ -268,7 +269,7 @@ export function Sidebar({ className, forceExpanded = false }: { className?: stri
           <Button asChild variant="ghost" size="compact" className="min-w-0 shrink gap-1 whitespace-nowrap px-1 text-[11px]"><Link href="/knowledge"><Library className="size-3.5" />知识</Link></Button>
           <Button asChild variant="ghost" size="compact" className="min-w-0 shrink gap-1 whitespace-nowrap px-1 text-[11px]"><Link href={kbId ? `/integrations?kb=${encodeURIComponent(kbId)}` : "/integrations"}><Cable className="size-3.5" />接入</Link></Button>
           <Button asChild variant="ghost" size="compact" className="min-w-0 shrink gap-1 whitespace-nowrap px-1 text-[11px]"><Link href="/tasks"><ListChecks className="size-3.5" />任务</Link></Button>
-          {canManage ? <Button asChild variant="ghost" size="compact" className="min-w-0 shrink gap-1 whitespace-nowrap px-1 text-[11px]"><Link href="/admin"><Settings className="size-3.5" />管理</Link></Button> : <span />}
+          {canOpenAdmin ? <Button asChild variant="ghost" size="compact" className="min-w-0 shrink gap-1 whitespace-nowrap px-1 text-[11px]"><Link href={adminHref}><Settings className="size-3.5" />管理</Link></Button> : <span />}
         </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -282,7 +283,7 @@ export function Sidebar({ className, forceExpanded = false }: { className?: stri
             <DropdownMenuLabel>{user?.email || "本地兼容模式"}</DropdownMenuLabel>
             <DropdownMenuSeparator />
             {authMode === "account" ? <DropdownMenuItem onSelect={() => router.push("/admin/security")}><Settings className="size-4" />账号安全</DropdownMenuItem> : null}
-            {canManage ? <DropdownMenuItem onSelect={() => router.push("/admin")}><FolderCog className="size-4" />工作区设置</DropdownMenuItem> : null}
+            {canOpenAdmin ? <DropdownMenuItem onSelect={() => router.push(adminHref)}><FolderCog className="size-4" />管理设置</DropdownMenuItem> : null}
             <DropdownMenuItem onSelect={logout}><LogOut className="size-4" />退出登录</DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

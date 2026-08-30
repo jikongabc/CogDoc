@@ -90,6 +90,38 @@ def test_same_query_across_channels_scores_twice_but_counts_one_query_hit():
     assert retrieval["matched_channels"] == ["hybrid", "derived_knowledge"]
 
 
+def test_fusion_preserves_strongest_confidence_signal_from_each_route():
+    vector = _doc("shared")
+    vector["retrieval"] = {"distance": 0.42}
+    lexical = _doc("shared")
+    lexical["retrieval"] = {"bm25_score": 18.0}
+    weaker_vector = _doc("shared")
+    weaker_vector["retrieval"] = {"distance": 0.91}
+
+    fused = fuse_ranked_candidates(
+        [
+            RankedCandidateList(
+                "query",
+                "rag_bm25",
+                [lexical],
+                is_original=True,
+            ),
+            RankedCandidateList(
+                "query rewrite",
+                "rag_vector",
+                [_doc("other"), vector, weaker_vector],
+            ),
+        ],
+        rrf_k=60,
+    )
+
+    retrieval = next(
+        doc for doc in fused if doc["meta"]["chunk_id"] == "shared"
+    )["retrieval"]
+    assert retrieval["bm25_score"] == 18.0
+    assert retrieval["distance"] == 0.42
+
+
 def test_weighted_fusion_exposes_per_channel_contributions():
     fused = fuse_ranked_candidates(
         [

@@ -1,5 +1,12 @@
+from threading import RLock
+
+import pytest
+
 from cogdoc.api.derived_knowledge_store import DerivedKnowledgeStore
-from cogdoc.tools.retriever.derived_knowledge import DerivedKnowledgeRetriever
+from cogdoc.tools.retriever.derived_knowledge import (
+    DerivedKnowledgeIndex,
+    DerivedKnowledgeRetriever,
+)
 
 
 # 验证只召回已审核派生知识。
@@ -49,6 +56,47 @@ def test_derived_knowledge_retriever_returns_approved_only(tmp_path):
     assert docs[0]["retrieval"]["query_term_count"] > 0
     assert docs[0]["retrieval"]["knowledge_term_count"] > 0
     assert "差旅" in docs[0]["retrieval"]["matched_terms"]
+
+
+@pytest.mark.parametrize(
+    ("expected_count", "actual_count"),
+    [(2, 1), (0, 1)],
+    ids=("partially-missing", "stale-residual-row"),
+)
+def test_derived_index_rebuilds_when_collection_count_disagrees_with_state(
+    expected_count, actual_count
+):
+    class Store:
+        @staticmethod
+        def revision_token():
+            return "current"
+
+    class Embedder:
+        EMBEDDING_CONTRACT_VERSION = "embedding-v1"
+
+    class Collection:
+        @staticmethod
+        def count():
+            return actual_count
+
+    index = object.__new__(DerivedKnowledgeIndex)
+    index._lock = RLock()
+    index.store = Store()
+    index.embedder = Embedder()
+    index._read_state = lambda _kb_id: {
+        "revision_token": "current",
+        "embedding_contract": "embedding-v1",
+        "count": expected_count,
+    }
+    index._collection = lambda _kb_id: Collection()
+    rebuilt = []
+    index.rebuild = lambda kb_id, *, revision_token=None: rebuilt.append(
+        (kb_id, revision_token)
+    )
+
+    index.ensure_fresh("kb")
+
+    assert rebuilt == [("kb", "current")]
 
 
 class FakeIndex:

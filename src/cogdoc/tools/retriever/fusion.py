@@ -38,6 +38,12 @@ class _CandidateState:
     best_ranking_index: int = 0
     original_query_hit: bool = False
     retrieval_round: int = 0
+    # The representative occurrence determines text/metadata, but confidence
+    # gating must still see the strongest raw signal from every route that hit
+    # the same stable chunk.  Otherwise a rank-1 lexical occurrence can hide a
+    # strong vector distance (or vice versa) during RRF materialization.
+    distances: list[float] = field(default_factory=list)
+    bm25_scores: list[float] = field(default_factory=list)
 
 
 def _append_unique(values: list[str], incoming: Sequence[str]) -> None:
@@ -56,6 +62,17 @@ def _candidate_chunk_id(doc: Mapping[str, Any]) -> str:
     if not normalized:
         raise ValueError("ranked candidate is missing a stable chunk_id")
     return normalized
+
+
+def _finite_retrieval_float(doc: Mapping[str, Any], name: str) -> float | None:
+    retrieval = doc.get("retrieval")
+    if not isinstance(retrieval, Mapping):
+        return None
+    try:
+        value = float(retrieval.get(name))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _is_better_occurrence(
@@ -105,6 +122,10 @@ def _materialize_candidate(candidate: _CandidateState) -> RetrievedDoc:
             "retrieval_round": candidate.retrieval_round,
         }
     )
+    if candidate.distances:
+        retrieval["distance"] = min(candidate.distances)
+    if candidate.bm25_scores:
+        retrieval["bm25_score"] = max(candidate.bm25_scores)
     doc["retrieval"] = cast(RetrievalMetrics, retrieval)
     return doc
 
@@ -167,6 +188,13 @@ def fuse_ranked_candidates(
             candidate.retrieval_round = max(
                 candidate.retrieval_round, ranking.retrieval_round
             )
+            for field_name, target in (
+                ("distance", candidate.distances),
+                ("bm25_score", candidate.bm25_scores),
+            ):
+                signal = _finite_retrieval_float(doc, field_name)
+                if signal is not None:
+                    target.append(signal)
 
             if _is_better_occurrence(
                 candidate,

@@ -1,8 +1,8 @@
 """API-backed CogDoc command line interface.
 
-The Web application and this CLI deliberately share the same HTTP boundary.  The
-legacy direct-storage console remains available through ``cogdoc --local-storage``
-for offline recovery, but it is no longer the default product interface.
+The Web application and this CLI deliberately share the same HTTP boundary.
+The established direct-storage console remains available through
+``cogdoc --local-storage`` for offline recovery and existing local workflows.
 """
 
 from __future__ import annotations
@@ -16,19 +16,84 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
+from cogdoc.config.llm_config import apply_llm_config
+from cogdoc.config.settings import get_settings
 from cogdoc.frontend.api_client import (
     CogDocAPIError,
     CogDocClient,
     format_api_error,
     response_payload,
 )
+from cogdoc.tools.source_parser import SUPPORTED_EXTENSIONS
 
 
 DEFAULT_API_URL = "http://localhost:8000"
 CONFIG_ENV = "COGDOC_CLI_CONFIG"
+BUILT_IN_ROLE_IDS = ("owner", "admin", "editor", "reviewer", "viewer")
+
+# Keep the established CogDoc console identity while the command implementation
+# uses the same authenticated API as the Web workspace.
+BANNER = r"""
+ ██████╗ ██████╗  ██████╗ ██████╗  ██████╗  ██████╗
+██╔════╝██╔═══██╗██╔════╝ ██╔══██╗██╔═══██╗██╔════╝
+██║     ██║   ██║██║  ███╗██║  ██║██║   ██║██║
+██║     ██║   ██║██║   ██║██║  ██║██║   ██║██║
+╚██████╗╚██████╔╝╚██████╔╝██████╔╝╚██████╔╝╚██████╗
+ ╚═════╝ ╚═════╝  ╚═════╝ ╚═════╝  ╚═════╝  ╚═════╝
+"""
+
+INTERACTIVE_HELP = """\
+可用命令（可省略开头的 /）：
+  账号与工作区
+    /status                         查看账号、Workspace 与服务状态
+    /workspace list|use|create      管理 Workspace
+    /workspace members|roles        查看成员与角色
+  知识库
+    /kb                              列出可访问的知识库
+    /kb new <名称>                   创建并选中知识库
+    /kb use <名称>                   切换当前知识库
+    /kb rm <名称>                    删除知识库
+    /kb access [名称]                查看或设置可访问角色
+  文档与任务
+    /docs 或 /ls                     列出当前库文档
+    /inbox                          列出本机文档收件箱
+    /add <文件...>                   批量上传并建立索引
+    /rm <文件名>                    删除文档
+    /jobs                            查看解析、索引、外部同步与系统任务
+  对话
+    <问题>                            向当前知识库发起流式问答
+    /qa <问题>                        强制问答模式
+    /summary <文件名>              总结指定文档
+    /compare <A> <B> ...              对比多篇文档
+    /chats                           列出会话历史
+    /new                             开启新会话
+  知识与质量
+    /knowledge ...                   派生知识与审核
+    /dk approve|reject|archive <ID>  审核派生知识
+    /tuning list|enable|disable      管理检索调权
+    /review summary|metrics|export  审核队列与闭环指标
+    /feedback ...                    反馈、分析与检索调权
+    /research ...                    Research 工作流
+    /trace ...                       Trace 调试
+    /diagnose <问题>                 运行检索诊断
+    /evaluation ...                  RAG 评测与声明核验
+  企业能力
+    /integration ...                 连接器与外部同步
+    /acl ...                         知识库与文档授权
+    /audit ...                       审计导出
+    /security ...                    安全策略与会话
+    /service-account ...             服务账号
+    /migration ...                   索引代际迁移
+  模型与运行
+    /local  /cloud                   切换本地 / 云端对话模式
+    /config                          配置本机服务的云模型
+  /help                             显示本帮助
+  /exit                             退出
+"""
 
 
 def default_config_path() -> Path:
@@ -73,12 +138,26 @@ class CLIState:
     def replace_session(self, **values: Any) -> None:
         """Persist a new identity without leaking the previous KB selection."""
 
-        for key in ("access_token", "expires_at", "email", "workspace_id", "kb_id"):
+        for key in (
+            "access_token",
+            "expires_at",
+            "email",
+            "workspace_id",
+            "kb_id",
+            "session_id",
+        ):
             self.values.pop(key, None)
         self.update(**values)
 
     def clear_session(self) -> None:
-        for key in ("access_token", "expires_at", "email", "workspace_id", "kb_id"):
+        for key in (
+            "access_token",
+            "expires_at",
+            "email",
+            "workspace_id",
+            "kb_id",
+            "session_id",
+        ):
             self.values.pop(key, None)
         self.save()
 
@@ -205,6 +284,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("logout", help="注销并清除本地登录态")
     sub.add_parser("status", help="显示账号、Workspace 和服务状态")
+
+    inbox = sub.add_parser("inbox", help="列出本机文档收件箱")
+    inbox.add_argument("--directory", type=Path)
+
+    config = sub.add_parser("config", help="配置本机 CogDoc 服务的云模型")
+    config.add_argument("--base-url")
+    config.add_argument("--model")
 
     auth = sub.add_parser("auth", help="账号、会话与 OIDC")
     auth_sub = auth.add_subparsers(dest="auth_action", required=True)
@@ -371,6 +457,11 @@ def build_parser() -> argparse.ArgumentParser:
     know_list = know_sub.add_parser("list")
     _add_kb_argument(know_list)
     know_list.add_argument("--status")
+    know_show = know_sub.add_parser("show")
+    know_show.add_argument("knowledge_id")
+    _add_kb_argument(know_show)
+    know_summary = know_sub.add_parser("summary")
+    _add_kb_argument(know_summary)
     know_create = know_sub.add_parser("create")
     know_create.add_argument("text", nargs="+")
     _add_kb_argument(know_create)
@@ -426,9 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
     feedback.add_argument("item_id", nargs="?")
     _add_kb_argument(feedback)
     feedback.add_argument("--trace-id")
-    feedback.add_argument(
-        "--value", choices=["thumbs_up", "thumbs_down", "correction"]
-    )
+    feedback.add_argument("--value", choices=["thumbs_up", "thumbs_down", "correction"])
     feedback.add_argument(
         "--issue",
         choices=[
@@ -757,9 +846,13 @@ class APICommandRunner:
 
         if explicit is not None:
             selected = csv_values(explicit)
+        elif not self.workspace_id:
+            config = checked(self.client.auth_config())
+            if not isinstance(config, Mapping) or config.get("account_auth_enabled") is not False:
+                raise ValueError("请先登录或执行 `cogdoc workspace use <ID>`")
+            selected = list(BUILT_IN_ROLE_IDS)
         else:
-            workspace_id = self.require_workspace()
-            payload = checked(self.client.list_workspace_roles(workspace_id))
+            payload = checked(self.client.list_workspace_roles(self.workspace_id))
             rows = payload.get("roles", []) if isinstance(payload, Mapping) else []
             selected = [
                 str(row.get("role_id"))
@@ -782,6 +875,43 @@ class APICommandRunner:
 
     def emit(self, payload: Any) -> None:
         print_payload(payload, compact=self.compact)
+
+    @staticmethod
+    def inbox_files(directory: Path | None = None) -> list[Path]:
+        root = (directory or Path(get_settings().cogdoc_doc_dir)).expanduser()
+        if not root.exists():
+            return []
+        if not root.is_dir():
+            raise ValueError(f"文档收件箱不是目录: {root}")
+        return sorted(
+            path
+            for path in root.iterdir()
+            if path.is_file() and path.suffix.casefold() in SUPPORTED_EXTENSIONS
+        )
+
+    def _configure_model(self, args: argparse.Namespace) -> int:
+        settings = get_settings()
+        base_url = args.base_url
+        model = args.model
+        if base_url is None:
+            current = str(settings.llm_base_url or "")
+            base_url = input(f"Base URL [{current}]: ").strip() or current
+        if model is None:
+            current = str(settings.llm_model_name or "")
+            model = input(f"模型 [{current}]: ").strip() or current
+        entered = getpass.getpass("API Key（留空保留当前值）: ").strip()
+        api_key = entered or None
+        apply_llm_config(api_key=api_key, base_url=base_url, model=model)
+        self.emit(
+            {
+                "updated": True,
+                "base_url": base_url,
+                "model": model,
+                "api_key_updated": api_key is not None,
+                "restart_required": True,
+            }
+        )
+        return 0
 
     def run(self, args: argparse.Namespace) -> int:
         command = args.command
@@ -869,6 +999,21 @@ class APICommandRunner:
                 result["session"] = None
             self.emit(result)
             return 0
+        if command == "inbox":
+            paths = self.inbox_files(args.directory)
+            self.emit(
+                {
+                    "directory": str(
+                        (args.directory or Path(get_settings().cogdoc_doc_dir))
+                        .expanduser()
+                        .resolve()
+                    ),
+                    "files": [path.name for path in paths],
+                }
+            )
+            return 0
+        if command == "config":
+            return self._configure_model(args)
         if command == "auth":
             return self._auth(args)
         if command in {"workspace", "ws"}:
@@ -916,9 +1061,7 @@ class APICommandRunner:
                     lambda: self.client.list_workspace_sync_jobs(limit=args.limit),
                 )
             if args.kind in {"all", "system"}:
-                load(
-                    "system_jobs", lambda: self.client.list_ha_jobs(limit=args.limit)
-                )
+                load("system_jobs", lambda: self.client.list_ha_jobs(limit=args.limit))
             if unavailable:
                 result["unavailable"] = unavailable
             self.emit(result)
@@ -1140,9 +1283,7 @@ class APICommandRunner:
         elif action == "kb-revoke":
             payload = checked(self.client.revoke_kb_access(kb_id, args.subject_id))
         elif action == "document-grants":
-            payload = checked(
-                self.client.list_document_grants(kb_id, args.document_id)
-            )
+            payload = checked(self.client.list_document_grants(kb_id, args.document_id))
         elif action == "document-grant":
             payload = checked(
                 self.client.grant_document_access(
@@ -1177,6 +1318,7 @@ class APICommandRunner:
             new_token = str(payload.get("access_token") or self.token)
             self.token = new_token
             self.state.values.pop("kb_id", None)
+            self.state.values.pop("session_id", None)
             self.state.update(
                 workspace_id=self.workspace_id,
                 access_token=new_token,
@@ -1260,6 +1402,7 @@ class APICommandRunner:
             ids = {str(row.get("kb_id")) for row in self.client.list_knowledge_bases()}
             if args.kb_id not in ids:
                 raise ValueError(f"当前 Workspace 不存在或无权访问知识库: {args.kb_id}")
+            self.state.values.pop("session_id", None)
             self.state.update(kb_id=args.kb_id)
             payload = {"kb_id": args.kb_id, "selected": True}
         elif action == "create":
@@ -1270,12 +1413,14 @@ class APICommandRunner:
                     role_ids=self.upload_role_ids(args.roles),
                 )
             )
+            self.state.values.pop("session_id", None)
             self.state.update(kb_id=args.kb_id)
         elif action == "delete":
             self.confirm(args.yes, f"确定永久删除知识库 {args.kb_id} 及关联数据吗")
             payload = checked(self.client.delete_knowledge_base(args.kb_id))
             if self.state.get("kb_id") == args.kb_id:
                 self.state.values.pop("kb_id", None)
+                self.state.values.pop("session_id", None)
                 self.state.save()
         elif action == "embedding-profiles":
             payload = self.client.list_embedding_profiles()
@@ -1365,6 +1510,8 @@ class APICommandRunner:
                 final = data
         if token_seen:
             print()
+        if final is None:
+            raise CogDocAPIError("流式回答在完成事件前中断")
         if final is not None:
             if not token_seen:
                 print(str(final.get("answer") or ""))
@@ -1401,6 +1548,25 @@ class APICommandRunner:
         if action == "list":
             payload = checked(
                 self.client.list_knowledge(self.require_kb(args.kb), status=args.status)
+            )
+        elif action == "show":
+            rows = checked(self.client.list_knowledge(self.require_kb(args.kb)))
+            values = rows if isinstance(rows, list) else rows.get("knowledge", [])
+            payload = next(
+                (
+                    row
+                    for row in values
+                    if isinstance(row, Mapping)
+                    and str(row.get("knowledge_id") or row.get("id") or "")
+                    == args.knowledge_id
+                ),
+                None,
+            )
+            if payload is None:
+                raise ValueError(f"找不到派生知识: {args.knowledge_id}")
+        elif action == "summary":
+            payload = checked(
+                self.client.review_queue_summary(self.require_kb(args.kb))
             )
         elif action == "create":
             payload = checked(
@@ -1587,9 +1753,7 @@ class APICommandRunner:
             )
         elif action == "delete":
             self.confirm(args.yes, f"确定删除连接器 {args.connection_id} 吗")
-            payload = checked(
-                self.client.delete_connection(kb_id, args.connection_id)
-            )
+            payload = checked(self.client.delete_connection(kb_id, args.connection_id))
         elif action == "sync":
             payload = checked(
                 self.client.start_connection_sync(kb_id, args.connection_id)
@@ -1621,7 +1785,9 @@ class APICommandRunner:
                 )
             )
         elif action == "source":
-            payload = checked(self.client.get_source_catalog_entry(kb_id, args.source_id))
+            payload = checked(
+                self.client.get_source_catalog_entry(kb_id, args.source_id)
+            )
         elif action == "versions":
             payload = checked(self.client.list_source_versions(kb_id, args.source_id))
         elif action == "diff":
@@ -1780,7 +1946,9 @@ class APICommandRunner:
             payload = checked(
                 self.client.update_workspace_oidc_policy(
                     workspace_id,
-                    allowed_domains=[str(value) for value in body.get("allowed_domains", [])],
+                    allowed_domains=[
+                        str(value) for value in body.get("allowed_domains", [])
+                    ],
                     default_role=str(body.get("default_role") or "viewer"),
                     enabled=boolean_value(body, "enabled"),
                     group_claim=str(body.get("group_claim") or "groups"),
@@ -1874,9 +2042,7 @@ class APICommandRunner:
                     max_tokens_per_account=int(
                         required_value(body, "max_tokens_per_account")
                     ),
-                    max_token_ttl_days=int(
-                        required_value(body, "max_token_ttl_days")
-                    ),
+                    max_token_ttl_days=int(required_value(body, "max_token_ttl_days")),
                     allow_non_expiring=boolean_value(
                         body, "allow_non_expiring", default=False
                     ),
@@ -1893,8 +2059,11 @@ class APICommandRunner:
 
 
 def _interactive(base_args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    print("CogDoc API 控制台 · 与 Web 共用账号、Workspace、权限和任务")
-    print("输入 help 查看命令，直接输入文本会向当前知识库提问，exit 退出。")
+    print(BANNER)
+    print("=" * 60)
+    print("🚀 CogDoc 控制台 | Workspace + 多知识库 + 多对话")
+    print("输入 /help 查看命令，直接输入文本向当前知识库提问。")
+    print("=" * 60)
     while True:
         state = CLIState(base_args.config_path or default_config_path())
         context = (
@@ -1911,17 +2080,52 @@ def _interactive(base_args: argparse.Namespace, parser: argparse.ArgumentParser)
         if line in {"exit", "quit", "/exit", "/quit"}:
             return 0
         if line in {"help", "/help"}:
-            parser.print_help()
+            print(INTERACTIVE_HELP)
             continue
         try:
             values = shlex.split(line)
             if values and values[0].startswith("/"):
                 values[0] = values[0][1:]
+            if values == ["new"]:
+                session_id = uuid4().hex
+                state.update(session_id=session_id)
+                print(f"🆕 已开启新对话（{session_id[:8]}）。")
+                continue
+            if values in (["local"], ["cloud"]):
+                is_local = values[0] == "local"
+                state.update(is_local=is_local)
+                print("已切换到本地模型。" if is_local else "已切换到云端模型。")
+                continue
+            was_inbox_add = values[:1] == ["add"]
+            values = _normalize_interactive_values(values)
+            if was_inbox_add:
+                runner = APICommandRunner(base_args)
+                files = runner.inbox_files()
+                if not files:
+                    print("文档收件箱里没有受支持的文件。")
+                    continue
+                if len(values) == 2:
+                    values.extend(str(path) for path in files)
+                else:
+                    by_name = {path.name: path for path in files}
+                    values = [
+                        *values[:2],
+                        *[
+                            str(
+                                path
+                                if path.is_file()
+                                else by_name.get(path.name, path)
+                            )
+                            for path in (Path(value).expanduser() for value in values[2:])
+                        ],
+                    ]
             known_commands = {
                 "login",
                 "register",
                 "logout",
                 "status",
+                "inbox",
+                "config",
                 "auth",
                 "workspace",
                 "ws",
@@ -1951,6 +2155,13 @@ def _interactive(base_args: argparse.Namespace, parser: argparse.ArgumentParser)
             }
             if values and values[0] not in known_commands:
                 values = ["chat", *values]
+            if values[:1] == ["chat"]:
+                if "--session" not in values:
+                    session_id = str(state.get("session_id") or uuid4().hex)
+                    state.update(session_id=session_id)
+                    values.extend(["--session", session_id])
+                if state.get("is_local") is True and "--local" not in values:
+                    values.append("--local")
             inherited: list[str] = []
             if base_args.api_url:
                 inherited.extend(["--api-url", base_args.api_url])
@@ -1964,6 +2175,9 @@ def _interactive(base_args: argparse.Namespace, parser: argparse.ArgumentParser)
                 inherited.append("--compact")
             parsed = parser.parse_args([*inherited, *values])
             APICommandRunner(parsed).run(parsed)
+        except KeyboardInterrupt:
+            print()
+            return 0
         except SystemExit:
             continue
         except httpx.HTTPError as exc:
@@ -1979,11 +2193,62 @@ def _interactive(base_args: argparse.Namespace, parser: argparse.ArgumentParser)
             print(f"错误: {exc}", file=sys.stderr)
 
 
+def _normalize_interactive_values(values: list[str]) -> list[str]:
+    """Preserve the original slash-console command muscle memory."""
+
+    if not values:
+        return values
+    if values == ["kb"]:
+        return ["kb", "list"]
+    if values[:2] == ["kb", "new"]:
+        return ["kb", "create", *values[2:]]
+    if values[:2] == ["kb", "rm"]:
+        return ["kb", "delete", *values[2:]]
+    if values == ["dk"] or values == ["knowledge"]:
+        return ["knowledge", "list"]
+    if values[:2] in (["dk", "add"], ["knowledge", "add"]):
+        return ["knowledge", "create", *values[2:]]
+    if len(values) >= 2 and values[0] in {"dk", "knowledge"}:
+        action = values[1]
+        if action in {"approve", "reject", "archive"}:
+            return ["knowledge", "review", action, *values[2:]]
+        if action in {"batch-approve", "batch-reject"}:
+            return ["knowledge", "batch", action, *values[2:]]
+        if action == "stale-scan":
+            return ["knowledge", "scan", *values[2:]]
+    if values[:1] == ["tuning"]:
+        action = values[1] if len(values) > 1 else "list"
+        mapped = "tuning" if action == "list" else action
+        return ["feedback", mapped, *values[2:]]
+    if values[:2] == ["review", "summary"]:
+        return ["knowledge", "summary", *values[2:]]
+    if values[:2] == ["review", "metrics"]:
+        return ["feedback", "metrics", *values[2:]]
+    if values[:2] == ["review", "export"]:
+        return ["feedback", "review-export", *values[2:]]
+    aliases = {
+        "docs": ["document", "list"],
+        "ls": ["document", "list"],
+        "add": ["document", "upload"],
+        "rm": ["document", "delete"],
+        "chats": ["sessions", "list"],
+        "open": ["sessions", "history"],
+        "rmchat": ["sessions", "delete"],
+    }
+    if values[0] in aliases:
+        return [*aliases[values[0]], *values[1:]]
+    if values[0] == "qa":
+        return ["chat", *values[1:], "--mode", "qa"]
+    if values[0] == "summary":
+        return ["chat", "总结文档", *values[1:], "--mode", "summary"]
+    if values[0] == "compare":
+        return ["chat", "对比文档", *values[1:], "--mode", "compare"]
+    return values
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
     if values[:1] in (["--local-storage"], ["local-storage"]):
-        # Preserve offline recovery without importing the heavyweight local RAG
-        # stack for ordinary API commands (including `cogdoc --help`).
         from cogdoc.cli import local_main
 
         return int(local_main() or 0)

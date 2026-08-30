@@ -45,14 +45,15 @@ COGDOC_OIDC_FLOW_KEY=replace-with-base64url-32-byte-key
 COGDOC_OIDC_DISPLAY_NAME=Company SSO
 COGDOC_OIDC_SCOPES=openid,email,profile
 COGDOC_OIDC_ALLOWED_ENDPOINT_HOSTS=id.example.com
-COGDOC_OIDC_ALLOWED_RETURN_URLS=https://app.example.com/
+COGDOC_OIDC_ALLOWED_RETURN_URLS=https://app.example.com/login
 
-COGDOC_FRONTEND_PUBLIC_URL=https://app.example.com/
+# 仅在同时运行 Streamlit 兼容客户端时配置，并把该精确 URL 也加入上面的 allowlist：
+# COGDOC_FRONTEND_PUBLIC_URL=https://legacy-app.example.com/
 COGDOC_OIDC_JIT_PROVISIONING_ENABLED=false
 COGDOC_OIDC_ALLOW_VERIFIED_EMAIL_LINK=false
 ```
 
-`COGDOC_OIDC_ISSUER` 必须与 discovery 和 ID token 的 `iss` 完全一致。若 discovery 返回另一个 token/JWKS hostname，需要把它显式加入 `COGDOC_OIDC_ALLOWED_ENDPOINT_HOSTS`；仅列 hostname，不含 scheme、port 或 path。`COGDOC_OIDC_ALLOWED_RETURN_URLS` 是逗号分隔的精确 HTTPS URL 列表，必须包含 Streamlit 使用的 `COGDOC_FRONTEND_PUBLIC_URL`。
+`COGDOC_OIDC_ISSUER` 必须与 discovery 和 ID token 的 `iss` 完全一致。若 discovery 返回另一个 token/JWKS hostname，需要把它显式加入 `COGDOC_OIDC_ALLOWED_ENDPOINT_HOSTS`；仅列 hostname，不含 scheme、port 或 path。`COGDOC_OIDC_ALLOWED_RETURN_URLS` 是逗号分隔的精确 HTTPS URL 列表。Next.js 工作台必须允许完整的登录页地址，例如 `https://app.example.com/login`；地址按规范化后的完整值精确匹配，站点根路径不能代替 `/login`。若启用 Streamlit 兼容客户端，还必须配置 `COGDOC_FRONTEND_PUBLIC_URL`，并将它的精确值加入同一 allowlist。
 
 public client 可以留空 client secret；confidential client 应从密钥管理系统注入。不要把 client secret、flow key 或 Bearer 写入仓库、镜像、URL、命令历史和日志。
 

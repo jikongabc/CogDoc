@@ -47,10 +47,17 @@ export function UploadZone({ kbId }: { kbId: string }) {
   const profilesQuery = useQuery({ queryKey: queryKeys.embeddingProfiles, queryFn: api.embeddingProfiles });
   const knowledgeBasesQuery = useQuery({ queryKey: queryKeys.knowledgeBases(workspaceId), queryFn: api.knowledgeBases });
   const knowledgeBase = knowledgeBasesQuery.data?.find((item) => item.kb_id === kbId);
-  const activeProfileId = knowledgeBase?.embedding_profile_id ?? "local";
+  const activeProfileId = knowledgeBase?.embedding_profile_id || "local";
   const embeddingProfileId = embeddingProfileSelection ?? activeProfileId;
-  const availableRoles = rolesQuery.data?.roles ?? BUILT_IN_WORKSPACE_ROLES;
+  const roleConfigurationReady = !workspaceId || rolesQuery.isSuccess;
+  const availableRoles = workspaceId ? (rolesQuery.data?.roles ?? []) : BUILT_IN_WORKSPACE_ROLES;
   const profiles = profilesQuery.data ?? [];
+  const selectedProfile = profiles.find((profile) => profile.profile_id === embeddingProfileId);
+  const uploadConfigurationReady = knowledgeBasesQuery.isSuccess
+    && Boolean(knowledgeBase)
+    && profilesQuery.isSuccess
+    && Boolean(selectedProfile?.available)
+    && roleConfigurationReady;
 
   const jobQuery = useQuery({
     queryKey: queryKeys.indexJob(workspaceId, jobId || "none"),
@@ -113,13 +120,24 @@ export function UploadZone({ kbId }: { kbId: string }) {
 
   const upload = async () => {
     if (!files.length) return;
+    if (!knowledgeBasesQuery.isSuccess || !knowledgeBase) {
+      setUploadError("无法确认知识库配置，请刷新后重试");
+      return;
+    }
+    if (!profilesQuery.isSuccess || !selectedProfile) {
+      setUploadError("无法确认 Embedding 模型，请重试");
+      return;
+    }
+    if (!roleConfigurationReady) {
+      setUploadError("无法确认工作区角色，请重试");
+      return;
+    }
     const roleIds = selectedRoleIds ?? availableRoles.map((role) => role.role_id);
     if (!roleIds.length) {
       setUploadError("请至少选择一个可访问角色");
       return;
     }
-    const selectedProfile = profiles.find((profile) => profile.profile_id === embeddingProfileId);
-    if (selectedProfile && !selectedProfile.available) {
+    if (!selectedProfile.available) {
       setUploadError("云端 Embedding 尚未由管理员配置");
       return;
     }
@@ -185,7 +203,7 @@ export function UploadZone({ kbId }: { kbId: string }) {
                   <span className="min-w-0"><span className="block truncate font-medium">{profile.kind === "local" ? "本地" : "云端"}</span><span className="block truncate text-[10px] text-muted-foreground">{profile.model || "模型未配置"}{!profile.available ? " · 不可用" : ""}</span></span>
                 </button>
               );
-            }) : <><div className="h-[52px] animate-pulse bg-surface-subtle" /><div className="h-[52px] animate-pulse bg-surface-subtle" /></>}
+            }) : profilesQuery.isError ? <div className="col-span-2 flex min-h-[52px] items-center justify-between gap-3 px-3 text-xs text-warning"><span>无法读取 Embedding 模型</span><Button type="button" variant="ghost" size="compact" onClick={() => void profilesQuery.refetch()}>重试</Button></div> : <><div className="h-[52px] animate-pulse bg-surface-subtle" /><div className="h-[52px] animate-pulse bg-surface-subtle" /></>}
           </div>
         </div>
         {switchingModel ? <div className="border-t border-warning/30 bg-warning-subtle px-3 py-2 text-xs text-warning"><AlertTriangle className="mr-1.5 inline size-3.5" />切换模型会重新生成整个知识库的向量索引，已有文档不会丢失。</div> : null}
@@ -231,9 +249,10 @@ export function UploadZone({ kbId }: { kbId: string }) {
         )}
       </div>
 
-      {files.length && !job ? <div className="space-y-1.5"><div className="flex items-center justify-between gap-3"><p className="text-[13px] font-medium">文档可访问角色</p><div className="flex items-center gap-2"><span className="text-[11px] text-muted-foreground">应用到本批全部文件</span><CreateWorkspaceRoleDialog workspaceId={workspaceId || ""} triggerVariant="ghost" /></div></div><RoleSelector roles={availableRoles} selected={selectedRoleIds ?? availableRoles.map((role) => role.role_id)} onChange={setSelectedRoleIds} compact disabled={uploading} /><p className="text-xs text-muted-foreground">入库后，只有选中的角色能在文档列表和 RAG 结果中看到这些文件。</p></div> : null}
+      {files.length && !job ? <div className="space-y-1.5"><div className="flex items-center justify-between gap-3"><p className="text-[13px] font-medium">文档可访问角色</p><div className="flex items-center gap-2"><span className="text-[11px] text-muted-foreground">应用到本批全部文件</span><CreateWorkspaceRoleDialog workspaceId={workspaceId || ""} triggerVariant="ghost" /></div></div>{roleConfigurationReady ? <RoleSelector roles={availableRoles} selected={selectedRoleIds ?? availableRoles.map((role) => role.role_id)} onChange={setSelectedRoleIds} compact disabled={uploading} /> : rolesQuery.isError ? <div className="flex items-center justify-between gap-3 border-l-2 border-warning bg-warning-subtle px-3 py-2 text-xs text-warning"><span>无法读取工作区角色。</span><Button type="button" variant="ghost" size="compact" onClick={() => void rolesQuery.refetch()}>重试</Button></div> : <p role="status" className="text-xs text-muted-foreground">正在读取工作区角色…</p>}<p className="text-xs text-muted-foreground">入库后，只有选中的角色能在文档列表和 RAG 结果中看到这些文件。</p></div> : null}
+      {knowledgeBasesQuery.isError ? <div role="alert" className="flex items-center justify-between border-l-2 border-warning bg-warning-subtle px-3 py-2 text-[13px] text-warning"><span>无法读取知识库配置。</span><Button type="button" variant="ghost" size="compact" onClick={() => void knowledgeBasesQuery.refetch()}>重试</Button></div> : null}
       {uploadError ? <div role="alert" className="border-l-2 border-error bg-error-subtle px-3 py-2 text-[13px] text-error">{uploadError}</div> : null}
-      {files.length && !job ? <div className="flex justify-end"><Button variant="primary" loading={uploading} onClick={() => void upload()}><FileUp className="size-4" />{uploading ? "正在上传" : switchingModel ? "上传并重建索引" : `上传 ${files.length} 个文件`}</Button></div> : null}
+      {files.length && !job ? <div className="flex justify-end"><Button variant="primary" disabled={!uploadConfigurationReady} loading={uploading} onClick={() => void upload()}><FileUp className="size-4" />{uploading ? "正在上传" : switchingModel ? "上传并重建索引" : `上传 ${files.length} 个文件`}</Button></div> : null}
       {jobQuery.isError ? <div className="flex items-center justify-between border-l-2 border-warning bg-warning-subtle px-3 py-2 text-[13px] text-warning"><span>暂时无法读取入库状态。</span><Button variant="ghost" size="compact" onClick={() => { void jobQuery.refetch(); toast.info("正在重新查询状态"); }}>重试</Button></div> : null}
     </div>
   );

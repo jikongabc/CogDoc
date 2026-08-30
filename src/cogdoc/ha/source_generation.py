@@ -17,6 +17,7 @@ from cogdoc.ha.object_store import ObjectIntegrityError, ObjectNotFound, ObjectS
 from cogdoc.ha.outbox import OutboxStore
 from cogdoc.ha.storage import DatabaseBackend, DatabaseConnection
 from cogdoc.service.kb_lifecycle import LIFECYCLE_ACTIVE
+from cogdoc.service.mutation_paths import MUTATION_BACKUP_SUFFIX
 from cogdoc.tools.source_parser import SUPPORTED_EXTENSIONS
 
 
@@ -183,7 +184,9 @@ class SourceGenerationStore:
             if not candidate.is_file():
                 continue
             relative = self._safe_relative(candidate, root)
-            if relative == _LOCAL_MARKER or candidate.name.endswith(".cogdoc-bak"):
+            if relative == _LOCAL_MARKER or candidate.name.endswith(
+                MUTATION_BACKUP_SUFFIX
+            ):
                 continue
             size = candidate.stat().st_size
             total_bytes += size

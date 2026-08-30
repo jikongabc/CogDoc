@@ -377,19 +377,19 @@ def evaluate_evidence_unit_outcomes(
 def _requirement_is_covered(
     top_items: Sequence[Mapping[str, Any]], requirement: Mapping[str, Any]
 ) -> bool:
-    expected_chunks = {
-        str(value)
-        for value in requirement.get("acceptable_chunk_ids", [])
-        if str(value)
-    }
-    expected_sources = {
-        str(value) for value in requirement.get("acceptable_sources", []) if str(value)
-    }
+    expected_chunks = set(_string_values(requirement.get("acceptable_chunk_ids")))
+    expected_sources = set(_string_values(requirement.get("acceptable_sources")))
     for item in top_items:
         chunk_id, source = _identity(item)
-        if (chunk_id and chunk_id in expected_chunks) or (
-            source and source in expected_sources
-        ):
+        # Chunk annotations are the precise contract.  When both fields are
+        # present, the source is descriptive/fallback metadata and must not
+        # make an arbitrary wrong chunk from that document count as evidence.
+        matched = (
+            bool(chunk_id and chunk_id in expected_chunks)
+            if expected_chunks
+            else bool(source and source in expected_sources)
+        )
+        if matched:
             return True
     return False
 
@@ -415,19 +415,16 @@ def _requirement_mask(
     chunk_id, source = _identity(item)
     mask = 0
     for index, requirement in enumerate(requirements):
-        expected_chunks = {
-            str(value)
-            for value in requirement.get("acceptable_chunk_ids", [])
-            if str(value)
-        }
-        expected_sources = {
-            str(value)
-            for value in requirement.get("acceptable_sources", [])
-            if str(value)
-        }
-        if (chunk_id and chunk_id in expected_chunks) or (
-            source and source in expected_sources
-        ):
+        expected_chunks = set(
+            _string_values(requirement.get("acceptable_chunk_ids"))
+        )
+        expected_sources = set(_string_values(requirement.get("acceptable_sources")))
+        matched = (
+            bool(chunk_id and chunk_id in expected_chunks)
+            if expected_chunks
+            else bool(source and source in expected_sources)
+        )
+        if matched:
             mask |= 1 << index
     return mask
 
@@ -440,14 +437,17 @@ def _ideal_requirement_masks(
     by_identity: Dict[tuple[str, str], int] = {}
     for index, requirement in enumerate(requirements):
         bit = 1 << index
-        for chunk_id in requirement.get("acceptable_chunk_ids", []):
-            identity = ("chunk", str(chunk_id))
-            if identity[1]:
-                by_identity[identity] = by_identity.get(identity, 0) | bit
-        for source in requirement.get("acceptable_sources", []):
-            identity = ("source", str(source))
-            if identity[1]:
-                by_identity[identity] = by_identity.get(identity, 0) | bit
+        chunk_ids = _string_values(requirement.get("acceptable_chunk_ids"))
+        identities = (
+            (("chunk", chunk_id) for chunk_id in chunk_ids)
+            if chunk_ids
+            else (
+                ("source", source)
+                for source in _string_values(requirement.get("acceptable_sources"))
+            )
+        )
+        for identity in identities:
+            by_identity[identity] = by_identity.get(identity, 0) | bit
 
     # 实际 item 可能同时用 chunk 和 source 命中不同需求；将其可实现 mask 纳入
     # 理想候选，保证 IDCG 不会低于当前排序本身可实现的增益。
@@ -496,16 +496,9 @@ def evaluate_requirement_coverage(
         return {}
 
     expected_chunk_ids = {
-        str(chunk_id)
+        chunk_id
         for requirement in requirements
-        for chunk_id in requirement.get("acceptable_chunk_ids", [])
-        if str(chunk_id)
-    }
-    expected_sources = {
-        str(source)
-        for requirement in requirements
-        for source in requirement.get("acceptable_sources", [])
-        if str(source)
+        for chunk_id in _string_values(requirement.get("acceptable_chunk_ids"))
     }
     hard_negatives = {str(value) for value in hard_negative_chunk_ids if str(value)}
     metrics: Dict[str, float] = {}
@@ -526,13 +519,9 @@ def evaluate_requirement_coverage(
 
         relevances = []
         for item in top_items:
-            chunk_id, source = _identity(item)
             relevances.append(
                 float(
-                    bool(
-                        (chunk_id and chunk_id in expected_chunk_ids)
-                        or (source and source in expected_sources)
-                    )
+                    any(_requirement_is_covered((item,), row) for row in requirements)
                 )
             )
         actual_masks = [

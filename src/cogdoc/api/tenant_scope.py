@@ -109,6 +109,21 @@ def _scope_from_record(record: Mapping[str, Any]) -> KnowledgeBaseScope:
     )
 
 
+def _canonical_legacy_kb_id(value: object) -> str | None:
+    """Apply the registry's path-safe ID contract to legacy direct scopes."""
+
+    if not isinstance(value, str) or (
+        not value
+        or value != value.strip()
+        or len(value) > 56
+        or value in {".", ".."}
+        or "\x00" in value
+        or any(character in "/\\" or character.isspace() for character in value)
+    ):
+        return None
+    return value
+
+
 def _lifecycle_active(storage_id: str) -> bool:
     try:
         return shared_lifecycle_store().status(storage_id) == LIFECYCLE_ACTIVE
@@ -318,21 +333,26 @@ def resolve_kb_scope(
         and principal.tenant_id == "default"
         and not is_user_session_principal(principal)
     ):
+        legacy_kb_id = _canonical_legacy_kb_id(kb_id)
+        if legacy_kb_id is None:
+            return None
         # Never reinterpret a named tenant's physical identifier as a legacy
         # default-tenant slug.  The non-default namespace is reserved even
         # after a registry entry is deleted, so orphaned index data cannot be
         # reached by guessing the deterministic storage ID.
         physical_getter = getattr(registry, "get_by_storage_id", None)
-        physical_record = physical_getter(kb_id) if callable(physical_getter) else None
-        if isinstance(physical_record, Mapping) or kb_id.startswith("t-"):
+        physical_record = (
+            physical_getter(legacy_kb_id) if callable(physical_getter) else None
+        )
+        if isinstance(physical_record, Mapping) or legacy_kb_id.startswith("t-"):
             return None
         # Pre-registry test runners and legacy default-KB deployments used the
         # public ID directly throughout the runtime. This fallback never exists
         # for named tenants, so it cannot cross a tenant boundary.
         legacy_scope = KnowledgeBaseScope(
             tenant_id="default",
-            external_id=kb_id,
-            storage_id=kb_id,
+            external_id=legacy_kb_id,
+            storage_id=legacy_kb_id,
             owner_id="default",
             created_at="",
         )

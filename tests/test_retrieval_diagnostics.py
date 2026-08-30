@@ -3,9 +3,9 @@ from cogdoc.service.retrieval_pipeline import RetrievalQuery
 from cogdoc.tools.retriever.scope import RetrievalScope
 
 
-def _doc(chunk_id, *, retrieval=None):
+def _doc(chunk_id, *, retrieval=None, text=None):
     return {
-        "text": f"text {chunk_id}",
+        "text": text or f"text {chunk_id}",
         "meta": {
             "chunk_id": chunk_id,
             "source": "paper.pdf",
@@ -60,3 +60,40 @@ def test_diagnostics_exposes_routes_rrf_contributions_and_gate_decision():
     }
     assert result["decision"]["supported"] is True
     assert result["latency_ms"]["total"] >= 0
+
+
+def test_diagnostics_uses_query_for_exact_term_support():
+    class ExactTermEngine:
+        def search_many_channels(self, queries, top_k=3, scope=None):
+            return [
+                {
+                    "vector": [
+                        _doc(
+                            "definition",
+                            retrieval={"distance": 0.95},
+                            text="ACM，全称 ACM-ICPC 国际大学生程序设计竞赛。",
+                        )
+                    ],
+                    "bm25": [],
+                }
+                for _ in queries
+            ]
+
+    result = run_retrieval_diagnostics(
+        engine=ExactTermEngine(),
+        derived_knowledge_retriever=_Knowledge(),
+        retrieval_feedback_store=None,
+        kb_id="kb",
+        query="ICPC全称是什么",
+        queries=[RetrievalQuery("ICPC全称是什么", is_original=True)],
+        top_k=3,
+        scope=RetrievalScope(include_derived_knowledge=True),
+        rerank=False,
+    )
+
+    assert result["decision"]["supported"] is False
+    assert result["decision"]["score"] < 1.0
+    assert (
+        result["decision"]["reason"]
+        == "lexical_coverage_requires_verification"
+    )

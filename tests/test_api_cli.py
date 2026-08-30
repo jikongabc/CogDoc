@@ -4,6 +4,7 @@ from argparse import Namespace
 from pathlib import Path
 
 import httpx
+import pytest
 
 from cogdoc import api_cli
 from cogdoc.frontend.api_client import CogDocClient
@@ -67,7 +68,9 @@ def test_cli_login_persists_server_workspace_and_reuses_it_for_kb_list(
 def test_cli_login_clears_previous_kb_selection(tmp_path: Path, monkeypatch):
     config = tmp_path / "cli.json"
     config.write_text(
-        json.dumps({"access_token": "old", "workspace_id": "old-ws", "kb_id": "old-kb"}),
+        json.dumps(
+            {"access_token": "old", "workspace_id": "old-ws", "kb_id": "old-kb"}
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(api_cli, "_password", lambda confirm=False: "password-1234")
@@ -90,6 +93,114 @@ def test_cli_login_clears_previous_kb_selection(tmp_path: Path, monkeypatch):
     stored = json.loads(config.read_text(encoding="utf-8"))
     assert stored["workspace_id"] == "new-ws"
     assert "kb_id" not in stored
+
+
+def test_workspace_switch_clears_kb_and_chat_session(tmp_path: Path, monkeypatch):
+    config = tmp_path / "cli.json"
+    config.write_text(
+        json.dumps(
+            {
+                "access_token": "old-token",
+                "workspace_id": "old-workspace",
+                "kb_id": "old-kb",
+                "session_id": "old-chat",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        CogDocClient,
+        "switch_workspace",
+        lambda self, workspace_id: _response(
+            payload={
+                "access_token": "new-token",
+                "workspace": {"workspace_id": workspace_id},
+            }
+        ),
+    )
+    args = api_cli.build_parser().parse_args(
+        [
+            "--config-path",
+            str(config),
+            "workspace",
+            "use",
+            "new-workspace",
+        ]
+    )
+
+    assert api_cli.APICommandRunner(args).run(args) == 0
+    stored = json.loads(config.read_text(encoding="utf-8"))
+    assert stored["workspace_id"] == "new-workspace"
+    assert "kb_id" not in stored
+    assert "session_id" not in stored
+
+
+def test_local_api_mode_uses_builtin_roles_without_workspace_state(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        CogDocClient,
+        "auth_config",
+        lambda self: _response(payload={"account_auth_enabled": False}),
+    )
+    args = api_cli.build_parser().parse_args(
+        ["--config-path", str(tmp_path / "cli.json"), "kb", "list"]
+    )
+
+    assert api_cli.APICommandRunner(args).upload_role_ids(None) == list(
+        api_cli.BUILT_IN_ROLE_IDS
+    )
+
+
+def test_account_api_mode_requires_workspace_before_defaulting_roles(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        CogDocClient,
+        "auth_config",
+        lambda self: _response(payload={"account_auth_enabled": True}),
+    )
+    args = api_cli.build_parser().parse_args(
+        ["--config-path", str(tmp_path / "cli.json"), "kb", "list"]
+    )
+
+    with pytest.raises(ValueError, match="workspace use"):
+        api_cli.APICommandRunner(args).upload_role_ids(None)
+
+
+def test_chat_rejects_stream_that_ends_before_final_event(
+    tmp_path: Path, monkeypatch, capsys
+):
+    config = tmp_path / "cli.json"
+    config.write_text(json.dumps({"kb_id": "handbook"}), encoding="utf-8")
+
+    def truncated_stream(self, kb_id, query, **kwargs):
+        yield "token", {"content": "partial answer"}
+
+    monkeypatch.setattr(CogDocClient, "stream_chat", truncated_stream)
+    args = api_cli.build_parser().parse_args(
+        ["--config-path", str(config), "chat", "question"]
+    )
+
+    with pytest.raises(api_cli.CogDocAPIError, match="完成事件前中断"):
+        api_cli.APICommandRunner(args).run(args)
+    assert capsys.readouterr().out == "partial answer\n"
+
+
+def test_interactive_keyboard_interrupt_during_dispatch_exits_cleanly(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr("builtins.input", lambda prompt="": "status")
+    monkeypatch.setattr(
+        api_cli.APICommandRunner,
+        "run",
+        lambda self, args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    base = api_cli.build_parser().parse_args(
+        ["--config-path", str(tmp_path / "cli.json")]
+    )
+
+    assert api_cli._interactive(base, api_cli.build_parser()) == 0
 
 
 def test_interactive_commands_inherit_global_context(tmp_path: Path, monkeypatch):
@@ -123,6 +234,131 @@ def test_interactive_commands_inherit_global_context(tmp_path: Path, monkeypatch
     assert captured[0].workspace == "ws-one"
     assert captured[0].config_path == config
     assert captured[0].compact is True
+
+
+def test_interactive_console_keeps_brand_and_original_command_aliases(
+    tmp_path: Path, monkeypatch, capsys
+):
+    inputs = iter(["/kb", "/kb new handbook", "/docs", "/qa 谁可以访问", "exit"])
+    captured: list[Namespace] = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+    monkeypatch.setattr(
+        api_cli.APICommandRunner,
+        "run",
+        lambda self, args: captured.append(args) or 0,
+    )
+    base = api_cli.build_parser().parse_args(
+        ["--config-path", str(tmp_path / "cli.json")]
+    )
+
+    assert api_cli._interactive(base, api_cli.build_parser()) == 0
+    output = capsys.readouterr().out
+    assert "██████╗" in output
+    assert "CogDoc 控制台" in output
+    assert [
+        (item.command, getattr(item, "kb_action", None)) for item in captured[:2]
+    ] == [
+        ("kb", "list"),
+        ("kb", "create"),
+    ]
+    assert captured[1].kb_id == "handbook"
+    assert captured[2].command == "document"
+    assert captured[2].document_action == "list"
+    assert captured[3].command == "chat"
+    assert captured[3].query == ["谁可以访问"]
+    assert captured[3].mode == "qa"
+
+
+def test_original_review_and_tuning_aliases_use_the_api_commands():
+    assert api_cli._normalize_interactive_values(["dk", "approve", "dk-1"]) == [
+        "knowledge",
+        "review",
+        "approve",
+        "dk-1",
+    ]
+    assert api_cli._normalize_interactive_values(["dk", "stale-scan"]) == [
+        "knowledge",
+        "scan",
+    ]
+    assert api_cli._normalize_interactive_values(["tuning", "list"]) == [
+        "feedback",
+        "tuning",
+    ]
+    assert api_cli._normalize_interactive_values(["review", "summary"]) == [
+        "knowledge",
+        "summary",
+    ]
+
+
+def test_original_add_command_resolves_files_from_the_inbox(
+    tmp_path: Path, monkeypatch
+):
+    inbox = tmp_path / "documents"
+    inbox.mkdir()
+    document = inbox / "report.pdf"
+    document.write_bytes(b"pdf")
+    inputs = iter(["/add report.pdf", "exit"])
+    captured: list[Namespace] = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+    monkeypatch.setattr(
+        api_cli,
+        "get_settings",
+        lambda: Namespace(cogdoc_doc_dir=str(inbox)),
+    )
+    monkeypatch.setattr(
+        api_cli.APICommandRunner,
+        "run",
+        lambda self, args: captured.append(args) or 0,
+    )
+    base = api_cli.build_parser().parse_args(
+        ["--config-path", str(tmp_path / "cli.json")]
+    )
+
+    assert api_cli._interactive(base, api_cli.build_parser()) == 0
+    assert captured[0].command == "document"
+    assert captured[0].document_action == "upload"
+    assert captured[0].files == [str(document)]
+
+
+def test_cloud_configuration_hides_api_key_and_uses_the_single_cli(
+    tmp_path: Path, monkeypatch
+):
+    captured = {}
+    monkeypatch.setattr(api_cli.getpass, "getpass", lambda _prompt: "new-secret")
+    monkeypatch.setattr(
+        api_cli,
+        "get_settings",
+        lambda: Namespace(
+            llm_base_url="https://old.example.com/v1",
+            llm_model_name="old-model",
+        ),
+    )
+    monkeypatch.setattr(
+        api_cli,
+        "apply_llm_config",
+        lambda **values: captured.update(values),
+    )
+    answers = iter(["https://api.example.com/v1", "model-v1"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    args = api_cli.build_parser().parse_args(
+        ["--config-path", str(tmp_path / "cli.json"), "config"]
+    )
+
+    assert api_cli.APICommandRunner(args).run(args) == 0
+    assert captured == {
+        "api_key": "new-secret",
+        "base_url": "https://api.example.com/v1",
+        "model": "model-v1",
+    }
+
+    parser = api_cli.build_parser()
+    config_parser = next(
+        action.choices["config"]
+        for action in parser._actions
+        if isinstance(getattr(action, "choices", None), dict)
+        and "config" in action.choices
+    )
+    assert "--api-key" not in config_parser.format_help()
 
 
 def test_cli_kb_use_rejects_inaccessible_kb(tmp_path: Path, monkeypatch):
@@ -275,7 +511,9 @@ def test_jobs_preserve_available_sources_when_ha_is_disabled(
     monkeypatch.setattr(
         CogDocClient,
         "list_index_jobs",
-        lambda self, kb_id=None, limit=200: _response(payload={"jobs": [{"id": "idx"}]}),
+        lambda self, kb_id=None, limit=200: _response(
+            payload={"jobs": [{"id": "idx"}]}
+        ),
     )
     monkeypatch.setattr(
         CogDocClient,
@@ -287,9 +525,7 @@ def test_jobs_preserve_available_sources_when_ha_is_disabled(
         "list_ha_jobs",
         lambda self, limit=200: _response(503, {"detail": "HA 控制面未启用"}),
     )
-    args = api_cli.build_parser().parse_args(
-        ["--config-path", str(config), "jobs"]
-    )
+    args = api_cli.build_parser().parse_args(["--config-path", str(config), "jobs"])
 
     assert api_cli.APICommandRunner(args).run(args) == 0
     output = json.loads(capsys.readouterr().out)
@@ -373,3 +609,13 @@ def test_feedback_submit_and_knowledge_binding_are_exposed(tmp_path: Path, monke
     assert knowledge_seen["related_document_id"] == "doc-1"
     assert knowledge_seen["related_source_sha256"] == "abc"
     assert knowledge_seen["created_from_trace_id"] == "trace-1"
+
+
+def test_local_storage_compatibility_entrypoint_is_preserved(monkeypatch):
+    import cogdoc.cli as local_cli
+
+    calls: list[bool] = []
+    monkeypatch.setattr(local_cli, "local_main", lambda: calls.append(True) or 7)
+
+    assert api_cli.main(["--local-storage"]) == 7
+    assert calls == [True]

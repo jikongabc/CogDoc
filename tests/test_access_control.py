@@ -517,6 +517,8 @@ def test_role_permission_matrix_is_explicit_and_least_privilege():
         ("PUT", "/v1/research-jobs/r-1/review", Permission.REVIEW),
         ("POST", "/v1/research-jobs/r-1/publish", Permission.PUBLISH),
         ("GET", "/v1/retrieval-eval-drafts/d-1", Permission.REVIEW),
+        ("POST", "/v1/retrieval-diagnostics", Permission.REVIEW),
+        ("POST", "/v1/retrieval-diagnostics/labels", Permission.REVIEW),
         (
             "GET",
             "/v1/claim-verification/observations/summary",
@@ -538,6 +540,47 @@ def test_role_permission_matrix_is_explicit_and_least_privilege():
             "DELETE",
             "/v1/workspaces/wsp-1/security-sessions/ses-1",
             Permission.MANAGE_ACCESS,
+        ),
+        ("GET", "/v1/ha/jobs", Permission.MANAGE_ACCESS),
+        (
+            "POST",
+            "/v1/knowledge-bases/kb/connector-credentials",
+            Permission.MANAGE_ACCESS,
+        ),
+        (
+            "POST",
+            "/v1/knowledge-bases/kb/connector-oauth/authorize",
+            Permission.MANAGE_ACCESS,
+        ),
+        (
+            "GET",
+            "/v1/knowledge-bases/kb/source-catalog",
+            Permission.MANAGE_ACCESS,
+        ),
+        (
+            "DELETE",
+            "/v1/knowledge-bases/kb/source-artifacts/trash",
+            Permission.MANAGE_ACCESS,
+        ),
+        (
+            "POST",
+            "/v1/knowledge-bases/kb/connections",
+            Permission.MANAGE_ACCESS,
+        ),
+        (
+            "GET",
+            "/v1/knowledge-bases/kb/connections",
+            Permission.READ,
+        ),
+        (
+            "POST",
+            "/v1/knowledge-bases/kb/sync-jobs/job/cancel",
+            Permission.MANAGE_ACCESS,
+        ),
+        (
+            "GET",
+            "/v1/knowledge-bases/kb/sync-jobs",
+            Permission.READ,
         ),
         ("GET", "/v1/tenants/t-1", Permission.MANAGE_TENANT),
         ("CONNECT", "/v1/unknown", Permission.MANAGE_TENANT),
@@ -845,8 +888,10 @@ async def test_viewer_can_read_and_query_but_cannot_mutate_delete_or_review():
     [
         (Role.REVIEWER, "POST", "/v1/knowledge/k-1/approve", 200),
         (Role.REVIEWER, "POST", "/v1/research-jobs/r-1/publish", 200),
+        (Role.REVIEWER, "POST", "/v1/retrieval-diagnostics", 200),
         (Role.REVIEWER, "POST", "/v1/knowledge-bases", 403),
         (Role.EDITOR, "POST", "/v1/knowledge-bases", 200),
+        (Role.EDITOR, "POST", "/v1/retrieval-diagnostics", 403),
         (Role.EDITOR, "PUT", "/v1/research-jobs/r-1/review", 403),
         (Role.EDITOR, "DELETE", "/v1/knowledge-bases/kb", 403),
         (Role.ADMIN, "DELETE", "/v1/knowledge-bases/kb", 200),
@@ -870,6 +915,60 @@ async def test_role_policy_enforced(role, method, path, expected_status):
     assert response.status_code == expected_status
     if expected_status == 403:
         assert response.json()["error_code"] == "FORBIDDEN"
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("GET", "/v1/ha/jobs"),
+        ("POST", "/v1/knowledge-bases/kb/connector-credentials"),
+        ("POST", "/v1/knowledge-bases/kb/connector-oauth/authorize"),
+        ("GET", "/v1/knowledge-bases/kb/source-catalog"),
+        ("DELETE", "/v1/knowledge-bases/kb/source-artifacts/trash"),
+        ("POST", "/v1/knowledge-bases/kb/connections"),
+        ("POST", "/v1/knowledge-bases/kb/connections/connection/sync"),
+        ("POST", "/v1/knowledge-bases/kb/sync-jobs/job/cancel"),
+    ],
+)
+@pytest.mark.anyio
+async def test_manage_access_scoped_principal_reaches_management_routes(method, path):
+    api_key = f"manage-{method}-{path}"
+    principal = Principal(
+        tenant_id="tenant-a",
+        subject_id="service-account",
+        role=Role.ADMIN,
+        key_fingerprint=fingerprint_api_key(api_key),
+        permission_scope=frozenset({Permission.MANAGE_ACCESS}),
+    )
+    app = _policy_app(principals={api_key: principal})
+
+    async with await _client(app) as client:
+        response = await client.request(method, path, headers={"X-API-Key": api_key})
+
+    assert response.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_manage_access_scope_does_not_grant_read_only_connector_routes():
+    api_key = "manage-only"
+    principal = Principal(
+        tenant_id="tenant-a",
+        subject_id="service-account",
+        role=Role.ADMIN,
+        key_fingerprint=fingerprint_api_key(api_key),
+        permission_scope=frozenset({Permission.MANAGE_ACCESS}),
+    )
+    app = _policy_app(principals={api_key: principal})
+
+    async with await _client(app) as client:
+        connections = await client.get(
+            "/v1/knowledge-bases/kb/connections", headers={"X-API-Key": api_key}
+        )
+        sync_jobs = await client.get(
+            "/v1/knowledge-bases/kb/sync-jobs", headers={"X-API-Key": api_key}
+        )
+
+    assert connections.status_code == sync_jobs.status_code == 403
 
 
 # 验证 startup warns when auth disabled 场景。

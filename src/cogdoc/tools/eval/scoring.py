@@ -164,6 +164,14 @@ def _configured_rate(
     return value
 
 
+def _identifier_set(value: Any) -> set[str]:
+    if not isinstance(value, Sequence) or isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return set()
+    return {str(item).strip() for item in value if str(item).strip()}
+
+
 def _claim_audit_assertion(
     audit: Mapping[str, Any], config: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -189,16 +197,8 @@ def _claim_audit_assertion(
         if verdict == "not_factual":
             counts["not_factual"] += 1
             continue
-        cited_ids = {
-            str(chunk_id)
-            for chunk_id in list(claim.get("cited_chunk_ids") or [])
-            if str(chunk_id)
-        }
-        supporting_ids = {
-            str(chunk_id)
-            for chunk_id in list(claim.get("supporting_chunk_ids") or [])
-            if str(chunk_id)
-        }
+        cited_ids = _identifier_set(claim.get("cited_chunk_ids"))
+        supporting_ids = _identifier_set(claim.get("supporting_chunk_ids"))
         # 外部 eval case 可能伪造自相矛盾的 supported。按运行时门禁的
         # 同一规则重算：必须至少有一个 supporting id，且全部属于合法引用集。
         if verdict == "supported" and (

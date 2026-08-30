@@ -414,6 +414,7 @@ _STREAM_DONE = object()
 _STREAM_WORKER_STARTED = object()
 _STREAM_QUEUE_WATCHDOG_SECONDS = 0.05
 _STREAM_WORKER_START_TIMEOUT_SECONDS = 1.0
+_STREAM_KEEPALIVE_SECONDS = 10.0
 
 
 # 封装SSE 帧。
@@ -662,27 +663,13 @@ async def chat_stream(request_body: ChatRequest, request: Request):
         recorded = False
         worker_started = False
         current_acknowledgement: threading.Event | None = None
+        last_keepalive_at = loop.time()
 
         # 记录最终结果。
         async def record_final(result: ChatResult) -> None:
             nonlocal recorded
             if recorded:
                 return
-            request.app.state.metrics.chat_results.labels(
-                result.task_type, str(result.is_valid).lower()
-            ).inc()
-            request.app.state.metrics.observe_claim_audit(
-                result.task_type,
-                result.raw_output.get("claim_audit"),
-            )
-            request.app.state.metrics.observe_claim_verification_rollout(
-                result.task_type,
-                result.raw_output.get("claim_verification_rollout"),
-            )
-            record_claim_verification_observation(request, result, kb_id=doc_id)
-            request.app.state.metrics.observe_retrieval(
-                result.task_type, result.raw_output
-            )
             if ha_coordinator is None:
                 await run_sync(
                     request.app.state.offload_executor,
@@ -701,6 +688,25 @@ async def chat_stream(request_body: ChatRequest, request: Request):
                         },
                     ],
                 )
+            # Match the synchronous endpoint: a chat only counts as delivered
+            # after its session state is durable.  Otherwise a transient
+            # SQLite failure would inflate success/quality metrics even though
+            # the client receives a terminal stream error.
+            request.app.state.metrics.chat_results.labels(
+                result.task_type, str(result.is_valid).lower()
+            ).inc()
+            request.app.state.metrics.observe_claim_audit(
+                result.task_type,
+                result.raw_output.get("claim_audit"),
+            )
+            request.app.state.metrics.observe_claim_verification_rollout(
+                result.task_type,
+                result.raw_output.get("claim_verification_rollout"),
+            )
+            record_claim_verification_observation(request, result, kb_id=doc_id)
+            request.app.state.metrics.observe_retrieval(
+                result.task_type, result.raw_output
+            )
             recorded = True
 
         try:
@@ -731,6 +737,13 @@ async def chat_stream(request_body: ChatRequest, request: Request):
                         )
                         break
                     except TimeoutError:
+                        now = loop.time()
+                        if now - last_keepalive_at >= _STREAM_KEEPALIVE_SECONDS:
+                            # SSE comment frames keep reverse proxies from treating a
+                            # long model/tool step as an abandoned response. Clients
+                            # ignore comments, so no public stream contract changes.
+                            yield ": keepalive\n\n"
+                            last_keepalive_at = now
                         continue
                 if event is None:
                     stop_event.set()
@@ -783,7 +796,30 @@ async def chat_stream(request_body: ChatRequest, request: Request):
                         break
                 if event.type == "final":
                     final_result = event.payload["result"]
-                    await record_final(final_result)
+                    try:
+                        await record_final(final_result)
+                    except Exception as exc:
+                        # A finalized answer that was not durably recorded must
+                        # not end as a truncated 200 response with no terminal
+                        # SSE event.  Match the existing synchronous endpoint's
+                        # fail-closed persistence semantics while keeping the
+                        # stream contract machine-readable.
+                        stop_event.set()
+                        final_result = None
+                        failure_event = ChatEvent(
+                            "error",
+                            {
+                                "error_class": type(exc).__name__,
+                                "message": "会话记录失败，流式响应已中断",
+                                "stage": "stream",
+                            },
+                        )
+                        yield _event_to_frame(
+                            failure_event,
+                            doc_id=external_doc_id,
+                            session_id=session_id,
+                        )
+                        break
                 frame = _event_to_frame(
                     event, doc_id=external_doc_id, session_id=session_id
                 )
@@ -809,4 +845,13 @@ async def chat_stream(request_body: ChatRequest, request: Request):
                     timeout=_STREAM_QUEUE_WATCHDOG_SECONDS * 2,
                 )
 
-    return StreamingResponse(event_source(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            # Disable intermediary buffering/caching so loading indicators and
+            # incremental answer frames arrive while the request is running.
+            "Cache-Control": "no-cache, no-store, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )

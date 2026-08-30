@@ -2,7 +2,7 @@
 
 Status: normative
 Scope: every CogDoc 2.0 web surface
-Last updated: 2026-08-25
+Last updated: 2026-08-30
 
 This document defines the visual primitives for CogDoc 2.0. Product pages may
 compose these primitives, but must not introduce local color systems, spacing
@@ -218,7 +218,7 @@ Respect `prefers-reduced-motion` by removing non-essential transforms.
 
 ### Context rail
 
-- Preserve the Streamlit grouping order: identity/workspace, knowledge base,
+- Preserve the established CogDoc grouping order: identity/workspace, knowledge base,
   conversations, then documents and access.
 - Use compact section headers and dividers instead of nesting each group in a
   card.

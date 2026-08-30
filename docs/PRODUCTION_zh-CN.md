@@ -119,15 +119,15 @@ docker run --rm --user 0 \
 5. 企业部署确认 bootstrap owner 可正常使用后，设置 `COGDOC_SELF_REGISTRATION_ENABLED=false` 并重启。必须保留至少一条验证过的 owner 恢复路径；尚无 owner 时先关注册会导致账号初始化锁死。
 6. 对外开放前，实测登录、工作区切换、移除成员、撤销会话、知识库/文档 ACL、一次被拒查询和一次获准 Research。
 
-已有静态主体的部署必须分阶段迁移，不能假设主体配置会自动变成真人用户。系统不会把 `COGDOC_API_PRINCIPALS` 自动转换为密码账号，新注册账号的工作区 ID 也是新生成的。改开关前先导出全部 tenant/KB ID 清单，并在迁移期间保留旧服务主体；ACL 开始执行后，无策略的 KB 会按设计从普通列表中消失。每个已知旧知识库都必须由同租户 owner/admin 服务 key 调用 `PATCH /v1/knowledge-bases/{kb}/access` 初始化，否则缺失 ACL 记录会对管理员也拒绝访问。先用 `GET /v1/knowledge-bases/{kb}/documents` 获取稳定 `document_id`，再增加逐文档策略或 grant。若要把旧库迁入新生成的账号工作区，应在目标工作区建库，并通过受支持 API/CLI 重新入库原始 PDF；禁止直接在 SQLite 中改写 registry 或 ACL 的 tenant ID。确认账号工作区、策略、成员、配额、Trace 与 Research 产物都正确后，才移除旧 key。
+已有静态主体的部署必须分阶段迁移，不能假设主体配置会自动变成真人用户。系统不会把 `COGDOC_API_PRINCIPALS` 自动转换为密码账号，新注册账号的工作区 ID 也是新生成的。改开关前先导出全部 tenant/KB ID 清单，并在迁移期间保留旧服务主体；ACL 开始执行后，无策略的 KB 会按设计从普通列表中消失。每个已知旧知识库都必须由同租户 owner/admin 服务 key 调用 `PATCH /v1/knowledge-bases/{kb}/access` 初始化，否则缺失 ACL 记录会对管理员也拒绝访问。先用 `GET /v1/knowledge-bases/{kb}/documents` 获取稳定 `document_id`，再增加逐文档策略或 grant。若要把旧库迁入新生成的账号工作区，应在目标工作区建库，并通过受支持 API/CLI 重新入库原始源文档；禁止直接在 SQLite 中改写 registry 或 ACL 的 tenant ID。确认账号工作区、策略、成员、配额、Trace 与 Research 产物都正确后，才移除旧 key。
 
-本版本新增 `document_id = source-name-v1` 元数据，并把 chunk 身份契约提升为 `source_sha256_name_page_span_local_v6_document_acl_parent_child_section_index_cs600_ov60_min30_ctx160`。这属于强制重建变化：ACL 上线完成前，必须通过正常入库流程重建所有受影响 PDF 的向量/BM25 generation。`SUBSET` 权限会在向量和 BM25 的 top-k 选择前下推，并在融合后再次过滤；后台 Research 会持久化创建者和冻结 allowlist，在召回前后复验当前成员/ACL，权限被撤销或后端无法执行子集过滤时 fail-closed。
+当前版本使用 `document_id = source-name-v1` 元数据和 `source_sha256_name_page_span_local_v7_document_acl_parent_child_section_index_adaptive_blocks_cs600_ov60_min30_ctx160_strategy_adaptive-structural-v2` chunk 身份契约。从旧契约升级属于强制重建变化：上线完成前，必须通过正常入库流程重建所有受影响来源的向量/BM25 generation。`SUBSET` 权限会在向量和 BM25 的 top-k 选择前下推，并在融合后再次过滤；后台 Research 会持久化创建者和冻结 allowlist，在召回前后复验当前成员/ACL，权限被撤销或后端无法执行子集过滤时 fail-closed。
 
 本地身份实现面向共享同一受保护数据目录的单个可写 CogDoc 服务实例。不能把各自持有独立 `state.db` 的实例直接放到负载均衡器后，并期待会话、邀请、成员或 ACL epoch 自动收敛。严格限制文件权限并加密备份，因为 `state.db` 含密码哈希、OIDC 身份映射/加密在途 flow、SCIM 用户/组/revision 和活动 token 摘要；获得仍有效的原始 Bearer 或邀请 token 依然足以执行对应操作。本版本提供单 provider 企业 OIDC 登录、显式账号绑定与工作区级 SCIM 目录预配，完整上线、密钥轮换和故障排查见 [OIDC](OIDC_zh-CN.md) 与 [SCIM](SCIM_zh-CN.md) 部署指南。邮件投递、邮箱密码重置与 CogDoc 自身强制 MFA 仍不提供；MFA/条件访问应由 IdP 强制，不能绕过本地会话和 ACL 校验。
 
 长期自动化优先使用[持久服务账号](SERVICE_ACCOUNTS_zh-CN.md)，为每个用途签发独立、有限期、最小角色 token；静态 `COGDOC_API_PRINCIPALS` 只保留迁移和受控 break-glass。服务 token 原文不在备份中，恢复后必须从外部密钥系统重新注入客户端，无法确认的 token应撤销重发。
 
-共享 Streamlit 部署禁止设置单数的 `COGDOC_API_KEY`。它是前端向外发请求的客户端凭据；一旦存在，每个尚无真人会话的浏览器都会按设计跳过登录页，并以该服务主体操作。多用户前端必须留空它，API 端服务身份只用 `COGDOC_API_KEYS` 或 `COGDOC_API_PRINCIPALS` 配置。单数变量仅适合受信的单用户控制台或专用自动化前端。
+单数的 `COGDOC_API_KEY` 是 CLI/兼容客户端向外发请求的凭据，不是 API 端白名单。Next.js 工作台使用真人浏览器会话，不读取它；共享 Streamlit 兼容部署必须留空该变量，否则没有独立真人会话的浏览器会以同一服务主体操作。API 端机器身份优先使用持久服务账号，也可使用 `COGDOC_API_KEYS` 或 `COGDOC_API_PRINCIPALS`；单数变量只用于受信单用户控制台或专用自动化客户端。
 
 反向代理必须保留 `X-CogDoc-Workspace`。它是非敏感的工作区选择器，不是独立权限；API 每次请求都会把它与已认证会话的实时成员关系绑定验证。新客户端用它使并发标签页固定在预期工作区；不带它的旧客户端继续使用 session 活动工作区。上游网关应拒绝或覆盖伪造的不同值，且不得仅按此 header 分路/缓存响应而忽略认证身份分区。
 
