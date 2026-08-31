@@ -3,15 +3,30 @@ from __future__ import annotations
 import copy
 import logging
 import re
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Any, cast
 
 from cogdoc.graph.state import RetrievedDoc
+from cogdoc.tools.rust_core_loader import ensure_rust_core
 from cogdoc.tools.tokenizer import tokenize_mixed_text
 
 
 logger = logging.getLogger(__name__)
+_rust_core: ModuleType | None = None
+_rust_core_lock = threading.Lock()
+
+
+def _get_rust_core() -> ModuleType:
+    global _rust_core
+    if _rust_core is None:
+        with _rust_core_lock:
+            if _rust_core is None:
+                _rust_core = ensure_rust_core("select_evidence_span_native")
+    assert _rust_core is not None
+    return _rust_core
 
 REASON_WITHIN_BUDGET = "within_budget"
 REASON_QUERY_SPAN = "query_span"
@@ -46,8 +61,6 @@ _REQUIREMENT_TEXT_KEYS = (
 )
 _WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[_.-][A-Za-z0-9]+)*")
 _CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff]")
-_CLOSING_PUNCTUATION = frozenset("\"'\u2019\u201d)\uff09]\u3011}\u3009\u300d\u300f")
-_UNCONDITIONAL_SENTENCE_END = frozenset("\u3002\uff01\uff1f!?\uff1b;")
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,12 +86,6 @@ class _SourceView:
     start: int
     end: int
     overlap_chars: int
-
-
-@dataclass(frozen=True, slots=True)
-class _TextSpan:
-    start: int
-    end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,320 +308,6 @@ def _active_requirements(
     )
 
 
-def _is_sentence_period(text: str, index: int) -> bool:
-    if text[index] != ".":
-        return False
-    previous = text[index - 1] if index else ""
-    following = text[index + 1] if index + 1 < len(text) else ""
-    if previous.isdigit() and following.isdigit():
-        return False
-    return not following or following.isspace() or following in _CLOSING_PUNCTUATION
-
-
-def _trimmed_span(text: str, start: int, end: int) -> _TextSpan | None:
-    while start < end and text[start].isspace():
-        start += 1
-    while end > start and text[end - 1].isspace():
-        end -= 1
-    return _TextSpan(start, end) if start < end else None
-
-
-def _sentence_spans(text: str) -> tuple[_TextSpan, ...]:
-    spans: list[_TextSpan] = []
-    start = 0
-    index = 0
-    while index < len(text):
-        char = text[index]
-        boundary = (
-            char == "\n"
-            or char in _UNCONDITIONAL_SENTENCE_END
-            or _is_sentence_period(text, index)
-        )
-        if not boundary:
-            index += 1
-            continue
-        end = index if char == "\n" else index + 1
-        if char != "\n":
-            while end < len(text) and text[end] in _CLOSING_PUNCTUATION:
-                end += 1
-        span = _trimmed_span(text, start, end)
-        if span is not None:
-            spans.append(span)
-        index = max(index + 1, end)
-        start = index
-    span = _trimmed_span(text, start, len(text))
-    if span is not None:
-        spans.append(span)
-    return tuple(spans)
-
-
-def _quality(
-    tokens: set[str],
-    *,
-    query_terms: tuple[str, ...],
-    requirement_terms: tuple[tuple[str, ...], ...],
-    all_terms: tuple[str, ...],
-) -> tuple[int, int, int]:
-    requirement_hits = sum(
-        bool(tokens.intersection(terms)) for terms in requirement_terms
-    )
-    query_hits = len(tokens.intersection(query_terms))
-    distinct_hits = len(tokens.intersection(all_terms))
-    return requirement_hits, query_hits, distinct_hits
-
-
-def _score(quality: tuple[int, int, int]) -> float:
-    requirement_hits, query_hits, distinct_hits = quality
-    return float(requirement_hits * 100 + query_hits * 10 + distinct_hits)
-
-
-def _matched_terms(tokens: set[str], all_terms: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(term for term in all_terms if term in tokens)
-
-
-def _matching_intervals(text: str, terms: set[str]) -> tuple[_TextSpan, ...]:
-    intervals: set[tuple[int, int]] = set()
-    lowered = text.casefold()
-    for term in terms:
-        # Chinese terms and identifiers generally survive tokenization verbatim.
-        # Pure Latin terms may be stems (for example ``retriev``), so matching
-        # them as arbitrary substrings would turn ``art`` into a hit on
-        # ``partial``.  Lexical units below handle those terms safely.
-        if term.isascii() and term.isalpha():
-            continue
-        search_from = 0
-        while term and (found := lowered.find(term, search_from)) >= 0:
-            intervals.add((found, found + len(term)))
-            search_from = found + max(1, len(term))
-    # English terms may be stemmed.  Map the normalized token back to the exact
-    # lexical unit instead of attempting to synthesize a substring.
-    for match in _WORD_RE.finditer(text):
-        lexical_terms = set(_stable_tokens(match.group(0)))
-        lexical_terms.add(match.group(0).casefold())
-        if terms.intersection(lexical_terms):
-            intervals.add((match.start(), match.end()))
-    return tuple(_TextSpan(start, end) for start, end in sorted(intervals))
-
-
-def _scoring_tokens(text: str, target_terms: tuple[str, ...]) -> set[str]:
-    """Include exact lexical hits that the corpus tokenizer punctuates."""
-
-    tokens = set(_stable_tokens(text))
-    lowered = text.casefold()
-    target = set(target_terms)
-    tokens.update(
-        term
-        for term in target_terms
-        if term and term in lowered and (not term.isascii() or not term.isalpha())
-    )
-    for match in _WORD_RE.finditer(text):
-        word_tokens = set(_stable_tokens(match.group(0)))
-        word_tokens.add(match.group(0).casefold())
-        tokens.update(target.intersection(word_tokens))
-    return tokens
-
-
-def _window_around_interval(
-    *,
-    text_chars: int,
-    interval: _TextSpan,
-    max_chars: int,
-) -> _TextSpan:
-    interval_chars = interval.end - interval.start
-    if interval_chars >= max_chars:
-        center = (interval.start + interval.end) // 2
-        start = max(0, center - max_chars // 2)
-    else:
-        left_context = (max_chars - interval_chars) // 2
-        start = max(0, interval.start - left_context)
-    start = min(start, max(0, text_chars - max_chars))
-    return _TextSpan(start, min(text_chars, start + max_chars))
-
-
-def _select_long_sentence_window(
-    text: str,
-    *,
-    target_terms: tuple[str, ...],
-    query_terms: tuple[str, ...],
-    requirement_terms: tuple[tuple[str, ...], ...],
-    max_chars: int,
-) -> _Selection | None:
-    intervals = _matching_intervals(text, set(target_terms))
-    if not intervals:
-        return None
-    choices: list[tuple[tuple[int, int, int], _TextSpan, set[str]]] = []
-    for interval in intervals:
-        span = _window_around_interval(
-            text_chars=len(text), interval=interval, max_chars=max_chars
-        )
-        tokens = _scoring_tokens(text[span.start : span.end], target_terms)
-        quality = _quality(
-            tokens,
-            query_terms=query_terms,
-            requirement_terms=requirement_terms,
-            all_terms=target_terms,
-        )
-        choices.append((quality, span, tokens))
-    quality, span, tokens = max(
-        choices,
-        key=lambda choice: (*choice[0], -choice[1].start),
-    )
-    return _Selection(
-        start=span.start,
-        end=span.end,
-        score=_score(quality),
-        matched_terms=_matched_terms(tokens, target_terms),
-        reason=REASON_LONG_SENTENCE_WINDOW,
-    )
-
-
-def _select_span(
-    text: str,
-    *,
-    query_terms: tuple[str, ...],
-    requirement_terms: tuple[tuple[str, ...], ...],
-    target_terms: tuple[str, ...],
-    max_chars: int,
-    context_sentences: int,
-) -> _Selection:
-    full_tokens = _scoring_tokens(text, target_terms)
-    full_quality = _quality(
-        full_tokens,
-        query_terms=query_terms,
-        requirement_terms=requirement_terms,
-        all_terms=target_terms,
-    )
-    full_matches = _matched_terms(full_tokens, target_terms)
-    if len(text) <= max_chars:
-        return _Selection(
-            0,
-            len(text),
-            _score(full_quality),
-            full_matches,
-            REASON_WITHIN_BUDGET,
-        )
-    if not target_terms:
-        return _Selection(
-            0,
-            len(text),
-            0.0,
-            (),
-            REASON_FALLBACK_NO_TERMS,
-            fallback=True,
-        )
-    if not full_matches:
-        return _Selection(
-            0,
-            len(text),
-            0.0,
-            (),
-            REASON_FALLBACK_NO_MATCH,
-            fallback=True,
-        )
-
-    sentences = _sentence_spans(text)
-    sentence_tokens = [
-        _scoring_tokens(text[span.start : span.end], target_terms) for span in sentences
-    ]
-    matching_sentence_indexes = [
-        index
-        for index, tokens in enumerate(sentence_tokens)
-        if tokens.intersection(target_terms)
-    ]
-    if not matching_sentence_indexes:
-        # This is uncommon (for example, a tokenizer boundary disagreement),
-        # but a raw lexical hit can still provide a trustworthy exact window.
-        window = _select_long_sentence_window(
-            text,
-            target_terms=target_terms,
-            query_terms=query_terms,
-            requirement_terms=requirement_terms,
-            max_chars=max_chars,
-        )
-        if window is not None:
-            return window
-        return _Selection(
-            0,
-            len(text),
-            0.0,
-            (),
-            REASON_FALLBACK_NO_MATCH,
-            fallback=True,
-        )
-
-    focal_index = max(
-        matching_sentence_indexes,
-        key=lambda index: (
-            *_quality(
-                sentence_tokens[index],
-                query_terms=query_terms,
-                requirement_terms=requirement_terms,
-                all_terms=target_terms,
-            ),
-            -index,
-        ),
-    )
-    focal = sentences[focal_index]
-    if focal.end - focal.start > max_chars:
-        focal_text = text[focal.start : focal.end]
-        local_window = _select_long_sentence_window(
-            focal_text,
-            target_terms=target_terms,
-            query_terms=query_terms,
-            requirement_terms=requirement_terms,
-            max_chars=max_chars,
-        )
-        if local_window is not None:
-            return _Selection(
-                start=focal.start + local_window.start,
-                end=focal.start + local_window.end,
-                score=local_window.score,
-                matched_terms=local_window.matched_terms,
-                reason=local_window.reason,
-            )
-        return _Selection(
-            0,
-            len(text),
-            0.0,
-            (),
-            REASON_FALLBACK_NO_MATCH,
-            fallback=True,
-        )
-
-    lower = max(0, focal_index - context_sentences)
-    upper = min(len(sentences) - 1, focal_index + context_sentences)
-    choices: list[tuple[tuple[int, int, int], int, int, _TextSpan, set[str]]] = []
-    for start_index in range(lower, focal_index + 1):
-        for end_index in range(focal_index, upper + 1):
-            span = _TextSpan(sentences[start_index].start, sentences[end_index].end)
-            if span.end - span.start > max_chars:
-                continue
-            tokens = _scoring_tokens(text[span.start : span.end], target_terms)
-            quality = _quality(
-                tokens,
-                query_terms=query_terms,
-                requirement_terms=requirement_terms,
-                all_terms=target_terms,
-            )
-            choices.append((quality, start_index, end_index, span, tokens))
-    quality, start_index, end_index, span, tokens = max(
-        choices,
-        key=lambda choice: (
-            *choice[0],
-            choice[2] - choice[1] + 1,
-            -abs((focal_index - choice[1]) - (choice[2] - focal_index)),
-            -choice[1],
-        ),
-    )
-    return _Selection(
-        start=span.start,
-        end=span.end,
-        score=_score(quality),
-        matched_terms=_matched_terms(tokens, target_terms),
-        reason=REASON_QUERY_SPAN,
-    )
-
-
 def _materialize_doc(
     doc: RetrievedDoc,
     source: _SourceView,
@@ -641,7 +334,7 @@ def _materialize_doc(
     retrieval = dict(_mapping(snapshot.get("retrieval")))
     ultimate_start = source.start + selection.start
     ultimate_end = source.start + selection.end
-    selected_tokens = _scoring_tokens(snapshot["text"], _target_terms((), requirements))
+    selected_tokens = set(selection.matched_terms)
     detected_requirement_ids = [
         requirement.requirement_id
         for requirement in requirements
@@ -736,13 +429,21 @@ class EvidenceSpanSelector:
         )
         target_terms = _target_terms(self._query_terms, requirements)
         source = _source_view(doc)
-        selection = _select_span(
+        native_selection = _get_rust_core().select_evidence_span_native(
             source.text,
-            query_terms=self._query_terms,
-            requirement_terms=requirement_terms,
-            target_terms=target_terms,
-            max_chars=self.max_chars_per_doc,
-            context_sentences=self.context_sentences,
+            list(self._query_terms),
+            [list(terms) for terms in requirement_terms],
+            list(target_terms),
+            self.max_chars_per_doc,
+            self.context_sentences,
+        )
+        selection = _Selection(
+            start=int(native_selection["start"]),
+            end=int(native_selection["end"]),
+            score=float(native_selection["score"]),
+            matched_terms=tuple(str(term) for term in native_selection["matched_terms"]),
+            reason=str(native_selection["reason"]),
+            fallback=bool(native_selection["fallback"]),
         )
         return (
             _materialize_doc(

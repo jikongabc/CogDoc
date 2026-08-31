@@ -1,7 +1,11 @@
 import pytest
 from tests._native import require_rust_core
 
-rust_core = require_rust_core("scan_pdf_manifest_native")
+rust_core = require_rust_core(
+    "list_supported_files_native",
+    "scan_pdf_manifest_native",
+    "scan_source_manifest_native",
+)
 
 
 # 写入。
@@ -85,5 +89,47 @@ def test_identical_content_is_stable_across_scans(tmp_path):
 def test_missing_directory_raises(tmp_path):
     # 验证目录不存在时 native scanner 抛出异常。
     missing = tmp_path / "does_not_exist"
-    with pytest.raises(Exception):
+    with pytest.raises(FileNotFoundError):
         rust_core.scan_pdf_manifest_native("kb", str(missing))
+
+
+def test_pdf_manifest_rejects_non_directory_with_specific_error(tmp_path):
+    regular_file = tmp_path / "regular.pdf"
+    _write(regular_file)
+
+    with pytest.raises(NotADirectoryError):
+        rust_core.scan_pdf_manifest_native("kb", str(regular_file))
+
+
+def test_source_manifest_scans_allowlist_and_enforces_per_file_limit(tmp_path):
+    _write(tmp_path / "a.md", b"abc")
+    _write(tmp_path / "b.TXT", b"1234")
+    _write(tmp_path / "ignored.pdf", b"pdf")
+
+    manifest = rust_core.scan_source_manifest_native(
+        "kb", str(tmp_path), [".md", ".txt"], 4
+    )
+
+    assert _names(manifest) == ["a.md", "b.TXT"]
+    assert [row["size"] for row in manifest["documents"]] == [3, 4]
+    assert rust_core.list_supported_files_native(
+        str(tmp_path), [".md", ".txt"]
+    ) == ["a.md", "b.TXT"]
+
+    with pytest.raises(OSError, match=r"source exceeds 2 bytes: a\.md"):
+        rust_core.scan_source_manifest_native(
+            "kb", str(tmp_path), [".md"], 2
+        )
+
+
+def test_source_manifest_preserves_missing_and_not_directory_errors(tmp_path):
+    missing = tmp_path / "missing"
+    regular_file = tmp_path / "regular.txt"
+    regular_file.write_text("content", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError):
+        rust_core.scan_source_manifest_native("kb", str(missing), [".txt"], 10)
+    with pytest.raises(NotADirectoryError):
+        rust_core.scan_source_manifest_native(
+            "kb", str(regular_file), [".txt"], 10
+        )

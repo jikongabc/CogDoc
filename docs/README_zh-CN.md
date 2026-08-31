@@ -600,7 +600,7 @@ Python 层负责图编排、Prompt、模型客户端、索引、API CLI、离线
 
 由 `build_kb_index_transactional` 在知识库的受支持来源经 Web/API 上传、连接器同步、删除、CLI 维护或显式重建发生变化时驱动：
 
-1. **扫描** — 全部为 PDF 时走 `scan_pdf_manifest_native`（Rust）的 rayon 并行、1 MiB 缓冲 SHA-256 快速路径；混合格式语料走统一来源扫描器。两者都会返回按文件名排序的 `{doc_id, documents: [{name, size, sha256}]}` manifest。
+1. **扫描** — 来源 manifest 统一在 Rust 中以 rayon 并行、1 MiB 缓冲计算 SHA-256。全 PDF 兼容路径使用 `scan_pdf_manifest_native`；混合格式使用 `scan_source_manifest_native`，由 Python 产品层传入格式白名单和单文件大小上限。两者都会返回按文件名排序的 `{doc_id, documents: [{name, size, sha256}]}` manifest。
 2. **比对** — `manifests_match` 仅当 `doc_id`、`chunk_identity_version` 及每个 `{name, sha256}` 都与已存 manifest 一致时才复用索引；任一不匹配都强制重建。
 3. **解析** — PDF 通过 `smart_parse` / PyMuPDF 抽取页文本、按 block 重排双栏，并可在预算内调用本地 Tesseract OCR。统一 `parse_source` 路径为 Markdown/文本/HTML 保留行与章节定位，为 DOCX 保留段落定位，为 PPTX 保留幻灯片定位，为 XLSX 保留工作表/单元格定位，并支持图片来源。
 4. **切块** — `chunk_paper` 先保守识别章节，再把每个 child 限制在 600 字符以内、重叠 60 字符，优先沿段落、句末/分号、换行和空白边界切分，超长无断句文本才退回固定窗口。无结构噪声仍沿用最短 30 字符过滤，但每个非空的已识别章节或 preamble 都会保留，避免章节硬边界抹掉短证据。child 不跨越已识别的章节边界；每块保存稳定 `parent_chunk_id`、章节路径、父级内序号及最多 160 字符的章节内定位上下文，同时保留自己的稳定 `chunk_id` 和页码跨度作为引用身份。
@@ -643,15 +643,18 @@ chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{
 
 ## Rust 原生核心
 
-`rust_core` 是 PyO3/maturin 扩展，通过 `tools.rust_core_loader.ensure_rust_core` 加载；若构建缺失或符号过期，会尽早失败并给出 `maturin develop` 提示。共暴露六个 native 符号，全部登记在 `scripts/check_native.py`，使 `make check` 能对旧构建报错。
+`rust_core` 是 PyO3/maturin 扩展，通过 `tools.rust_core_loader.ensure_rust_core` 加载；若构建缺失或符号过期，会尽早失败并给出 `maturin develop` 提示。运行时所需 native 符号全部登记在 `scripts/check_native.py`，使 `make check` 能对旧构建报错。
 
 | 符号 | 模块 | 用途 |
 | --- | --- | --- |
-| `scan_pdf_manifest_native` | `scanner.rs` | rayon 并行、缓冲式 SHA-256 的全 PDF 快速路径；混合格式改走 Python 来源扫描器 |
+| `scan_pdf_manifest_native` | `scanner.rs` | rayon 并行、缓冲式 SHA-256 的全 PDF 兼容路径 |
+| `list_supported_files_native` | `scanner.rs` | 与 manifest 扫描共用同一格式白名单逻辑的稳定文件枚举 |
+| `scan_source_manifest_native` | `scanner.rs` | 格式白名单约束的通用并行 SHA-256 扫描，并 fail-closed 执行单文件大小上限 |
 | `rrf_fusion_native` | `rrf.rs` | 对 vector + BM25 结果做确定性 RRF（`k=60`）融合，以 `chunk_id` 为键 |
 | `validate_citations_native` | `citation.rs` | 结构化引用校验 → `invalid_sources` / `invalid_pages` / `missing_citations` |
 | `tokenize_mixed_text_native` | `tokenizer.rs` | 中英混合分词：中文走 `jieba-rs`，英文做 Snowball 词干化 + 停用词过滤（标识符/版本号原样保留），与 Python 参照逐 token 对齐 |
 | `tokenize_corpus_native` | `tokenizer.rs` | BM25 建库使用的批量语料分词，避免 Python 侧逐文档分词循环 |
+| `select_evidence_span_native` | `evidence_span.rs` | 单次 native 调用完成 query-aware 分句、窗口评分；Python 保留来源追踪与 ACL materialize |
 | `Bm25Index`（类） | `bm25.rs` | BM25 索引 + `score_topk` + native 字节持久化，与 `rank_bm25.BM25Okapi` 逐位对齐，top-k 在 native 端选出 |
 
 ## 项目结构
@@ -693,7 +696,7 @@ CogDoc/
 | `src/cogdoc/graph/` | LangGraph 状态、主 workflow、QA / Summary / Compare 子图 |
 | `src/cogdoc/service/` | chat / ingest 服务、KB 生命周期、事务化索引、锁、清理和后台任务 |
 | `src/cogdoc/tools/` | 统一来源解析、PDF/OCR、切块、manifest、embedding、rerank、Rust loader 和检索器 |
-| `rust_core/src/` | PyO3 原生内核：scanner、tokenizer、BM25、RRF、citation validator |
+| `rust_core/src/` | PyO3 原生内核：scanner、tokenizer、evidence-span selector、BM25、RRF、citation validator |
 | `scripts/`、`tests/`、`eval/`、`docs/` | 健康检查脚本、测试、离线评测集和项目文档 |
 
 ## 扫描 PDF OCR（可选）

@@ -16,5 +16,6 @@ hex = "0.4"
 jieba-rs = "0.10"
 rust-stemmers = "1"
 regex = "1"
+unicode-casefold = "0.2"
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"

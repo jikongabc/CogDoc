@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import hashlib
 import html
 import mimetypes
 import os
 import re
 import subprocess
+import threading
 import zipfile
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, Iterable, cast
 from xml.etree import ElementTree as ET
 
@@ -24,6 +25,7 @@ from cogdoc.tools.ocr import (
     probe_ocr_dependency,
 )
 from cogdoc.tools.parser import smart_parse
+from cogdoc.tools.rust_core_loader import ensure_rust_core
 
 if TYPE_CHECKING:
     from cogdoc.source_model import SourceDocument
@@ -57,6 +59,20 @@ SUPPORTED_EXTENSIONS = frozenset(
         ".bmp",
     }
 )
+_rust_core: ModuleType | None = None
+_rust_core_lock = threading.Lock()
+
+
+def _get_rust_core() -> ModuleType:
+    global _rust_core
+    if _rust_core is None:
+        with _rust_core_lock:
+            if _rust_core is None:
+                _rust_core = ensure_rust_core(
+                    "list_supported_files_native", "scan_source_manifest_native"
+                )
+    assert _rust_core is not None
+    return _rust_core
 
 
 class SourceParseError(RuntimeError):
@@ -72,34 +88,28 @@ class UnsafeSourceArchiveError(SourceParseError):
 
 
 def list_supported_files(source_dir: str) -> list[str]:
-    return sorted(
-        name
-        for name in os.listdir(source_dir)
-        if Path(name).suffix.casefold() in SUPPORTED_EXTENSIONS
-        and os.path.isfile(os.path.join(source_dir, name))
+    return list(
+        _get_rust_core().list_supported_files_native(
+            os.path.abspath(source_dir), sorted(SUPPORTED_EXTENSIONS)
+        )
     )
 
 
 def scan_source_manifest(kb_id: str, source_dir: str) -> dict[str, Any]:
-    documents = []
-    for name in list_supported_files(source_dir):
-        path = os.path.join(source_dir, name)
-        digest = hashlib.sha256()
-        size = 0
-        with open(path, "rb") as handle:
-            while block := handle.read(1024 * 1024):
-                size += len(block)
-                if size > MAX_SOURCE_BYTES:
-                    raise SourceParseError(
-                        f"source exceeds {MAX_SOURCE_BYTES} bytes: {name}"
-                    )
-                digest.update(block)
-        documents.append({"name": name, "size": size, "sha256": digest.hexdigest()})
-    return {
-        "doc_id": kb_id,
-        "doc_dir": os.path.abspath(source_dir),
-        "documents": documents,
-    }
+    try:
+        return _get_rust_core().scan_source_manifest_native(
+            kb_id,
+            os.path.abspath(source_dir),
+            sorted(SUPPORTED_EXTENSIONS),
+            MAX_SOURCE_BYTES,
+        )
+    except (FileNotFoundError, NotADirectoryError):
+        raise
+    except OSError as exc:
+        message = str(exc)
+        if (offset := message.find("source exceeds ")) >= 0:
+            message = message[offset:]
+        raise SourceParseError(message) from exc
 
 
 def _page(source: str, number: int, text: str, **metadata: Any) -> dict[str, Any]:

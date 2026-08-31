@@ -5,10 +5,13 @@ from types import ModuleType
 # 运行链路里各处 ensure_rust_core 调用的符号并集；check_native 与就绪探针共用。
 REQUIRED_NATIVE_SYMBOLS = (
     "scan_pdf_manifest_native",
+    "list_supported_files_native",
+    "scan_source_manifest_native",
     "rrf_fusion_native",
     "validate_citations_native",
     "tokenize_mixed_text_native",
     "tokenize_corpus_native",
+    "select_evidence_span_native",
     "Bm25Index",
 )
 
