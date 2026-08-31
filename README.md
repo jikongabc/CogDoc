@@ -645,7 +645,7 @@ The Python layer owns orchestration, prompts, model clients, indexing, the API-b
 
 Driven by `build_kb_index_transactional` whenever a KB's supported sources change through Web/API upload, connector synchronization, deletion, CLI maintenance, or an explicit rebuild:
 
-1. **Scan** — an all-PDF corpus uses `scan_pdf_manifest_native` (Rust) for rayon-parallel, 1 MiB-buffered SHA-256; mixed-format corpora use the format-neutral source scanner. Both return a filename-sorted `{doc_id, documents: [{name, size, sha256}]}` manifest.
+1. **Scan** — source manifests are hashed in Rust with rayon-parallel, 1 MiB-buffered SHA-256. The all-PDF compatibility path uses `scan_pdf_manifest_native`; mixed-format corpora use `scan_source_manifest_native` with the Python product layer supplying the supported-extension allowlist and per-file byte limit. Both return a filename-sorted `{doc_id, documents: [{name, size, sha256}]}` manifest.
 2. **Compare** — `manifests_match` reuses the index only if `doc_id`, `chunk_identity_version`, and every `{name, sha256}` match the saved manifest; any mismatch forces a rebuild.
 3. **Parse** — PDFs use `smart_parse` / PyMuPDF for page text, block-aware two-column reflow, and optional bounded local Tesseract OCR. The format-neutral `parse_source` path preserves appropriate locators for Markdown/text/HTML lines and sections, DOCX paragraphs, PPTX slides, XLSX sheets/cells, and supported images.
 4. **Chunk** — `chunk_paper` first detects conservative section spans, then keeps each child under 600 chars with 60-char overlap, preferring paragraph, sentence/semicolon, newline, and whitespace boundaries before falling back to a fixed window for very long unbroken text. The legacy 30-character minimum still filters unstructured noise, while every non-empty detected section or preamble is retained so structural boundaries cannot erase short evidence. Children never cross a detected section boundary. Each child stores a stable `parent_chunk_id`, section breadcrumb and within-parent order, plus up to 160 chars of section-bounded context; its own stable `chunk_id` and page span remain the citation identity.
@@ -688,15 +688,18 @@ chunk_id = sha256:{source_sha256}:src:{source_name}:p{page_start}-p{page_end}:c{
 
 ## Native Core
 
-`rust_core` is a PyO3/maturin extension, loaded via `tools.rust_core_loader.ensure_rust_core`, which fails fast with a `maturin develop` hint if the build is missing or a symbol is stale. It exposes six native symbols, all listed in `scripts/check_native.py` so `make check` fails against a stale build.
+`rust_core` is a PyO3/maturin extension, loaded via `tools.rust_core_loader.ensure_rust_core`, which fails fast with a `maturin develop` hint if the build is missing or a symbol is stale. Its required native symbols are all listed in `scripts/check_native.py` so `make check` fails against a stale build.
 
 | Symbol | Module | Purpose |
 | --- | --- | --- |
-| `scan_pdf_manifest_native` | `scanner.rs` | Rayon-parallel, buffered SHA-256 all-PDF fast path; mixed formats use the Python source scanner |
+| `scan_pdf_manifest_native` | `scanner.rs` | Rayon-parallel, buffered SHA-256 all-PDF compatibility path |
+| `list_supported_files_native` | `scanner.rs` | Stable format-allowlisted file enumeration shared with manifest scanning |
+| `scan_source_manifest_native` | `scanner.rs` | Format-neutral, allowlisted parallel SHA-256 scan with a fail-closed per-file size limit |
 | `rrf_fusion_native` | `rrf.rs` | Deterministic RRF (`k=60`) merge of vector + BM25 results, keyed on `chunk_id` |
 | `validate_citations_native` | `citation.rs` | Structured citation check → `invalid_sources` / `invalid_pages` / `missing_citations` |
 | `tokenize_mixed_text_native` | `tokenizer.rs` | Mixed CN/EN tokenizer: `jieba-rs` for Chinese, Snowball stemming + stopword removal for English (identifiers/versions kept verbatim); token-for-token aligned with a Python reference |
 | `tokenize_corpus_native` | `tokenizer.rs` | Batch corpus tokenizer used by BM25 indexing to avoid Python-side per-document tokenization loops |
+| `select_evidence_span_native` | `evidence_span.rs` | Query-aware sentence/window scoring in one native call; Python retains provenance and ACL materialization |
 | `Bm25Index` (class) | `bm25.rs` | BM25 index + `score_topk` + native bytes persistence, bit-aligned with `rank_bm25.BM25Okapi`; top-k selected natively |
 
 ## Project Layout
@@ -738,7 +741,7 @@ CogDoc/
 | `src/cogdoc/graph/` | LangGraph state, main workflow, and QA / Summary / Compare subgraphs |
 | `src/cogdoc/service/` | Chat / ingest services, KB lifecycle, transactional indexing, locks, cleanup, and background work |
 | `src/cogdoc/tools/` | Format-neutral source parsing, PDF/OCR handling, chunking, manifests, embedding, rerank, Rust loading, and retrievers |
-| `rust_core/src/` | PyO3 native core: scanner, tokenizer, BM25, RRF, citation validator |
+| `rust_core/src/` | PyO3 native core: scanner, tokenizer, evidence-span selector, BM25, RRF, citation validator |
 | `scripts/`, `tests/`, `eval/`, `docs/` | Health-check scripts, tests, offline eval sets, and project docs |
 
 ## Configuration

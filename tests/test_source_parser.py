@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from cogdoc.tools import source_parser as source_parser_module
 from cogdoc.config.settings import Settings
 from cogdoc.tools.source_parser import (
     SourceParseError,
@@ -210,3 +211,24 @@ def test_manifest_scans_all_supported_formats_deterministically(tmp_path):
     (tmp_path / "ignored.exe").write_bytes(b"x")
     manifest = scan_source_manifest("kb", str(tmp_path))
     assert [row["name"] for row in manifest["documents"]] == ["a.txt", "b.md"]
+
+
+def test_manifest_preserves_filesystem_exception_contract(tmp_path):
+    missing = tmp_path / "missing"
+    regular_file = tmp_path / "regular.txt"
+    regular_file.write_text("content", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError):
+        scan_source_manifest("kb", str(missing))
+    with pytest.raises(NotADirectoryError):
+        scan_source_manifest("kb", str(regular_file))
+
+
+def test_manifest_preserves_source_size_error_contract(tmp_path, monkeypatch):
+    (tmp_path / "oversized.md").write_bytes(b"abc")
+    monkeypatch.setattr(source_parser_module, "MAX_SOURCE_BYTES", 2)
+
+    with pytest.raises(SourceParseError) as raised:
+        scan_source_manifest("kb", str(tmp_path))
+
+    assert str(raised.value) == "source exceeds 2 bytes: oversized.md"

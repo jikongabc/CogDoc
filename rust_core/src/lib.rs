@@ -3,6 +3,7 @@ use pyo3::types::{PyDict, PyList};
 
 mod bm25;
 mod citation;
+mod evidence_span;
 mod rrf;
 mod scanner;
 mod tokenizer;
@@ -16,7 +17,7 @@ fn scan_pdf_manifest_native<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let scanned_files = match scanner::parallel_scan_manifest(&doc_dir) {
         Ok(files) => files,
-        Err(e) => return Err(pyo3::exceptions::PyIOError::new_err(e.to_string())),
+        Err(error) => return Err(PyErr::from(error)),
     };
 
     let py_list = PyList::empty(py);
@@ -34,6 +35,44 @@ fn scan_pdf_manifest_native<'py>(
     final_manifest.set_item("doc_dir", doc_dir)?;
     final_manifest.set_item("documents", py_list)?;
 
+    Ok(final_manifest)
+}
+
+// 与通用 manifest 扫描复用同一份格式白名单和目录语义，只返回稳定文件名。
+#[pyfunction]
+fn list_supported_files_native(
+    source_dir: String,
+    supported_extensions: Vec<String>,
+) -> PyResult<Vec<String>> {
+    scanner::list_supported_source_files(&source_dir, &supported_extensions).map_err(PyErr::from)
+}
+
+// 扫描所有受支持来源格式；扩展名与单文件上限由 Python 产品契约传入。
+#[pyfunction]
+fn scan_source_manifest_native<'py>(
+    py: Python<'py>,
+    doc_id: String,
+    doc_dir: String,
+    supported_extensions: Vec<String>,
+    max_source_bytes: u64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let scanned_files =
+        scanner::parallel_scan_source_manifest(&doc_dir, &supported_extensions, max_source_bytes)
+            .map_err(PyErr::from)?;
+
+    let py_list = PyList::empty(py);
+    for file in scanned_files {
+        let single_file_dict = PyDict::new(py);
+        single_file_dict.set_item("name", file.name)?;
+        single_file_dict.set_item("size", file.size)?;
+        single_file_dict.set_item("sha256", file.sha256)?;
+        py_list.append(single_file_dict)?;
+    }
+
+    let final_manifest = PyDict::new(py);
+    final_manifest.set_item("doc_id", doc_id)?;
+    final_manifest.set_item("doc_dir", doc_dir)?;
+    final_manifest.set_item("documents", py_list)?;
     Ok(final_manifest)
 }
 
@@ -70,14 +109,51 @@ fn tokenize_corpus_native(texts: Vec<String>) -> Vec<Vec<String>> {
     tokenizer::tokenize_corpus_core(texts)
 }
 
+// 在一次 native 调用内完成分句、分词、候选窗口评分与稳定决胜。
+#[pyfunction]
+fn select_evidence_span_native<'py>(
+    py: Python<'py>,
+    text: String,
+    query_terms: Vec<String>,
+    requirement_terms: Vec<Vec<String>>,
+    target_terms: Vec<String>,
+    max_chars: usize,
+    context_sentences: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    if max_chars == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "max_chars must be positive",
+        ));
+    }
+    let selection = evidence_span::select_evidence_span_core(
+        &text,
+        &query_terms,
+        &requirement_terms,
+        &target_terms,
+        max_chars,
+        context_sentences,
+    );
+    let result = PyDict::new(py);
+    result.set_item("start", selection.start)?;
+    result.set_item("end", selection.end)?;
+    result.set_item("score", selection.score)?;
+    result.set_item("matched_terms", selection.matched_terms)?;
+    result.set_item("reason", selection.reason)?;
+    result.set_item("fallback", selection.fallback)?;
+    Ok(result)
+}
+
 // 模块入口：向 Python 注册导出的 native 函数
 #[pymodule]
 fn rust_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan_pdf_manifest_native, m)?)?;
+    m.add_function(wrap_pyfunction!(list_supported_files_native, m)?)?;
+    m.add_function(wrap_pyfunction!(scan_source_manifest_native, m)?)?;
     m.add_function(wrap_pyfunction!(rrf_fusion_native, m)?)?;
     m.add_function(wrap_pyfunction!(validate_citations_native, m)?)?;
     m.add_function(wrap_pyfunction!(tokenize_mixed_text_native, m)?)?;
     m.add_function(wrap_pyfunction!(tokenize_corpus_native, m)?)?;
+    m.add_function(wrap_pyfunction!(select_evidence_span_native, m)?)?;
     m.add_class::<bm25::Bm25Index>()?;
     Ok(())
 }
